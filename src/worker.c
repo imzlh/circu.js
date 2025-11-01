@@ -29,9 +29,6 @@
 #include <string.h>
 #include <unistd.h>
 
-extern const uint8_t tjs__worker_bootstrap[];
-extern const uint32_t tjs__worker_bootstrap_size;
-
 enum {
     MSGPIPE_EVENT_MESSAGE = 0,
     MSGPIPE_EVENT_MESSAGE_ERROR,
@@ -395,7 +392,8 @@ static void worker_entry(void *arg) {
     JS_FreeValue(ctx, sym);
     JS_FreeValue(ctx, global_obj);
 
-    CHECK_EQ(tjs__eval_bytecode(ctx, tjs__worker_bootstrap, tjs__worker_bootstrap_size, true), 0);
+	/* run core bootstrap code */
+	tjs__run_main(wrt);
 
     /* Load and eval the specifier when the loop runs. */
     JSValue specifier = JS_NewString(ctx, wd->specifier);

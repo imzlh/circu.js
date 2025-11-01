@@ -106,9 +106,7 @@ char *tjs_module_normalizer(JSContext *ctx, const char *base_name, const char *n
 int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpath, bool is_main);
 
 JSValue tjs__get_args(JSContext *ctx);
-
-int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len, bool check_promise);
-
+void tjs__run_main(TJSRuntime* qrt);
 void tjs__destroy_timers(TJSRuntime *qrt);
 
 void tjs__sab_free(void *opaque, void *ptr);

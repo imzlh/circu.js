@@ -45,7 +45,8 @@ macro(cpr_option OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
 endmacro()
 
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" ON)
-cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" OFF)
+cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
+cpr_option(TJS_WASM "Enable WebAssembly support" ON)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
@@ -54,8 +55,10 @@ add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_subdirectory(deps/sqlite3 EXCLUDE_FROM_ALL)
 
-set(BUILD_WASI "simple" CACHE STRING "WASI implementation")
-add_subdirectory(deps/wasm3 EXCLUDE_FROM_ALL)
+if(TJS_WASM)
+    set(BUILD_WASI "simple" CACHE STRING "WASI implementation")
+    add_subdirectory(deps/wasm3 EXCLUDE_FROM_ALL)
+endif()
 
 if(BUILD_WITH_MIMALLOC)
     option(MI_OVERRIDE "" OFF)
@@ -68,12 +71,10 @@ endif()
 
 find_package(CURL REQUIRED)
 
-add_library(tjs STATIC
-    src/builtins.c
+add_library(tjs
     src/curl-utils.c
     src/curl-websocket.c
     src/error.c
-    src/eval.c
     src/mem.c
     src/modules.c
     src/sha1.c
@@ -97,11 +98,6 @@ add_library(tjs STATIC
     src/mod_streams.c
     src/mod_sys.c
     src/mod_udp.c
-    src/bundles/c/core/core.c
-    src/bundles/c/core/polyfills.c
-    src/bundles/c/core/run-main.c
-    src/bundles/c/core/run-repl.c
-    src/bundles/c/core/worker-bootstrap.c
     deps/quickjs/cutils.c
 )
 
@@ -120,36 +116,36 @@ add_library(sqlite-test SHARED
 target_link_libraries(sqlite-test sqlite3)
 
 
-if(NOT USE_EXTERNAL_FFI AND NOT MINGW AND NOT APPLE)
-    set(LIBFFI_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/libffi")
-    set(TMP_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffi_root")
-    if(MINGW)
-        set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.dll.a)
-    else()
-        set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.a)
-    endif()
-    ExternalProject_Add(
-        libffi
-        BUILD_IN_SOURCE 1
-        SOURCE_DIR "${LIBFFI_SRC}"
-        CONFIGURE_COMMAND ./autogen.sh COMMAND ./configure --enable-static=yes --disable-shared --disable-docs --disable-multi-os-directory
-        BUILD_COMMAND make
-        INSTALL_DIR ${TMP_INSTALL_DIR}
-        INSTALL_COMMAND make DESTDIR=${TMP_INSTALL_DIR} install
-        EXCLUDE_FROM_ALL TRUE
-        BUILD_BYPRODUCTS ${LIBFFI_STATIC_PATH}
-    )
-    add_dependencies(tjs libffi)
-    add_library(libffi_a STATIC IMPORTED)
-    set_target_properties(libffi_a PROPERTIES IMPORTED_LOCATION ${LIBFFI_STATIC_PATH})
-    target_include_directories(tjs PRIVATE ${TMP_INSTALL_DIR}/usr/local/include)
-    target_link_libraries(tjs libffi_a)
-else()
+# if(NOT USE_EXTERNAL_FFI AND NOT MINGW AND NOT APPLE)
+#     set(LIBFFI_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/libffi")
+#     set(TMP_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffi_root")
+#     if(MINGW)
+#         set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.dll.a)
+#     else()
+#         set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.a)
+#     endif()
+#     ExternalProject_Add(
+#         libffi
+#         BUILD_IN_SOURCE 1
+#         SOURCE_DIR "${LIBFFI_SRC}"
+#         CONFIGURE_COMMAND ./autogen.sh COMMAND ./configure --enable-static=yes --disable-shared --disable-docs --disable-multi-os-directory
+#         BUILD_COMMAND make
+#         INSTALL_DIR ${TMP_INSTALL_DIR}
+#         INSTALL_COMMAND make DESTDIR=${TMP_INSTALL_DIR} install
+#         EXCLUDE_FROM_ALL TRUE
+#         BUILD_BYPRODUCTS ${LIBFFI_STATIC_PATH}
+#     )
+#     add_dependencies(tjs libffi)
+#     add_library(libffi_a STATIC IMPORTED)
+#     set_target_properties(libffi_a PROPERTIES IMPORTED_LOCATION ${LIBFFI_STATIC_PATH})
+#     target_include_directories(tjs PRIVATE ${TMP_INSTALL_DIR}/usr/local/include)
+#     target_link_libraries(tjs libffi_a)
+# else()
     find_library(FFI_LIB NAMES libffi ffi REQUIRED)
     find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
     target_include_directories(tjs PRIVATE ${FFI_INCLUDE_DIR})
     target_link_libraries(tjs ${FFI_LIB})
-endif()
+# endif()
 
 set_target_properties(tjs PROPERTIES
     C_STANDARD 11

@@ -105,40 +105,278 @@ static const JSSharedArrayBufferFunctions tjs_sf = {
 };
 
 /* core */
-extern const uint8_t tjs__core[];
-extern const uint32_t tjs__core_size;
-extern const uint8_t tjs__polyfills[];
-extern const uint32_t tjs__polyfills_size;
-extern const uint8_t tjs__run_main[];
-extern const uint32_t tjs__run_main_size;
-
-
 static int tjs__argc = 0;
 static char **tjs__argv = NULL;
 
+struct TJSModule {
+	const char *name;
+	void (*init)(JSContext *ctx, JSValue ns);
+};
 
-static void tjs__bootstrap_core(JSContext *ctx, JSValue ns) {
-    tjs__mod_dns_init(ctx, ns);
-    tjs__mod_engine_init(ctx, ns);
-    tjs__mod_error_init(ctx, ns);
-    tjs__mod_ffi_init(ctx, ns);
-    tjs__mod_fs_init(ctx, ns);
-    tjs__mod_fswatch_init(ctx, ns);
-    tjs__mod_os_init(ctx, ns);
-    tjs__mod_process_init(ctx, ns);
-    tjs__mod_signals_init(ctx, ns);
-    tjs__mod_sqlite3_init(ctx, ns);
-    tjs__mod_streams_init(ctx, ns);
-    tjs__mod_sys_init(ctx, ns);
-    tjs__mod_timers_init(ctx, ns);
-    tjs__mod_udp_init(ctx, ns);
-    tjs__mod_wasm_init(ctx, ns);
-    tjs__mod_worker_init(ctx, ns);
-    tjs__mod_ws_init(ctx, ns);
-    tjs__mod_xhr_init(ctx, ns);
-#ifndef _WIN32
-    tjs__mod_posix_socket_init(ctx, ns);
+static const struct TJSModule tjs_modules[] = {
+	{ "dns", tjs__mod_dns_init },
+	{ "engine", tjs__mod_engine_init },
+	{ "error", tjs__mod_error_init },
+	{ "ffi", tjs__mod_ffi_init },
+	{ "fs", tjs__mod_fs_init },
+	{ "fswatch", tjs__mod_fswatch_init },
+	{ "os", tjs__mod_os_init },
+	{ "process", tjs__mod_process_init },
+	{ "signals", tjs__mod_signals_init },
+	{ "sqlite3", tjs__mod_sqlite3_init },
+	{ "streams", tjs__mod_streams_init },
+	{ "sys", tjs__mod_sys_init },
+	{ "timers", tjs__mod_timers_init },
+	{ "udp", tjs__mod_udp_init },
+#ifdef TJS_WASM
+	{ "wasm", tjs__mod_wasm_init },
 #endif
+	{ "worker", tjs__mod_worker_init },
+	{ "ws", tjs__mod_ws_init },
+	{ "xhr", tjs__mod_xhr_init },
+#ifndef _WIN32
+	{ "posix_socket", tjs__mod_posix_socket_init },
+#endif
+};
+
+JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
+	JSValue ns = value[0];
+
+	// find name
+	if(argc == 0){
+		return JS_NULL;
+	}
+
+	const char* name = JS_ToCString(ctx, argv[0]);
+	if(!name) return JS_NULL;
+
+	struct TJSModule *mod = NULL;
+	for (int i = 0; i < countof(tjs_modules); i ++){
+		struct TJSModule *m = &tjs_modules[i];
+		if (strcmp(m->name, name) == 0){
+			mod = m;
+			break;
+		}
+	}
+	if(!mod) return JS_NULL;
+
+	JSValue module_obj = JS_GetPropertyStr(ctx, ns, mod->name);
+	if(!JS_IsUndefined(module_obj)){
+		return module_obj;
+	}
+
+	// init
+	module_obj = JS_NewObjectProto(ctx, JS_NULL);
+	mod->init(ctx, module_obj);
+	JS_SetPropertyStr(ctx, ns, mod->name, module_obj);
+	return module_obj;
+}
+#ifdef _WIN32
+    #include <windows.h>
+    #include <libloaderapi.h>
+	#include <windows.h>
+    #include <io.h>
+    #define access _access
+    #define F_OK 0
+#else
+    #include <unistd.h>
+    #include <limits.h>
+#endif
+
+char* tjs__get_self() {
+    static char path[4096] = {0};
+    
+#ifdef _WIN32
+    HMODULE hModule = GetModuleHandle(NULL);
+    if (hModule) {
+        DWORD size = GetModuleFileNameA(hModule, path, sizeof(path) - 1);
+        if (size > 0) {
+            path[size] = '\0';
+            return path;
+        }
+    }
+#else
+    #if defined(__linux__)
+        ssize_t count = readlink("/proc/self/exe", path, sizeof(path) - 1);
+        if (count >= 0) {
+            path[count] = '\0';
+            return path;
+        }
+    #elif defined(__APPLE__)
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) == 0) {
+            char real_path[4096];
+            if (realpath(path, real_path) != NULL) {
+                strcpy(path, real_path);
+                return path;
+            }
+        }
+    #elif defined(__FreeBSD__)
+        ssize_t count = readlink("/proc/curproc/file", path, sizeof(path) - 1);
+        if (count >= 0) {
+            path[count] = '\0';
+            return path;
+        }
+    #endif
+    
+    if (strlen(path) == 0) {
+        const char* argv0 = getenv("_");
+        if (argv0 && argv0[0] == '/') {
+            strncpy(path, argv0, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+            return path;
+        }
+    }
+#endif
+
+    return NULL;
+}
+
+static inline int file_exists(const char *filename) {
+    return access(filename, F_OK) == 0;
+}
+
+static uint8_t* read_file(const char *filename, size_t *file_size) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return NULL;
+    
+    fseek(file, 0, SEEK_END);
+    *file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    assert (*file_size >= 4);
+    
+    unsigned char *buffer = malloc(*file_size);
+    if (!buffer) {
+        fclose(file);
+        return NULL;
+    }
+    
+    if (fread(buffer, 1, *file_size, file) != *file_size) {
+        free(buffer);
+        fclose(file);
+        return NULL;
+    }
+    
+    fclose(file);
+    return buffer;
+}
+
+static uint8_t* tjs__read_attached(const char *filename, uint32_t *text_length) {
+    size_t file_size;
+    uint8_t *file_data = read_file(filename, &file_size);
+    if (!file_data) {
+        return NULL;
+    }
+    
+    *text_length = *(uint32_t*)(file_data + file_size - 4);
+    
+    assert (*text_length + 4 <= file_size);
+    
+    uint8_t *attach = malloc(*text_length);
+    if (!attach) {
+        return NULL;
+    }
+    
+    memcpy(attach, file_data + file_size - 4 - *text_length, *text_length);
+    
+    free(file_data);
+    return attach;
+}
+
+static int write_file_with_text(const char *filename, const unsigned char *original_data, 
+                        size_t original_size, const char *text, uint32_t text_length) {
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        return -1;
+    }
+    
+    if (fwrite(original_data, 1, original_size, file) != original_size) {
+        fclose(file);
+        return -1;
+    }
+    
+    if (text && text_length > 0 && fwrite(text, 1, text_length, file) != text_length) {
+        fclose(file);
+        return -1;
+    }
+
+    if (fwrite(&text_length, 1, 4, file) != 4) {
+        perror("fwrite length");
+        fclose(file);
+        return -1;
+    }
+    
+    fclose(file);
+    return 0;
+}
+
+int has_text_attached(const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        return 0;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    
+    if (file_size < 4) {
+        fclose(file);
+        return 0;
+    }
+    
+    fseek(file, -4, SEEK_END);
+    
+    uint32_t text_length;
+    if (fread(&text_length, 1, 4, file) != 4) {
+        fclose(file);
+        return 0;
+    }
+    
+    fclose(file);
+    
+    return (text_length > 0 && text_length + 4 <= file_size);
+}
+
+static int tjs__build_binary(const char *filename, const char *new_text, int overwrite) {
+    size_t original_size;
+    unsigned char *original_data = read_file(filename, &original_size);
+    if (!original_data) {
+        return -1;
+    }
+    
+    uint32_t new_text_length = new_text ? strlen(new_text) : 0;
+    size_t program_size;
+    if (overwrite && has_text_attached(filename)) {
+        uint32_t old_text_length;
+        char *old_text = tjs__read_attached(filename, &old_text_length);
+        if (old_text) {
+            program_size = original_size - old_text_length - 4;
+            free(old_text);
+        } else {
+            program_size = original_size;
+        }
+    } else {
+        program_size = original_size;
+    }
+    
+    int result = write_file_with_text(filename, original_data, program_size, 
+                                    new_text, new_text_length);
+    
+    free(original_data);
+    return result;
+}
+
+static uint8_t* tjs__read_self_attached(uint32_t *text_length){
+	static uint8_t* js = NULL;
+	static uint32_t size = 0;
+	static char* self_exe_path = NULL;
+	if(size == 0){
+		tjs__get_self();
+		js = tjs__read_attached(self_exe_path, &size);
+	}
+	*text_length = size;
+	return js;
 }
 
 JSValue tjs__get_args(JSContext *ctx) {
@@ -292,19 +530,9 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
 
-    /* start bootstrap */
-    JSValue global_obj = JS_GetGlobalObject(ctx);
-    JSValue core_sym = JS_NewSymbol(ctx, "tjs.internal.core", true);
-    JSAtom core_atom = JS_ValueToAtom(ctx, core_sym);
-    JSValue core = JS_NewObjectProto(ctx, JS_NULL);
-
-    CHECK_EQ(JS_DefinePropertyValue(ctx, global_obj, core_atom, core, JS_PROP_C_W_E), true);
-    CHECK_EQ(JS_DefinePropertyValueStr(ctx, core, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_C_W_E), true);
-
-    tjs__bootstrap_core(ctx, core);
-
-    CHECK_EQ(tjs__eval_bytecode(ctx, tjs__polyfills, tjs__polyfills_size, true), 0);
-    CHECK_EQ(tjs__eval_bytecode(ctx, tjs__core, tjs__core_size, true), 0);
+    /* define some global properties */
+	JSValue global_obj = JS_GetGlobalObject(ctx);
+    CHECK_EQ(JS_DefinePropertyValueStr(ctx, global_obj, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_ENUMERABLE), true);
 
     /* Load some builtin references for easy access */
     qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
@@ -313,12 +541,12 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
 
     /* end bootstrap */
-    JS_FreeAtom(ctx, core_atom);
-    JS_FreeValue(ctx, core_sym);
     JS_FreeValue(ctx, global_obj);
 
     /* WASM */
+#ifdef TJS_WASM
     qrt->wasm_ctx.env = m3_NewEnvironment();
+#endif
 
     /* Timers */
     qrt->timers.timers = NULL;
@@ -452,6 +680,76 @@ static void uv__check_cb(uv_check_t *handle) {
     uv__maybe_idle(qrt);
 }
 
+static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len, bool check_promise) {
+    JSValue obj = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
+
+    if (JS_IsException(obj)) {
+        goto error;
+    }
+
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
+        if (JS_ResolveModule(ctx, obj) < 0) {
+            JS_FreeValue(ctx, obj);
+            goto error;
+        }
+
+		// define module meta
+		JSModuleDef* m = JS_VALUE_GET_PTR(obj);
+		JSValue meta = JS_GetImportMeta(ctx, m);
+
+		// define use()
+		JSValue cache_obj = JS_NewObjectProto(ctx, JS_NULL);
+		JSValue use_func = JS_NewCFunctionData(ctx, tjs_module_use, 1, 0, 1, (JSValueConst[]) { cache_obj });
+		JS_FreeValue(ctx, cache_obj);
+		JS_DefinePropertyValueStr(ctx, meta, "use", use_func, JS_PROP_C_W_E);
+
+		// end
+		JS_FreeValue(ctx, meta);
+    }
+
+    JSValue val = JS_EvalFunction(ctx, obj);
+    if (JS_IsException(val)) {
+        goto error;
+    }
+
+    if (check_promise) {
+        JSPromiseStateEnum promise_state = JS_PromiseState(ctx, val);
+        if (promise_state != -1) {
+            // It's a promise!
+            if (promise_state == JS_PROMISE_REJECTED) {
+                JSValue res = JS_PromiseResult(ctx, val);
+                tjs_dump_error1(ctx, res);
+                JS_FreeValue(ctx, res);
+                JS_FreeValue(ctx, val);
+
+                return -1;
+            }
+        }
+    }
+
+    JS_FreeValue(ctx, val);
+
+    return 0;
+
+error:
+    tjs_dump_error(ctx);
+    return -1;
+}
+
+void tjs__run_main(TJSRuntime* qrt) {
+	/* get built-in script */
+	uint8_t* tjs__core_js = NULL;
+	uint32_t tjs__core_js_size = 0;
+	tjs__core_js = tjs__read_self_attached(&tjs__core_js_size);
+
+	/* If we are running the main interpreter, run the entrypoint. */
+	if (tjs__eval_bytecode(qrt->ctx, tjs__core_js, tjs__core_js_size, true) != 0) {
+		fprintf(stderr, "CorePanic: Eval entry script failed immediately\n");
+		fflush(stderr);
+		abort();
+	}
+}
+
 /* main loop which calls the user JS callbacks */
 int TJS_Run(TJSRuntime *qrt) {
     int ret = 0;
@@ -465,8 +763,7 @@ int TJS_Run(TJSRuntime *qrt) {
     if (!qrt->is_worker) {
         uv_unref((uv_handle_t *) &qrt->stop);
 
-        /* If we are running the main interpreter, run the entrypoint. */
-        ret = tjs__eval_bytecode(qrt->ctx, tjs__run_main, tjs__run_main_size, true);
+		tjs__run_main(qrt);
     }
 
     if (ret != 0) {
