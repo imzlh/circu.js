@@ -25,8 +25,8 @@
  * THE SOFTWARE.
  */
 
-import path from 'tjs:path';
-import { Database } from 'tjs:sqlite';
+// import path from 'tjs:path';
+// import { Database } from 'tjs:sqlite';
 
 
 (async function(g) {
@@ -121,7 +121,7 @@ import { Database } from 'tjs:sqlite';
     var hex_mode = false;
     var use_strict = false;
 
-    var historyDb;
+    // var historyDb;
     var history = [];
     var history_load_index = 0;
     var history_index;
@@ -1507,8 +1507,8 @@ import { Database } from 'tjs:sqlite';
 
     function clear_history() {
         try {
-            historyDb.exec('DELETE FROM history');
-            historyDb.exec('VACUUM');
+            // historyDb.exec('DELETE FROM history');
+            // historyDb.exec('VACUUM');
         } catch (_) {}
 
         history = [];
@@ -1879,52 +1879,52 @@ import { Database } from 'tjs:sqlite';
     }
 
     function save_history() {
-        if (historyDb) {
-            try {
-              const insert = historyDb.prepare('INSERT INTO history (entry) VALUES(?)');
-              const insertMany = historyDb.transaction(entries => {
-                for (const str of entries) {
-                  insert.run(str);
-                }
-              });
-              insertMany(history.slice(history_load_index));
-            } catch (e) {
-              tjs.stderr.write(encoder.encode(`Failed to save history: ${e}\n`));
-            }
-        }
+        // if (historyDb) {
+        //     try {
+        //       const insert = historyDb.prepare('INSERT INTO history (entry) VALUES(?)');
+        //       const insertMany = historyDb.transaction(entries => {
+        //         for (const str of entries) {
+        //           insert.run(str);
+        //         }
+        //       });
+        //       insertMany(history.slice(history_load_index));
+        //     } catch (e) {
+        //       tjs.stderr.write(encoder.encode(`Failed to save history: ${e}\n`));
+        //     }
+        // }
     }
 
     async function load_history() {
-        const TJS_HOME = tjs.env.TJS_HOME ?? path.join(tjs.homeDir, '.tjs');
-        const historyDbPath = path.join(TJS_HOME, 'history.db');
+    //     const TJS_HOME = tjs.env.TJS_HOME ?? path.join(tjs.homeDir, '.tjs');
+    //     const historyDbPath = path.join(TJS_HOME, 'history.db');
 
-        try {
-            await tjs.makeDir(path.dirname(historyDbPath), { recursive: true });
-        } catch (e) {
-            // Ignore.
-        }
+    //     try {
+    //         await tjs.makeDir(path.dirname(historyDbPath), { recursive: true });
+    //     } catch (e) {
+    //         // Ignore.
+    //     }
 
-        try {
-            historyDb = new Database(historyDbPath);
-        } catch (e) {
-            // Ignore.
+    //     try {
+    //         historyDb = new Database(historyDbPath);
+    //     } catch (e) {
+    //         // Ignore.
     
-            return;
-        }
+    //         return;
+    //     }
 
-        try {
-            historyDb.prepare('CREATE TABLE IF NOT EXISTS history (entry TEXT NOT NULL)').run();
-        } catch (_) {
-            historyDb.close();
-            historyDb = null;
+    //     try {
+    //         historyDb.prepare('CREATE TABLE IF NOT EXISTS history (entry TEXT NOT NULL)').run();
+    //     } catch (_) {
+    //         historyDb.close();
+    //         historyDb = null;
 
-            return;
-        }
+    //         return;
+    //     }
 
-        const data = historyDb.prepare('SELECT entry from history').all();
+    //     const data = historyDb.prepare('SELECT entry from history').all();
 
-        history = data.map(row => row.entry);
-        history_load_index = data.length;
+    //     history = data.map(row => row.entry);
+    //     history_load_index = data.length;
     }
     function load_config() {
         var m, s = std.getenv("COLORFGBG");

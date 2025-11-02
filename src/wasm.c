@@ -22,6 +22,8 @@
  * THE SOFTWARE.
  */
 
+#ifdef TJS__HAS_WASM
+
 #include "wasm.h"
 
 #include "private.h"
@@ -402,3 +404,5 @@ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns) {
 
     JS_DefinePropertyValueStr(ctx, ns, "wasm", obj, JS_PROP_C_W_E);
 }
+
+#endif

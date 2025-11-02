@@ -1,7 +1,7 @@
 /*
- * txiki.js
+ * txiki.ts
  *
- * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2025-present imzlh
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,12 +22,11 @@
  * THE SOFTWARE.
  */
 
-#ifndef TJS__HAS_WASM_H
-#define TJS__HAS_WASM_H
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
 
-#include <m3_api_wasi.h>
-#include <wasm3.h>
-// XXX: Needed for enumerating a module's functions
-#include <m3_env.h>
-
-#endif
+int tjs__set_self_attached(uint8_t *binary, uint32_t text_length, bool overwrite);
+uint8_t* tjs__read_self_attached(uint32_t *text_length);
+int tjs__build_binary(FILE* file, uint8_t *binary, uint32_t size, int create);
+uint8_t* tjs__read_attached(FILE* file, uint32_t *text_length);

@@ -25,6 +25,7 @@
  */
 #include "../deps/quickjs/cutils.h"
 #include "quickjs.h"
+#include "binary.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -179,6 +180,8 @@ static void dump_hex(FILE *f, const uint8_t *buf, size_t len) {
 }
 
 static void output_object_code(JSContext *ctx,
+							   bool compile_into_binary,
+							   bool no_binary_check,
                                FILE *fo,
                                JSValue obj,
                                const char *c_name,
@@ -200,10 +203,11 @@ static void output_object_code(JSContext *ctx,
 
     namelist_add(&cname_list, c_name, NULL, 0);
 
-    fprintf(fo, "const uint32_t %s%s_size = %u;\n\n", prefix, c_name, (unsigned int) out_buf_len);
-    fprintf(fo, "const uint8_t %s%s[%u] = {\n", prefix, c_name, (unsigned int) out_buf_len);
-    dump_hex(fo, out_buf, out_buf_len);
-    fprintf(fo, "};\n\n");
+	if(!prefix) prefix = "";
+	if(-1 == tjs__build_binary(fo, out_buf, out_buf_len, no_binary_check)){
+		fprintf(stderr, "Failed to build binary for %s\n", c_name);
+		exit(1);
+	}
 
     js_free(ctx, out_buf);
 }
@@ -238,7 +242,8 @@ JSModuleDef *jsc_module_loader(JSContext *ctx, const char *module_name, void *op
     return m;
 }
 
-static void compile_file(JSContext *ctx, FILE *fo, const char *filename, int module, const char *prefix, const char *modname) {
+static void compile_file(JSContext *ctx, bool compile_into_binary, bool no_binary_check, 
+	FILE *fo, const char *filename, int module, const char *prefix, const char *modname) {
     uint8_t *buf;
     char c_name[1024];
     int eval_flags;
@@ -267,21 +272,24 @@ static void compile_file(JSContext *ctx, FILE *fo, const char *filename, int mod
         exit(1);
     }
     js_free(ctx, buf);
-    output_object_code(ctx, fo, obj, c_name, prefix);
+    output_object_code(ctx, compile_into_binary, no_binary_check, fo, obj, c_name, prefix);
     JS_FreeValue(ctx, obj);
 }
 
 
 void help(void) {
-    printf("QuickJS Compiler version %s\n"
-           "usage: qjsc [options] [files]\n"
+    printf("Txiki.ts Compiler version %s\n"
+           "usage: tjsc [options] [files]\n"
            "\n"
            "options are:\n"
            "-o output   set the output filename\n"
            "-p prefix   set a prefix for the generated variables\n"
            "-n name     set the module name\n"
            "-m          compile as Javascript module (default=autodetect)\n"
-           "-s          strip source code (if -ss is specified debugging info is also stripped)\n",
+           "-s          strip source code (if -ss is specified debugging info is also stripped)\n"
+		   "-b binary   compile opcode into tjs binary\n"
+		   "-e			create only. only used when -b and binary has no attached source code\n"
+		   "\n",
            JS_GetVersion());
     exit(1);
 }
@@ -292,11 +300,13 @@ int main(int argc, char **argv) {
     const char *out_filename;
     const char *out_var_prefix;
     const char *modname;
+	const char *binary_filename;
     char cfilename[1024];
     FILE *fo;
     JSRuntime *rt;
     JSContext *ctx;
     int module;
+	int no_bcheck = 0;
 
     out_filename = NULL;
     out_var_prefix = NULL;
@@ -305,7 +315,7 @@ int main(int argc, char **argv) {
     strip = 0;
 
     for (;;) {
-        c = getopt(argc, argv, "ho:p:n:ms");
+        c = getopt(argc, argv, "ho:p:n:msb:e");
         if (c == -1)
             break;
         switch (c) {
@@ -326,6 +336,12 @@ int main(int argc, char **argv) {
             case 's':
                 strip++;
                 break;
+			case 'b':
+				binary_filename = optarg;
+				break;
+			case 'e':
+				no_bcheck = 1;
+				break;
             default:
                 break;
         }
@@ -334,17 +350,35 @@ int main(int argc, char **argv) {
     if (optind >= argc)
         help();
 
-    if (!out_filename)
-        out_filename = "out.c";
+	if (!binary_filename){
+		if (!out_filename)
+			out_filename = "out.c";
 
-    js__pstrcpy(cfilename, sizeof(cfilename), out_filename);
+		js__pstrcpy(cfilename, sizeof(cfilename), out_filename);
 
-    fo = fopen(cfilename, "w");
-    if (!fo) {
-        perror(cfilename);
-        exit(1);
-    }
-    outfile = fo;
+		fo = fopen(cfilename, "w");
+		if (!fo) {
+			perror(cfilename);
+			exit(1);
+		}
+		outfile = fo;
+	}else{
+		if (argc - optind > 1){
+			fprintf(stderr, "Error: only one file can be compiled into a binary file\n");
+			fprintf(stderr, "if you want to compile multiple files into a binary file, use esbuild or similar tools\n");
+			exit(1);
+		}
+
+		if (!modname) modname = "<core>";
+		js__pstrcpy(cfilename, sizeof(cfilename), binary_filename);
+
+		fo = fopen(cfilename, "rb+");
+		if (!fo) {
+			perror(cfilename);
+			exit(1);
+		}
+		outfile = fo;
+	}
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
@@ -352,7 +386,8 @@ int main(int argc, char **argv) {
     /* loader for ES6 modules */
     JS_SetModuleLoaderFunc(rt, NULL, jsc_module_loader, NULL);
 
-    fprintf(fo,
+	if(!binary_filename)
+    	fprintf(fo,
             "/* File generated automatically by the QuickJS compiler. */\n"
             "\n"
             "#include <inttypes.h>\n"
@@ -360,7 +395,7 @@ int main(int argc, char **argv) {
 
     for (i = optind; i < argc; i++) {
         const char *filename = argv[i];
-        compile_file(ctx, fo, filename, module, out_var_prefix, modname);
+        compile_file(ctx, binary_filename != NULL, no_bcheck, fo, filename, module, out_var_prefix, modname);
     }
 
     JS_FreeContext(ctx);

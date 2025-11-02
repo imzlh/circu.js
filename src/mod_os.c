@@ -24,7 +24,10 @@
 
 #include "private.h"
 #include "utils.h"
+
+#ifdef TJS__HAS_WASM
 #include "wasm.h"
+#endif
 
 #include <curl/curl.h>
 #include <string.h>

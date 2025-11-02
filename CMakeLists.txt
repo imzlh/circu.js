@@ -46,7 +46,7 @@ endmacro()
 
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" ON)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
-cpr_option(TJS_WASM "Enable WebAssembly support" ON)
+cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
@@ -55,7 +55,7 @@ add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_subdirectory(deps/sqlite3 EXCLUDE_FROM_ALL)
 
-if(TJS_WASM)
+if(BUILD_WITH_WASM)
     set(BUILD_WASI "simple" CACHE STRING "WASI implementation")
     add_subdirectory(deps/wasm3 EXCLUDE_FROM_ALL)
 endif()
@@ -74,6 +74,7 @@ find_package(CURL REQUIRED)
 add_library(tjs
     src/curl-utils.c
     src/curl-websocket.c
+    src/binary.c
     src/error.c
     src/mem.c
     src/modules.c
@@ -156,11 +157,16 @@ string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(tjs PRIVATE ${tjs_cflags})
 target_compile_definitions(tjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(tjs PUBLIC src)
-target_link_libraries(tjs qjs uv_a m3 sqlite3 CURL::libcurl)
+target_link_libraries(tjs qjs uv_a sqlite3 CURL::libcurl)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(tjs PRIVATE TJS__HAS_MIMALLOC)
     target_link_libraries(tjs mimalloc-static)
+endif()
+
+if (BUILD_WITH_WASM)
+    target_compile_definitions(tjs PRIVATE TJS__HAS_WASM)
+    target_link_libraries(tjs wasm3)
 endif()
 
 add_executable(tjs-cli
@@ -172,6 +178,7 @@ set_target_properties(tjs-cli
 )
 
 add_executable(tjsc EXCLUDE_FROM_ALL
+    src/binary.c
     src/qjsc.c
 )
 target_link_libraries(tjsc qjs)

@@ -25,11 +25,13 @@
 #include "mem.h"
 #include "private.h"
 #include "tjs.h"
+#include "binary.h"
 
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #define TJS__DEFAULT_STACK_SIZE 1024 * 1024  // 1 MB
 
@@ -128,7 +130,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "sys", tjs__mod_sys_init },
 	{ "timers", tjs__mod_timers_init },
 	{ "udp", tjs__mod_udp_init },
-#ifdef TJS_WASM
+#ifdef TJS__HAS_WASM
 	{ "wasm", tjs__mod_wasm_init },
 #endif
 	{ "worker", tjs__mod_worker_init },
@@ -150,9 +152,9 @@ JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	const char* name = JS_ToCString(ctx, argv[0]);
 	if(!name) return JS_NULL;
 
-	struct TJSModule *mod = NULL;
+	const struct TJSModule *mod = NULL;
 	for (int i = 0; i < countof(tjs_modules); i ++){
-		struct TJSModule *m = &tjs_modules[i];
+		const struct TJSModule *m = &tjs_modules[i];
 		if (strcmp(m->name, name) == 0){
 			mod = m;
 			break;
@@ -171,213 +173,6 @@ JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	JS_SetPropertyStr(ctx, ns, mod->name, module_obj);
 	return module_obj;
 }
-#ifdef _WIN32
-    #include <windows.h>
-    #include <libloaderapi.h>
-	#include <windows.h>
-    #include <io.h>
-    #define access _access
-    #define F_OK 0
-#else
-    #include <unistd.h>
-    #include <limits.h>
-#endif
-
-char* tjs__get_self() {
-    static char path[4096] = {0};
-    
-#ifdef _WIN32
-    HMODULE hModule = GetModuleHandle(NULL);
-    if (hModule) {
-        DWORD size = GetModuleFileNameA(hModule, path, sizeof(path) - 1);
-        if (size > 0) {
-            path[size] = '\0';
-            return path;
-        }
-    }
-#else
-    #if defined(__linux__)
-        ssize_t count = readlink("/proc/self/exe", path, sizeof(path) - 1);
-        if (count >= 0) {
-            path[count] = '\0';
-            return path;
-        }
-    #elif defined(__APPLE__)
-        uint32_t size = sizeof(path);
-        if (_NSGetExecutablePath(path, &size) == 0) {
-            char real_path[4096];
-            if (realpath(path, real_path) != NULL) {
-                strcpy(path, real_path);
-                return path;
-            }
-        }
-    #elif defined(__FreeBSD__)
-        ssize_t count = readlink("/proc/curproc/file", path, sizeof(path) - 1);
-        if (count >= 0) {
-            path[count] = '\0';
-            return path;
-        }
-    #endif
-    
-    if (strlen(path) == 0) {
-        const char* argv0 = getenv("_");
-        if (argv0 && argv0[0] == '/') {
-            strncpy(path, argv0, sizeof(path) - 1);
-            path[sizeof(path) - 1] = '\0';
-            return path;
-        }
-    }
-#endif
-
-    return NULL;
-}
-
-static inline int file_exists(const char *filename) {
-    return access(filename, F_OK) == 0;
-}
-
-static uint8_t* read_file(const char *filename, size_t *file_size) {
-    FILE *file = fopen(filename, "rb");
-    if (!file) return NULL;
-    
-    fseek(file, 0, SEEK_END);
-    *file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    
-    assert (*file_size >= 4);
-    
-    unsigned char *buffer = malloc(*file_size);
-    if (!buffer) {
-        fclose(file);
-        return NULL;
-    }
-    
-    if (fread(buffer, 1, *file_size, file) != *file_size) {
-        free(buffer);
-        fclose(file);
-        return NULL;
-    }
-    
-    fclose(file);
-    return buffer;
-}
-
-static uint8_t* tjs__read_attached(const char *filename, uint32_t *text_length) {
-    size_t file_size;
-    uint8_t *file_data = read_file(filename, &file_size);
-    if (!file_data) {
-        return NULL;
-    }
-    
-    *text_length = *(uint32_t*)(file_data + file_size - 4);
-    
-    assert (*text_length + 4 <= file_size);
-    
-    uint8_t *attach = malloc(*text_length);
-    if (!attach) {
-        return NULL;
-    }
-    
-    memcpy(attach, file_data + file_size - 4 - *text_length, *text_length);
-    
-    free(file_data);
-    return attach;
-}
-
-static int write_file_with_text(const char *filename, const unsigned char *original_data, 
-                        size_t original_size, const char *text, uint32_t text_length) {
-    FILE *file = fopen(filename, "wb");
-    if (!file) {
-        return -1;
-    }
-    
-    if (fwrite(original_data, 1, original_size, file) != original_size) {
-        fclose(file);
-        return -1;
-    }
-    
-    if (text && text_length > 0 && fwrite(text, 1, text_length, file) != text_length) {
-        fclose(file);
-        return -1;
-    }
-
-    if (fwrite(&text_length, 1, 4, file) != 4) {
-        perror("fwrite length");
-        fclose(file);
-        return -1;
-    }
-    
-    fclose(file);
-    return 0;
-}
-
-int has_text_attached(const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (!file) {
-        return 0;
-    }
-    
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    
-    if (file_size < 4) {
-        fclose(file);
-        return 0;
-    }
-    
-    fseek(file, -4, SEEK_END);
-    
-    uint32_t text_length;
-    if (fread(&text_length, 1, 4, file) != 4) {
-        fclose(file);
-        return 0;
-    }
-    
-    fclose(file);
-    
-    return (text_length > 0 && text_length + 4 <= file_size);
-}
-
-static int tjs__build_binary(const char *filename, const char *new_text, int overwrite) {
-    size_t original_size;
-    unsigned char *original_data = read_file(filename, &original_size);
-    if (!original_data) {
-        return -1;
-    }
-    
-    uint32_t new_text_length = new_text ? strlen(new_text) : 0;
-    size_t program_size;
-    if (overwrite && has_text_attached(filename)) {
-        uint32_t old_text_length;
-        char *old_text = tjs__read_attached(filename, &old_text_length);
-        if (old_text) {
-            program_size = original_size - old_text_length - 4;
-            free(old_text);
-        } else {
-            program_size = original_size;
-        }
-    } else {
-        program_size = original_size;
-    }
-    
-    int result = write_file_with_text(filename, original_data, program_size, 
-                                    new_text, new_text_length);
-    
-    free(original_data);
-    return result;
-}
-
-static uint8_t* tjs__read_self_attached(uint32_t *text_length){
-	static uint8_t* js = NULL;
-	static uint32_t size = 0;
-	static char* self_exe_path = NULL;
-	if(size == 0){
-		tjs__get_self();
-		js = tjs__read_attached(self_exe_path, &size);
-	}
-	*text_length = size;
-	return js;
-}
 
 JSValue tjs__get_args(JSContext *ctx) {
     JSValue args = JS_NewArray(ctx);
@@ -387,7 +182,7 @@ JSValue tjs__get_args(JSContext *ctx) {
     return args;
 }
 
-static JSValue tjs__dispatch_event(JSContext *ctx, JSValue *event) {
+static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
@@ -395,9 +190,10 @@ static JSValue tjs__dispatch_event(JSContext *ctx, JSValue *event) {
         return JS_UNDEFINED;
     }
 
-    JSValue global_obj = JS_GetGlobalObject(ctx);
-    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, global_obj, 1, event);
-    JS_FreeValue(ctx, global_obj);
+	JSValue evname_obj = JS_NewString(ctx, evname);
+    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
+		evname_obj, data
+	});
 
     return ret;
 }
@@ -415,18 +211,12 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
     }
 
     if (!is_handled) {
-        JSValue event_name = JS_NewString(ctx, "unhandledrejection");
-        JSValue args[3];
-        args[0] = event_name;
-        args[1] = promise;
-        args[2] = reason;
+        JSValue args = JS_NewArrayFrom(ctx, 2, (JSValueConst[]){
+			promise, reason
+		});
 
-        JSValue event = JS_CallConstructor(ctx, qrt->builtins.promise_event_ctor, countof(args), args);
-        CHECK_EQ(JS_IsException(event), 0);
-        JSValue ret = tjs__dispatch_event(ctx, &event);
-
-        JS_FreeValue(ctx, event);
-        JS_FreeValue(ctx, event_name);
+        JSValue ret = tjs__dispatch_event(ctx, "unhandledrejection", args);
+		JS_FreeValue(ctx, args);
 
         if (JS_IsException(ret)) {
             tjs_dump_error(ctx);
@@ -535,16 +325,17 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     CHECK_EQ(JS_DefinePropertyValueStr(ctx, global_obj, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_ENUMERABLE), true);
 
     /* Load some builtin references for easy access */
-    qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
-    CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
-    qrt->builtins.promise_event_ctor = JS_GetPropertyStr(qrt->ctx, global_obj, "PromiseRejectionEvent");
-    CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
+	// note: unused, will use setOption instead
+    // qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
+    // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
+    // qrt->builtins.promise_event_ctor = JS_GetPropertyStr(qrt->ctx, global_obj, "PromiseRejectionEvent");
+    // CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
 
     /* end bootstrap */
     JS_FreeValue(ctx, global_obj);
 
     /* WASM */
-#ifdef TJS_WASM
+#ifdef TJS__HAS_WASM
     qrt->wasm_ctx.env = m3_NewEnvironment();
 #endif
 
@@ -567,6 +358,13 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
         uv_close((uv_handle_t *) &qrt->curl_ctx.timer, NULL);
     }
 
+	/* Free module loader */
+	JS_FreeValue(qrt->ctx, qrt->module.resolver);
+	JS_FreeValue(qrt->ctx, qrt->module.loader);
+	JS_FreeValue(qrt->ctx, qrt->module.metaloader);
+	qrt->module.resolver = qrt->module.loader = 
+	qrt->module.metaloader = JS_UNDEFINED;
+
     /* Destroy all timers */
     tjs__destroy_timers(qrt);
 
@@ -575,6 +373,8 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     qrt->builtins.dispatch_event_func = JS_UNDEFINED;
     JS_FreeValue(qrt->ctx, qrt->builtins.promise_event_ctor);
     qrt->builtins.promise_event_ctor = JS_UNDEFINED;
+	JS_FreeValue(qrt->ctx, qrt->builtins.message_pipe);
+	qrt->builtins.message_pipe = JS_UNDEFINED;
     JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
 
@@ -585,8 +385,10 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     }
 
     /* Destroy WASM runtime. */
+#ifdef TJS__HAS_WASM
     m3_FreeEnvironment(qrt->wasm_ctx.env);
     qrt->wasm_ctx.env = NULL;
+#endif
 
     /* Cleanup loop. All handles should be closed. */
     int closed = 0;
@@ -744,9 +546,10 @@ void tjs__run_main(TJSRuntime* qrt) {
 
 	/* If we are running the main interpreter, run the entrypoint. */
 	if (tjs__eval_bytecode(qrt->ctx, tjs__core_js, tjs__core_js_size, true) != 0) {
+#ifndef NDEBUG
 		fprintf(stderr, "CorePanic: Eval entry script failed immediately\n");
-		fflush(stderr);
-		abort();
+#endif
+		exit(1);
 	}
 }
 
@@ -777,7 +580,7 @@ int TJS_Run(TJSRuntime *qrt) {
     } while (r == 0 && JS_IsJobPending(qrt->rt));
 
     if (JS_HasException(qrt->ctx)) {
-        tjs_dump_error(qrt->ctx);
+        // tjs_dump_error(qrt->ctx);
         ret = 1;
     }
 
@@ -843,11 +646,11 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
 
     /* Emit window 'load' event. */
     if (!JS_IsException(ret) && is_main) {
-        static char emit_window_load[] = "window.dispatchEvent(new Event('load'));";
-        JSValue ret1 = JS_Eval(ctx, emit_window_load, strlen(emit_window_load), "<global>", JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(ret1)) {
-            tjs_dump_error(ctx);
-        }
+		JSValue ret = tjs__dispatch_event(ctx, "load", JS_UNDEFINED);
+		if (JS_IsException(ret)){
+			tjs_dump_error(ctx);
+		}
+		JS_FreeValue(ctx, ret);
     }
 
     return ret;

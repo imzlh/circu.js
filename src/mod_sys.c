@@ -27,6 +27,7 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
 #include <uv.h>
 
 static JSValue tjs_evalFile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -73,6 +74,7 @@ static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	if(!JS_IsArrayBuffer(argv[0])) return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
     JS_DetachArrayBuffer(ctx, argv[0]);
 
     return JS_UNDEFINED;
@@ -148,6 +150,56 @@ static JSValue tjs_randomUUID(JSContext *ctx, JSValue this_val, int argc, JSValu
     return JS_NewString(ctx, v);
 }
 
+#define IFOPT(optname, optcheckfunc, then) \
+	valtmp = JS_GetPropertyStr(ctx, argv[0], optname); \
+	if (optcheckfunc(valtmp)) then
+#define IFOPT2(optname, optcheckfunc, then) \
+	valtmp = JS_GetPropertyStr(ctx, argv[0], optname); \
+	if (optcheckfunc(ctx, valtmp)) then
+static JSValue tjs__setVmOptions(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	if(argc == 0 || !JS_IsObject(argv[0])){
+		return JS_ThrowTypeError(ctx, "options must be an object");
+	}
+
+	TJSRuntime* trt = JS_GetContextOpaque(ctx);
+	assert(trt != NULL);
+	JSValue valtmp = JS_UNDEFINED;
+	IFOPT("maxMemory", JS_IsNumber, {
+		int64_t maxMemory;
+		if (JS_ToInt64(ctx, &maxMemory, valtmp) == -1 || maxMemory < 0) {
+			return JS_ThrowRangeError(ctx, "maxMemory must be a non-negative integer");
+		}
+		JS_SetMemoryLimit(JS_GetRuntime(ctx), maxMemory);
+	})
+	IFOPT("maxStackSize", JS_IsNumber, {
+		uint32_t max_stack;
+		if (JS_ToUint32(ctx, &max_stack, valtmp) == -1 || max_stack < 16) {
+			return JS_ThrowRangeError(ctx, "maxStackSize must be a positive integer greater than or equal to 16");
+		}
+		JS_SetMaxStackSize(JS_GetRuntime(ctx), max_stack);
+	});
+	IFOPT2("moduleLoader", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->module.loader);
+		trt->module.loader = JS_DupValue(ctx, valtmp);
+	});
+	IFOPT2("moduleResolver", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->module.resolver);
+		trt->module.resolver = JS_DupValue(ctx, valtmp);
+	});
+	IFOPT2("moduleInit", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->module.metaloader);
+		trt->module.metaloader = JS_DupValue(ctx, valtmp);
+	})
+	IFOPT2("eventReceiver", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->builtins.dispatch_event_func);
+		trt->builtins.dispatch_event_func = JS_DupValue(ctx, valtmp);
+	});
+	IFOPT2("promiseConstruct", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->builtins.promise_event_ctor);
+		trt->builtins.promise_event_ctor = JS_DupValue(ctx, valtmp);
+	});
+}
+
 /* clang-format off */
 static const JSCFunctionListEntry tjs_sys_funcs[] = {
     TJS_CFUNC_DEF("evalFile", 1, tjs_evalFile),
@@ -156,6 +208,7 @@ static const JSCFunctionListEntry tjs_sys_funcs[] = {
     TJS_CFUNC_DEF("randomUUID", 0, tjs_randomUUID),
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
+	TJS_CFUNC_DEF("setOptions", 1, tjs__setVmOptions),
     TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
 };
 /* clang-format on */

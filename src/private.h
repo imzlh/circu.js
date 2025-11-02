@@ -28,7 +28,10 @@
 #include "../deps/quickjs/cutils.h"
 #include "tjs.h"
 #include "utils.h"
+
+#ifdef TJS__HAS_WASM
 #include "wasm.h"
+#endif
 
 #include <curl/curl.h>
 #include <quickjs.h>
@@ -55,9 +58,11 @@ struct TJSRuntime {
         CURLM *curlm_h;
         uv_timer_t timer;
     } curl_ctx;
+#ifdef TJS__HAS_WASM
     struct {
         IM3Environment env;
     } wasm_ctx;
+#endif
     struct {
         TJSTimer *timers;
         int64_t next_timer;
@@ -65,7 +70,13 @@ struct TJSRuntime {
     struct {
         JSValue promise_event_ctor;
         JSValue dispatch_event_func;
+		JSValue message_pipe;	// for worker messaging
     } builtins;
+	struct {
+		JSValue resolver;
+		JSValue loader;
+		JSValue metaloader;
+	} module;
 };
 
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
@@ -123,5 +134,4 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
                               bool use_realpath,
                               const char *content,
                               size_t len);
-
 #endif
