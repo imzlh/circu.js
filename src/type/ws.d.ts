@@ -1,5 +1,5 @@
 declare namespace CModuleWebSocket {
-    export interface CloseEvent {
+    export interface ErrorEvent {
         /**
          * WebSocket 连接关闭的状态码
          */

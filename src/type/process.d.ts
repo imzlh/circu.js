@@ -1,4 +1,6 @@
 declare namespace CModuleProcess {
+    type Pipe = CModuleStreams.Pipe;
+
     /**
      * 进程退出码
      */
@@ -61,17 +63,17 @@ declare namespace CModuleProcess {
         /**
          * 标准输入流（如果配置为管道）
          */
-        readonly stdin?: WritableStream;
+        readonly stdin?: Pipe;
 
         /**
          * 标准输出流（如果配置为管道）
          */
-        readonly stdout?: ReadableStream;
+        readonly stdout?: Pipe;
 
         /**
          * 标准错误流（如果配置为管道）
          */
-        readonly stderr?: ReadableStream;
+        readonly stderr?: Pipe;
 
         /**
          * 等待进程退出
