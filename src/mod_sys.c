@@ -69,6 +69,40 @@ static JSValue tjs_evalScript(JSContext *ctx, JSValue this_val, int argc, JSValu
     return ret;
 }
 
+static JSValue tjs_encodeString(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
+	if(argc == 0 || !JS_IsString(argv[0])){
+		return JS_ThrowTypeError(ctx, "argument must be a string");
+	}
+
+	size_t strlen;
+	const char* str = JS_ToCStringLen(ctx, &strlen, argv[0]);
+	JSValue buffer = JS_NewArrayBufferCopy(ctx, (uint8_t*)str, strlen);
+	JS_FreeCString(ctx, str);
+	return buffer;
+}
+
+static JSValue tjs_decodeString(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
+	if(argc == 0){
+typerr:
+		return JS_ThrowTypeError(ctx, "argument must be an ArrayBuffer");
+	}
+
+	uint8_t* buf = NULL;
+	size_t buflen;
+	if (JS_GetTypedArrayType(argv[0]) != -1){
+		buf = JS_GetUint8Array(ctx, &buflen, argv[0]);
+	} else if (JS_IsArrayBuffer(argv[0])) {
+		buf = JS_GetArrayBuffer(ctx, &buflen, argv[0]);
+	}
+
+	if (!buf){
+		goto typerr;
+	}
+
+	JSValue str = JS_NewStringLen(ctx, (char*)buf, buflen);
+	return str;
+}
+
 static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     return JS_NewBool(ctx, JS_IsArrayBuffer(argv[0]));
 }
@@ -198,6 +232,8 @@ static JSValue tjs__setVmOptions(JSContext *ctx, JSValue this_val, int argc, JSV
 		JS_FreeValue(ctx, trt->builtins.promise_event_ctor);
 		trt->builtins.promise_event_ctor = JS_DupValue(ctx, valtmp);
 	});
+
+	return JS_UNDEFINED;
 }
 
 /* clang-format off */
@@ -209,6 +245,8 @@ static const JSCFunctionListEntry tjs_sys_funcs[] = {
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
 	TJS_CFUNC_DEF("setOptions", 1, tjs__setVmOptions),
+	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
+	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
     TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
 };
 /* clang-format on */

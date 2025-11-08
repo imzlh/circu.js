@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND tjs_cflags -Wall -g)
 if (CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND tjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
+    add_compile_definitions(DEBUG)
 endif()
 
 set(TJS__VERSION_MAJOR 24)
@@ -70,6 +71,7 @@ if(BUILD_WITH_MIMALLOC)
 endif()
 
 find_package(CURL REQUIRED)
+find_package(llhttp REQUIRED)
 
 add_library(tjs
     src/curl-utils.c
@@ -88,6 +90,8 @@ add_library(tjs
     src/worker.c
     src/ws.c
     src/xhr.c
+    src/console.c
+    src/mod_algorithm.c
     src/mod_dns.c
     src/mod_engine.c
     src/mod_ffi.c
@@ -95,6 +99,8 @@ add_library(tjs
     src/mod_fswatch.c
     src/mod_os.c
     src/mod_process.c
+    src/mod_pty.c
+    src/mod_server.c
     src/mod_sqlite3.c
     src/mod_streams.c
     src/mod_sys.c
@@ -103,7 +109,10 @@ add_library(tjs
 )
 
 if(UNIX)
-    target_sources(tjs PUBLIC src/mod_posix-socket.c)
+    target_sources(tjs PUBLIC 
+        src/mod_posix-socket.c
+        src/mod_posix-ffi.c
+    )
 endif()
 
 add_library(ffi-test SHARED
@@ -157,7 +166,7 @@ string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(tjs PRIVATE ${tjs_cflags})
 target_compile_definitions(tjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(tjs PUBLIC src)
-target_link_libraries(tjs qjs uv_a sqlite3 CURL::libcurl)
+target_link_libraries(tjs qjs uv_a sqlite3 CURL::libcurl llhttp)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(tjs PRIVATE TJS__HAS_MIMALLOC)

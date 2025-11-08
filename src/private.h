@@ -26,6 +26,7 @@
 #define TJS_PRIVATE_H
 
 #include "../deps/quickjs/cutils.h"
+#include "../deps/quickjs/quickjs.h"
 #include "tjs.h"
 #include "utils.h"
 
@@ -34,10 +35,17 @@
 #endif
 
 #include <curl/curl.h>
-#include <quickjs.h>
 #include <sqlite3.h>
 #include <stdbool.h>
 #include <uv.h>
+
+enum {
+    __JS_ATOM_NULL = JS_ATOM_NULL,
+#define DEF(name, str) JS_ATOM_ ## name,
+#include "../deps/quickjs/quickjs-atom.h"
+#undef DEF
+    JS_ATOM_END,
+};
 
 typedef struct TJSTimer TJSTimer;
 
@@ -79,6 +87,7 @@ struct TJSRuntime {
 	} module;
 };
 
+void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
@@ -87,6 +96,7 @@ void tjs__mod_fs_init(JSContext *ctx, JSValue ns);
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns);
 void tjs__mod_os_init(JSContext *ctx, JSValue ns);
 void tjs__mod_process_init(JSContext *ctx, JSValue ns);
+void tjs__mod_server_init(JSContext *ctx, JSValue ns);
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns);
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns);
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
@@ -97,9 +107,12 @@ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ws_init(JSContext *ctx, JSValue ns);
 void tjs__mod_xhr_init(JSContext *ctx, JSValue ns);
+void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
+void tjs__mod_console_init(JSContext *ctx);
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
+void tjs__mod_posix_ffi_init(JSContext *ctx, JSValue ns);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);

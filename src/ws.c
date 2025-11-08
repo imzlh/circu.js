@@ -116,20 +116,19 @@ static void cws__on_close(void *data,
                           const char *reason_text,
                           size_t reason_text_len) {
     TJSWs *w = (TJSWs *) data;
+    JSContext *ctx = w->ctx;
 
     w->ready_state = WS_STATE_CLOSED;
 
-    JSContext *ctx = w->ctx;
-    JSValue event = JS_NewObjectProto(ctx, JS_NULL);
-    JS_DefinePropertyValueStr(ctx, event, "code", JS_NewInt32(ctx, reason), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, event, "reason", JS_NewStringLen(ctx, reason_text, reason_text_len), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx,
-                              event,
-                              "wasClean",
-                              JS_NewBool(ctx, reason == CWS_CLOSE_REASON_NORMAL),
-                              JS_PROP_C_W_E);
+    maybe_emit_event(w, WS_EVENT_CLOSE, JS_UNDEFINED);
 
-    maybe_emit_event(w, WS_EVENT_CLOSE, event);
+	if (reason != CWS_CLOSE_REASON_NORMAL) {
+		JSValue event = JS_NewObjectProto(ctx, JS_NULL);
+		JS_DefinePropertyValueStr(ctx, event, "code", JS_NewInt32(ctx, reason), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, event, "reason", JS_NewStringLen(ctx, reason_text, reason_text_len), JS_PROP_C_W_E);
+
+		maybe_emit_event(w, WS_EVENT_ERROR, event);
+	}
 }
 
 static JSValue tjs_ws_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {

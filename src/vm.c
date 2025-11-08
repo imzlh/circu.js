@@ -116,6 +116,7 @@ struct TJSModule {
 };
 
 static const struct TJSModule tjs_modules[] = {
+	{ "algorithm", tjs__mod_algorithm_init },
 	{ "dns", tjs__mod_dns_init },
 	{ "engine", tjs__mod_engine_init },
 	{ "error", tjs__mod_error_init },
@@ -124,6 +125,8 @@ static const struct TJSModule tjs_modules[] = {
 	{ "fswatch", tjs__mod_fswatch_init },
 	{ "os", tjs__mod_os_init },
 	{ "process", tjs__mod_process_init },
+	{ "pty", tjs__mod_pty_init },
+	{ "server", tjs__mod_server_init },
 	{ "signals", tjs__mod_signals_init },
 	{ "sqlite3", tjs__mod_sqlite3_init },
 	{ "streams", tjs__mod_streams_init },
@@ -138,6 +141,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "xhr", tjs__mod_xhr_init },
 #ifndef _WIN32
 	{ "posix_socket", tjs__mod_posix_socket_init },
+	{ "posix_ffi", tjs__mod_posix_ffi_init },
 #endif
 };
 
@@ -170,7 +174,7 @@ JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	// init
 	module_obj = JS_NewObjectProto(ctx, JS_NULL);
 	mod->init(ctx, module_obj);
-	JS_SetPropertyStr(ctx, ns, mod->name, module_obj);
+	JS_SetPropertyStr(ctx, ns, mod->name, JS_DupValue(ctx, module_obj));
 	return module_obj;
 }
 
@@ -186,7 +190,7 @@ static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue d
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
-    if (qrt->freeing) {
+    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_func)) {
         return JS_UNDEFINED;
     }
 
@@ -194,6 +198,7 @@ static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue d
     JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
 		evname_obj, data
 	});
+	JS_FreeValue(ctx, evname_obj);
 
     return ret;
 }
@@ -212,7 +217,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
 
     if (!is_handled) {
         JSValue args = JS_NewArrayFrom(ctx, 2, (JSValueConst[]){
-			promise, reason
+			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
 		});
 
         JSValue ret = tjs__dispatch_event(ctx, "unhandledrejection", args);
@@ -222,12 +227,17 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
             tjs_dump_error(ctx);
             goto fail;
         } else {
-            if (JS_ToBool(ctx, ret)) {
-            // The event wasn't cancelled, maybe abort.
+            if (!JS_ToBool(ctx, ret)) {
+            // The event wasn't cancelled or not handled(true), maybe abort.
             fail:;
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
                 CHECK_NOT_NULL(qrt);
                 JS_Throw(qrt->ctx, JS_DupValue(qrt->ctx, reason));
+
+#ifdef DEBUG
+				tjs_dump_error1(ctx, reason);
+#endif
+
                 TJS_Stop(qrt);
             }
         }
@@ -330,6 +340,14 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
     // qrt->builtins.promise_event_ctor = JS_GetPropertyStr(qrt->ctx, global_obj, "PromiseRejectionEvent");
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
+	qrt->builtins.dispatch_event_func =
+	qrt->builtins.promise_event_ctor =
+	qrt->builtins.message_pipe = JS_UNDEFINED;
+
+	/* Initialize print for debugging */
+#ifdef DEBUG
+	tjs__mod_console_init(ctx);
+#endif
 
     /* end bootstrap */
     JS_FreeValue(ctx, global_obj);
@@ -543,10 +561,14 @@ void tjs__run_main(TJSRuntime* qrt) {
 	uint8_t* tjs__core_js = NULL;
 	uint32_t tjs__core_js_size = 0;
 	tjs__core_js = tjs__read_self_attached(&tjs__core_js_size);
+	if(tjs__core_js_size == 0 || !tjs__core_js){
+		fprintf(stderr, "CorePanic: Cannot load embedded core JS script\n");
+		exit(1);
+	}
 
 	/* If we are running the main interpreter, run the entrypoint. */
 	if (tjs__eval_bytecode(qrt->ctx, tjs__core_js, tjs__core_js_size, true) != 0) {
-#ifndef NDEBUG
+#ifdef DEBUG
 		fprintf(stderr, "CorePanic: Eval entry script failed immediately\n");
 #endif
 		exit(1);

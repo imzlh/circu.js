@@ -12,7 +12,7 @@
 	ignore = dirty
 [submodule "deps/quickjs"]
 	path = deps/quickjs
-	url = https://github.com/quickjs-ng/quickjs.git
+	url = https://github.com/imzlh/quickjs-cjs
 [submodule "deps/mimalloc"]
 	path = deps/mimalloc
 	url = https://github.com/microsoft/mimalloc
