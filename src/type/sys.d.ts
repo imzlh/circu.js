@@ -1,4 +1,48 @@
 declare namespace CModuleSys {
+
+    interface Promise<T = any> extends globalThis.Promise<T> {
+        /**
+         * 创建promise时的堆栈信息，用于调试<br>
+         * 在event内返回true可以阻止cjs创建stack
+         */
+        readonly stack: string;
+
+        /**
+         * 对应cjs内部的uv tick id，在event内对比即可以得出当前事件是否是异步导致的
+         */
+        readonly index: number;
+    }
+
+    interface GlobalEvents {
+        unhandledrejection: [Promise, Error | any, number],
+        exit: [number],
+    }
+
+    /**
+     * (不安全，谨慎使用) 模块类
+     */
+    export class Module {
+        /**
+         * 将传入的模块内容编译
+         */
+        constructor(content: string);
+
+        /**
+         * 获取模块(JSModuleDef)指针位置
+         */
+        get ptr(): number | bigint;
+
+        /**
+         * 获取模块的import.meta对象
+         */
+        get meta(): ImportMeta;
+
+        /**
+         * 导出模块为字节码
+         */
+        dump(): ArrayBuffer;
+    }
+
     /**
      * 评估文件并返回结果
      * @param filename 文件路径
@@ -65,22 +109,22 @@ declare namespace CModuleSys {
         /**
          * 模块加载器函数
          */
-        moduleLoader?: () => any;
+        moduleLoader?: (resolvedName: string) => Module | string;
 
         /**
          * 模块解析器函数
          */
-        moduleResolver?: () => any;
+        moduleResolver?: (name: string, parent: string) => string;
 
         /**
          * 模块初始化函数
          */
-        moduleInit?: () => any;
+        moduleInit?: (name: string, importMeta: Record<string, any>) => void;
 
         /**
-         * 事件接收器函数
+         * 事件接收器函数，返回true表示事件已处理，否则可能被底层处理，如退出
          */
-        eventReceiver?: () => any;
+        eventReceiver?: <T extends keyof GlobalEvents>(eventName: T, eventData: GlobalEvents[T]) => boolean;
 
         /**
          * Promise 构造函数

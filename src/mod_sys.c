@@ -228,13 +228,102 @@ static JSValue tjs__setVmOptions(JSContext *ctx, JSValue this_val, int argc, JSV
 		JS_FreeValue(ctx, trt->builtins.dispatch_event_func);
 		trt->builtins.dispatch_event_func = JS_DupValue(ctx, valtmp);
 	});
-	IFOPT2("promiseConstruct", JS_IsFunction, {
-		JS_FreeValue(ctx, trt->builtins.promise_event_ctor);
-		trt->builtins.promise_event_ctor = JS_DupValue(ctx, valtmp);
-	});
+	JS_FreeValue(ctx, valtmp);
 
 	return JS_UNDEFINED;
 }
+
+// fixme: thread_local?
+static JSClassID js_module_class_id;
+
+static inline JSValue module_new(JSContext* ctx, JSModuleDef* def){
+    JSValue obj = JS_NewObjectClass(ctx, js_module_class_id);
+    JS_SetOpaque(obj, def);
+    return obj;
+}
+
+static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
+    if(argc < 2 || !JS_IsString(argv[0])){
+        // return LJS_Throw(ctx, EXCEPTION_TYPEERROR, "loadModule() requires 2 argument",
+        //     "loadModule(source: string, module_name: string): Module"
+        // );
+		return JS_ThrowTypeError(ctx, "loadModule() requires 2 argument");
+    }
+
+    size_t len;
+    const char *source = JS_ToCStringLen(ctx, &len, argv[0]);
+    if(!source) return JS_EXCEPTION;
+	const char *module_name = JS_ToCString(ctx, argv[1]);
+	if(!module_name) module_name = "<module>";
+
+    JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if(JS_IsException(compiled)) goto fail;
+
+    JS_FreeCString(ctx, source);
+    JS_FreeCString(ctx, module_name);
+    return module_new(ctx, (JSModuleDef*)JS_VALUE_GET_PTR(compiled));
+fail:
+    JS_FreeCString(ctx, source);
+    JS_FreeCString(ctx, module_name);
+    return JS_EXCEPTION;
+}
+
+static void js_module_finalizer(JSRuntime *rt, JSValue val) {
+    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque(val, js_module_class_id);
+    if(def) {
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_MODULE, def));
+    }
+}
+
+static JSValue js_module_get_ptr(JSContext *ctx, JSValueConst this_val){
+    return 
+#if __SIZEOF_POINTER__ == 8
+    JS_NewInt64
+#else
+    JS_NewInt32
+#endif
+    (ctx, (uintptr_t)JS_GetOpaque(this_val, js_module_class_id));
+}
+
+static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
+	js_free_rt(rt, ptr);
+}
+
+static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
+    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if(!def) return JS_EXCEPTION;
+
+    size_t len = 0;
+    uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, def), JS_WRITE_OBJ_BYTECODE);
+    if(!data) return JS_EXCEPTION;
+
+    return JS_NewArrayBuffer(ctx, data, len, free_js_malloc, NULL, false);
+}
+
+static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
+    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if(!def) return JS_EXCEPTION;
+
+    JSValue meta = JS_MKPTR(JS_TAG_MODULE, def);
+	// fixme: more efficient way to get meta?
+    return JS_DupValue(ctx, meta);
+}
+
+JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
+    JSModuleDef* def = (JSModuleDef*)JS_GetOpaque(this_val, js_module_class_id);
+    return def;
+}
+
+static const JSClassDef js_module_class = {
+    "Module",
+    .finalizer = js_module_finalizer,
+};
+
+static const JSCFunctionListEntry js_module_proto_funcs[] = {
+    JS_CGETSET_DEF("ptr", js_module_get_ptr, NULL),
+    JS_CFUNC_DEF("dump", 0, js_module_dump),
+    JS_CGETSET_DEF("meta", js_module_get_meta, NULL)
+};
 
 /* clang-format off */
 static const JSCFunctionListEntry tjs_sys_funcs[] = {
@@ -247,7 +336,7 @@ static const JSCFunctionListEntry tjs_sys_funcs[] = {
 	TJS_CFUNC_DEF("setOptions", 1, tjs__setVmOptions),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
-    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
+    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL)
 };
 /* clang-format on */
 
@@ -256,4 +345,14 @@ void tjs__mod_sys_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, ns, "args", tjs__get_args(ctx), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, ns, "version", JS_NewString(ctx, tjs_version()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, ns, "platform", JS_NewString(ctx, TJS__PLATFORM), JS_PROP_C_W_E);
+
+	// class Module
+	JS_NewClassID(JS_GetRuntime(ctx), &js_module_class_id);
+	JS_NewClass(JS_GetRuntime(ctx), js_module_class_id, &js_module_class);
+	JSValue proto = JS_NewObjectProto(ctx, JS_NULL);
+	JS_SetPropertyFunctionList(ctx, proto, js_module_proto_funcs, countof(js_module_proto_funcs));
+	JS_SetClassProto(ctx, js_module_class_id, proto);
+	JSValue ctor = JS_NewCFunction2(ctx, js_module_constructor, "Module", 2, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, ctor, proto);
+	JS_DefinePropertyValue(ctx, ns, JS_ATOM_Module, ctor, JS_PROP_C_W_E);
 }

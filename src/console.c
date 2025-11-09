@@ -402,7 +402,7 @@ main:
         dbuf_putstr(output, ANSI_CYAN "NaN" ANSI_RESET);
         else
             dbuf_printf(output, ANSI_CYAN "%g" ANSI_RESET, num);
-    } else if (JS_IsBigInt(ctx, val)) {
+    } else if (JS_IsBigInt(val)) {
         const char *str = JS_ToCString(ctx, val);
         if(str){
             dbuf_printf(output, ANSI_CYAN "%s" ANSI_RESET ANSI_GREEN "n" ANSI_RESET, str);
@@ -531,7 +531,7 @@ __function_break:
         visited[depth] = JS_NULL;
     } else if (JS_IsObject(val)) {
         // Error
-        if(JS_IsError(ctx, val) && depth == 0){
+        if(JS_IsError(val) && depth == 0){
             print_jserror(ctx, val, depth, output);
             goto end;
         }

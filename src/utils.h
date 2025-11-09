@@ -27,7 +27,12 @@
 
 #include "../deps/quickjs/cutils.h"
 
+#ifdef FOREIGN_QJS
 #include <quickjs.h>
+#else
+#include "../deps/quickjs/quickjs.h"
+#endif
+
 #include <stdbool.h>
 #include <stdlib.h>
 #include <uv.h>

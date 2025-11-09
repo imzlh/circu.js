@@ -58,6 +58,7 @@ struct TJSRuntime {
         uv_check_t check;
         uv_idle_t idle;
         uv_prepare_t prepare;
+		uint32_t tick_id; 
     } jobs;
     uv_async_t stop;
     bool is_worker;
@@ -76,7 +77,6 @@ struct TJSRuntime {
         int64_t next_timer;
     } timers;
     struct {
-        JSValue promise_event_ctor;
         JSValue dispatch_event_func;
 		JSValue message_pipe;	// for worker messaging
     } builtins;
@@ -147,4 +147,7 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
                               bool use_realpath,
                               const char *content,
                               size_t len);
+
+// Warn: will not dup, use JS_Dup if you want to keep it alive
+JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
 #endif

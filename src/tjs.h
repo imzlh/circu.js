@@ -26,7 +26,11 @@
 #ifndef TJS_H
 #define TJS_H
 
+#ifdef FOREIGN_QJS
 #include <quickjs.h>
+#else
+#include "../deps/quickjs/quickjs.h"
+#endif
 
 typedef struct TJSRuntime TJSRuntime;
 

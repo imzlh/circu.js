@@ -203,6 +203,26 @@ static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue d
     return ret;
 }
 
+static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
+							JSValueConst promise, JSValueConst parent_promise,
+							void* opaque) {
+	TJSRuntime *qrt = TJS_GetRuntime(ctx);
+	switch (type){
+		case JS_PROMISE_HOOK_INIT:
+			// save stack trace for unhandled rejections
+			JS_BuildPromiseStack(ctx, promise);
+			JS_SetProperty(ctx, promise, JS_ATOM_index, JS_NewUint32(ctx, qrt->jobs.tick_id));
+
+			// call event
+			
+		break;
+
+		// todo: handle more cases
+		default:
+		break;
+	}
+}
+
 static void tjs__promise_rejection_tracker(JSContext *ctx,
                                            JSValue promise,
                                            JSValue reason,
@@ -216,8 +236,8 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
     }
 
     if (!is_handled) {
-        JSValue args = JS_NewArrayFrom(ctx, 2, (JSValueConst[]){
-			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
+        JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]){
+			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason), JS_NewUint32(ctx, qrt->jobs.tick_id)
 		});
 
         JSValue ret = tjs__dispatch_event(ctx, "unhandledrejection", args);
@@ -233,11 +253,6 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
                 CHECK_NOT_NULL(qrt);
                 JS_Throw(qrt->ctx, JS_DupValue(qrt->ctx, reason));
-
-#ifdef DEBUG
-				tjs_dump_error1(ctx, reason);
-#endif
-
                 TJS_Stop(qrt);
             }
         }
@@ -302,6 +317,11 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     /* SharedArrayBuffer functions */
     JS_SetSharedArrayBufferFunctions(rt, &tjs_sf);
 
+	/* Debug */
+#ifdef DEBUG
+	JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_ATOM_LEAKS);
+#endif
+
     /* Worker support */
     qrt->is_worker = is_worker;
     JS_SetCanBlock(rt, is_worker);
@@ -329,6 +349,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
+	JS_SetPromiseHook(rt, tjs__promise_hook, NULL);
 
     /* define some global properties */
 	JSValue global_obj = JS_GetGlobalObject(ctx);
@@ -338,10 +359,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 	// note: unused, will use setOption instead
     // qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
-    // qrt->builtins.promise_event_ctor = JS_GetPropertyStr(qrt->ctx, global_obj, "PromiseRejectionEvent");
-    // CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
 	qrt->builtins.dispatch_event_func =
-	qrt->builtins.promise_event_ctor =
 	qrt->builtins.message_pipe = JS_UNDEFINED;
 
 	/* Initialize print for debugging */
@@ -389,8 +407,6 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     /* Destroy the JS engine. */
     JS_FreeValue(qrt->ctx, qrt->builtins.dispatch_event_func);
     qrt->builtins.dispatch_event_func = JS_UNDEFINED;
-    JS_FreeValue(qrt->ctx, qrt->builtins.promise_event_ctor);
-    qrt->builtins.promise_event_ctor = JS_UNDEFINED;
 	JS_FreeValue(qrt->ctx, qrt->builtins.message_pipe);
 	qrt->builtins.message_pipe = JS_UNDEFINED;
     JS_FreeContext(qrt->ctx);
@@ -474,9 +490,11 @@ static void uv__prepare_cb(uv_prepare_t *handle) {
 
 void tjs__execute_jobs(JSContext *ctx) {
     JSContext *ctx1;
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
     int err;
 
     /* execute the pending jobs */
+	bool tick = false;
     for (;;) {
         err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (err <= 0) {
@@ -484,11 +502,17 @@ void tjs__execute_jobs(JSContext *ctx) {
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
                 CHECK_NOT_NULL(qrt);
                 TJS_Stop(qrt);
-            }
+            } else {
+				tick = true;
+			}
 
             break;
         }
     }
+
+	if (tick){
+		trt->jobs.tick_id ++;
+	}
 }
 
 static void uv__check_cb(uv_check_t *handle) {
