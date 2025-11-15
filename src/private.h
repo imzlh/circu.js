@@ -1,5 +1,5 @@
 /*
- * txiki.js
+ * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
  *
@@ -58,7 +58,6 @@ struct TJSRuntime {
         uv_check_t check;
         uv_idle_t idle;
         uv_prepare_t prepare;
-		uint32_t tick_id; 
     } jobs;
     uv_async_t stop;
     bool is_worker;
@@ -108,6 +107,7 @@ void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ws_init(JSContext *ctx, JSValue ns);
 void tjs__mod_xhr_init(JSContext *ctx, JSValue ns);
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
+void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx);
 
 #ifndef _WIN32

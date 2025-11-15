@@ -1,5 +1,5 @@
 /*
- * txiki.js
+ * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
  *
@@ -29,7 +29,7 @@
 #include "version.h"
 
 #define TJS__UA_STRING                                                                                                 \
-    "txiki.js/" STRINGIFY(TJS_VERSION_MAJOR) "." STRINGIFY(TJS_VERSION_MINOR) "." STRINGIFY(TJS_VERSION_PATCH)         \
+    "circu.js/" STRINGIFY(TJS_VERSION_MAJOR) "." STRINGIFY(TJS_VERSION_MINOR) "." STRINGIFY(TJS_VERSION_PATCH)         \
         TJS_VERSION_SUFFIX
 
 CURL *tjs__curl_easy_init(CURL *curl_h) {

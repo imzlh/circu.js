@@ -1,5 +1,5 @@
 /*
- * txiki.js
+ * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
  *
@@ -211,16 +211,21 @@ static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
 		case JS_PROMISE_HOOK_INIT:
 			// save stack trace for unhandled rejections
 			JS_BuildPromiseStack(ctx, promise);
-			JS_SetProperty(ctx, promise, JS_ATOM_index, JS_NewUint32(ctx, qrt->jobs.tick_id));
-
-			// call event
-			
 		break;
 
 		// todo: handle more cases
 		default:
 		break;
 	}
+
+	// call JS event handler
+	JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]){
+		JS_NewUint32(ctx, type),
+		JS_DupValue(ctx, promise),
+		JS_DupValue(ctx, parent_promise)
+	});
+	tjs__dispatch_event(ctx, "promise", args);
+	JS_FreeValue(ctx, args);
 }
 
 static void tjs__promise_rejection_tracker(JSContext *ctx,
@@ -237,7 +242,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
 
     if (!is_handled) {
         JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]){
-			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason), JS_NewUint32(ctx, qrt->jobs.tick_id)
+			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
 		});
 
         JSValue ret = tjs__dispatch_event(ctx, "unhandledrejection", args);
@@ -509,10 +514,6 @@ void tjs__execute_jobs(JSContext *ctx) {
             break;
         }
     }
-
-	if (tick){
-		trt->jobs.tick_id ++;
-	}
 }
 
 static void uv__check_cb(uv_check_t *handle) {

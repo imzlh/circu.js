@@ -1,26 +1,13 @@
-
-<p align="center">
-    <img width="480" src="https://raw.githubusercontent.com/saghul/txiki.js/master/logo.png" />
-</p>
-
-# txiki.js — The tiny JavaScript runtime
+# circu.js — The tiny JavaScript runtime
+Revision of LightJS and based on circu.js
 
 ## Overview
 
 > **txikia** (basque): small, tiny.
 
-*txiki.js* is a small and powerful JavaScript runtime.  It targets state-of-the-art ECMAScript
-and aims to be [WinterCG] compliant.
+*circu.js* is a small and powerful JavaScript runtime.  It targets state-of-the-art ECMAScript
 
 It's built on the shoulders of giants: it uses [QuickJS-ng] as its JavaScript engine and [libuv] as the platform layer.
-
-See it in action here:
-
-<p align="center">
-    <a href="https://video.fosdem.org/2022/D.javascript/building_a_tiny_javascript_runtime_with_quickjs.mp4" title="Building a tiny JavaScript runtime with QuickJS">
-        <img width="460" src="https://raw.githubusercontent.com/saghul/txiki.js/master/video.png" alt="Building a tiny JavaScript runtime with QuickJS"/>
-    </a>
-</p>
 
 ## Getting started
 
@@ -54,7 +41,7 @@ Support for the [ES2023] specification (almost complete).
 
 ### WinterCG
 
-*txiki.js* aims to be [WinterCG] compliant, you can track the progress [here](https://github.com/saghul/txiki.js/issues/418).
+*circu.js* aims to be [WinterCG] compliant, you can track the progress [here](https://github.com/saghul/circu.js/issues/418).
 
 ### Web Platform APIs
 
@@ -105,14 +92,14 @@ Other extras:
 
 The following modules compose the standard library:
 
-- [`tjs:assert`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_assert.html)
-- [`tjs:ffi`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_ffi.html)
-- [`tjs:getopts`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_getopts.html)
-- [`tjs:hashing`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_hashing.html)
-- [`tjs:ipaddr`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_ipaddr.html)
-- [`tjs:path`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_path.html)
-- [`tjs:sqlite`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_sqlite.html)
-- [`tjs:uuid`](https://bettercallsaghul.com/txiki.js/api/modules/tjs_uuid.html)
+- [`tjs:assert`](https://bettercallsaghul.com/circu.js/api/modules/tjs_assert.html)
+- [`tjs:ffi`](https://bettercallsaghul.com/circu.js/api/modules/tjs_ffi.html)
+- [`tjs:getopts`](https://bettercallsaghul.com/circu.js/api/modules/tjs_getopts.html)
+- [`tjs:hashing`](https://bettercallsaghul.com/circu.js/api/modules/tjs_hashing.html)
+- [`tjs:ipaddr`](https://bettercallsaghul.com/circu.js/api/modules/tjs_ipaddr.html)
+- [`tjs:path`](https://bettercallsaghul.com/circu.js/api/modules/tjs_path.html)
+- [`tjs:sqlite`](https://bettercallsaghul.com/circu.js/api/modules/tjs_sqlite.html)
+- [`tjs:uuid`](https://bettercallsaghul.com/circu.js/api/modules/tjs_uuid.html)
 
 ## Supported platforms
 
@@ -125,7 +112,7 @@ The following modules compose the standard library:
 
 [CMake] is necessary.
 
-*NOTE:* The txiki.js build depends on a number of git submodules ([libffi], [libuv] and [wasm3]).
+*NOTE:* The circu.js build depends on a number of git submodules ([libffi], [libuv] and [wasm3]).
 If you didn't already clone this repository recursively, make sure you initialize these
 submodules with `git submodule update --init` before proceeding to the build.
 
@@ -150,7 +137,7 @@ brew install cmake autoconf automake libtool texinfo
 
 ```bash
 # Get the code
-git clone --recursive https://github.com/saghul/txiki.js --shallow-submodules && cd txiki.js
+git clone --recursive https://github.com/saghul/circu.js --shallow-submodules && cd circu.js
 # Compile it!
 make
 # Run the REPL
@@ -211,7 +198,7 @@ make js
 ## `tjs compile` - creating standalone executables
 
 Creating standalone executables is possible with `tjs compile`. The resulting executable
-will bundle the given code and the txiki.js runtime. No compiler is needed.
+will bundle the given code and the circu.js runtime. No compiler is needed.
 
 **NOTE:** The resulting executable will have the same runtime dependencies as the `tjs`
 executable.
@@ -248,21 +235,21 @@ npx esbuild my-app/index.js \
 
 ## Versioning
 
-txiki.js uses [calendar versioning] with the form YY.MM.MICRO.
+circu.js uses [calendar versioning] with the form YY.MM.MICRO.
 
 <br />
 <br />
 
 <footer>
 <p align="center" style="font-size: smaller;">
-Built with ❤️ by saghul and these awesome <a href="https://github.com/saghul/txiki.js/graphs/contributors" target="_blank">contributors</a>.
+Built with ❤️ by saghul and these awesome <a href="https://github.com/saghul/circu.js/graphs/contributors" target="_blank">contributors</a>.
 </footer>
 
 [QuickJS-ng]: https://github.com/quickjs-ng/quickjs
 [libuv]: https://libuv.org/
 [curl]: https://github.com/curl/curl
 [libffi]: https://github.com/libffi/libffi
-[full API documentation]: https://bettercallsaghul.com/txiki.js/api/
+[full API documentation]: https://bettercallsaghul.com/circu.js/api/
 [CMake]: https://cmake.org/
 [wasm3]: https://github.com/wasm3/wasm3
 [alert, confirm, prompt]: https://developer.mozilla.org/en-US/docs/Web/API/Window/alert

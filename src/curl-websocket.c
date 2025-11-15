@@ -2,6 +2,7 @@
 
 /*
  * Copyright (C) 2016 Gustavo Sverzut Barbieri
+ * Copyright (c) 2025 iz
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
@@ -635,7 +636,7 @@ _cws_dispatch(struct cws_data *priv)
         if (priv->recv.current.used >= sizeof(uint16_t)) {
             uint16_t r;
             memcpy(&r, priv->recv.current.payload, sizeof(uint16_t));
-            _cws_ntoh(&r, sizeof(r));
+            ntoh(&r, sizeof(r));
             if (!cws_close_reason_is_valid(r)) {
                 cws_close(priv->easy, CWS_CLOSE_REASON_PROTOCOL_ERROR, "invalid close reason", SIZE_MAX);
                 r = CWS_CLOSE_REASON_PROTOCOL_ERROR;

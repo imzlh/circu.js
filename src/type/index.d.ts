@@ -1,5 +1,5 @@
 /**
- * Txiki.js dynamic module type definitions
+ * circu.js dynamic module type definitions
  */
 
 interface TjsModules {

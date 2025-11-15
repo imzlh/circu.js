@@ -1,5 +1,5 @@
 /**
- * txiki.js test suite entry point.
+ * circu.js test suite entry point.
  */
 
 const { use } = import.meta;
@@ -28,8 +28,8 @@ use('sys').setOptions({
 const self = use("sys");
 const os = use("os");
 if(self.args.length < 2){
-    print(`Usage: ${self.exepath()} <script.js>
-Run a txiki.js test suite script.`);
+    print(`Usage: ${self.exePath} <script.js>
+Run a circu.js test suite script.`);
     os.exit(1);
 }
 
@@ -39,4 +39,5 @@ if(!script || !script.endsWith(".js")){
 }
 
 print("Test suite, tjs", self.version, "on", self.platform);
+print("Loading script:", await use('fs').realPath(script));
 await self.evalFile(script);

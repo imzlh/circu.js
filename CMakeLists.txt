@@ -80,7 +80,6 @@ add_library(tjs
     src/error.c
     src/mem.c
     src/modules.c
-    src/sha1.c
     src/signals.c
     src/timers.c
     src/utils.c
@@ -91,6 +90,7 @@ add_library(tjs
     src/ws.c
     src/xhr.c
     src/console.c
+    src/sourcemap.c
     src/mod_algorithm.c
     src/mod_dns.c
     src/mod_engine.c

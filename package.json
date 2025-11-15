@@ -1,7 +1,7 @@
 {
-  "name": "txiki.js",
+  "name": "circu.js",
   "version": "0.0.0",
-  "description": "Utilities for txiki.js",
+  "description": "Utilities for circu.js",
   "private": true,
   "scripts": {
     "api-docs": "typedoc --tsconfig src/tsconfig.json",

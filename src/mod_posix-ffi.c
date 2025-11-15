@@ -1,5 +1,5 @@
 /**
- * LightJS cFFI support(linux only)
+ * circu.js cFFI support(linux only)
  * dangerous: this is a low-level interface, it's easy to cause memory leaks and crashes.
  *
  * Copyright (c) 2025 iz
