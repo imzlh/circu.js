@@ -136,6 +136,10 @@ JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
     return def;
 }
 
+JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def){
+	return module_new(ctx, def);
+}
+
 static const JSClassDef js_module_class = {
     "Module",
     .finalizer = js_module_finalizer,
@@ -244,10 +248,12 @@ static JSValue tjs_evalBytecode(JSContext *ctx, JSValue this_val, int argc, JSVa
 
 #define IFOPT(optname, optcheckfunc, then) \
 	valtmp = JS_GetPropertyStr(ctx, argv[0], optname); \
-	if (optcheckfunc(valtmp)) then
+	if (optcheckfunc(valtmp)) then \
+	else JS_FreeValue(ctx, valtmp)
 #define IFOPT2(optname, optcheckfunc, then) \
 	valtmp = JS_GetPropertyStr(ctx, argv[0], optname); \
-	if (optcheckfunc(ctx, valtmp)) then
+	if (optcheckfunc(ctx, valtmp)) then \
+	else JS_FreeValue(ctx, valtmp)
 static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 	if(argc == 0 || !JS_IsObject(argv[0])){
 		return JS_ThrowTypeError(ctx, "options must be an object");
@@ -258,17 +264,16 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 	JSValue valtmp = JS_UNDEFINED;
 	IFOPT2("load", JS_IsFunction, {
 		JS_FreeValue(ctx, trt->module.loader);
-		trt->module.loader = JS_DupValue(ctx, valtmp);
+		trt->module.loader = valtmp;
 	});
 	IFOPT2("resolve", JS_IsFunction, {
 		JS_FreeValue(ctx, trt->module.resolver);
-		trt->module.resolver = JS_DupValue(ctx, valtmp);
+		trt->module.resolver = valtmp;
 	});
 	IFOPT2("init", JS_IsFunction, {
 		JS_FreeValue(ctx, trt->module.metaloader);
-		trt->module.metaloader = JS_DupValue(ctx, valtmp);
-	})
-	JS_FreeValue(ctx, valtmp);
+		trt->module.metaloader = valtmp;
+	});
 
 	return JS_UNDEFINED;
 }

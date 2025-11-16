@@ -1,7 +1,8 @@
 /*
- * circu.js
+ * circu.js syncfs module
+ * Synchronous filesystem operations for IO-intensive scripts and module loading
  *
- * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2025 iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,1648 +25,786 @@
 
 #include "private.h"
 #include "utils.h"
-
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <string.h>
-#include <uv.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#define stat _stat64
+#define fstat _fstat64
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#define S_ISLNK(m) (0)
+#define open _open
+#define close _close
+#define read _read
+#define write _write
+#define lseek _lseeki64
+#define mkdir(path, mode) _mkdir(path)
+#define rmdir _rmdir
+#define unlink _unlink
+#else
+#include <unistd.h>
+#include <dirent.h>
+#endif
 
-static JSClassID tjs_file_class_id;
-
-typedef struct {
-    JSContext *ctx;
-    uv_file fd;
-    JSValue path;
-} TJSFile;
-
-static void tjs_file_finalizer(JSRuntime *rt, JSValue val) {
-    TJSFile *f = JS_GetOpaque(val, tjs_file_class_id);
-    if (f) {
-        if (f->fd != -1) {
-            uv_fs_t req;
-            uv_fs_close(NULL, &req, f->fd, NULL);
-            uv_fs_req_cleanup(&req);
-        }
-        JS_FreeValueRT(rt, f->path);
-        js_free_rt(rt, f);
-    }
-}
-
-static JSClassDef tjs_file_class = {
-    "File",
-    .finalizer = tjs_file_finalizer,
+/* File mode flags using magic */
+enum {
+    OPEN_RDONLY = O_RDONLY,
+    OPEN_WRONLY = O_WRONLY,
+    OPEN_RDWR = O_RDWR,
+    OPEN_CREAT = O_CREAT,
+    OPEN_EXCL = O_EXCL,
+    OPEN_TRUNC = O_TRUNC,
+    OPEN_APPEND = O_APPEND,
 };
 
-static JSClassID tjs_dir_class_id;
-
-typedef struct {
-    JSContext *ctx;
-    uv_dir_t *dir;
-    uv_dirent_t dirent;  // TODO: Use an array and an index.
-    JSValue path;
-    bool done;
-} TJSDir;
-
-static void tjs_dir_finalizer(JSRuntime *rt, JSValue val) {
-    TJSDir *d = JS_GetOpaque(val, tjs_dir_class_id);
-    if (d) {
-        if (d->dir) {
-            uv_fs_t req;
-            uv_fs_closedir(NULL, &req, d->dir, NULL);
-            uv_fs_req_cleanup(&req);
+/* Helper: build flags from JS object */
+static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
+    int flags = 0;
+    
+    if (JS_IsString(flags_obj)) {
+        const char* str = JS_ToCString(ctx, flags_obj);
+        if (!str) return -1;
+        
+        if (strcmp(str, "r") == 0) {
+            flags = O_RDONLY;
+        } else if (strcmp(str, "r+") == 0) {
+            flags = O_RDWR;
+        } else if (strcmp(str, "w") == 0) {
+            flags = O_WRONLY | O_CREAT | O_TRUNC;
+        } else if (strcmp(str, "w+") == 0) {
+            flags = O_RDWR | O_CREAT | O_TRUNC;
+        } else if (strcmp(str, "a") == 0) {
+            flags = O_WRONLY | O_CREAT | O_APPEND;
+        } else if (strcmp(str, "a+") == 0) {
+            flags = O_RDWR | O_CREAT | O_APPEND;
+        } else if (strcmp(str, "wx") == 0) {
+            flags = O_WRONLY | O_CREAT | O_EXCL;
+        } else if (strcmp(str, "wx+") == 0) {
+            flags = O_RDWR | O_CREAT | O_EXCL;
+        } else {
+            JS_FreeCString(ctx, str);
+            return -1;
         }
-        JS_FreeValueRT(rt, d->path);
-        js_free_rt(rt, d);
-    }
-}
-
-static JSClassDef tjs_dir_class = { "Directory", .finalizer = tjs_dir_finalizer };
-
-static JSClassID tjs_dirent_class_id;
-
-typedef struct {
-    JSValue name;
-    uv_dirent_type_t type;
-} TJSDirEnt;
-
-static void tjs_dirent_finalizer(JSRuntime *rt, JSValue val) {
-    TJSDirEnt *de = JS_GetOpaque(val, tjs_dirent_class_id);
-    if (de) {
-        JS_FreeValueRT(rt, de->name);
-        js_free_rt(rt, de);
-    }
-}
-
-static JSClassDef tjs_dirent_class = { "DirEnt", .finalizer = tjs_dirent_finalizer };
-
-static JSClassID tjs_stat_class_id;
-
-typedef struct {
-    uint64_t st_mode;
-} TJSStatResult;
-
-static void tjs_stat_finalizer(JSRuntime *rt, JSValue val) {
-    TJSStatResult *sr = JS_GetOpaque(val, tjs_stat_class_id);
-    if (sr) {
-        js_free_rt(rt, sr);
-    }
-}
-
-static JSClassDef tjs_stat_class = { "StatResult", .finalizer = tjs_stat_finalizer };
-
-typedef struct {
-    uv_fs_t req;
-    JSContext *ctx;
-    JSValue obj;
-    TJSPromise result;
-    struct {
-        JSValue tarray;
-    } rw;
-} TJSFsReq;
-
-typedef struct {
-    uv_work_t req;
-    DynBuf dbuf;
-    JSContext *ctx;
-    int r;
-    char *filename;
-    TJSPromise result;
-} TJSReadFileReq;
-
-static JSValue tjs_new_file(JSContext *ctx, uv_file fd, const char *path) {
-    TJSFile *f;
-    JSValue obj;
-
-    obj = JS_NewObjectClass(ctx, tjs_file_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    f = js_malloc(ctx, sizeof(*f));
-    if (!f) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    f->path = JS_NewString(ctx, path);
-    f->ctx = ctx;
-    f->fd = fd;
-
-    JS_SetOpaque(obj, f);
-    return obj;
-}
-
-static TJSFile *tjs_file_get(JSContext *ctx, JSValue obj) {
-    return JS_GetOpaque2(ctx, obj, tjs_file_class_id);
-}
-
-static JSValue tjs_new_dir(JSContext *ctx, uv_dir_t *dir, const char *path) {
-    TJSDir *d;
-    JSValue obj;
-
-    obj = JS_NewObjectClass(ctx, tjs_dir_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    d = js_malloc(ctx, sizeof(*d));
-    if (!d) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    d->path = JS_NewString(ctx, path);
-    d->ctx = ctx;
-    d->dir = dir;
-    d->done = false;
-
-    JS_SetOpaque(obj, d);
-    return obj;
-}
-
-static TJSDir *tjs_dir_get(JSContext *ctx, JSValue obj) {
-    return JS_GetOpaque2(ctx, obj, tjs_dir_class_id);
-}
-
-static JSValue tjs_new_dirent(JSContext *ctx, uv_dirent_t *dent) {
-    JSValue obj = JS_NewObjectClass(ctx, tjs_dirent_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    TJSDirEnt *de = js_malloc(ctx, sizeof(*de));
-    if (!de) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    de->name = JS_NewString(ctx, dent->name);
-    de->type = dent->type;
-
-    JS_SetOpaque(obj, de);
-    return obj;
-}
-
-static TJSDirEnt *tjs_dirent_get(JSContext *ctx, JSValue obj) {
-    return JS_GetOpaque2(ctx, obj, tjs_dirent_class_id);
-}
-
-static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st) {
-    JSValue obj = JS_NewObjectClass(ctx, tjs_stat_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    TJSStatResult *sr = js_malloc(ctx, sizeof(*sr));
-    if (!sr) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    sr->st_mode = st->st_mode;
-
-#define SET_UINT64_FIELD(x)                                                                                            \
-    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->st_##x), JS_PROP_C_W_E);
-
-    SET_UINT64_FIELD(dev);
-    SET_UINT64_FIELD(mode);
-    SET_UINT64_FIELD(nlink);
-    SET_UINT64_FIELD(uid);
-    SET_UINT64_FIELD(gid);
-    SET_UINT64_FIELD(rdev);
-    SET_UINT64_FIELD(ino);
-    SET_UINT64_FIELD(size);
-    SET_UINT64_FIELD(blksize);
-    SET_UINT64_FIELD(blocks);
-    SET_UINT64_FIELD(flags);
-#undef SET_UINT64_FIELD
-
-#define SET_TIMESPEC_FIELD(x)                                                                                          \
-    JS_DefinePropertyValueStr(ctx,                                                                                     \
-                              obj,                                                                                     \
-                              STRINGIFY(x),                                                                            \
-                              JS_NewDate(ctx, st->st_##x.tv_sec * 1e3 + st->st_##x.tv_nsec / 1e6),                     \
-                              JS_PROP_C_W_E);
-    SET_TIMESPEC_FIELD(atim);
-    SET_TIMESPEC_FIELD(mtim);
-    SET_TIMESPEC_FIELD(ctim);
-    SET_TIMESPEC_FIELD(birthtim);
-#undef SET_TIMESPEC_FIELD
-
-    JS_SetOpaque(obj, sr);
-    return obj;
-}
-
-static TJSStatResult *tjs_stat_get(JSContext *ctx, JSValue obj) {
-    return JS_GetOpaque2(ctx, obj, tjs_stat_class_id);
-}
-
-static JSValue tjs_new_statfs(JSContext *ctx, uv_statfs_t *st) {
-    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-#define DEF_FIELD(x) JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->f_##x), JS_PROP_C_W_E);
-    DEF_FIELD(type);
-    DEF_FIELD(bsize);
-    DEF_FIELD(blocks);
-    DEF_FIELD(bfree);
-    DEF_FIELD(bavail);
-    DEF_FIELD(files);
-    DEF_FIELD(ffree);
-#undef DEF_FIELD
-
-    return obj;
-}
-
-static JSValue tjs_fsreq_init(JSContext *ctx, TJSFsReq *fr, JSValue obj) {
-    fr->ctx = ctx;
-    fr->req.data = fr;
-    fr->obj = JS_DupValue(ctx, obj);
-    fr->rw.tarray = JS_UNDEFINED;
-
-    return TJS_InitPromise(ctx, &fr->result);
-}
-
-static void uv__fs_req_cb(uv_fs_t *req) {
-    TJSFsReq *fr = req->data;
-    if (!fr) {
-        return;
-    }
-
-    JSContext *ctx = fr->ctx;
-    JSValue arg;
-    TJSFile *f;
-    TJSDir *d;
-    bool is_reject = false;
-
-    if (req->result < 0) {
-        arg = tjs_new_error(ctx, fr->req.result);
-        is_reject = true;
-        goto skip;
-    }
-
-    switch (req->fs_type) {
-        case UV_FS_OPEN:
-            arg = tjs_new_file(ctx, fr->req.result, fr->req.path);
-            break;
-        case UV_FS_CLOSE:
-            arg = JS_UNDEFINED;
-            f = tjs_file_get(ctx, fr->obj);
-            CHECK_NOT_NULL(f);
-            f->fd = -1;
-            JS_FreeValue(ctx, f->path);
-            f->path = JS_UNDEFINED;
-            break;
-        case UV_FS_READ:
-            arg = fr->req.result == 0 ? JS_NULL : JS_NewInt32(ctx, fr->req.result);
-            break;
-        case UV_FS_WRITE:
-            arg = JS_NewInt32(ctx, fr->req.result);
-            break;
-
-        case UV_FS_STAT:
-        case UV_FS_LSTAT:
-        case UV_FS_FSTAT:
-            arg = tjs_new_stat(ctx, &fr->req.statbuf);
-            break;
-
-        case UV_FS_STATFS:
-            arg = tjs_new_statfs(ctx, fr->req.ptr);
-            break;
-
-        case UV_FS_READLINK:
-        case UV_FS_REALPATH:
-            arg = JS_NewString(ctx, fr->req.ptr);
-            break;
-
-        case UV_FS_COPYFILE:
-        case UV_FS_FDATASYNC:
-        case UV_FS_FSYNC:
-        case UV_FS_FTRUNCATE:
-        case UV_FS_MKDIR:
-        case UV_FS_RENAME:
-        case UV_FS_RMDIR:
-        case UV_FS_UNLINK:
-        case UV_FS_CHOWN:
-        case UV_FS_LCHOWN:
-        case UV_FS_FCHOWN:
-        case UV_FS_CHMOD:
-        case UV_FS_FCHMOD:
-        case UV_FS_UTIME:
-        case UV_FS_LUTIME:
-        case UV_FS_FUTIME:
-        case UV_FS_LINK:
-        case UV_FS_SYMLINK:
-            arg = JS_UNDEFINED;
-            break;
-
-        case UV_FS_MKDTEMP:
-            arg = JS_NewString(ctx, fr->req.path);
-            break;
-
-        case UV_FS_MKSTEMP:
-            arg = tjs_new_file(ctx, fr->req.result, fr->req.path);
-            break;
-
-        case UV_FS_OPENDIR:
-            arg = tjs_new_dir(ctx, fr->req.ptr, fr->req.path);
-            break;
-
-        case UV_FS_CLOSEDIR:
-            arg = JS_UNDEFINED;
-            d = tjs_dir_get(ctx, fr->obj);
-            CHECK_NOT_NULL(d);
-            d->dir = NULL;
-            JS_FreeValue(ctx, d->path);
-            d->path = JS_UNDEFINED;
-            break;
-
-        case UV_FS_READDIR:
-            d = tjs_dir_get(ctx, fr->obj);
-            d->done = fr->req.result == 0;
-            arg = JS_NewObjectProto(ctx, JS_NULL);
-            JS_DefinePropertyValueStr(ctx, arg, "done", JS_NewBool(ctx, d->done), JS_PROP_C_W_E);
-            if (fr->req.result != 0) {
-                JSValue item = tjs_new_dirent(ctx, &d->dirent);
-                JS_DefinePropertyValueStr(ctx, arg, "value", item, JS_PROP_C_W_E);
-            }
-            break;
-
-        default:
-            abort();
-    }
-
-skip:
-    TJS_SettlePromise(ctx, &fr->result, is_reject, 1, &arg);
-
-    JS_FreeValue(ctx, fr->obj);
-    JS_FreeValue(ctx, fr->rw.tarray);
-
-    uv_fs_req_cleanup(&fr->req);
-    js_free(ctx, fr);
-}
-
-/* File functions */
-
-static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    /* arg 0: buffer */
-    size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-
-    /* arg 1: position (on the file) */
-    int64_t pos = -1;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &pos, argv[1])) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    uv_buf_t b = uv_buf_init((char *) buf, size);
-
-    int r;
-    if (magic) {
-        r = uv_fs_write(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
+        JS_FreeCString(ctx, str);
     } else {
-        r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
-    }
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    tjs_fsreq_init(ctx, fr, this_val);
-    fr->rw.tarray = JS_DupValue(ctx, argv[0]);
-    return fr->result.p;
-}
-
-static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_close(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_fstat(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    int64_t offset = 0;
-    if (!JS_IsUndefined(argv[0]) && JS_ToInt64(ctx, &offset, argv[0])) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_ftruncate(tjs_get_loop(ctx), &fr->req, f->fd, offset, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_fsync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_datasync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_fdatasync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    int mode;
-    if (JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &mode, argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a number for mode parameter");
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_fchmod(tjs_get_loop(ctx), &fr->req, f->fd, mode, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    int uid;
-    if (JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &uid, argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a number for uid parameter");
-    }
-
-    int gid;
-    if (JS_IsUndefined(argv[1]) || JS_ToInt32(ctx, &gid, argv[1])) {
-        return JS_ThrowTypeError(ctx, "expected a number for gid parameter");
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_fchown(tjs_get_loop(ctx), &fr->req, f->fd, uid, gid, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    double atime;
-    if (JS_ToFloat64(ctx, &atime, argv[0])) {
-        return JS_EXCEPTION;
-    }
-
-    double mtime;
-    if (JS_ToFloat64(ctx, &mtime, argv[1])) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    /* Date.getTime is in ms, convert to seconds. */
-    int r = uv_fs_futime(tjs_get_loop(ctx), &fr->req, f->fd, atime / 1000, mtime / 1000, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_file_fileno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewInt32(ctx, f->fd);
-}
-
-static JSValue tjs_file_path_get(JSContext *ctx, JSValue this_val) {
-    TJSFile *f = tjs_file_get(ctx, this_val);
-    if (!f) {
-        return JS_EXCEPTION;
-    }
-    return JS_DupValue(ctx, f->path);
-}
-
-/* Dir functions */
-
-static JSValue tjs_dir_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDir *d = tjs_dir_get(ctx, this_val);
-    if (!d) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_closedir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_dir_path_get(JSContext *ctx, JSValue this_val) {
-    TJSDir *d = tjs_dir_get(ctx, this_val);
-    if (!d) {
-        return JS_EXCEPTION;
-    }
-    return JS_DupValue(ctx, d->path);
-}
-
-static JSValue tjs_dir_next(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDir *d = tjs_dir_get(ctx, this_val);
-    if (!d) {
-        return JS_EXCEPTION;
-    }
-
-    if (d->done) {
-        return JS_UNDEFINED;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        return JS_EXCEPTION;
-    }
-
-    d->dir->dirents = &d->dirent;
-    d->dir->nentries = 1;
-
-    int r = uv_fs_readdir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, this_val);
-}
-
-static JSValue tjs_dir_iterator(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    return JS_DupValue(ctx, this_val);
-}
-
-/* DirEnt functions */
-
-static JSValue tjs_dirent_name_get(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-    return JS_DupValue(ctx, de->name);
-}
-
-static JSValue tjs_dirent_isblockdevice(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_BLOCK);
-}
-
-static JSValue tjs_dirent_ischaracterdevice(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_CHAR);
-}
-
-static JSValue tjs_dirent_isdirectory(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_DIR);
-}
-
-static JSValue tjs_dirent_isfifo(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_FIFO);
-}
-
-static JSValue tjs_dirent_isfile(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_FILE);
-}
-
-static JSValue tjs_dirent_issocket(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_SOCKET);
-}
-
-static JSValue tjs_dirent_issymlink(JSContext *ctx, JSValue this_val) {
-    TJSDirEnt *de = tjs_dirent_get(ctx, this_val);
-    if (!de) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, de->type == UV_DIRENT_LINK);
-}
-
-/* StatResult functions */
-
-static JSValue tjs_stat_isblockdevice(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFBLK);
-}
-
-static JSValue tjs_stat_ischaracterdevice(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFCHR);
-}
-
-static JSValue tjs_stat_isdirectory(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFDIR);
-}
-
-static JSValue tjs_stat_isfifo(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFIFO);
-}
-
-static JSValue tjs_stat_isfile(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFREG);
-}
-
-static JSValue tjs_stat_issocket(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-#if defined(S_IFSOCK)
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFSOCK);
-#else
-    return JS_FALSE;
-#endif
-}
-
-static JSValue tjs_stat_issymlink(JSContext *ctx, JSValue this_val) {
-    TJSStatResult *sr = tjs_stat_get(ctx, this_val);
-    if (!sr) {
-        return JS_EXCEPTION;
-    }
-
-    return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFLNK);
-}
-
-/* Module functions */
-
-static int js__uv_open_flags(const char *strflags, size_t len) {
-    int flags = 0, read = 0, write = 0;
-
-    for (int i = 0; i < len; i++) {
-        switch (strflags[i]) {
-            case 'r':
-                read = 1;
-                break;
-            case 'w':
-                write = 1;
-                flags |= O_TRUNC | O_CREAT;
-                break;
-            case 'a':
-                write = 1;
-                flags |= O_APPEND | O_CREAT;
-                break;
-            case '+':
-                read = 1;
-                write = 1;
-                break;
-            case 'x':
-                flags |= O_EXCL;
-                break;
-            default:
-                break;
+        if (JS_ToInt32(ctx, &flags, flags_obj) < 0) {
+            return -1;
         }
     }
-
-    flags |= read ? (write ? O_RDWR : O_RDONLY) : (write ? O_WRONLY : 0);
-
+    
+#ifdef _WIN32
+    flags |= O_BINARY;  /* Always binary mode on Windows */
+#endif
+    
     return flags;
 }
 
-static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path;
-    const char *strflags;
-    size_t len;
-    int flags;
-    int32_t mode;
-
+/* stat() - get file status */
+static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    struct stat st;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "stat() requires 1 argument: path");
+    }
+    
     path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    strflags = JS_ToCStringLen(ctx, &len, argv[1]);
-    if (!strflags) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-    flags = js__uv_open_flags(strflags, len);
-    JS_FreeCString(ctx, strflags);
-
-    mode = 0666;
-    if (!JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &mode, argv[2])) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, uv__fs_req_cb);
+    
+    int ret = stat(path, &st);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "stat failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_new_stdio_file(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path;
-    uv_file fd;
-
-    path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt32(ctx, &fd, argv[1])) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    JSValue obj = tjs_new_file(ctx, fd, path);
-
-    JS_FreeCString(ctx, path);
-
+    
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "dev", JS_NewInt64(ctx, st.st_dev));
+    JS_SetPropertyStr(ctx, obj, "ino", JS_NewInt64(ctx, st.st_ino));
+    JS_SetPropertyStr(ctx, obj, "mode", JS_NewUint32(ctx, st.st_mode));
+    JS_SetPropertyStr(ctx, obj, "nlink", JS_NewInt64(ctx, st.st_nlink));
+    JS_SetPropertyStr(ctx, obj, "uid", JS_NewUint32(ctx, st.st_uid));
+    JS_SetPropertyStr(ctx, obj, "gid", JS_NewUint32(ctx, st.st_gid));
+    JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
+    JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
+    JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
+    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512));
+    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, st.st_atime * 1000));
+    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, st.st_mtime * 1000));
+    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, st.st_ctime * 1000));
+    
+    /* Helper methods */
+    JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isSymbolicLink", JS_NewBool(ctx, S_ISLNK(st.st_mode)));
+    
     return obj;
 }
 
-static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* lstat() - like stat but doesn't follow symlinks */
+static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    struct stat st;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "lstat() requires 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r;
-    if (magic) {
-        r = uv_fs_lstat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    } else {
-        r = uv_fs_stat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    }
+    
+#ifdef _WIN32
+    int ret = stat(path, &st);  /* Windows doesn't have lstat */
+#else
+    int ret = lstat(path, &st);
+#endif
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "lstat failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "dev", JS_NewInt64(ctx, st.st_dev));
+    JS_SetPropertyStr(ctx, obj, "ino", JS_NewInt64(ctx, st.st_ino));
+    JS_SetPropertyStr(ctx, obj, "mode", JS_NewUint32(ctx, st.st_mode));
+    JS_SetPropertyStr(ctx, obj, "nlink", JS_NewInt64(ctx, st.st_nlink));
+    JS_SetPropertyStr(ctx, obj, "uid", JS_NewUint32(ctx, st.st_uid));
+    JS_SetPropertyStr(ctx, obj, "gid", JS_NewUint32(ctx, st.st_gid));
+    JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
+    JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
+    JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
+    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512));
+    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, st.st_atime * 1000));
+    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, st.st_mtime * 1000));
+    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, st.st_ctime * 1000));
+    
+    JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isSymbolicLink", JS_NewBool(ctx, S_ISLNK(st.st_mode)));
+    
+    return obj;
 }
 
-static JSValue tjs_fs_stat_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* exists() - check if file exists */
+static JSValue tjs_syncfs_exists(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    struct stat st;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "exists() requires 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    uv_fs_t req;
-    int r = uv_fs_stat(NULL, &req, path, NULL);
+    
+    int ret = stat(path, &st);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        uv_fs_req_cleanup(&req);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    JSValue ret = tjs_new_stat(ctx, &req.statbuf);
-    uv_fs_req_cleanup(&req);
-
-    return ret;
+    
+    return JS_NewBool(ctx, ret == 0);
 }
 
-static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* open() - open file and return fd */
+static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int flags;
+    int mode = 0666;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "open() requires 2 arguments: path and flags");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
+    
+    flags = parse_open_flags(ctx, argv[1]);
+    if (flags < 0) {
         JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "Invalid flags");
     }
-
-    int r = uv_fs_realpath(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    const char *new_path = JS_ToCString(ctx, argv[1]);
-    if (!new_path) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, new_path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_rename(tjs_get_loop(ctx), &fr->req, path, new_path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, new_path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *tpl = JS_ToCString(ctx, argv[0]);
-    if (!tpl) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, tpl);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_mkdtemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
-    JS_FreeCString(ctx, tpl);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *tpl = JS_ToCString(ctx, argv[0]);
-    if (!tpl) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, tpl);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_mkstemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
-    JS_FreeCString(ctx, tpl);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_rmdir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    int32_t mode = 0777;
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32(ctx, &mode, argv[1])) {
+    
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &mode, argv[2]) < 0) {
             JS_FreeCString(ctx, path);
             return JS_EXCEPTION;
         }
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_mkdir(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
+    
+    int fd = open(path, flags, mode);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (fd < 0) {
+        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_NewInt32(ctx, fd);
 }
 
-static JSValue tjs_fs_mkdir_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
+/* close() - close file descriptor */
+static JSValue tjs_syncfs_close(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "close() requires 1 argument: fd");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
         return JS_EXCEPTION;
     }
-
-    int32_t mode = 0777;
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32(ctx, &mode, argv[1])) {
-            JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
-        }
+    
+    if (close(fd) < 0) {
+        return JS_ThrowInternalError(ctx, "close failed: %s", strerror(errno));
     }
-
-    uv_fs_t req;
-    int r = uv_fs_mkdir(NULL, &req, path, mode, NULL);
-    JS_FreeCString(ctx, path);
-    uv_fs_req_cleanup(&req);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    
     return JS_UNDEFINED;
 }
 
-static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
+/* read() - read from file descriptor */
+static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    size_t buf_size;
+    uint8_t* buffer;
+    int32_t length = -1;
+    int32_t offset = 0;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "read() requires at least 2 arguments: fd and buffer");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
         return JS_EXCEPTION;
     }
-
-    const char *new_path = JS_ToCString(ctx, argv[1]);
-    if (!new_path) {
-        JS_FreeCString(ctx, path);
+    
+    buffer = JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, new_path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_copyfile(tjs_get_loop(ctx), &fr->req, path, new_path, 0, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, new_path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_opendir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
-}
-
-static void tjs__readfile_work_cb(uv_work_t *req) {
-    TJSReadFileReq *fr = req->data;
-    CHECK_NOT_NULL(fr);
-
-    fr->r = tjs__load_file(fr->ctx, &fr->dbuf, fr->filename);
-}
-
-static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
-    TJSReadFileReq *fr = req->data;
-    CHECK_NOT_NULL(fr);
-
-    JSContext *ctx = fr->ctx;
-    JSValue arg;
-    bool is_reject = false;
-
-    if (status != 0) {
-        arg = tjs_new_error(ctx, status);
-        is_reject = true;
-        dbuf_free(&fr->dbuf);
-    } else if (fr->r < 0) {
-        arg = tjs_new_error(ctx, fr->r);
-        is_reject = true;
-        dbuf_free(&fr->dbuf);
-    } else {
-        arg = TJS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size);
-        if (JS_IsException(arg)) {
-            dbuf_free(&fr->dbuf);
+    
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &offset, argv[2]) < 0) {
+            return JS_EXCEPTION;
         }
     }
-
-    TJS_SettlePromise(ctx, &fr->result, is_reject, 1, &arg);
-
-    js_free(ctx, fr->filename);
-    js_free(ctx, fr);
+    
+    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
+        if (JS_ToInt32(ctx, &length, argv[3]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    if (offset < 0 || offset > (int32_t)buf_size) {
+        return JS_ThrowRangeError(ctx, "offset out of bounds");
+    }
+    
+    if (length < 0) {
+        length = buf_size - offset;
+    }
+    
+    if (offset + length > (int32_t)buf_size) {
+        return JS_ThrowRangeError(ctx, "length out of bounds");
+    }
+    
+    ssize_t bytes_read = read(fd, buffer + offset, length);
+    
+    if (bytes_read < 0) {
+        return JS_ThrowInternalError(ctx, "read failed: %s", strerror(errno));
+    }
+    
+    return JS_NewInt32(ctx, bytes_read);
 }
 
-static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* write() - write to file descriptor */
+static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    size_t buf_size;
+    const uint8_t* buffer;
+    int32_t length = -1;
+    int32_t offset = 0;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "write() requires at least 2 arguments: fd and buffer");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    buffer = JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
+        return JS_EXCEPTION;
+    }
+    
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &offset, argv[2]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
+        if (JS_ToInt32(ctx, &length, argv[3]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    if (offset < 0 || offset > (int32_t)buf_size) {
+        return JS_ThrowRangeError(ctx, "offset out of bounds");
+    }
+    
+    if (length < 0) {
+        length = buf_size - offset;
+    }
+    
+    if (offset + length > (int32_t)buf_size) {
+        return JS_ThrowRangeError(ctx, "length out of bounds");
+    }
+    
+    ssize_t bytes_written = write(fd, buffer + offset, length);
+    
+    if (bytes_written < 0) {
+        return JS_ThrowInternalError(ctx, "write failed: %s", strerror(errno));
+    }
+    
+    return JS_NewInt32(ctx, bytes_written);
+}
+
+/* readFile() - read entire file */
+static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    struct stat st;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "readFile() requires 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSReadFileReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
+    
+    int fd = open(path, O_RDONLY
+#ifdef _WIN32
+        | O_BINARY
+#endif
+    );
+    if (fd < 0) {
         JS_FreeCString(ctx, path);
+        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
+    }
+    
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowInternalError(ctx, "fstat failed: %s", strerror(errno));
+    }
+    
+    JS_FreeCString(ctx, path);
+    
+    size_t size = st.st_size;
+    uint8_t* buf = js_malloc(ctx, size);
+    if (!buf) {
+        close(fd);
         return JS_EXCEPTION;
     }
-
-    fr->ctx = ctx;
-    tjs_dbuf_init(ctx, &fr->dbuf);
-    fr->r = -1;
-    fr->filename = js_strdup(ctx, path);
-    fr->req.data = fr;
-    JS_FreeCString(ctx, path);
-
-    int r = uv_queue_work(tjs_get_loop(ctx), &fr->req, tjs__readfile_work_cb, tjs__readfile_after_work_cb);
-    if (r != 0) {
-        js_free(ctx, fr->filename);
-		dbuf_free(&fr->dbuf);
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    ssize_t total_read = 0;
+    while (total_read < (ssize_t)size) {
+        ssize_t n = read(fd, buf + total_read, size - total_read);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            js_free(ctx, buf);
+            close(fd);
+            return JS_ThrowInternalError(ctx, "read failed: %s", strerror(errno));
+        }
+        if (n == 0) break;
+        total_read += n;
     }
-
-    return TJS_InitPromise(ctx, &fr->result);
+    
+    close(fd);
+    
+    JSValue result = JS_NewArrayBufferCopy(ctx, buf, total_read);
+    js_free(ctx, buf);
+    
+    return result;
 }
 
-static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* writeFile() - write entire file */
+static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    size_t data_len;
+    const uint8_t* data;
+    int mode = 0666;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "writeFile() requires 2 arguments: path and data");
     }
-
-    int uid;
-    if (JS_IsUndefined(argv[1]) || JS_ToInt32(ctx, &uid, argv[1])) {
-        return JS_ThrowTypeError(ctx, "expected a number for uid parameter");
-    }
-
-    int gid;
-    if (JS_IsUndefined(argv[2]) || JS_ToInt32(ctx, &gid, argv[2])) {
-        return JS_ThrowTypeError(ctx, "expected a number for gid parameter");
-    }
-
-    const char *path = JS_ToCString(ctx, argv[0]);
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
+    
+    data = JS_GetArrayBuffer(ctx, &data_len, argv[1]);
+    if (!data) {
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
-
-    int r = (magic == 1 ? uv_fs_lchown : uv_fs_chown)(tjs_get_loop(ctx), &fr->req, path, uid, gid, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &mode, argv[2]) < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC
+#ifdef _WIN32
+        | O_BINARY
+#endif
+    , mode);
+    JS_FreeCString(ctx, path);
+    
+    if (fd < 0) {
+        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
+    }
+    
+    ssize_t total_written = 0;
+    while (total_written < (ssize_t)data_len) {
+        ssize_t n = write(fd, data + total_written, data_len - total_written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return JS_ThrowInternalError(ctx, "write failed: %s", strerror(errno));
+        }
+        total_written += n;
+    }
+    
+    close(fd);
+    
+    return JS_UNDEFINED;
 }
 
-static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* mkdir() - create directory */
+static JSValue tjs_syncfs_mkdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int mode = 0777;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "mkdir() requires 1 argument: path");
     }
-
-    int mode;
-    if (JS_IsUndefined(argv[1]) || JS_ToInt32(ctx, &mode, argv[1])) {
-        return JS_ThrowTypeError(ctx, "expected a number for mode parameter");
-    }
-
-    const char *path = JS_ToCString(ctx, argv[0]);
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+    
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
     }
-
-    int r = uv_fs_chmod(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
+    
+    int ret = mkdir(path, mode);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "mkdir failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_UNDEFINED;
 }
 
-static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* rmdir() - remove directory */
+static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "rmdir() requires 1 argument: path");
     }
-
-    double atime;
-    if (JS_ToFloat64(ctx, &atime, argv[1])) {
-        return JS_EXCEPTION;
-    }
-
-    double mtime;
-    if (JS_ToFloat64(ctx, &mtime, argv[2])) {
-        return JS_EXCEPTION;
-    }
-
-    const char *path = JS_ToCString(ctx, argv[0]);
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    /* Date.getTime is in ms, convert to seconds. */
-    int r = (magic == 1 ? uv_fs_lutime
-                        : uv_fs_utime)(tjs_get_loop(ctx), &fr->req, path, atime / 1000, mtime / 1000, uv__fs_req_cb);
+    
+    int ret = rmdir(path);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "rmdir failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_UNDEFINED;
 }
 
-static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* unlink() - delete file */
+static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "unlink() requires 1 argument: path");
     }
-
-    const char *path = JS_ToCString(ctx, argv[0]);
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_readlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
+    
+    int ret = unlink(path);
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "unlink failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_UNDEFINED;
 }
 
-static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* rename() - rename/move file */
+static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char *oldpath, *newpath;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "rename() requires 2 arguments: oldpath and newpath");
     }
-    if (!JS_IsString(argv[1])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+    
+    oldpath = JS_ToCString(ctx, argv[0]);
+    if (!oldpath) {
+        return JS_EXCEPTION;
     }
+    
+    newpath = JS_ToCString(ctx, argv[1]);
+    if (!newpath) {
+        JS_FreeCString(ctx, oldpath);
+        return JS_EXCEPTION;
+    }
+    
+    int ret = rename(oldpath, newpath);
+    JS_FreeCString(ctx, oldpath);
+    JS_FreeCString(ctx, newpath);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "rename failed: %s", strerror(errno));
+    }
+    
+    return JS_UNDEFINED;
+}
 
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* readdir() - read directory contents */
+static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "readdir() requires 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    const char *path2 = JS_ToCString(ctx, argv[1]);
-    if (!path2) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, path2);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_link(tjs_get_loop(ctx), &fr->req, path, path2, uv__fs_req_cb);
+    
+#ifdef _WIN32
+    WIN32_FIND_DATAA find_data;
+    char search_path[MAX_PATH];
+    snprintf(search_path, sizeof(search_path), "%s\\*", path);
+    
+    HANDLE handle = FindFirstFileA(search_path, &find_data);
     JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, path2);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (handle == INVALID_HANDLE_VALUE) {
+        return JS_ThrowInternalError(ctx, "opendir failed");
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+    
+    do {
+        if (strcmp(find_data.cFileName, ".") != 0 && 
+            strcmp(find_data.cFileName, "..") != 0) {
+            JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, find_data.cFileName));
+        }
+    } while (FindNextFileA(handle, &find_data));
+    
+    FindClose(handle);
+#else
+    DIR* dir = opendir(path);
+    JS_FreeCString(ctx, path);
+    
+    if (!dir) {
+        return JS_ThrowInternalError(ctx, "opendir failed: %s", strerror(errno));
+    }
+    
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+    struct dirent* entry;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && 
+            strcmp(entry->d_name, "..") != 0) {
+            JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, entry->d_name));
+        }
+    }
+    
+    closedir(dir);
+#endif
+    
+    return arr;
 }
 
-static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* realpath() - resolve canonical path */
+static JSValue tjs_syncfs_realpath(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "realpath() requires 1 argument: path");
     }
-    if (!JS_IsString(argv[1])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
-    }
-
-    const char *path = JS_ToCString(ctx, argv[0]);
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    const char *path2 = JS_ToCString(ctx, argv[1]);
-    if (!path2) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int flags;
-    if (JS_ToInt32(ctx, &flags, argv[2])) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, path2);
-        return JS_EXCEPTION;
-    }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, path2);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_symlink(tjs_get_loop(ctx), &fr->req, path, path2, flags, uv__fs_req_cb);
+    
+#ifdef _WIN32
+    char resolved[MAX_PATH];
+    DWORD ret = GetFullPathNameA(path, MAX_PATH, resolved, NULL);
     JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, path2);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret == 0 || ret > MAX_PATH) {
+        return JS_ThrowInternalError(ctx, "realpath failed");
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_NewString(ctx, resolved);
+#else
+    char resolved[PATH_MAX];
+    char* result = realpath(path, resolved);
+    JS_FreeCString(ctx, path);
+    
+    if (!result) {
+        return JS_ThrowInternalError(ctx, "realpath failed: %s", strerror(errno));
+    }
+    
+    return JS_NewString(ctx, resolved);
+#endif
 }
 
-static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "expected a string for path parameter");
+/* getcwd() - get current working directory */
+static JSValue tjs_syncfs_getcwd(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char buf[4096];
+    
+#ifdef _WIN32
+    if (!_getcwd(buf, sizeof(buf))) {
+        return JS_ThrowInternalError(ctx, "getcwd failed");
     }
+#else
+    if (!getcwd(buf, sizeof(buf))) {
+        return JS_ThrowInternalError(ctx, "getcwd failed: %s", strerror(errno));
+    }
+#endif
+    
+    return JS_NewString(ctx, buf);
+}
 
-    const char *path = JS_ToCString(ctx, argv[0]);
+/* chdir() - change current working directory */
+static JSValue tjs_syncfs_chdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "chdir() requires 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
-
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
-    if (!fr) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    int r = uv_fs_statfs(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
+    
+#ifdef _WIN32
+    int ret = _chdir(path);
+#else
+    int ret = chdir(path);
+#endif
     JS_FreeCString(ctx, path);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+    
+    if (ret < 0) {
+        return JS_ThrowInternalError(ctx, "chdir failed: %s", strerror(errno));
     }
-
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    
+    return JS_UNDEFINED;
 }
 
-static const JSCFunctionListEntry tjs_file_proto_funcs[] = {
-    TJS_CFUNC_MAGIC_DEF("read", 2, tjs_file_rw, 0),
-    TJS_CFUNC_MAGIC_DEF("write", 2, tjs_file_rw, 1),
-    TJS_CFUNC_DEF("close", 0, tjs_file_close),
-    TJS_CFUNC_DEF("fileno", 0, tjs_file_fileno),
-    TJS_CFUNC_DEF("stat", 0, tjs_file_stat),
-    TJS_CFUNC_DEF("truncate", 1, tjs_file_truncate),
-    TJS_CFUNC_DEF("sync", 0, tjs_file_sync),
-    TJS_CFUNC_DEF("datasync", 0, tjs_file_datasync),
-    TJS_CFUNC_DEF("chmod", 1, tjs_file_chmod),
-    TJS_CFUNC_DEF("chown", 2, tjs_file_chown),
-    TJS_CFUNC_DEF("utime", 2, tjs_file_utime),
-    TJS_CGETSET_DEF("path", tjs_file_path_get, NULL),
-    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "FileHandle", JS_PROP_C_W_E),
+/* Module function list */
+static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
+    /* File status */
+    JS_CFUNC_DEF("stat", 1, tjs_syncfs_stat),
+    JS_CFUNC_DEF("lstat", 1, tjs_syncfs_lstat),
+    JS_CFUNC_DEF("exists", 1, tjs_syncfs_exists),
+    
+    /* File operations */
+    JS_CFUNC_DEF("open", 3, tjs_syncfs_open),
+    JS_CFUNC_DEF("close", 1, tjs_syncfs_close),
+    JS_CFUNC_DEF("read", 4, tjs_syncfs_read),
+    JS_CFUNC_DEF("write", 4, tjs_syncfs_write),
+    JS_CFUNC_DEF("readFile", 1, tjs_syncfs_read_file),
+    JS_CFUNC_DEF("writeFile", 3, tjs_syncfs_write_file),
+    
+    /* Directory operations */
+    JS_CFUNC_DEF("mkdir", 2, tjs_syncfs_mkdir),
+    JS_CFUNC_DEF("rmdir", 1, tjs_syncfs_rmdir),
+    JS_CFUNC_DEF("readdir", 1, tjs_syncfs_readdir),
+    
+    /* File management */
+    JS_CFUNC_DEF("unlink", 1, tjs_syncfs_unlink),
+    JS_CFUNC_DEF("rename", 2, tjs_syncfs_rename),
+    
+    /* Path operations */
+    JS_CFUNC_DEF("realpath", 1, tjs_syncfs_realpath),
+    JS_CFUNC_DEF("getcwd", 0, tjs_syncfs_getcwd),
+    JS_CFUNC_DEF("chdir", 1, tjs_syncfs_chdir),
+    
+#define CCONST(val) JS_PROP_INT32_DEF(#val, val, JS_PROP_CONFIGURABLE)
+
+    /* Constants - file open flags */
+	CCONST(O_RDONLY),
+	CCONST(O_WRONLY),
+	CCONST(O_RDWR),
+	CCONST(O_CREAT),
+	CCONST(O_EXCL),
+	CCONST(O_TRUNC),
+	CCONST(O_APPEND),
+    
+    /* Constants - file modes */
+	CCONST(S_IFMT),
+	CCONST(S_IFREG),
+	CCONST(S_IFDIR),
+	CCONST(S_IRWXU),
+	CCONST(S_IRUSR),
+	CCONST(S_IWUSR),
+	CCONST(S_IXUSR),
+	CCONST(S_IRWXG),
+	CCONST(S_IRGRP),
+	CCONST(S_IWGRP),
+	CCONST(S_IXGRP),
+	CCONST(S_IRWXO),
+	CCONST(S_IROTH),
+	CCONST(S_IWOTH),
+	CCONST(S_IXOTH),
+
+#undef CCONST
 };
 
-static const JSCFunctionListEntry tjs_dir_proto_funcs[] = {
-    TJS_CFUNC_DEF("close", 0, tjs_dir_close),
-    JS_CGETSET_DEF("path", tjs_dir_path_get, NULL),
-    TJS_CFUNC_DEF("next", 0, tjs_dir_next),
-    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DirHandle", JS_PROP_C_W_E),
-    TJS_CFUNC_DEF("[Symbol.asyncIterator]", 0, tjs_dir_iterator),
-};
-
-static const JSCFunctionListEntry tjs_dirent_proto_funcs[] = {
-    TJS_CGETSET_DEF("isBlockDevice", tjs_dirent_isblockdevice, NULL),
-    TJS_CGETSET_DEF("isCharacterDevice", tjs_dirent_ischaracterdevice, NULL),
-    TJS_CGETSET_DEF("isDirectory", tjs_dirent_isdirectory, NULL),
-    TJS_CGETSET_DEF("isFIFO", tjs_dirent_isfifo, NULL),
-    TJS_CGETSET_DEF("isFile", tjs_dirent_isfile, NULL),
-    TJS_CGETSET_DEF("isSocket", tjs_dirent_issocket, NULL),
-    TJS_CGETSET_DEF("isSymbolicLink", tjs_dirent_issymlink, NULL),
-    TJS_CGETSET_DEF("name", tjs_dirent_name_get, NULL),
-    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DirEnt", JS_PROP_C_W_E),
-};
-
-static const JSCFunctionListEntry tjs_stat_proto_funcs[] = {
-    TJS_CGETSET_DEF("isBlockDevice", tjs_stat_isblockdevice, NULL),
-    TJS_CGETSET_DEF("isCharacterDevice", tjs_stat_ischaracterdevice, NULL),
-    TJS_CGETSET_DEF("isDirectory", tjs_stat_isdirectory, NULL),
-    TJS_CGETSET_DEF("isFIFO", tjs_stat_isfifo, NULL),
-    TJS_CGETSET_DEF("isFile", tjs_stat_isfile, NULL),
-    TJS_CGETSET_DEF("isSocket", tjs_stat_issocket, NULL),
-    TJS_CGETSET_DEF("isSymbolicLink", tjs_stat_issymlink, NULL),
-    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "StatResult", JS_PROP_C_W_E),
-};
-
-static const JSCFunctionListEntry tjs_fs_funcs[] = {
-    TJS_UVCONST(FS_SYMLINK_DIR),
-    TJS_UVCONST(FS_SYMLINK_JUNCTION),
-    TJS_CFUNC_DEF("open", 3, tjs_fs_open),
-    TJS_CFUNC_DEF("newStdioFile", 2, tjs_fs_new_stdio_file),
-    TJS_CFUNC_MAGIC_DEF("stat", 1, tjs_fs_stat, 0),
-    TJS_CFUNC_MAGIC_DEF("lstat", 1, tjs_fs_stat, 1),
-    TJS_CFUNC_DEF("realPath", 1, tjs_fs_realpath),
-    TJS_CFUNC_DEF("unlink", 1, tjs_fs_unlink),
-    TJS_CFUNC_DEF("rename", 2, tjs_fs_rename),
-    TJS_CFUNC_DEF("makeTempDir", 1, tjs_fs_mkdtemp),
-    TJS_CFUNC_DEF("mkstemp", 1, tjs_fs_mkstemp),
-    TJS_CFUNC_DEF("rmdir", 1, tjs_fs_rmdir),
-    TJS_CFUNC_DEF("mkdir", 2, tjs_fs_mkdir),
-    TJS_CFUNC_DEF("copyFile", 2, tjs_fs_copyfile),
-    TJS_CFUNC_DEF("readDir", 1, tjs_fs_readdir),
-    TJS_CFUNC_DEF("readFile", 1, tjs_fs_readfile),
-    TJS_CFUNC_MAGIC_DEF("chown", 3, tjs_fs_xchown, 0),
-    TJS_CFUNC_MAGIC_DEF("lchown", 3, tjs_fs_xchown, 1),
-    TJS_CFUNC_DEF("chmod", 2, tjs_fs_chmod),
-    TJS_CFUNC_MAGIC_DEF("utime", 3, tjs_fs_xutime, 0),
-    TJS_CFUNC_MAGIC_DEF("lutime", 3, tjs_fs_xutime, 1),
-    TJS_CFUNC_DEF("readLink", 1, tjs_fs_readlink),
-    TJS_CFUNC_DEF("link", 2, tjs_fs_link),
-    TJS_CFUNC_DEF("symlink", 3, tjs_fs_symlink),
-    TJS_CFUNC_DEF("statFs", 1, tjs_fs_statfs),
-    /* Internal */
-    TJS_CFUNC_DEF("mkdirSync", 2, tjs_fs_mkdir_sync),
-    TJS_CFUNC_DEF("statSync", 1, tjs_fs_stat_sync),
-};
-
-void tjs__mod_fs_init(JSContext *ctx, JSValue ns) {
-    JSRuntime *rt = JS_GetRuntime(ctx);
-    JSValue proto;
-
-    /* File object */
-    JS_NewClassID(rt, &tjs_file_class_id);
-    JS_NewClass(rt, tjs_file_class_id, &tjs_file_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_file_proto_funcs, countof(tjs_file_proto_funcs));
-    JS_SetClassProto(ctx, tjs_file_class_id, proto);
-
-    /* Dir object */
-    JS_NewClassID(rt, &tjs_dir_class_id);
-    JS_NewClass(rt, tjs_dir_class_id, &tjs_dir_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_dir_proto_funcs, countof(tjs_dir_proto_funcs));
-    JS_SetClassProto(ctx, tjs_dir_class_id, proto);
-
-    /* DirEnt object */
-    JS_NewClassID(rt, &tjs_dirent_class_id);
-    JS_NewClass(rt, tjs_dirent_class_id, &tjs_dirent_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_dirent_proto_funcs, countof(tjs_dirent_proto_funcs));
-    JS_SetClassProto(ctx, tjs_dirent_class_id, proto);
-
-    /* StatResult object */
-    JS_NewClassID(rt, &tjs_stat_class_id);
-    JS_NewClass(rt, tjs_stat_class_id, &tjs_stat_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_stat_proto_funcs, countof(tjs_stat_proto_funcs));
-    JS_SetClassProto(ctx, tjs_stat_class_id, proto);
-
-    JS_SetPropertyFunctionList(ctx, ns, tjs_fs_funcs, countof(tjs_fs_funcs));
+void tjs__mod_fs_init(JSContext* ctx, JSValue ns) {
+    JS_SetPropertyFunctionList(ctx, ns, tjs_syncfs_funcs, countof(tjs_syncfs_funcs));
 }

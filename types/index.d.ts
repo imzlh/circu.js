@@ -7,6 +7,7 @@ interface TjsModules {
     engine: typeof CModuleEngine,
     error: typeof CModuleError,
     ffi: typeof CModuleFFI,
+    asyncfs: typeof CModuleAsyncFS,
     fs: typeof CModuleFS,
     fswatch: typeof CModuleFSWatch,
     os: typeof CModuleOS,
@@ -22,7 +23,9 @@ interface TjsModules {
     worker: typeof CModuleWorker,
     crypto: typeof CModuleCrypto,
     console: typeof CModuleConsole,
-    zlib: typeof CModuleZLib
+    zlib: typeof CModuleZLib,
+    xhr: typeof CModuleXHR,
+    sourcemap: typeof CModuleSourceMap,
 }
 
 interface TjsPosixModules {

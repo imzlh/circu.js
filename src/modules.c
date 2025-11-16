@@ -101,6 +101,10 @@ JSModuleDef *tjs_module_loader(JSContext *ctx, const char *module_name, void *op
 			JSModuleDef* m = tjs__module_getdef(ctx, ret);
 			JS_FreeValue(ctx, ret);
 			return m;
+		} else if(JS_IsException(ret)){
+			// failed
+			JS_FreeValue(ctx, ret);
+			return NULL;
 		} else {
 			JS_FreeValue(ctx, ret);
 			JS_ThrowTypeError(ctx, "module loader did not return a string or a module");

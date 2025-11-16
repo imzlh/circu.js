@@ -2,29 +2,16 @@
  * circu.js SourceMap Extension 
  * 
  * Copyright (c) 2025 iz
- * 
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * MIT License
  */
+
+#ifndef SOURCEMAP_H
+#define SOURCEMAP_H
 
 #include "tjs.h"
 
-typedef struct {
+typedef struct MappingContext MappingContext;
+typedef struct MappingResult {
     const char *original_file;
     int original_line;
     int original_column;
@@ -32,7 +19,15 @@ typedef struct {
     int found;
 } MappingResult;
 
-bool js_has_sourcemap(const char *file_path);
-int js_load_sourcemap(JSContext *ctx, const char *file_path, JSValue sourcemap_obj);
-int js_load_sourcemap_cjson(JSContext *ctx, const char *file_path, const char *json_str);
-MappingResult js_get_source_mapping(const char *file_path, int generated_line, int generated_column);
+/* Context management */
+MappingContext *js_create_mapping_context(void);
+void js_destroy_mapping_context(MappingContext *ctx);
+
+/* Source map operations */
+bool js_has_sourcemap(MappingContext *ctx, const char *file_path);
+int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx, const char *file_path, JSValue sourcemap_obj);
+int js_load_sourcemap_cjson(MappingContext *ctx, JSContext *js_ctx, const char *file_path, const char *json_str);
+MappingResult js_get_source_mapping(MappingContext *ctx, const char *file_path, int line, int col);
+bool js_remove_sourcemap(MappingContext *ctx, const char *file_path);
+
+#endif

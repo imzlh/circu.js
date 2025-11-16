@@ -122,6 +122,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "engine", tjs__mod_engine_init },
 	{ "error", tjs__mod_error_init },
 	{ "ffi", tjs__mod_ffi_init },
+	{ "asyncfs", tjs__mod_asyncfs_init },
 	{ "fs", tjs__mod_fs_init },
 	{ "fswatch", tjs__mod_fswatch_init },
 	{ "os", tjs__mod_os_init },
@@ -129,6 +130,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "pty", tjs__mod_pty_init },
 	{ "server", tjs__mod_server_init },
 	{ "signals", tjs__mod_signals_init },
+	{ "sourcemap", tjs__mod_sourcemap_init },
 	{ "sqlite3", tjs__mod_sqlite3_init },
 	{ "streams", tjs__mod_streams_init },
 	{ "sys", tjs__mod_sys_init },
@@ -203,6 +205,17 @@ static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue d
 	JS_FreeValue(ctx, evname_obj);
 
     return ret;
+}
+
+static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col){
+	TJSRuntime *qrt = TJS_GetRuntime(ctx);
+
+	MappingResult res = js_get_source_mapping(qrt->module.mapctx, name, *line, *col);
+	if (res.found){
+		// FIXME: function name is not available to overwrite
+		*line = res.original_line;
+		*col = res.original_column;
+	}
 }
 
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
@@ -343,10 +356,16 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* loader for ES modules */
     JS_SetModuleLoaderFunc(rt, tjs_module_normalizer, tjs_module_loader, qrt);
+	qrt->module.resolver = qrt->module.loader = 
+	qrt->module.metaloader = JS_UNDEFINED;
 
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
 	JS_SetPromiseHook(rt, tjs__promise_hook, NULL);
+	
+	/* debug hook */
+	qrt->module.mapctx = js_create_mapping_context();
+	JS_SetBacktraceHook(rt, tjs__use_sourcemap, NULL);
 
     /* define some global properties */
 	JSValue global_obj = JS_GetGlobalObject(ctx);
@@ -358,8 +377,8 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
 	qrt->builtins.dispatch_event_func =
 	qrt->builtins.message_pipe = JS_UNDEFINED;
-	qrt->console_count = JS_NewObjectProto(ctx, JS_NULL);
-	qrt->console_time = JS_NewObjectProto(ctx, JS_NULL);
+	qrt->builtins.concount = JS_NewObjectProto(ctx, JS_NULL);
+	qrt->builtins.contime = JS_NewObjectProto(ctx, JS_NULL);
 
     /* end bootstrap */
     JS_FreeValue(ctx, global_obj);
@@ -396,8 +415,11 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	qrt->module.metaloader = JS_UNDEFINED;
 
 	/* remove console.count cache */
-	JS_FreeValue(qrt->ctx, qrt->console_count);
-	JS_FreeValue(qrt->ctx, qrt->console_time);
+	JS_FreeValue(qrt->ctx, qrt->builtins.concount);
+	JS_FreeValue(qrt->ctx, qrt->builtins.contime);
+
+	/* remove debug sourcemap */
+	js_destroy_mapping_context(qrt->module.mapctx);
 
     /* Destroy all timers */
     tjs__destroy_timers(qrt);

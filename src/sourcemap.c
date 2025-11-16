@@ -2,34 +2,37 @@
  * circu.js SourceMap Extension 
  * 
  * Copyright (c) 2025 iz
- * 
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * MIT License
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <stdint.h>
+
+#include "../deps/quickjs/list.h"
 
 #include "private.h"
 #include "sourcemap.h"
+
+#pragma region Macros and Constants
+/* ---------- Macros ---------- */
+
+#define HASH_INIT_SIZE 1024
+#define FILE_INIT_CAPACITY 16
+
+#define CALC_HASH(line, col, size) (hash_position((line), (col)) % (size))
+#define MAKE_KEY(line, col) (((uint64_t)(line) << 32) | (uint32_t)(col))
+
+#define FREE_STR_ARRAY(arr, cnt) \
+    do { \
+        if (arr) { \
+            for (int i = 0; i < (cnt); i++) free((arr)[i]); \
+            free(arr); \
+        } \
+    } while (0)
+
+/* ---------- Structures ---------- */
 
 typedef struct {
     int generated_line;
@@ -40,59 +43,51 @@ typedef struct {
     char *name;
 } SourceMapping;
 
-// mapping node using hash table
+/* Node in hash bucket and global list */
 typedef struct MappingNode {
-    uint64_t key;               // (line << 32) | column
+    uint64_t key;
     SourceMapping mapping;
-    struct MappingNode *next;
+    struct list_head hash_link;  /* Hash bucket chain */
+    struct list_head list_link;  /* Global ordered list */
 } MappingNode;
 
-// 单个文件的SourceMap
+/* Hash bucket head */
 typedef struct {
-    char *file_path;            // file path
-    char **sources;             // sources
+    struct list_head head;
+} HashBucket;
+
+/* Per-file source map */
+typedef struct FileSourceMap {
+    char *file_path;
+    char **sources;
     int sources_count;
-    char **names;               // name
+    char **names;
     int names_count;
-    MappingNode **hash_table;   // hash table
+    HashBucket *hash_table;
     int hash_size;
-    pthread_rwlock_t rwlock;    // rwlock
-    int ref_count;              // refcount
+    struct list_head mappings_list;  /* All mappings in order */
+    int mappings_count;
+    int ref_count;
 } FileSourceMap;
 
-// global source map manager
-typedef struct {
-    FileSourceMap **files;      // file array
+/* Context replacing global manager */
+struct MappingContext {
+    FileSourceMap **files;
     int files_count;
     int files_capacity;
-    pthread_rwlock_t global_rwlock;  // global rwlock
-} SourceMapManager;
+};
 
-static SourceMapManager g_manager = {0};
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+#pragma region Static Functions
+/* ---------- Static Functions ---------- */
 
-// initialize source map manager
-__attribute__((constructor)) static void init_manager() {
-    memset(&g_manager, 0, sizeof(g_manager));
-    pthread_rwlock_init(&g_manager.global_rwlock, NULL);
-    g_manager.files_capacity = 16;
-    g_manager.files = calloc(g_manager.files_capacity, sizeof(FileSourceMap*));
-}
-
-// hash function for mapping node
 static uint32_t hash_position(int line, int column) {
-    uint64_t key = ((uint64_t)line << 32) | (uint32_t)column;
+    uint64_t key = MAKE_KEY(line, column);
     key ^= key >> 33;
-    key *= 0xff51afd7ed558ccd;
+    key *= 0xff51afd7ed558ccdULL;
     key ^= key >> 33;
-    key *= 0xc4ceb9fe1a85ec53;
+    key *= 0xc4ceb9fe1a85ec53ULL;
     key ^= key >> 33;
     return (uint32_t)key;
-}
-
-// position key
-static uint64_t make_position_key(int line, int column) {
-    return ((uint64_t)line << 32) | (uint32_t)column;
 }
 
 static inline int base64_decode_char(char c) {
@@ -104,152 +99,201 @@ static inline int base64_decode_char(char c) {
     return -1;
 }
 
-// VLQ decode
 static int decode_vlq(const char **input, int *value) {
-    int result = 0;
-    int shift = 0;
-    int continuation = 1;
+    int result = 0, shift = 0, digit;
     
-    while (continuation && **input) {
-        int digit = base64_decode_char(**input);
+    while (**input) {
+        digit = base64_decode_char(**input);
         if (digit == -1) return 0;
         
-        continuation = digit & 1;
-        digit >>= 1;
-        
-        result += digit << shift;
-        shift += 5;
         (*input)++;
+        result |= (digit & 31) << shift;
+        if (!(digit & 32)) break;
+        shift += 5;
     }
     
-    if (result & 1) {
-        *value = -(result >> 1);
-    } else {
-        *value = result >> 1;
-    }
-    
+    *value = (result & 1) ? -(result >> 1) : (result >> 1);
     return 1;
 }
 
-// parse source map array
 static char **parse_json_array(JSContext *ctx, JSValue array, int *count) {
     *count = 0;
-    
     if (!JS_IsArray(array)) return NULL;
     
-    JSValue length_val = JS_GetPropertyStr(ctx, array, "length");
-    int32_t length;
-    if (JS_ToInt32(ctx, &length, length_val) < 0) {
-        JS_FreeValue(ctx, length_val);
+    JSValue len_val = JS_GetPropertyStr(ctx, array, "length");
+    int32_t len;
+    if (JS_ToInt32(ctx, &len, len_val) < 0) {
+        JS_FreeValue(ctx, len_val);
         return NULL;
     }
-    JS_FreeValue(ctx, length_val);
+    JS_FreeValue(ctx, len_val);
     
-    if (length <= 0) return NULL;
+    if (len <= 0) return NULL;
     
-    char **result = malloc(length * sizeof(char*));
+    char **result = malloc(len * sizeof(char*));
     if (!result) return NULL;
     
-    int actual_count = 0;
-    for (int i = 0; i < length; i++) {
+    int actual = 0;
+    for (int i = 0; i < len; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, array, i);
         if (JS_IsString(item)) {
             const char *str = JS_ToCString(ctx, item);
             if (str) {
-                result[actual_count] = strdup(str);
+                result[actual++] = strdup(str);
                 JS_FreeCString(ctx, str);
-                actual_count++;
             }
         }
         JS_FreeValue(ctx, item);
     }
     
-    *count = actual_count;
+    *count = actual;
     return result;
 }
 
-// release string array
-static void free_string_array(char **array, int count) {
-    if (!array) return;
-    for (int i = 0; i < count; i++) {
-        free(array[i]);
+static FileSourceMap *create_file_map(const char *file_path) {
+    FileSourceMap *map = calloc(1, sizeof(FileSourceMap));
+    if (!map) return NULL;
+    
+    map->file_path = strdup(file_path);
+    map->hash_size = HASH_INIT_SIZE;
+    map->hash_table = calloc(map->hash_size, sizeof(HashBucket));
+    init_list_head(&map->mappings_list);
+    map->ref_count = 1;
+    
+    if (!map->file_path || !map->hash_table) {
+        free(map->file_path);
+        free(map->hash_table);
+        free(map);
+        return NULL;
     }
-    free(array);
+    
+    for (int i = 0; i < map->hash_size; i++) {
+        init_list_head(&map->hash_table[i].head);
+    }
+    
+    return map;
 }
 
-// insert into hash table
-static void insert_mapping(FileSourceMap *file_map, int gen_line, int gen_col,
-                          int orig_line, int orig_col, const char *orig_file, const char *name) {
-    uint64_t key = make_position_key(gen_line, gen_col);
-    uint32_t hash = hash_position(gen_line, gen_col) % file_map -> hash_size;
+static void free_file_map(FileSourceMap *map) {
+    if (!map) return;
     
+    /* Free all mappings */
+	struct list_head *cur, *tmp;
+    list_for_each_safe(cur, tmp, &map->mappings_list) {
+		struct MappingNode *node = list_entry(cur, MappingNode, list_link);
+        list_del(&node->hash_link);
+        list_del(&node->list_link);
+        free(node->mapping.original_file);
+        free(node->mapping.name);
+        free(node);
+    }
+    
+    free(map->hash_table);
+    FREE_STR_ARRAY(map->sources, map->sources_count);
+    FREE_STR_ARRAY(map->names, map->names_count);
+    free(map->file_path);
+    free(map);
+}
+
+static FileSourceMap *find_file_map(MappingContext *ctx, const char *path) {
+    for (int i = 0; i < ctx->files_count; i++) {
+        if (ctx->files[i] && strcmp(ctx->files[i]->file_path, path) == 0) {
+            return ctx->files[i];
+        }
+    }
+    return NULL;
+}
+
+static FileSourceMap *get_or_create_file_map(MappingContext *ctx, const char *path) {
+    FileSourceMap *map = find_file_map(ctx, path);
+    if (map) {
+        map->ref_count++;
+        return map;
+    }
+    
+    map = create_file_map(path);
+    if (!map) return NULL;
+    
+    /* Resize file array if needed */
+    if (ctx->files_count >= ctx->files_capacity) {
+        int new_cap = ctx->files_capacity ? ctx->files_capacity * 2 : FILE_INIT_CAPACITY;
+        FileSourceMap **new_files = realloc(ctx->files, new_cap * sizeof(FileSourceMap*));
+        if (!new_files) {
+            free_file_map(map);
+            return NULL;
+        }
+        ctx->files = new_files;
+        ctx->files_capacity = new_cap;
+    }
+    
+    ctx->files[ctx->files_count++] = map;
+    return map;
+}
+
+static void insert_mapping(FileSourceMap *map, int gen_line, int gen_col,
+                          int orig_line, int orig_col, const char *orig_file, const char *name) {
     MappingNode *node = malloc(sizeof(MappingNode));
     if (!node) return;
     
-    node -> key = key;
-    node -> mapping.generated_line = gen_line;
-    node -> mapping.generated_column = gen_col;
-    node -> mapping.original_line = orig_line;
-    node -> mapping.original_column = orig_col;
-    node -> mapping.original_file = orig_file ? strdup(orig_file) : NULL;
-    node -> mapping.name = name ? strdup(name) : NULL;
+    node->key = MAKE_KEY(gen_line, gen_col);
+    node->mapping = (SourceMapping){
+        .generated_line = gen_line,
+        .generated_column = gen_col,
+        .original_line = orig_line,
+        .original_column = orig_col,
+        .original_file = orig_file ? strdup(orig_file) : NULL,
+        .name = name ? strdup(name) : NULL
+    };
     
-    node -> next = file_map -> hash_table[hash];
-    file_map -> hash_table[hash] = node;
+    uint32_t hash = CALC_HASH(gen_line, gen_col, map->hash_size);
+    list_add_tail(&node->list_link, &map->mappings_list);
+    list_add(&node->hash_link, &map->hash_table[hash].head);
+    map->mappings_count++;
 }
 
-// find mapping in hash table
-static SourceMapping *find_mapping(FileSourceMap *file_map, int line, int column) {
-    if (!file_map || !file_map -> hash_table) return NULL;
+static SourceMapping *find_exact_mapping(FileSourceMap *map, int line, int column) {
+    uint32_t hash = CALC_HASH(line, column, map->hash_size);
+    uint64_t key = MAKE_KEY(line, column);
     
-    uint64_t key = make_position_key(line, column);
-    uint32_t hash = hash_position(line, column) % file_map -> hash_size;
-    
-    MappingNode *node = file_map -> hash_table[hash];
-    while (node) {
-        if (node -> key == key) {
-            return &node -> mapping;
-        }
-        node = node -> next;
+    struct list_head *cur;
+    list_for_each(cur, &map->hash_table[hash].head) {
+		struct MappingNode* node = list_entry(cur, MappingNode, hash_link);
+        if (node->key == key) return &node->mapping;
     }
+    return NULL;
+}
+
+static SourceMapping *find_nearest_mapping(FileSourceMap *map, int line, int column) {
+    struct list_head *cur;
+    SourceMapping *best = NULL;
     
-    // no exact match, find the nearest match
-    SourceMapping *best_match = NULL;
-    for (int i = 0; i < file_map -> hash_size; i++) {
-        node = file_map -> hash_table[i];
-        while (node) {
-            if (node -> mapping.generated_line < line || 
-                (node -> mapping.generated_line == line && node -> mapping.generated_column <= column)) {
-                if (!best_match || 
-                    node -> mapping.generated_line > best_match -> generated_line ||
-                    (node -> mapping.generated_line == best_match -> generated_line && 
-                     node -> mapping.generated_column > best_match -> generated_column)) {
-                    best_match = &node -> mapping;
-                }
+    /* List is in insertion order (sorted by generated position) */
+    list_for_each(cur, &map->mappings_list) {
+		struct MappingNode *node = list_entry(cur, MappingNode, list_link);
+        if (node->mapping.generated_line < line ||
+            (node->mapping.generated_line == line && node->mapping.generated_column <= column)) {
+            if (!best || node->mapping.generated_line > best->generated_line ||
+                (node->mapping.generated_line == best->generated_line && 
+                 node->mapping.generated_column > best->generated_column)) {
+                best = &node->mapping;
             }
-            node = node -> next;
         }
     }
     
-    return best_match;
+    return best;
 }
 
-// parse source map
-static int parse_mappings(FileSourceMap *file_map, const char *mappings_str) {
+static int parse_mappings(FileSourceMap *map, const char *mappings_str) {
     if (!mappings_str) return 0;
     
     const char *p = mappings_str;
-    int generated_line = 0;
-    int generated_column = 0;
-    int source_index = 0;
-    int original_line = 0;
-    int original_column = 0;
-    int name_index = 0;
+    int gen_line = 0, gen_col = 0;
+    int src_idx = 0, orig_line = 0, orig_col = 0, name_idx = 0;
     
     while (*p) {
         if (*p == ';') {
-            generated_line++;
-            generated_column = 0;
+            gen_line++;
+            gen_col = 0;
             p++;
             continue;
         }
@@ -259,38 +303,32 @@ static int parse_mappings(FileSourceMap *file_map, const char *mappings_str) {
             continue;
         }
         
-        int values[5];
-        int value_count = 0;
-        
-        while (*p && *p != ',' && *p != ';' && value_count < 5) {
-            int value;
-            if (!decode_vlq(&p, &value)) break;
-            values[value_count++] = value;
+        int values[5] = {0}, cnt = 0;
+        while (*p && *p != ',' && *p != ';' && cnt < 5) {
+            if (!decode_vlq(&p, &values[cnt++])) break;
         }
         
-        if (value_count >= 1) {
-            generated_column += values[0];
-            
-            if (value_count >= 4) {
-                source_index += values[1];
-                original_line += values[2];
-                original_column += values[3];
+        if (cnt >= 1) {
+            gen_col += values[0];
+            if (cnt >= 4) {
+                src_idx += values[1];
+                orig_line += values[2];
+                orig_col += values[3];
                 
                 const char *orig_file = NULL;
-                if (source_index >= 0 && source_index < file_map -> sources_count) {
-                    orig_file = file_map -> sources[source_index];
+                if (src_idx >= 0 && src_idx < map->sources_count) {
+                    orig_file = map->sources[src_idx];
                 }
                 
                 const char *name = NULL;
-                if (value_count >= 5) {
-                    name_index += values[4];
-                    if (name_index >= 0 && name_index < file_map -> names_count) {
-                        name = file_map -> names[name_index];
+                if (cnt >= 5) {
+                    name_idx += values[4];
+                    if (name_idx >= 0 && name_idx < map->names_count) {
+                        name = map->names[name_idx];
                     }
                 }
                 
-                insert_mapping(file_map, generated_line, generated_column,
-                             original_line, original_column, orig_file, name);
+                insert_mapping(map, gen_line, gen_col, orig_line, orig_col, orig_file, name);
             }
         }
     }
@@ -298,254 +336,234 @@ static int parse_mappings(FileSourceMap *file_map, const char *mappings_str) {
     return 1;
 }
 
-// create file source map
-static FileSourceMap *create_file_sourcemap(const char *file_path) {
-    FileSourceMap *file_map = calloc(1, sizeof(FileSourceMap));
-    if (!file_map) return NULL;
+#pragma region JS Public API
+
+MappingContext *js_create_mapping_context(void) {
+    MappingContext *ctx = calloc(1, sizeof(MappingContext));
+    if (!ctx) return NULL;
     
-    file_map -> file_path = strdup(file_path);
-    file_map -> hash_size = 1024;
-    file_map -> hash_table = calloc(file_map -> hash_size, sizeof(MappingNode*));
-    file_map -> ref_count = 1;
-    
-    if (pthread_rwlock_init(&file_map -> rwlock, NULL) != 0) {
-        free(file_map -> file_path);
-        free(file_map -> hash_table);
-        free(file_map);
+    ctx->files_capacity = FILE_INIT_CAPACITY;
+    ctx->files = calloc(ctx->files_capacity, sizeof(FileSourceMap*));
+    if (!ctx->files) {
+        free(ctx);
         return NULL;
     }
     
-    return file_map;
+    return ctx;
 }
 
-// release file source map
-static void free_file_sourcemap(FileSourceMap *file_map) {
-    if (!file_map) return;
+void js_destroy_mapping_context(MappingContext *ctx) {
+    if (!ctx) return;
     
-    if (file_map -> hash_table) {
-        for (int i = 0; i < file_map -> hash_size; i++) {
-            MappingNode *node = file_map -> hash_table[i];
-            while (node) {
-                MappingNode *next = node -> next;
-                free(node -> mapping.original_file);
-                free(node -> mapping.name);
-                free(node);
-                node = next;
-            }
-        }
-        free(file_map -> hash_table);
+    for (int i = 0; i < ctx->files_count; i++) {
+        if (ctx->files[i]) free_file_map(ctx->files[i]);
     }
     
-    free_string_array(file_map -> sources, file_map -> sources_count);
-    free_string_array(file_map -> names, file_map -> names_count);
-    free(file_map -> file_path);
-    pthread_rwlock_destroy(&file_map -> rwlock);
-    free(file_map);
+    free(ctx->files);
+    free(ctx);
 }
 
-// find or create file source map
-static FileSourceMap *get_or_create_file_map(const char *file_path) {
-    pthread_once(&g_init_once, init_manager);
-    
-    pthread_rwlock_rdlock(&g_manager.global_rwlock);
-    
-    FileSourceMap *found = NULL;
-    for (int i = 0; i < g_manager.files_count; i++) {
-        if (g_manager.files[i] && strcmp(g_manager.files[i] -> file_path, file_path) == 0) {
-            found = g_manager.files[i];
-            found -> ref_count++;
-            break;
-        }
-    }
-    
-    pthread_rwlock_unlock(&g_manager.global_rwlock);
-    
-    if (found) return found;
-    
-    // not found, create a new one
-    FileSourceMap *new_map = create_file_sourcemap(file_path);
-    if (!new_map) return NULL;
-    
-    pthread_rwlock_wrlock(&g_manager.global_rwlock);
-    
-    if (g_manager.files_count >= g_manager.files_capacity) {
-        g_manager.files_capacity *= 2;
-        FileSourceMap **new_files = realloc(g_manager.files, 
-            g_manager.files_capacity * sizeof(FileSourceMap*));
-        if (!new_files) {
-            pthread_rwlock_unlock(&g_manager.global_rwlock);
-            free_file_sourcemap(new_map);
-            return NULL;
-        }
-        g_manager.files = new_files;
-    }
-    
-    g_manager.files[g_manager.files_count++] = new_map;
-    
-    pthread_rwlock_unlock(&g_manager.global_rwlock);
-    
-    return new_map;
+bool js_has_sourcemap(MappingContext *ctx, const char *file_path) {
+    return file_path && find_file_map(ctx, file_path) != NULL;
 }
 
-// load global source map
-int js_load_sourcemap(JSContext *ctx, const char *file_path, JSValue sourcemap_obj) {
-    if (!file_path || !JS_IsObject(sourcemap_obj)) {
-        return 0;
+int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx, 
+                     const char *file_path, JSValue sm_obj) {
+    if (!ctx || !file_path || !JS_IsObject(sm_obj)) return 0;
+    
+    FileSourceMap *map = get_or_create_file_map(ctx, file_path);
+    if (!map) return 0;
+    
+    /* Clear existing mappings */
+	struct list_head *cur, *tmp;
+    list_for_each_safe(cur, tmp, &map->mappings_list) {
+		struct MappingNode *node = list_entry(cur, MappingNode, list_link);
+        list_del(&node->hash_link);
+        list_del(&node->list_link);
+        free(node->mapping.original_file);
+        free(node->mapping.name);
+        free(node);
     }
+    init_list_head(&map->mappings_list);
+    map->mappings_count = 0;
     
-    FileSourceMap *file_map = get_or_create_file_map(file_path);
-    if (!file_map) return 0;
+    FREE_STR_ARRAY(map->sources, map->sources_count);
+    FREE_STR_ARRAY(map->names, map->names_count);
+    map->sources = map->names = NULL;
+    map->sources_count = map->names_count = 0;
     
-    pthread_rwlock_wrlock(&file_map -> rwlock);
-    
-    // 清除现有映射
-    if (file_map -> hash_table) {
-        for (int i = 0; i < file_map -> hash_size; i++) {
-            MappingNode *node = file_map -> hash_table[i];
-            while (node) {
-                MappingNode *next = node -> next;
-                free(node -> mapping.original_file);
-                free(node -> mapping.name);
-                free(node);
-                node = next;
-            }
-            file_map -> hash_table[i] = NULL;
-        }
+    /* Parse JSON */
+    JSValue sources = JS_GetPropertyStr(js_ctx, sm_obj, "sources");
+    if (JS_IsArray(sources)) {
+        map->sources = parse_json_array(js_ctx, sources, &map->sources_count);
     }
+    JS_FreeValue(js_ctx, sources);
     
-    free_string_array(file_map -> sources, file_map -> sources_count);
-    free_string_array(file_map -> names, file_map -> names_count);
-    file_map -> sources = NULL;
-    file_map -> names = NULL;
-    file_map -> sources_count = 0;
-    file_map -> names_count = 0;
+    JSValue names = JS_GetPropertyStr(js_ctx, sm_obj, "names");
+    if (JS_IsArray(names)) {
+        map->names = parse_json_array(js_ctx, names, &map->names_count);
+    }
+    JS_FreeValue(js_ctx, names);
     
     int success = 0;
-    
-    // 解析sources
-    JSValue sources = JS_GetPropertyStr(ctx, sourcemap_obj, "sources");
-    if (JS_IsArray(sources)) {
-        file_map -> sources = parse_json_array(ctx, sources, &file_map -> sources_count);
-    }
-    JS_FreeValue(ctx, sources);
-    
-    // 解析names
-    JSValue names = JS_GetPropertyStr(ctx, sourcemap_obj, "names");
-    if (JS_IsArray(names)) {
-        file_map -> names = parse_json_array(ctx, names, &file_map -> names_count);
-    }
-    JS_FreeValue(ctx, names);
-    
-    // 解析mappings
-    JSValue mappings_val = JS_GetPropertyStr(ctx, sourcemap_obj, "mappings");
-    const char *mappings_str = JS_ToCString(ctx, mappings_val);
+    JSValue mappings_val = JS_GetPropertyStr(js_ctx, sm_obj, "mappings");
+    const char *mappings_str = JS_ToCString(js_ctx, mappings_val);
     if (mappings_str) {
-        success = parse_mappings(file_map, mappings_str);
-        JS_FreeCString(ctx, mappings_str);
+        success = parse_mappings(map, mappings_str);
+        JS_FreeCString(js_ctx, mappings_str);
     }
-    JS_FreeValue(ctx, mappings_val);
-    
-    pthread_rwlock_unlock(&file_map -> rwlock);
+    JS_FreeValue(js_ctx, mappings_val);
     
     return success;
 }
 
-// 从JSON字符串加载
-int js_load_sourcemap_cjson(JSContext *ctx, const char *file_path, const char *json_str) {
-    JSValue json_obj = JS_ParseJSON(ctx, json_str, strlen(json_str), "<sourcemap>");
-    if (JS_IsException(json_obj)) {
-        return 0;
-    }
+int js_load_sourcemap_cjson(MappingContext *ctx, JSContext *js_ctx, 
+                           const char *file_path, const char *json_str) {
+    if (!ctx || !file_path || !json_str) return 0;
     
-    int result = js_load_sourcemap(ctx, file_path, json_obj);
-    JS_FreeValue(ctx, json_obj);
+    JSValue json_obj = JS_ParseJSON(js_ctx, json_str, strlen(json_str), "<sourcemap>");
+    if (JS_IsException(json_obj)) return 0;
+    
+    int result = js_load_sourcemap(ctx, js_ctx, file_path, json_obj);
+    JS_FreeValue(js_ctx, json_obj);
     return result;
 }
 
-bool js_has_sourcemap(const char *file_path){
-    if(!file_path) return false;
-
-    pthread_once(&g_init_once, init_manager);
-
-    pthread_rwlock_rdlock(&g_manager.global_rwlock);
-
-    FileSourceMap *file_map = NULL;
-    for (int i = 0; i < g_manager.files_count; i++) {
-        if (g_manager.files[i] && strcmp(g_manager.files[i] -> file_path, file_path) == 0) {
-            file_map = g_manager.files[i];
-            break;
-        }
-    }
-
-    pthread_rwlock_unlock(&g_manager.global_rwlock);
-
-    if (file_map) return true;
-
-    return false;
-}
-
-// Get mapping for a given position in a file
-MappingResult js_get_source_mapping(const char *file_path, int generated_line, int generated_column) {
+MappingResult js_get_source_mapping(MappingContext *ctx, const char *file_path, 
+                                   int gen_line, int gen_col) {
     MappingResult result = {0};
     
-    if (!file_path) return result;
+    if (!ctx || !file_path) return result;
     
-    pthread_once(&g_init_once, init_manager);
+    FileSourceMap *map = find_file_map(ctx, file_path);
+    if (!map) return result;
     
-    pthread_rwlock_rdlock(&g_manager.global_rwlock);
+    SourceMapping *mapping = find_exact_mapping(map, gen_line - 1, gen_col);
+    if (!mapping) mapping = find_nearest_mapping(map, gen_line - 1, gen_col);
     
-    FileSourceMap *file_map = NULL;
-    for (int i = 0; i < g_manager.files_count; i++) {
-        if (g_manager.files[i] && strcmp(g_manager.files[i] -> file_path, file_path) == 0) {
-            file_map = g_manager.files[i];
-            break;
-        }
-    }
-    
-    if (!file_map) {
-        pthread_rwlock_unlock(&g_manager.global_rwlock);
-        return result;
-    }
-    
-    pthread_rwlock_rdlock(&file_map -> rwlock);
-    pthread_rwlock_unlock(&g_manager.global_rwlock);
-    
-    SourceMapping *mapping = find_mapping(file_map, generated_line - 1, generated_column);
-    
-    if (mapping && mapping -> original_file) {
-        result.original_file = mapping -> original_file;
-        result.original_line = mapping -> original_line + 1;
-        result.original_column = mapping -> original_column;
-        result.function_name = mapping -> name;
+    if (mapping && mapping->original_file) {
+        result.original_file = mapping->original_file;
+        result.original_line = mapping->original_line + 1;
+        result.original_column = mapping->original_column;
+        result.function_name = mapping->name;
         result.found = 1;
     } else {
-        result.original_line = generated_line;
-        result.original_column = generated_column;
+        result.original_line = gen_line;
+        result.original_column = gen_col;
         result.found = 0;
     }
     
-    pthread_rwlock_unlock(&file_map -> rwlock);
-    
     return result;
 }
 
-// Cleanup mapping manager
-__attribute__((destructor)) static void js_cleanup_mapping(void) {
-    pthread_once(&g_init_once, init_manager);
+bool js_remove_sourcemap(MappingContext *ctx, const char *file_path) {
+    if (!ctx || !file_path) return false;
     
-    pthread_rwlock_wrlock(&g_manager.global_rwlock);
-    
-    for (int i = 0; i < g_manager.files_count; i++) {
-        if (g_manager.files[i]) {
-            free_file_sourcemap(g_manager.files[i]);
+    for (int i = 0; i < ctx->files_count; i++) {
+        if (ctx->files[i] && strcmp(ctx->files[i]->file_path, file_path) == 0) {
+            free_file_map(ctx->files[i]);
+            /* Swap with last element for O(1) removal */
+            if (i < ctx->files_count - 1) {
+                ctx->files[i] = ctx->files[ctx->files_count - 1];
+            }
+            ctx->files_count--;
+            return true;
         }
     }
     
-    free(g_manager.files);
-    g_manager.files = NULL;
-    g_manager.files_count = 0;
-    g_manager.files_capacity = 0;
+    return false;
+}
+
+static JSValue tjs__has_sourcemap(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_EXCEPTION;
     
-    pthread_rwlock_unlock(&g_manager.global_rwlock);
-    pthread_rwlock_destroy(&g_manager.global_rwlock);
+    const char *file_path = JS_ToCString(ctx, argv[0]);
+    if (!file_path) return JS_EXCEPTION;
+
+    TJSRuntime *rt = TJS_GetRuntime(ctx);
+    bool has = js_has_sourcemap(rt->module.mapctx, file_path);
+
+    JS_FreeCString(ctx, file_path);
+    return JS_NewBool(ctx, has);
+}
+
+static JSValue tjs__load_sourcemap(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_EXCEPTION;
+    
+    const char *file_path = JS_ToCString(ctx, argv[0]);
+    if (!file_path) return JS_EXCEPTION;
+
+    TJSRuntime *rt = TJS_GetRuntime(ctx);
+    int ret = js_load_sourcemap(rt->module.mapctx, ctx, file_path, argv[1]);
+
+    JS_FreeCString(ctx, file_path);
+    return JS_NewInt32(ctx, ret);
+}
+
+static JSValue tjs__load_sourcemap_cjson(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_EXCEPTION;
+    
+    const char *file_path = JS_ToCString(ctx, argv[0]);
+    const char *json_str = JS_ToCString(ctx, argv[1]);
+    if (!file_path || !json_str) {
+        if (file_path) JS_FreeCString(ctx, file_path);
+        if (json_str) JS_FreeCString(ctx, json_str);
+        return JS_EXCEPTION;
+    }
+
+    TJSRuntime *rt = TJS_GetRuntime(ctx);
+    int ret = js_load_sourcemap_cjson(rt->module.mapctx, ctx, file_path, json_str);
+
+    JS_FreeCString(ctx, file_path);
+    JS_FreeCString(ctx, json_str);
+    return JS_NewInt32(ctx, ret);
+}
+
+static JSValue tjs__get_source_mapping(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_EXCEPTION;
+    
+    const char *file_path = JS_ToCString(ctx, argv[0]);
+    int line, col;
+    if (!file_path || JS_ToInt32(ctx, &line, argv[1]) || JS_ToInt32(ctx, &col, argv[2])) {
+        if (file_path) JS_FreeCString(ctx, file_path);
+        return JS_EXCEPTION;
+    }
+
+    TJSRuntime *rt = TJS_GetRuntime(ctx);
+    MappingResult res = js_get_source_mapping(rt->module.mapctx, file_path, line, col);
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "original_file", JS_NewString(ctx, res.original_file ? res.original_file : ""));
+    JS_SetPropertyStr(ctx, obj, "original_line", JS_NewInt32(ctx, res.original_line));
+    JS_SetPropertyStr(ctx, obj, "original_column", JS_NewInt32(ctx, res.original_column));
+    JS_SetPropertyStr(ctx, obj, "function_name", JS_NewString(ctx, res.function_name ? res.function_name : ""));
+    JS_SetPropertyStr(ctx, obj, "found", JS_NewBool(ctx, res.found));
+
+    JS_FreeCString(ctx, file_path);
+    return obj;
+}
+
+static JSValue tjs__remove_sourcemap(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_EXCEPTION;
+    
+    const char *file_path = JS_ToCString(ctx, argv[0]);
+    if (!file_path) return JS_EXCEPTION;
+
+    TJSRuntime *rt = TJS_GetRuntime(ctx);
+    bool removed = js_remove_sourcemap(rt->module.mapctx, file_path);
+
+    JS_FreeCString(ctx, file_path);
+    return JS_NewBool(ctx, removed);
+}
+
+static const JSCFunctionListEntry js_sourcemap_funcs[] = {
+    JS_CFUNC_DEF("has", 1, tjs__has_sourcemap),
+    JS_CFUNC_DEF("load", 2, tjs__load_sourcemap),
+    JS_CFUNC_DEF("loadJSON", 2, tjs__load_sourcemap_cjson),
+    JS_CFUNC_DEF("getMapping", 3, tjs__get_source_mapping),
+    JS_CFUNC_DEF("remove", 1, tjs__remove_sourcemap),
+};
+
+void tjs__mod_sourcemap_init(JSContext *ctx, JSValue ns) {
+	JS_SetPropertyFunctionList(ctx, ns, js_sourcemap_funcs, countof(js_sourcemap_funcs));
 }

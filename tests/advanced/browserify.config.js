@@ -1,6 +1,6 @@
 const browserify = require('browserify');
 const path = require('path')
-const fs = require('fs')
+const fs = require('../../types/asyncfs')
 
 function createGeneratorInput(generatorName) {
   console.log(`generating ${generatorName}...`)

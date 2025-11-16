@@ -871,7 +871,7 @@ static inline JSValue tjs_get_t_cache(JSContext* ctx, JSValue symbol, JSAtom* at
         *atom = JS_ValueToAtom(ctx, symbol);
     }
     
-	JSValue val = JS_GetProperty(ctx, trt->console_time, *atom);
+	JSValue val = JS_GetProperty(ctx, trt->builtins.contime, *atom);
 	if (JS_IsUndefined(val)){
 		val = JS_NewInt32(ctx, 0);
 	}
@@ -880,7 +880,7 @@ static inline JSValue tjs_get_t_cache(JSContext* ctx, JSValue symbol, JSAtom* at
 }
 
 static inline void tjs_set_t_cache(JSContext* ctx, JSAtom atom, JSValue val){
-	JS_SetProperty(ctx, TJS_GetRuntime(ctx)->console_time, atom, val);
+	JS_SetProperty(ctx, TJS_GetRuntime(ctx)->builtins.contime, atom, val);
 }
 
 static JSValue js_console_count(JSContext* ctx, JSValueConst this_val,
@@ -894,10 +894,10 @@ static JSValue js_console_count(JSContext* ctx, JSValueConst this_val,
         atom = JS_ValueToAtom(ctx, symbol);
     }
     
-	JSValue val = JS_GetProperty(ctx, trt->console_count, atom);
+	JSValue val = JS_GetProperty(ctx, trt->builtins.concount, atom);
 	if (JS_IsUndefined(val)) val = JS_MKVAL(JS_TAG_INT, 1);
 	else val.u.int32++;
-	JS_SetProperty(ctx, trt->console_count, atom, val);
+	JS_SetProperty(ctx, trt->builtins.concount, atom, val);
 
 	const char* label = JS_AtomToCString(ctx, atom);
 	printf(ANSI_GRAY "count '%s'" ANSI_BLUE " %d\n", label ? label : "default", val.u.int32);
@@ -919,7 +919,7 @@ static JSValue js_console_countReset(JSContext* ctx, JSValueConst this_val,
     }
 
     JSValue val = JS_NewInt32(ctx, 0);
-    JS_SetProperty(ctx, trt->console_count, atom, val);
+    JS_SetProperty(ctx, trt->builtins.concount, atom, val);
 
     const char* label = JS_AtomToCString(ctx, atom);
     printf(ANSI_GRAY "countReset '%s'" ANSI_BLUE " %d\n", 

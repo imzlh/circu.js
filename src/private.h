@@ -29,6 +29,7 @@
 #include "../deps/quickjs/quickjs.h"
 #include "tjs.h"
 #include "utils.h"
+#include "sourcemap.h"
 
 #ifdef TJS__HAS_WASM
 #include "wasm.h"
@@ -78,15 +79,17 @@ struct TJSRuntime {
     struct {
         JSValue dispatch_event_func;
 		JSValue message_pipe;	// for worker messaging
+
+		JSValue concount;
+		JSValue contime;
     } builtins;
 	struct {
 		JSValue resolver;
 		JSValue loader;
 		JSValue metaloader;
-	} module;
 
-	JSValue console_count;
-	JSValue console_time;
+		MappingContext* mapctx;
+	} module;
 };
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
@@ -94,7 +97,8 @@ void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
-void tjs__mod_fs_init(JSContext *ctx, JSValue ns);
+void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns);
+void tjs__mod_fs_init(JSContext* ctx, JSValue ns);
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns);
 void tjs__mod_os_init(JSContext *ctx, JSValue ns);
 void tjs__mod_process_init(JSContext *ctx, JSValue ns);
@@ -113,6 +117,7 @@ void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
+void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
@@ -154,4 +159,5 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
 
 // Warn: will not dup, use JS_Dup if you want to keep it alive
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
+JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def);
 #endif

@@ -1,24 +1,24 @@
 declare namespace CModuleSys {
     /**
-     * 评估文件并返回结果
+     * 加载模块文件
      * @param filename 文件路径
-     * @returns 返回一个 Promise，解析为评估结果。
+     * @returns 返回一个 Promise。
      */
-    function evalFile(filename: string): Promise<any>;
+    function loadModule(filename: string): Promise<any>;
 
     /**
      * 加载脚本文件
      * @param filename 文件路径
-     * @returns 返回一个 Promise，解析为 undefined。
+     * @returns 返回脚本返回内容
      */
-    function loadScript(filename: string): Promise<void>;
+    function loadScript(filename: string): any;
 
     /**
-     * 评估脚本字符串
+     * 执行异步脚本。允许全局await。
      * @param script 脚本字符串
-     * @returns 返回一个 Promise，解析为评估结果。
+     * @returns 返回一个 脚本返回内容的Promise。
      */
-    function evalScript(script: string): Promise<any>;
+    function loadAsyncScript(script: string): Promise<any>;
 
     /**
      * 检查值是否为 ArrayBuffer
@@ -63,9 +63,9 @@ declare namespace CModuleSys {
 
     // 导出所有内容
     export {
-        evalFile,
+        loadModule,
         loadScript,
-        evalScript,
+        loadAsyncScript,
         isArrayBuffer,
         detachArrayBuffer,
         exePath,

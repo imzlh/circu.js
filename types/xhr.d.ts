@@ -1,4 +1,4 @@
-declare module 'txiki.ts/xhr' {
+declare namespace CModuleXHR {
     /**
      * XMLHttpRequest 模块
      */

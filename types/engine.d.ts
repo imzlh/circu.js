@@ -1,5 +1,6 @@
 declare namespace CModuleEngine {
     type Promise = globalThis.Promise<any>;
+    type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
 
     enum PromiseState {
         CONSTRUCT,
@@ -149,7 +150,7 @@ declare namespace CModuleEngine {
         /**
          * 将传入的模块内容编译
          */
-        constructor(content: string);
+        constructor(content: string, filename: string);
 
         /**
          * 获取模块(JSModuleDef)指针位置

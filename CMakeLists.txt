@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-project(tjs LANGUAGES C)
+project(cjs LANGUAGES C)
 
 include(ExternalProject)
 include(GNUInstallDirs)
@@ -18,14 +18,14 @@ set(CMAKE_C_STANDARD 11)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-list(APPEND tjs_cflags -Wall -g)
+list(APPEND cjs_cflags -Wall -g)
 if (CMAKE_BUILD_TYPE MATCHES "Debug")
-    list(APPEND tjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
+    list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
     add_compile_definitions(DEBUG)
 endif()
 
-set(TJS__VERSION_MAJOR 24)
-set(TJS__VERSION_MINOR 12)
+set(TJS__VERSION_MAJOR 25)
+set(TJS__VERSION_MINOR 0)
 set(TJS__VERSION_PATCH 0)
 set(TJS__VERSION_SUFFIX "")
 configure_file(
@@ -76,7 +76,7 @@ find_package(ZLIB)
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
-add_library(tjs
+add_library(cjs
     src/curl-utils.c
     src/curl-websocket.c
     src/binary.c
@@ -99,6 +99,7 @@ add_library(tjs
     src/mod_engine.c
     src/mod_ffi.c
     src/mod_fs.c
+    src/mod_asyncfs.c
     src/mod_fswatch.c
     src/mod_os.c
     src/mod_process.c
@@ -113,7 +114,7 @@ add_library(tjs
 )
 
 if(UNIX)
-    target_sources(tjs PUBLIC 
+    target_sources(cjs PUBLIC 
         src/mod_posix-socket.c
         src/mod_posix-ffi.c
     )
@@ -149,49 +150,49 @@ target_link_libraries(sqlite-test sqlite3)
 #         EXCLUDE_FROM_ALL TRUE
 #         BUILD_BYPRODUCTS ${LIBFFI_STATIC_PATH}
 #     )
-#     add_dependencies(tjs libffi)
+#     add_dependencies(cjs libffi)
 #     add_library(libffi_a STATIC IMPORTED)
 #     set_target_properties(libffi_a PROPERTIES IMPORTED_LOCATION ${LIBFFI_STATIC_PATH})
-#     target_include_directories(tjs PRIVATE ${TMP_INSTALL_DIR}/usr/local/include)
-#     target_link_libraries(tjs libffi_a)
+#     target_include_directories(cjs PRIVATE ${TMP_INSTALL_DIR}/usr/local/include)
+#     target_link_libraries(cjs libffi_a)
 # else()
     find_library(FFI_LIB NAMES libffi ffi REQUIRED)
     find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
-    target_include_directories(tjs PRIVATE ${FFI_INCLUDE_DIR})
-    target_link_libraries(tjs ${FFI_LIB})
+    target_include_directories(cjs PRIVATE ${FFI_INCLUDE_DIR})
+    target_link_libraries(cjs ${FFI_LIB})
 # endif()
 
-set_target_properties(tjs PROPERTIES
+set_target_properties(cjs PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
 )
 
-string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
-target_compile_options(tjs PRIVATE ${tjs_cflags})
-target_compile_definitions(tjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
-target_include_directories(tjs PUBLIC src)
-target_link_libraries(tjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+string(TOLOWER ${CMAKE_SYSTEM_NAME} cjs_PLATFORM)
+target_compile_options(cjs PRIVATE ${cjs_cflags})
+target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
+target_include_directories(cjs PUBLIC src)
+target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 
 if (BUILD_WITH_MIMALLOC)
-    target_compile_definitions(tjs PRIVATE TJS__HAS_MIMALLOC)
-    target_link_libraries(tjs mimalloc-static)
+    target_compile_definitions(cjs PRIVATE TJS__HAS_MIMALLOC)
+    target_link_libraries(cjs mimalloc-static)
 endif()
 
 if (BUILD_WITH_WASM)
-    target_compile_definitions(tjs PRIVATE TJS__HAS_WASM)
-    target_link_libraries(tjs wasm3)
+    target_compile_definitions(cjs PRIVATE TJS__HAS_WASM)
+    target_link_libraries(cjs wasm3)
 endif()
 
-add_executable(tjs-cli
+add_executable(cjs-cli
     src/cli.c
 )
-target_link_libraries(tjs-cli tjs)
-set_target_properties(tjs-cli
-    PROPERTIES OUTPUT_NAME tjs
+target_link_libraries(cjs-cli cjs)
+set_target_properties(cjs-cli
+    PROPERTIES OUTPUT_NAME cjs
 )
 
-add_executable(tjsc EXCLUDE_FROM_ALL
+add_executable(cjsc EXCLUDE_FROM_ALL
     src/binary.c
     src/qjsc.c
 )
-target_link_libraries(tjsc qjs)
+target_link_libraries(cjsc qjs)

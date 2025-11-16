@@ -1,4 +1,39 @@
-#include <uv.h>
+/**
+ * circu.js built-in OPCode processor
+ *
+ * Copyright (c) 2025 iz
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <libloaderapi.h>
+	#include <windows.h>
+    #include <io.h>
+    #define access _access
+    #define F_OK 0
+#else
+    #include <unistd.h>
+    #include <limits.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -8,12 +43,53 @@
 
 char* tjs__get_self() {
     static char path[4096] = {0};
-	size_t size;
 
 	if (path[0]) return path;	// cache result
-    if(-1 == uv_exepath(path, &size)) return NULL;
-	path[size] = '\0';
-	return path;
+    
+#ifdef _WIN32
+    HMODULE hModule = GetModuleHandle(NULL);
+    if (hModule) {
+		// todo: use GetModuleFileNameW for Unicode paths
+        DWORD size = GetModuleFileNameA(hModule, path, sizeof(path) - 1);
+        if (size > 0) {
+            path[size] = '\0';
+            return path;
+        }
+    }
+#else
+    #if defined(__linux__)
+        ssize_t count = readlink("/proc/self/exe", path, sizeof(path) - 1);
+        if (count >= 0) {
+            path[count] = '\0';
+            return path;
+        }
+    #elif defined(__APPLE__)
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) == 0) {
+            char real_path[4096];
+            if (realpath(path, real_path) != NULL) {
+                strcpy(path, real_path);
+                return path;
+            }
+        }
+    #elif defined(__FreeBSD__)
+        ssize_t count = readlink("/proc/curproc/file", path, sizeof(path) - 1);
+        if (count >= 0) {
+            path[count] = '\0';
+            return path;
+        }
+    #endif
+    
+    if (strlen(path) == 0) {
+        const char* argv0 = getenv("_");
+        if (argv0 && argv0[0] == '/') {
+            strncpy(path, argv0, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+            return path;
+        }
+    }
+#endif
+    return NULL;
 }
 
 static uint8_t* read_file(FILE* file, size_t *file_size) {

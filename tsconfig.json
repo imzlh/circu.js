@@ -2,7 +2,7 @@
     // Visit https://aka.ms/tsconfig to read more about this file
     "compilerOptions": {
         // File Layout
-        "rootDir": "./js",
+        "rootDir": "./",
         "outDir": "./dist",
         // Environment Settings
         // See also https://aka.ms/tsconfig/module
@@ -10,7 +10,7 @@
         "target": "esnext",
         // "types": [],
         "typeRoots": [
-            "type/"
+            "types/"
         ],
         // For nodejs:
         "lib": [
@@ -45,7 +45,7 @@
     "typedocOptions": {
         "name": "circu.js",
         "entryPoints": [
-            "type/"
+            "types/"
         ],
         "entryPointStrategy": "expand",
         "out": "../api/",
