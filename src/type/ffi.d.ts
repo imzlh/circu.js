@@ -1,6 +1,6 @@
 declare namespace CModuleFFI {
     /**
-     * FFI 类型枚举
+     * FFI 类型枚举（仅用于类型提示，实际使用 FfiTypeObject 实例）
      */
     const enum FfiType {
         /** void 类型 */
@@ -56,92 +56,94 @@ declare namespace CModuleFFI {
     }
 
     /**
-     * FFI 类型对象
+     * FFI 类型对象 - 表示C语言中的类型
      */
     interface FfiTypeObject {
         /**
-         * 将 JavaScript 值转换为缓冲区
-         * @param value 要转换的值
-         * @returns 返回包含转换后数据的 Uint8Array
+         * 将 JavaScript 值转换为 C 语言缓冲区
+         * @param value 要转换的 JS 值（数字、bigint或数组）
+         * @returns 包含转换后数据的 Uint8Array
          */
         toBuffer(value: any): Uint8Array;
 
         /**
-         * 从缓冲区读取 JavaScript 值
-         * @param buffer 包含数据的缓冲区
-         * @returns 返回转换后的 JavaScript 值
+         * 从 C 语言缓冲区读取 JavaScript 值
+         * @param buffer 包含数据的 Uint8Array
+         * @returns 转换后的 JS 值
          */
         fromBuffer(buffer: Uint8Array): any;
 
-        /**
-         * 获取类型名称
-         */
+        /** 类型名称（如 "uint32", "pointer"） */
         readonly name: string;
 
-        /**
-         * 获取类型大小（字节）
-         */
+        /** 类型大小（字节） */
         readonly size: number;
     }
 
     /**
-     * FFI 调用接口对象
+     * FFI 调用接口对象 - 描述函数签名
      */
     interface FfiCif {
         /**
          * 调用外部函数
-         * @param func 要调用的函数指针
-         * @param args 参数数组
-         * @returns 返回包含结果的 Uint8Array
+         * @param func 要调用的函数（UvDlSym对象，包含函数地址）
+         * @param args 参数数组，可以是原始指针（bigint）或类型化缓冲区（Uint8Array）
+         * @returns 包含返回值的 Uint8Array
+         * @throws {TypeError} func不是UvDlSym对象或参数数量不匹配
+         * @throws {RangeError} 参数数组长度与函数签名不匹配
          */
-        call(func: FfiPointer, args: (Uint8Array | FfiPointer)[]): Uint8Array;
+        call(func: UvDlSym, args: (Uint8Array | FfiPointer)[]): Uint8Array;
     }
 
     /**
-     * 动态库对象
+     * 动态库对象 - 表示已加载的共享库
      */
     interface UvLib {
         /**
-         * 获取符号地址
-         * @param name 符号名称
-         * @returns 返回符号指针
+         * 获取符号（函数或变量）地址
+         * @param name 符号名称（如 "printf", "sin"）
+         * @returns 符号对象（包含地址信息）
+         * @throws {InternalError} 符号查找失败
          */
-        symbol(name: string): FfiPointer;
+        symbol(name: string): UvDlSym;
     }
 
     /**
-     * 符号指针对象
+     * 符号指针对象 - 包装函数或变量地址
      */
     interface UvDlSym {
-        /**
-         * 获取指针地址
-         */
+        /** 获取原始指针地址（bigint） */
         readonly addr: FfiPointer;
     }
 
     /**
-     * FFI 闭包对象
+     * FFI 闭包对象 - 用于将 JS 函数暴露给 C 代码
+     * @warning 闭包回调的参数Buffer仅在回调期间有效，禁止在回调外持有引用
      */
     interface FfiClosure {
-        /**
-         * 获取闭包地址
-         */
+        /** 获取闭包的可调用地址 */
         readonly addr: FfiPointer;
     }
 
-    /**
-     * 指针类型（表示为 bigint）
+    /** 
+     * 指针类型 - 在 JS 中以 bigint 表示内存地址
+     * @example 0x7fff12345678n
      */
     type FfiPointer = bigint;
 
     /**
-     * 加载本地库
-     * @returns 返回 FFI 模块对象
+     * FFI 闭包回调函数签名
+     * @param args C函数传递的参数，每个参数都是Uint8Array视图
+     * @returns 必须是Uint8Array，表示返回值缓冲区
+     */
+    type FfiClosureCallback = (...args: Uint8Array[]) => Uint8Array;
+
+    /**
+     * 加载本地FFI模块
+     * @returns FFI 模块对象，包含所有FFI功能
      */
     function ffi_load_native(): {
-        /**
-         * 基本类型
-         */
+        // 基本类型实例
         type_void: FfiTypeObject;
         type_uint8: FfiTypeObject;
         type_sint8: FfiTypeObject;
@@ -169,125 +171,103 @@ declare namespace CModuleFFI {
         type_sll: FfiTypeObject;
 
         /**
-         * 创建 FFI 类型
+         * FFI 类型构造函数
+         * @overload 创建结构体类型: new FfiType(...memberTypes: FfiTypeObject[])
+         * @overload 创建数组类型: new FfiType(count: number, elementType: FfiTypeObject)
          */
         FfiType: {
-            /**
-             * 创建结构体类型
-             * @param types 结构体成员类型数组
-             * @returns 返回结构体类型对象
-             */
-            createStruct(types: FfiTypeObject[]): FfiTypeObject;
-
-            /**
-             * 创建数组类型
-             * @param count 数组元素数量
-             * @param type 数组元素类型
-             * @returns 返回数组类型对象
-             */
-            createArray(count: number, type: FfiTypeObject): FfiTypeObject;
+            new(...types: FfiTypeObject[]): FfiTypeObject;
+            new(count: number, type: FfiTypeObject): FfiTypeObject;
         };
 
-        /**
-         * 创建 FFI 调用接口
-         */
+        /** FFI 调用接口构造函数 */
         FfiCif: {
             /**
-             * 创建调用接口
-             * @param retType 返回类型
-             * @param argTypes 参数类型数组
-             * @param fixedArgs 固定参数数量（可选）
-             * @returns 返回调用接口对象
+             * 创建函数调用接口
+             * @param retType 返回类型对象
+             * @param argTypes 参数类型对象数组
+             * @param fixedArgs 可变参数函数的固定参数数量（可选）
+             * @example new FfiCif(type_void, [type_int, type_pointer]) // void func(int, void*)
+             * @example new FfiCif(type_int, [type_int], 1) // int printf(const char*, ...)
              */
             new(retType: FfiTypeObject, argTypes: FfiTypeObject[], fixedArgs?: number): FfiCif;
         };
 
-        /**
-         * 加载动态库
-         */
+        /** 动态库加载器 */
         UvLib: {
             /**
              * 打开动态库
-             * @param path 库文件路径
-             * @returns 返回动态库对象
+             * @param path 库文件路径（如 "libc.so.6", "libm.so"）
+             * @returns 动态库对象
+             * @throws {InternalError} 加载失败（文件不存在或格式错误）
              */
             new(path: string): UvLib;
         };
 
-        /**
-         * 创建 FFI 闭包
-         */
+        /** FFI 闭包构造函数 */
         FfiClosure: {
             /**
-             * 创建闭包
-             * @param cif 调用接口
-             * @param func JavaScript 回调函数
-             * @returns 返回闭包对象
+             * 创建可调用闭包（将JS函数暴露给C代码）
+             * @param cif 函数接口描述
+             * @param func JS回调函数，接收Uint8Array参数，返回Uint8Array
+             * @warning 闭包创建后需手动管理生命周期，避免内存泄漏
              */
-            new(cif: FfiCif, func: (...args: any[]) => any): FfiClosure;
+            new(cif: FfiCif, func: FfiClosureCallback): FfiClosure;
         };
 
-        /**
-         * 实用函数
-         */
+        /** 实用工具函数 */
         utils: {
-            /**
-             * 获取当前错误码
-             * @returns 返回错误码
-             */
+            /** 获取当前线程的错误码（errno） */
             errno(): number;
 
             /**
-             * 获取错误描述
-             * @param errnum 错误码
-             * @returns 返回错误描述
+             * 获取错误码描述字符串
+             * @param errnum 错误码（如 errno() 的返回值）
              */
             strerror(errnum: number): string;
 
             /**
-             * 获取 ArrayBuffer 指针
-             * @param buffer 缓冲区
-             * @returns 返回指针
+             * 获取 ArrayBuffer/Uint8Array 的内存指针
+             * @param buffer 类型化数组
+             * @returns 指向数组底层内存的指针
              */
             getArrayBufPtr(buffer: ArrayBuffer | Uint8Array): FfiPointer;
 
             /**
-             * 获取 C 字符串
-             * @param ptr 字符串指针
-             * @param maxLen 最大长度（可选）
-             * @returns 返回字符串
+             * 从C字符串指针读取字符串
+             * @param ptr 指向C字符串的指针
+             * @param maxLen 最大读取长度（防止读取超长字符串）
              */
             getCString(ptr: FfiPointer, maxLen?: number): string;
 
             /**
-             * 解引用指针
-             * @param ptr 指针
+             * 解引用指针（获取指针指向的地址）
+             * @param ptr 指针地址
              * @param times 解引用次数（默认1）
-             * @returns 返回解引用后的指针
              */
             derefPtr(ptr: FfiPointer, times?: number): FfiPointer;
 
             /**
-             * 将指针转换为缓冲区
-             * @param ptr 指针
-             * @param size 缓冲区大小
-             * @returns 返回缓冲区
+             * 将指针转换为 Uint8Array 视图
+             * @warning ⚠️ **内存安全警告**：
+             * - 返回的Buffer是**视图**，不拥有内存所有权
+             * - 若指针指向的内存被释放，Buffer将变为野指针
+             * - **禁止**在指针所有者生命周期外持有此Buffer
+             * @param ptr 内存地址
+             * @param size 缓冲区大小（字节）
              */
             ptrToBuffer(ptr: FfiPointer, size: number): Uint8Array;
         };
 
-        /**
-         * 系统库名称
-         */
+        /** 当前平台C标准库名称 */
         LIBC_NAME: string;
+        /** 当前平台数学库名称 */
         LIBM_NAME: string;
     };
 
-    // 导出 FFI 模块
+    /** FFI模块入口 */
     export const ffi: {
-        /**
-         * 加载本地 FFI 功能
-         */
+        /** 加载本地FFI功能，返回模块对象 */
         loadNative(): ReturnType<typeof ffi_load_native>;
     };
 }

@@ -29,6 +29,7 @@
 #include <stdint.h>
 
 #include "private.h"
+#include "sourcemap.h"
 
 typedef struct {
     int generated_line;

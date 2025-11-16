@@ -11,13 +11,8 @@ declare namespace CModuleServer {
         /** HTTP method (GET, POST, etc.) */
         method: string;
 
-        /** URL information */
-        url: {
-            /** URL pathname */
-            pathname: string;
-            /** Query parameters object */
-            query: Record<string, string>;
-        };
+        /** URL information, raw and not processed */
+        url: string;
 
         /** HTTP headers (lowercase keys) */
         headers: Record<string, string>;
@@ -38,13 +33,13 @@ declare namespace CModuleServer {
          * @param statusCode HTTP status code
          * @param headers Response headers
          */
-        writeHead(statusCode: number, headers?: Record<string, string>): void;
+        writeHead(statusCode: number, headers?: Record<string, string>): this;
 
         /**
          * Write response data
          * @param data Data to write (string or ArrayBuffer)
          */
-        write(data: string | ArrayBuffer): void;
+        write(data: string | ArrayBuffer): this;
 
         /**
          * End the response
@@ -57,7 +52,18 @@ declare namespace CModuleServer {
          * @param statusCode HTTP status code
          * @param body Response body (string or ArrayBuffer)
          */
-        send(statusCode: number, body?: string | ArrayBuffer): void;
+        send(statusCode: number, body?: string | ArrayBuffer): this;
+
+        /**
+         * Upgrade the connection, expose raw fd to user code
+         * @example Upgrade connection to WebSocket
+         * ```ts
+         * const fd = res.upgrade(), pipe = new use('stream').Pipe();
+         * pipe.open(fd); // Use pipe to read/write
+         * // pipe.read(); pipe.write();
+         * ```
+         */
+        upgrade(): number;
     }
 
     /**
@@ -68,46 +74,32 @@ declare namespace CModuleServer {
         port: number;
 
         /**
+         * address to listen on (default: 0.0.0.0)
+         * Set to '::' to listen on all IPv6 interfaces.
+         */
+        address?: string;
+
+        /**
          * Request handler callback
          * @param req HTTP request object
          * @param res HTTP response object
          */
-        onRequest: (req: HttpRequest, res: HttpResponse) => void;
+        onRequest: (req: HttpRequest, res: HttpResponse) => any;
 
         /**
-         * Optional upgrade handler for WebSocket/raw socket
-         * @param socket Upgraded socket connection
-         * @param extraData Any extra data received during upgrade
+         * Handle error events
+         * @param err Error object
+         * @param req HTTP request object
+         * @param res HTTP response object
          */
-        onUpgrade?: (socket: UpgradedSocket, extraData?: ArrayBuffer) => void;
-    }
-
-    /**
-     * Upgraded socket connection for WebSocket/custom protocols
-     */
-    export interface UpgradedSocket {
-        /** Raw file descriptor */
-        fd: number;
-
+        onError?: (err: Error, req: HttpRequest, res: HttpResponse) => any;
+        
         /**
-         * Write data to socket
-         * @param data Data to write
-         * @returns Number of bytes written
+         * Handle body data (if available)
+         * @param req HTTP request object
+         * @param res HTTP response object
          */
-        write(data: string | ArrayBuffer): number;
-
-        /**
-         * Close the socket
-         */
-        close(): void;
-
-        /**
-         * Register event handler
-         * @param event Event name
-         * @param callback Event callback
-         */
-        on(event: 'data', callback: (data: ArrayBuffer) => void): void;
-        on(event: 'close', callback: () => void): void;
+        onBody?: (req: HttpRequest, res: HttpResponse) => any;
     }
 
     /**

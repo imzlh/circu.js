@@ -1,11 +1,5 @@
 declare namespace CModuleEngine {
-    interface Promise<T = any> extends globalThis.Promise<T> {
-        /**
-         * 创建promise时的堆栈信息，用于调试<br>
-         * 在event内返回true可以阻止cjs创建stack
-         */
-        readonly stack: string;
-    }
+    type Promise = globalThis.Promise<any>;
 
     enum PromiseState {
         CONSTRUCT,
@@ -198,7 +192,7 @@ declare namespace CModuleEngine {
         /**
          * 事件接收器函数，返回true表示事件已处理，否则可能被底层处理，如退出
          */
-    export function eventReceiver(cb: 
+    export function onEvent(cb: 
         <T extends keyof GlobalEvents>(eventName: T, eventData: GlobalEvents[T]) => boolean
     ): void;
 }

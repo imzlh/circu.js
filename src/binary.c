@@ -8,9 +8,12 @@
 
 char* tjs__get_self() {
     static char path[4096] = {0};
+	size_t size;
 
 	if (path[0]) return path;	// cache result
-    if(-1 == uv_exepath(path, sizeof(path))) return NULL;
+    if(-1 == uv_exepath(path, &size)) return NULL;
+	path[size] = '\0';
+	return path;
 }
 
 static uint8_t* read_file(FILE* file, size_t *file_size) {

@@ -1,223 +1,217 @@
+/**
+ * @module tjs:streams
+ * 
+ * txiki.js Streams 模块 - 提供TCP、Pipe和TTY流操作API
+ */
+
 declare namespace CModuleStreams {
     /**
-     * Streams 模块
+     * 错误对象接口
      */
-
-    /**
-     * 错误对象
-     */
-    interface TJSError {
+    export interface TJSError {
         readonly message: string;
         readonly errno: number;
     }
 
     /**
-     * Stream 原型对象
+     * 基础Stream接口
      */
-    interface Stream {
+    export interface Stream {
         /**
-         * 监听连接
-         * @param backlog 最大挂起连接数
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 开始监听传入连接（仅服务器模式）
+         * @param backlog 挂起连接队列的最大长度，默认511
+         * @throws 同步抛出错误（如已监听、无效句柄等）
          */
-        listen(backlog?: number): Promise<void>;
+        listen(backlog?: number): void;
 
         /**
-         * 接受连接
-         * @returns 返回一个 Promise，解析为 Stream 对象。
+         * 接受一个传入连接（仅服务器模式）
+         * @returns Promise解析为新的Stream对象
+         * @throws 通过Promise拒绝错误（如未监听、接受失败等）
          */
         accept(): Promise<Stream>;
 
         /**
-         * 关闭连接
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 关闭写入/读取方向
+         * @returns Promise在关闭完成时解析
          */
         shutdown(): Promise<void>;
 
         /**
-         * 设置阻塞模式
-         * @param blocking 是否阻塞
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 设置流为阻塞或非阻塞模式
+         * @param blocking true为阻塞模式，false为非阻塞
+         * @throws 同步抛出错误
          */
-        setBlocking(blocking: boolean): Promise<void>;
+        setBlocking(blocking: boolean): void;
 
         /**
-         * 关闭 Stream
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 完全关闭流并释放资源
+         * @throws 同步抛出错误
          */
-        close(): Promise<void>;
+        close(): void;
 
         /**
-         * 从 Stream 读取数据
-         * @param buffer 用于存储读取数据的 Uint8Array
-         * @returns 返回一个 Promise，解析为读取的数据长度或 null 如果没有数据。
+         * 从流中读取数据
+         * @param buffer 用于存储数据的Uint8Array缓冲区
+         * @returns Promise解析为实际读取的字节数，或null(EOF)
          */
         read(buffer: Uint8Array): Promise<number | null>;
 
         /**
-         * 向 Stream 写入数据
-         * @param buffer 包含要写入数据的 Uint8Array
-         * @returns 返回一个 Promise，解析为写入的数据长度。
+         * 向流中写入数据
+         * @param buffer 包含要写入数据的Uint8Array
+         * @returns Promise解析为实际写入的字节数
          */
         write(buffer: Uint8Array): Promise<number>;
 
         /**
-         * 获取文件描述符
-         * @returns 返回文件描述符。
+         * 获取底层的文件描述符
+         * @returns 文件描述符数值（同步返回）
          */
-        fileno(): Promise<number>;
+        fileno(): number;
 
-        /**
-         * Stream 对象的类型标签
-         */
         readonly [Symbol.toStringTag]: 'Stream';
     }
 
     /**
-     * TCP 类
+     * TCP流接口
      */
-    interface TCP extends Stream {
+    export interface TCP extends Stream {
         /**
-         * 获取套接字名称
-         * @returns 返回一个 Promise，解析为包含套接字名称的对象。
+         * 获取本地套接字地址信息
+         * @returns 包含address、port、family等信息的对象
          */
-        getsockname(): Promise<Record<string, any>>;
+        getsockname(): Record<string, any>;
 
         /**
-         * 获取对等名称
-         * @returns 返回一个 Promise，解析为包含对等名称的对象。
+         * 获取远端对端地址信息
+         * @returns 包含address、port、family等信息的对象
          */
-        getpeername(): Promise<Record<string, any>>;
+        getpeername(): Record<string, any>;
 
         /**
-         * 连接到地址
-         * @param addr 地址对象
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 连接到指定地址
+         * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
+         * @returns Promise在连接建立时解析
          */
         connect(addr: Record<string, any>): Promise<void>;
 
         /**
-         * 绑定到地址
+         * 绑定到本地地址
          * @param addr 地址对象
-         * @param flags 绑定标志（可选）
-         * @returns 返回一个 Promise，解析为 undefined。
+         * @param flags 绑定标志（如TCP_IPV6ONLY）
+         * @throws 同步抛出错误
          */
-        bind(addr: Record<string, any>, flags?: number): Promise<void>;
+        bind(addr: Record<string, any>, flags?: number): void;
 
         /**
-         * 设置 keepalive
-         * @param enable 是否启用 keepalive
-         * @param delay 延迟时间（毫秒）
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 设置TCP keepalive选项
+         * @param enable 是否启用
+         * @param delay 探测间隔（毫秒）
+         * @throws 同步抛出错误
          */
-        setKeepAlive(enable: boolean, delay: number): Promise<void>;
+        setKeepAlive(enable: boolean, delay: number): void;
 
         /**
-         * 设置 nodelay
-         * @param enable 是否启用 nodelay
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 设置TCP_NODELAY选项（禁用Nagle算法）
+         * @param enable 是否启用
+         * @throws 同步抛出错误
          */
-        setNoDelay(enable: boolean): Promise<void>;
+        setNoDelay(enable: boolean): void;
     }
 
     /**
-     * TTY 类
+     * TTY流接口
      */
-    interface TTY extends Stream {
+    export interface TTY extends Stream {
         /**
-         * 设置 TTY 模式
-         * @param mode 模式（如 TTY_MODE_NORMAL, TTY_MODE_RAW）
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 设置TTY模式
+         * @param mode TTY_MODE_NORMAL或TTY_MODE_RAW
+         * @throws 同步抛出错误
          */
-        setMode(mode: number): Promise<void>;
+        setMode(mode: number): void;
 
         /**
-         * 获取窗口大小
-         * @returns 返回一个 Promise，解析为包含窗口大小的对象。
+         * 获取终端窗口大小
+         * @returns 包含width和height的对象
          */
-        getWinSize(): Promise<{ width: number; height: number }>;
+        getWinSize(): { width: number; height: number };
     }
 
     /**
-     * Pipe 类
+     * Pipe流接口（Unix域套接字/命名管道）
      */
-    interface Pipe extends Stream {
+    export interface Pipe extends Stream {
         /**
-         * 打开 Pipe
+         * 用现有文件描述符初始化Pipe
          * @param fd 文件描述符
-         * @returns 返回一个 Promise，解析为 undefined。
+         * @throws 同步抛出错误
          */
-        open(fd: number): Promise<void>;
+        open(fd: number): void;
 
         /**
-         * 获取套接字名称
-         * @returns 返回一个 Promise，解析为套接字名称字符串。
+         * 获取本地Pipe名称/路径
+         * @returns 名称字符串
          */
-        getsockname(): Promise<string>;
+        getsockname(): string;
 
         /**
-         * 获取对等名称
-         * @returns 返回一个 Promise，解析为对等名称字符串。
+         * 获取远端Pipe名称/路径
+         * @returns 名称字符串
          */
-        getpeername(): Promise<string>;
+        getpeername(): string;
 
         /**
-         * 连接到 Pipe
-         * @param name Pipe 名称
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 连接到指定Pipe
+         * @param name Pipe路径或名称
+         * @returns Promise在连接建立时解析
          */
         connect(name: string): Promise<void>;
 
         /**
-         * 绑定到 Pipe
-         * @param name Pipe 名称
-         * @returns 返回一个 Promise，解析为 undefined。
+         * 绑定到本地Pipe名称
+         * @param name Pipe路径或名称
+         * @throws 同步抛出错误
          */
-        bind(name: string): Promise<void>;
+        bind(name: string): void;
     }
 
     /**
-     * 创建 TCP 对象
-     * @param af 地址族（如 AF_UNSPEC, AF_INET, AF_INET6）
-     * @returns 返回一个 Promise，解析为 TCP 对象。
+     * TCP构造函数
+     * @example const tcp = new TCP();
      */
-    function createTCP(af: number): Promise<TCP>;
+    export const TCP: {
+        new(af?: number): TCP;
+        readonly prototype: TCP;
+    };
 
     /**
-     * 创建 TTY 对象
-     * @param fd 文件描述符
-     * @param readable 是否可读
-     * @returns 返回一个 Promise，解析为 TTY 对象。
+     * TTY构造函数
+     * @example const tty = new TTY(fd, true);
      */
-    function createTTY(fd: number, readable: boolean): Promise<TTY>;
+    export const TTY: {
+        new(fd: number, readable: boolean): TTY;
+        readonly prototype: TTY;
+    };
 
     /**
-     * 创建 Pipe 对象
-     * @returns 返回一个 Promise，解析为 Pipe 对象。
+     * Pipe构造函数
+     * @example const pipe = new Pipe();
      */
-    function createPipe(): Promise<Pipe>;
+    export const Pipe: {
+        new(): Pipe;
+        readonly prototype: Pipe;
+    };
 
     /**
      * 常量定义
      */
-    const enum Constants {
-        /** TCP 使用 IPv6 */
-        TCP_IPV6ONLY = 1,
-        /** TTY 模式正常 */
-        TTY_MODE_NORMAL = 0,
-        /** TTY 模式原始 */
-        TTY_MODE_RAW = 1
-    }
+    /** TCP绑定选项：仅使用IPv6 */
+    export const TCP_IPV6ONLY: number;
 
-    // 导出所有内容
-    export {
-        Stream,
-        TCP,
-        TTY,
-        Pipe,
-        createTCP,
-        createTTY,
-        createPipe,
-        Constants
-    };
+    /** TTY模式：正常行缓冲模式 */
+    export const TTY_MODE_NORMAL: number;
+
+    /** TTY模式：原始无缓冲模式 */
+    export const TTY_MODE_RAW: number;
 }

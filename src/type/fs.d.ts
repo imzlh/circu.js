@@ -1,6 +1,7 @@
-declare namespace CModuleFS {
+declare namespace TJSFsModule {
     /**
-     * 文件打开模式标志
+     * 文件打开模式标志（对应C字符串标志）
+     * @example 'r' (只读), 'w' (只写创建), 'r+' (读写), 'a' (追加)
      */
     const enum OpenMode {
         /** 只读 */
@@ -20,12 +21,13 @@ declare namespace CModuleFS {
     }
 
     /**
-     * 符号链接标志
+     * 符号链接类型（位标志）
+     * @internal 主要用于 Windows 平台
      */
     const enum SymlinkType {
         /** 目录符号链接 */
         DIR = 1,
-        /** 连接点符号链接（Windows） */
+        /** 连接点（Windows） */
         JUNCTION = 2
     }
 
@@ -33,597 +35,252 @@ declare namespace CModuleFS {
      * 文件类型枚举
      */
     const enum FileType {
-        /** 块设备 */
         BLOCK = 'block',
-        /** 字符设备 */
         CHAR = 'char',
-        /** 目录 */
         DIRECTORY = 'directory',
-        /** FIFO 管道 */
         FIFO = 'fifo',
-        /** 普通文件 */
         FILE = 'file',
-        /** 套接字 */
         SOCKET = 'socket',
-        /** 符号链接 */
         SYMLINK = 'symlink'
     }
 
     /**
-     * 文件对象
+     * 文件对象（基于文件描述符）
+     * @warning **资源管理警告**：
+     * - 必须调用 `close()` 显式关闭，否则将泄漏文件描述符
+     * - 未关闭的文件在GC时会同步关闭，可能阻塞事件循环
      */
-    interface FileHandle {
+    class FileHandle {
         /**
-         * 从文件中读取数据。
-         * @param buffer 用于存储读取数据的缓冲区。
-         * @param position 文件中读取数据的起始位置（可选）。
-         * @returns 返回一个 Promise，解析为读取的数据长度。
+         * 从文件读取数据（异步）
+         * @param buffer 写入数据的缓冲区（会被修改）
+         * @param position 文件读取位置，null表示当前偏移
+         * @returns 实际读取字节数，0表示EOF
+         * @throws {RangeError} position < 0
          */
-        read(buffer: Uint8Array, position?: number): Promise<number>;
+        read(buffer: Uint8Array, position?: number | null): Promise<number>;
 
         /**
-         * 向文件中写入数据。
-         * @param buffer 包含要写入数据的缓冲区。
-         * @param position 文件中写入数据的起始位置（可选）。
-         * @returns 返回一个 Promise，解析为写入的数据长度。
+         * 向文件写入数据（异步）
+         * @param buffer 要写入的数据
+         * @param position 文件写入位置，null表示当前偏移
+         * @returns 实际写入字节数
+         * @throws {RangeError} position < 0
          */
-        write(buffer: Uint8Array, position?: number): Promise<number>;
+        write(buffer: Uint8Array, position?: number | null): Promise<number>;
 
-        /**
-         * 关闭文件。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 关闭文件（强制释放资源） */
         close(): Promise<void>;
 
-        /**
-         * 获取文件的文件描述符。
-         * @returns 返回文件描述符。
-         */
+        /** 获取底层文件描述符（用于调试） */
         fileno(): number;
 
-        /**
-         * 获取文件的统计信息。
-         * @returns 返回一个 Promise，解析为 StatResult 对象。
-         */
+        /** 获取文件元数据（异步） */
         stat(): Promise<StatResult>;
 
-        /**
-         * 截断文件到指定长度。
-         * @param offset 截断后的文件长度。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 截断文件到指定大小 */
         truncate(offset?: number): Promise<void>;
 
-        /**
-         * 同步文件内容到磁盘。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 同步文件数据到磁盘（包含元数据） */
         sync(): Promise<void>;
 
-        /**
-         * 同步文件内容到磁盘，忽略文件的修改时间。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 同步文件数据到磁盘（不包含元数据） */
         datasync(): Promise<void>;
 
-        /**
-         * 更改文件的权限。
-         * @param mode 新的权限模式。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 修改文件权限（如 0o644） */
         chmod(mode: number): Promise<void>;
 
-        /**
-         * 更改文件的所有者和组。
-         * @param uid 新的所有者ID。
-         * @param gid 新的组ID。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 修改文件所有者和组 */
         chown(uid: number, gid: number): Promise<void>;
 
-        /**
-         * 更改文件的访问和修改时间。
-         * @param atime 新的访问时间（Unix 时间戳，毫秒）。
-         * @param mtime 新的修改时间（Unix 时间戳，毫秒）。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+        /** 修改文件访问和修改时间 */
         utime(atime: number, mtime: number): Promise<void>;
 
-        /**
-         * 获取文件的路径。
-         */
+        /** 文件路径（创建时传入） */
         readonly path: string;
 
-        /**
-         * 文件对象的类型标签。
-         */
         readonly [Symbol.toStringTag]: 'FileHandle';
     }
 
     /**
-     * 目录对象
+     * 目录对象（支持异步迭代）
+     * @example
+     * for await (const ent of dir) {
+     *   console.log(ent.name);
+     * }
      */
-    interface DirHandle {
-        /**
-         * 关闭目录。
-         * @returns 返回一个 Promise，解析为 undefined。
-         */
+    class DirHandle {
+        /** 关闭目录 */
         close(): Promise<void>;
 
-        /**
-         * 获取目录的路径。
-         */
+        /** 目录路径 */
         readonly path: string;
 
-        /**
-         * 读取目录中的下一项。
-         * @returns 返回一个 Promise，解析为 DirEnt 对象或 undefined。
-         */
-        next(): Promise<DirEnt | undefined>;
+        /** 读取下一个目录项（内部使用） */
+        next(): Promise<{ value: DirEnt, done: false } | { done: true, value: undefined }>;
 
-        /**
-         * 获取目录对象的异步迭代器。
-         * @returns 返回一个迭代器对象。
-         */
+        /** 获取异步迭代器 */
         [Symbol.asyncIterator](): AsyncIterableIterator<DirEnt>;
 
-        /**
-         * 目录对象的类型标签。
-         */
         readonly [Symbol.toStringTag]: 'DirHandle';
     }
 
     /**
-     * 目录项对象
+     * 目录项对象（readdir结果）
      */
     interface DirEnt {
-        /**
-         * 目录项的名称。
-         */
         readonly name: string;
-
-        /**
-         * 检查目录项是否为块设备。
-         * @returns 返回布尔值，表示是否为块设备。
-         */
         readonly isBlockDevice: boolean;
-
-        /**
-         * 检查目录项是否为字符设备。
-         * @returns 返回布尔值，表示是否为字符设备。
-         */
         readonly isCharacterDevice: boolean;
-
-        /**
-         * 检查目录项是否为目录。
-         * @returns 返回布尔值，表示是否为目录。
-         */
         readonly isDirectory: boolean;
-
-        /**
-         * 检查目录项是否为 FIFO 管道。
-         * @returns 返回布尔值，表示是否为 FIFO 管道。
-         */
         readonly isFIFO: boolean;
-
-        /**
-         * 检查目录项是否为普通文件。
-         * @returns 返回布尔值，表示是否为普通文件。
-         */
         readonly isFile: boolean;
-
-        /**
-         * 检查目录项是否为套接字。
-         * @returns 返回布尔值，表示是否为套接字。
-         */
         readonly isSocket: boolean;
-
-        /**
-         * 检查目录项是否为符号链接。
-         * @returns 返回布尔值，表示是否为符号链接。
-         */
         readonly isSymbolicLink: boolean;
-
-        /**
-         * 目录项对象的类型标签。
-         */
         readonly [Symbol.toStringTag]: 'DirEnt';
     }
 
     /**
-     * 文件统计信息对象
+     * 文件统计信息（stat结果）
      */
     interface StatResult {
-        /**
-         * 检查是否为块设备。
-         * @returns 返回布尔值，表示是否为块设备。
-         */
         readonly isBlockDevice: boolean;
-
-        /**
-         * 检查是否为字符设备。
-         * @returns 返回布尔值，表示是否为字符设备。
-         */
         readonly isCharacterDevice: boolean;
-
-        /**
-         * 检查是否为目录。
-         * @returns 返回布尔值，表示是否为目录。
-         */
         readonly isDirectory: boolean;
-
-        /**
-         * 检查是否为 FIFO 管道。
-         * @returns 返回布尔值，表示是否为 FIFO 管道。
-         */
         readonly isFIFO: boolean;
-
-        /**
-         * 检查是否为普通文件。
-         * @returns 返回布尔值，表示是否为普通文件。
-         */
         readonly isFile: boolean;
-
-        /**
-         * 检查是否为套接字。
-         * @returns 返回布尔值，表示是否为套接字。
-         */
         readonly isSocket: boolean;
-
-        /**
-         * 检查是否为符号链接。
-         * @returns 返回布尔值，表示是否为符号链接。
-         */
         readonly isSymbolicLink: boolean;
-
-        /**
-         * 文件的设备ID。
-         */
         readonly dev: number;
-
-        /**
-         * 文件的模式（权限）。
-         */
         readonly mode: number;
-
-        /**
-         * 文件的链接数。
-         */
         readonly nlink: number;
-
-        /**
-         * 文件的所有者ID。
-         */
         readonly uid: number;
-
-        /**
-         * 文件的组ID。
-         */
         readonly gid: number;
-
-        /**
-         * 文件的设备ID（特殊文件）。
-         */
         readonly rdev: number;
-
-        /**
-         * 文件的 inode 编号。
-         */
         readonly ino: number;
-
-        /**
-         * 文件大小（字节）。
-         */
         readonly size: number;
-
-        /**
-         * 文件块大小。
-         */
         readonly blksize: number;
-
-        /**
-         * 文件的块数。
-         */
         readonly blocks: number;
-
-        /**
-         * 文件标志。
-         */
         readonly flags: number;
-
-        /**
-         * 文件的访问时间。
-         */
         readonly atime: Date;
-
-        /**
-         * 文件的修改时间。
-         */
         readonly mtime: Date;
-
-        /**
-         * 文件的更改时间。
-         */
         readonly ctime: Date;
-
-        /**
-         * 文件的创建时间（仅在某些系统上可用）。
-         */
         readonly birthtime: Date;
-
-        /**
-         * 文件统计信息对象的类型标签。
-         */
         readonly [Symbol.toStringTag]: 'StatResult';
     }
 
     /**
-     * 打开文件并返回文件句柄。
-     * @param path 文件路径。
-     * @param flags 打开模式标志（如 'r', 'w', 'r+', 'a', 'a+', 'wx', 'w+x'）。
-     * @param mode 文件权限模式（可选，默认为 0666）。
-     * @returns 返回一个 Promise，解析为 FileHandle 对象。
+     * 文件系统统计信息
+     */
+    interface StatFsResult {
+        readonly type: number;
+        readonly bsize: number;
+        readonly blocks: number;
+        readonly bfree: number;
+        readonly bavail: number;
+        readonly files: number;
+        readonly ffree: number;
+    }
+
+    /* ==================== 文件操作 ==================== */
+
+    /**
+     * 打开文件（异步）
+     * @param path 文件路径
+     * @param flags 打开模式（如 OpenMode.READ）
+     * @param mode 权限（默认0o666）
      */
     function open(path: string, flags: OpenMode | string, mode?: number): Promise<FileHandle>;
 
+    /** 获取文件元数据（异步） */
+    function stat(path: string): Promise<StatResult>;
+
+    /** 获取符号链接本身元数据（异步） */
+    function lstat(path: string): Promise<StatResult>;
+
+    /** 
+     * 获取文件的绝对路径（异步）
+     * @throws {Error} 路径不存在或权限不足
+     */
+    function realPath(path: string): Promise<string>;
+
+    /** 删除文件（异步） */
+    function unlink(path: string): Promise<void>;
+
+    /** 重命名文件（异步） */
+    function rename(path: string, newPath: string): Promise<void>;
+
+    /** 复制文件（异步） */
+    function copyFile(path: string, newPath: string): Promise<void>;
+
+    /** 读取文件全部内容到内存（异步）
+     * @warning **内存警告**：大文件会消耗大量内存
+     * @param path 文件路径
+     * @returns 文件内容的Uint8Array视图
+     */
+    function readFile(path: string): Promise<Uint8Array>;
+
+    /* ==================== 目录操作 ==================== */
+
+    /** 创建目录（异步） */
+    function mkdir(path: string, mode?: number): Promise<void>;
+
+    /** 创建目录（同步） */
+    function mkdirSync(path: string, mode?: number): void;
+
+    /** 删除空目录（异步） */
+    function rmdir(path: string): Promise<void>;
+
+    /** 打开目录（支持迭代） */
+    function readDir(path: string): Promise<DirHandle>;
+
+    /** 创建临时目录（异步） */
+    function makeTempDir(template: string): Promise<string>;
+
+    /* ==================== 链接操作 ==================== */
+
+    /** 读取符号链接目标（异步） */
+    function readLink(path: string): Promise<string>;
+
+    /** 创建硬链接（异步） */
+    function link(path: string, newPath: string): Promise<void>;
+
+    /** 创建符号链接（异步） */
+    function symlink(path: string, newPath: string, type: SymlinkType): Promise<void>;
+
+    /* ==================== 权限操作 ==================== */
+
+    /** 修改文件权限（异步） */
+    function chmod(path: string, mode: number): Promise<void>;
+
+    /** 修改文件所有者和组（异步） */
+    function chown(path: string, uid: number, gid: number): Promise<void>;
+
+    /** 修改符号链接本身所有者和组（异步） */
+    function lchown(path: string, uid: number, gid: number): Promise<void>;
+
+    /** 修改文件时间戳（异步） */
+    function utime(path: string, atime: number, mtime: number): Promise<void>;
+
+    /** 修改符号链接本身时间戳（异步） */
+    function lutime(path: string, atime: number, mtime: number): Promise<void>;
+
+    /* ==================== 文件系统信息 ==================== */
+
+    /** 获取文件系统统计信息（异步） */
+    function statFs(path: string): Promise<StatFsResult>;
+
+    /* ==================== 内部API（不推荐） ==================== */
+
     /**
-     * 创建一个新的 stdio 文件句柄。
-     * @param path 文件路径。
-     * @param fd 文件描述符。
-     * @returns 返回 FileHandle 对象。
+     * 从已打开的文件描述符创建FileHandle（内部使用）
+     * @internal
      */
     function newStdioFile(path: string, fd: number): FileHandle;
 
     /**
-     * 获取文件的统计信息。
-     * @param path 文件路径。
-     * @returns 返回一个 Promise，解析为 StatResult 对象。
-     */
-    function stat(path: string): Promise<StatResult>;
-
-    /**
-     * 获取文件的链接统计信息。
-     * @param path 文件路径。
-     * @returns 返回一个 Promise，解析为 StatResult 对象。
-     */
-    function lstat(path: string): Promise<StatResult>;
-
-    /**
-     * 获取文件的绝对路径。
-     * @param path 文件路径。
-     * @returns 返回一个 Promise，解析为绝对路径字符串。
-     */
-    function realPath(path: string): Promise<string>;
-
-    /**
-     * 删除文件。
-     * @param path 文件路径。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function unlink(path: string): Promise<void>;
-
-    /**
-     * 重命名文件。
-     * @param path 当前文件路径。
-     * @param newPath 新文件路径。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function rename(path: string, newPath: string): Promise<void>;
-
-    /**
-     * 创建临时目录。
-     * @param template 模板路径（包含 'X' 字符）。
-     * @returns 返回一个 Promise，解析为临时目录路径字符串。
-     */
-    function makeTempDir(template: string): Promise<string>;
-
-    /**
-     * 创建临时文件。
-     * @param template 模板路径（包含 'X' 字符）。
-     * @returns 返回一个 Promise，解析为 FileHandle 对象。
-     */
-    function mkstemp(template: string): Promise<FileHandle>;
-
-    /**
-     * 删除目录。
-     * @param path 目录路径。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function rmdir(path: string): Promise<void>;
-
-    /**
-     * 创建目录。
-     * @param path 目录路径。
-     * @param mode 目录权限模式（可选，默认为 0777）。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function mkdir(path: string, mode?: number): Promise<void>;
-
-    /**
-     * 同步创建目录。
-     * @param path 目录路径。
-     * @param mode 目录权限模式（可选，默认为 0777）。
-     */
-    function mkdirSync(path: string, mode?: number): void;
-
-    /**
-     * 复制文件。
-     * @param path 源文件路径。
-     * @param newPath 目标文件路径。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function copyFile(path: string, newPath: string): Promise<void>;
-
-    /**
-     * 读取目录内容。
-     * @param path 目录路径。
-     * @returns 返回一个 Promise，解析为 DirHandle 对象。
-     */
-    function readDir(path: string): Promise<DirHandle>;
-
-    /**
-     * 读取文件内容。
-     * @param path 文件路径。
-     * @returns 返回一个 Promise，解析为文件内容的 Uint8Array。
-     */
-    function readFile(path: string): Promise<Uint8Array>;
-
-    /**
-     * 获取文件的统计信息（同步）。
-     * @param path 文件路径。
-     * @returns 返回 StatResult 对象。
+     * 获取文件元数据（同步）
+     * @internal 仅用于特殊场景，避免阻塞事件循环
      */
     function statSync(path: string): StatResult;
-
-    /**
-     * 更改文件的所有者和组。
-     * @param path 文件路径。
-     * @param uid 新的所有者ID。
-     * @param gid 新的组ID。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function chown(path: string, uid: number, gid: number): Promise<void>;
-
-    /**
-     * 更改符号链接的所有者和组。
-     * @param path 符号链接路径。
-     * @param uid 新的所有者ID。
-     * @param gid 新的组ID。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function lchown(path: string, uid: number, gid: number): Promise<void>;
-
-    /**
-     * 更改文件的权限。
-     * @param path 文件路径。
-     * @param mode 新的权限模式。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function chmod(path: string, mode: number): Promise<void>;
-
-    /**
-     * 更改文件的访问和修改时间。
-     * @param path 文件路径。
-     * @param atime 新的访问时间（Unix 时间戳，毫秒）。
-     * @param mtime 新的修改时间（Unix 时间戳，毫秒）。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function utime(path: string, atime: number, mtime: number): Promise<void>;
-
-    /**
-     * 更改符号链接的访问和修改时间。
-     * @param path 符号链接路径。
-     * @param atime 新的访问时间（Unix 时间戳，毫秒）。
-     * @param mtime 新的修改时间（Unix 时间戳，毫秒）。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function lutime(path: string, atime: number, mtime: number): Promise<void>;
-
-    /**
-     * 读取符号链接的目标路径。
-     * @param path 符号链接路径。
-     * @returns 返回一个 Promise，解析为符号链接的目标路径字符串。
-     */
-    function readLink(path: string): Promise<string>;
-
-    /**
-     * 创建硬链接。
-     * @param path 现有文件路径。
-     * @param newPath 新的硬链接路径。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function link(path: string, newPath: string): Promise<void>;
-
-    /**
-     * 创建符号链接。
-     * @param path 现有文件路径。
-     * @param newPath 新的符号链接路径。
-     * @param type 符号链接类型（如 SymlinkType.DIR 或 SymlinkType.JUNCTION）。
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    function symlink(path: string, newPath: string, type: SymlinkType): Promise<void>;
-
-    /**
-     * 获取文件系统的统计信息。
-     * @param path 文件路径（用于确定文件系统）。
-     * @returns 返回一个 Promise，解析为文件系统统计信息对象。
-     */
-    function statFs(path: string): Promise<StatFsResult>;
-
-    /**
-     * 文件系统统计信息对象
-     */
-    interface StatFsResult {
-        /**
-         * 文件系统类型。
-         */
-        readonly type: number;
-
-        /**
-         * 文件系统块大小。
-         */
-        readonly bsize: number;
-
-        /**
-         * 文件系统总块数。
-         */
-        readonly blocks: number;
-
-        /**
-         * 文件系统空闲块数。
-         */
-        readonly bfree: number;
-
-        /**
-         * 文件系统可用块数。
-         */
-        readonly bavail: number;
-
-        /**
-         * 文件系统总文件数。
-         */
-        readonly files: number;
-
-        /**
-         * 文件系统空闲文件数。
-         */
-        readonly ffree: number;
-    }
-
-    // 导出所有内容
-    export {
-        OpenMode,
-        SymlinkType,
-        FileType,
-        FileHandle,
-        DirHandle,
-        DirEnt,
-        StatResult,
-        StatFsResult,
-        open,
-        newStdioFile,
-        stat,
-        lstat,
-        realPath,
-        unlink,
-        rename,
-        makeTempDir,
-        mkstemp,
-        rmdir,
-        mkdir,
-        mkdirSync,
-        chmod,
-        copyFile,
-        readDir,
-        readFile,
-        statSync,
-        chown,
-        lchown,
-        utime,
-        lutime,
-        readLink,
-        link,
-        symlink,
-        statFs
-    };
 }

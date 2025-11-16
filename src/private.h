@@ -84,6 +84,9 @@ struct TJSRuntime {
 		JSValue loader;
 		JSValue metaloader;
 	} module;
+
+	JSValue console_count;
+	JSValue console_time;
 };
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
@@ -108,7 +111,8 @@ void tjs__mod_ws_init(JSContext *ctx, JSValue ns);
 void tjs__mod_xhr_init(JSContext *ctx, JSValue ns);
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
-void tjs__mod_console_init(JSContext *ctx);
+void tjs__mod_console_init(JSContext *ctx, JSValue ns);
+void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);

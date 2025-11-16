@@ -94,8 +94,7 @@ static const char *ffi_strerror(ffi_status status) {
             return "FFI_BAD_TYPEDEF";
         case FFI_BAD_ABI:
             return "FFI_BAD_ABI";
-        // FFI_BAD_ARGTYPE does not exist in older versions of libffi.
-        case 3:
+        case FFI_BAD_ARGTYPE:
             return "FFI_BAD_ARGTYPE";
         default:
             return "Unknown FFI error";
@@ -145,28 +144,28 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
         }
     }
     for (unsigned i = 0; i < typeCnt; i++) {
-        ffi_type *t = JS_GetOpaque(types[i], js_ffi_type_classid);
-        if (t == NULL) {
-            JS_ThrowTypeError(ctx, "argument %lld is not a FfiType", (long long int) ((types - argv) + i + 1));
+        if (JS_GetOpaque(types[i], js_ffi_type_classid) == NULL) {
+            JS_ThrowTypeError(ctx, "argument %lld is not a FfiType", (long long int)((types - argv) + i + 1));
             return JS_EXCEPTION;
         }
     }
 
     JSValue obj = JS_NewObjectClass(ctx, js_ffi_type_classid);
-    if (JS_IsException(obj)) {
-        return obj;
+    if (JS_IsException(obj)) return obj;
+
+    ffi_type **elements = js_malloc(ctx, sizeof(ffi_type *) * (arrSz > 0 ? arrSz + 1 : typeCnt + 1));
+    if (!elements) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
     }
 
-    ffi_type **elements;
     if (arrSz > 0) {
-        elements = js_malloc(ctx, sizeof(ffi_type *) * (arrSz + 1));
         js_ffi_type *jst = JS_GetOpaque(types[0], js_ffi_type_classid);
         for (unsigned i = 0; i < arrSz; i++) {
             elements[i] = jst->ffi_type;
         }
         elements[arrSz] = NULL;
     } else {
-        elements = js_malloc(ctx, sizeof(ffi_type *) * (typeCnt + 1));
         for (unsigned i = 0; i < typeCnt; i++) {
             js_ffi_type *jst = JS_GetOpaque(types[i], js_ffi_type_classid);
             elements[i] = jst->ffi_type;
@@ -175,20 +174,42 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
     }
 
     js_ffi_type *structType = js_malloc(ctx, sizeof(js_ffi_type));
+    if (!structType) {
+        js_free(ctx, elements);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+
     structType->elemCount = typeCnt;
     structType->dynamic = true;
+    structType->deps = NULL;
     structType->ffi_type = js_malloc(ctx, sizeof(ffi_type));
+    if (!structType->ffi_type) {
+        js_free(ctx, elements);
+        js_free(ctx, structType);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+
     structType->ffi_type->type = FFI_TYPE_STRUCT;
     structType->ffi_type->size = 0;
     structType->ffi_type->alignment = 0;
-    if (arrSz) {
-        structType->ffi_type->size = arrSz * ffi_type_get_sz(elements[0]);
-        structType->ffi_type->alignment = elements[0]->alignment;
-    }
     structType->ffi_type->elements = elements;
 
-    if (arrSz == 0) {
+    // 数组类型：直接计算大小和对齐
+    if (arrSz > 0) {
+        structType->ffi_type->size = arrSz * ffi_type_get_sz(elements[0]);
+        structType->ffi_type->alignment = elements[0]->alignment;
+    } else {
         size_t *offsets = js_malloc(ctx, sizeof(size_t) * typeCnt);
+        if (!offsets) {
+            js_free(ctx, elements);
+            js_free(ctx, structType->ffi_type);
+            js_free(ctx, structType);
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+
         ffi_status st = ffi_get_struct_offsets(FFI_DEFAULT_ABI, structType->ffi_type, offsets);
         if (st != FFI_OK) {
             js_free(ctx, elements);
@@ -203,11 +224,15 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
         for (unsigned i = 0; i < typeCnt; i++) {
             JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, offsets[i]));
         }
-        js_free(ctx, offsets);
         JS_SetPropertyStr(ctx, obj, "offsets", arr);
+        js_free(ctx, offsets);
     }
 
     structType->deps = js_malloc(ctx, sizeof(JSValue) * typeCnt);
+    if (!structType->deps) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     for (unsigned i = 0; i < typeCnt; i++) {
         structType->deps[i] = JS_DupValue(ctx, types[i]);
     }
@@ -373,14 +398,11 @@ int ffi_type_to_buffer(JSContext *ctx, JSValue val, ffi_type *type, uint8_t *buf
                 break;
             case FFI_TYPE_POINTER:
                 if (JS_IsNull(val)) {
-                    *(void **) buf = NULL;
+                    *(void **)buf = NULL;
                     return sizeof(void *);
                 }
-                uint64_t bla;
-                JS_TO_UINTPTR_T(ctx, &bla, val);
-                JS_TO_UINTPTR_T(ctx, (void *) buf, val);
+                JS_TO_UINTPTR_T(ctx, (void **)buf, val);
                 return sizeof(void *);
-                break;
             case FFI_TYPE_COMPLEX:
                 JS_ThrowTypeError(ctx, "FFI_TYPE_COMPLEX is not yet supported!");
                 return -1;
@@ -672,7 +694,7 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
     void *func;
     if (argc <= 0 || (func = JS_GetOpaque(argv[0], js_uv_dlsym_classid)) == NULL) {
-        JS_ThrowTypeError(ctx, "argument 1 must be UvDlsym");
+        JS_ThrowTypeError(ctx, "argument 1 must be UvDlSym object");
         return JS_EXCEPTION;
     }
 
@@ -686,6 +708,7 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     void **aval = NULL;
     if (ffi_arg_cnt > 0) {
         aval = js_malloc(ctx, ffi_arg_cnt * sizeof(void *) * 2);
+        if (!aval) return JS_EXCEPTION;
     }
     for (unsigned i = 0; i < ffi_arg_cnt; i++) {
         void *ptr;
@@ -705,13 +728,15 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     size_t retsz = ffi_type_get_sz(cif->ffi_cif.rtype);
-    // man page requires at least sizeof(long) for return value
     void *rptr = js_malloc(ctx, retsz > sizeof(long) ? retsz : sizeof(long));
+    if (!rptr) {
+        js_free(ctx, aval);
+        return JS_EXCEPTION;
+    }
 
     ffi_call(&cif->ffi_cif, func, rptr, aval);
-    if (aval != NULL) {
-        js_free(ctx, aval);
-    }
+    js_free(ctx, aval);
+    
     return TJS_NewUint8Array(ctx, rptr, retsz);
 }
 static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
@@ -915,10 +940,13 @@ typedef struct {
 } js_ffi_closure;
 
 void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) {
-    js_ffi_closure *jscl = (js_ffi_closure *) userptr;
+    js_ffi_closure *jscl = (js_ffi_closure *)userptr;
     JSContext *ctx = jscl->ctx;
     JSValue *jsargs = js_malloc(ctx, sizeof(JSValue) * cif->nargs);
-
+    if (!jsargs) {
+        fprintf(stderr, "js_ffi_closure_invoke: out of memory\n");
+        abort();
+    }
     for (unsigned i = 0; i < cif->nargs; i++) {
         jsargs[i] = TJS_NewUint8ArrayExternal(ctx, args[i], ffi_type_get_sz(cif->arg_types[i]));
     }
@@ -937,6 +965,11 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
     if (buf == NULL) {
         fprintf(stderr, "js_ffi_closure_invoke: function returned non-buffer\n");
         tjs_dump_error(ctx);
+        abort();
+    }
+    size_t expected_sz = ffi_type_get_sz(cif->rtype);
+    if (sz != expected_sz) {
+        fprintf(stderr, "js_ffi_closure_invoke: return buffer size mismatch (expected %zu, got %zu)\n", expected_sz, sz);
         abort();
     }
     memcpy(ret, buf, sz);

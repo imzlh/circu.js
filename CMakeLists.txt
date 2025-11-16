@@ -52,9 +52,6 @@ cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
 option(libuv_buildtests "" OFF)
-add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
-
-add_subdirectory(deps/sqlite3 EXCLUDE_FROM_ALL)
 
 if(BUILD_WITH_WASM)
     set(BUILD_WASI "simple" CACHE STRING "WASI implementation")
@@ -72,6 +69,12 @@ endif()
 
 find_package(CURL REQUIRED)
 find_package(llhttp REQUIRED)
+find_package(SQLite3 REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB)
+
+option(libuv_buildtests "" OFF)
+add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_library(tjs
     src/curl-utils.c
@@ -105,6 +108,7 @@ add_library(tjs
     src/mod_streams.c
     src/mod_sys.c
     src/mod_udp.c
+    src/mod_zlib.c
     deps/quickjs/cutils.c
 )
 
@@ -166,7 +170,7 @@ string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(tjs PRIVATE ${tjs_cflags})
 target_compile_definitions(tjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(tjs PUBLIC src)
-target_link_libraries(tjs qjs uv_a sqlite3 CURL::libcurl llhttp)
+target_link_libraries(tjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(tjs PRIVATE TJS__HAS_MIMALLOC)

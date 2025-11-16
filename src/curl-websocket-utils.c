@@ -35,17 +35,21 @@
 #include <fcntl.h>
 #include <uv.h>
 
-#include <openssl/sha.h>
 #include <openssl/evp.h>
 
 static void
 _cws_sha1(const void* input, const size_t input_len, void* output)
 {
-	SHA_CTX ctx;
+	// SHA_CTX ctx;
 
-	SHA1_Init(&ctx);
-	SHA1_Update(&ctx, input, input_len);
-	SHA1_Final(output, &ctx);
+	// SHA1_Init(&ctx);
+	// SHA1_Update(&ctx, input, input_len);
+	// SHA1_Final(output, &ctx);
+	EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
+	EVP_DigestUpdate(ctx, input, input_len);
+	EVP_DigestFinal_ex(ctx, output, NULL);
+	EVP_MD_CTX_free(ctx);
 }
 
 static inline void
@@ -69,7 +73,7 @@ _cws_debug(const char* prefix, const void* buffer, size_t len)
 static inline void
 _cws_encode_base64(const uint8_t* input, const size_t input_len, char* output)
 {
-	EVP_EncodeBlock(output, (const unsigned char*)input, input_len);
+	EVP_EncodeBlock((unsigned char*)output, (const unsigned char*)input, input_len);
 }
 
 static void

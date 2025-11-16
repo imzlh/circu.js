@@ -27,859 +27,1068 @@
 #include "tjs.h"
 #include "binary.h"
 
-
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 #ifndef L_NO_THREADS_H
 #include <threads.h>
 #endif
 #include <assert.h>
 
+/* Constants */
 #define MAX_DEPTH 64
-#define MAX_OUTPUT_LEN 1024
-#define MAX_OBJECT_PROP_LEN 16
-#define MAX_OBJEXT_INLINE_PROP_LEN 4
+#define MAX_INLINE_PROPS 4
+#define MAX_DISPLAY_PROPS 16
+#define MAX_BUFFER_DISPLAY 128
+#define MAX_TABLE_ROWS 100
+#define MAX_TABLE_COLS 20
 
-// ANSI 颜色代码
-#define ANSI_RESET   "\x1b[0m"
-#define ANSI_RED     "\x1b[31m"
-#define ANSI_GREEN   "\x1b[32m"
-#define ANSI_YELLOW  "\x1b[33m"
-#define ANSI_BLUE    "\x1b[34m"
-#define ANSI_MAGENTA "\x1b[35m"
-#define ANSI_CYAN    "\x1b[36m"
-#define ANSI_WHITE   "\x1b[37m"
-#define ANSI_BOLD    "\x1b[1m"
-#define ANSI_UNDERLINE "\x1b[4m"
-#define ANSI_ITALIC "\x1b[3m"
+/* ANSI Color Codes */
+#define ANSI_RESET     "\x1b[0m"
+#define ANSI_BOLD      "\x1b[1m"
+#define ANSI_ITALIC    "\x1b[3m"
+#define ANSI_RED       "\x1b[31m"
+#define ANSI_GREEN     "\x1b[32m"
+#define ANSI_YELLOW    "\x1b[33m"
+#define ANSI_BLUE      "\x1b[34m"
+#define ANSI_MAGENTA   "\x1b[35m"
+#define ANSI_CYAN      "\x1b[36m"
+#define ANSI_GRAY      "\x1b[90m"
 
-static const char* getClassName(JSContext *ctx, JSValue prototype) {
-    JSValue constructor, name;
+/* Indentation Helper */
+#define INDENT_SIZE 2
+#define BLANK_BUFFER "                                                                " \
+                     "                                                                " \
+                     "                                                                " \
+                     "                                                                "
 
-    constructor = JS_GetProperty(ctx, prototype, JS_ATOM_constructor);
-    if (JS_IsException(constructor))
-        return NULL;
-    name = JS_GetProperty(ctx, constructor, JS_ATOM_name);
-    if (JS_IsException(name))
-        return NULL;
+static const char* s_blank = BLANK_BUFFER;
+static const size_t s_blank_len = 64;
 
-    JS_FreeValue(ctx, constructor);
-    JS_FreeValue(ctx, name);
-    return JS_ToCString(ctx, name);
+static inline const char* get_indent(int depth) {
+    assert(depth <= (int)s_blank_len);
+    size_t offset = (s_blank_len - depth) * INDENT_SIZE;
+    return s_blank + offset;
 }
 
-void* dalloc(void *opaque, void *ptr, size_t size){
+/* Memory Allocator */
+static void* console_realloc(void* opaque, void* ptr, size_t size) {
     return js_realloc_rt((JSRuntime*)opaque, ptr, size);
 }
 
-#define PRINT_INDENT(depth) fputs(output, getBlank(depth))
-
-#define BLANK_64 "                                                                "
-static const char* blank = BLANK_64 BLANK_64 BLANK_64 BLANK_64; // max depth 64
-static size_t blank_len = 64;
-
-static inline const char* getBlank(int depth) {
-    assert(depth <= blank_len);
-    size_t offset = (blank_len - depth) * 4;
-    return blank + offset;
-}
-
-// forward declaration
-static inline void print_jsvalue(JSContext *ctx, JSValueConst val, JSValueConst prototype_of, int depth, JSValue visited[], DynBuf* dbuf);
-
-static inline bool check_circular(JSContext *ctx, JSValue val, JSValue visited[], int depth) {
-    if(depth == 64) return true; // max depth
-    for(int i = 0; i < depth; i++){
-        if(JS_IsSameValue(ctx, val, visited[i])) return true;
+/* Utility Functions */
+static inline bool is_circular(JSContext* ctx, JSValue val, JSValue visited[], int depth) {
+    if (depth >= MAX_DEPTH) return true;
+    for (int i = 0; i < depth; i++) {
+        if (JS_IsSameValue(ctx, val, visited[i])) return true;
     }
     return false;
 }
 
-static inline JSValue JS_GetPropertyNoDup(JSContext *ctx, JSValueConst obj, JSAtom atom){
-    JSValue ret = JS_GetProperty(ctx, obj, atom);
-    JS_FreeValue(ctx, ret);
-    return ret;
+static inline const char* try_get_string(JSContext* ctx, JSValueConst val) {
+    return JS_IsString(val) ? JS_ToCString(ctx, val) : NULL;
 }
 
-static inline JSValue JS_GetWeakRefValue(JSContext *ctx, JSValue val){
-	JSValue ret = JS_GetProperty(ctx, val, JS_ATOM_value);
-	return ret;
-}
-
-static inline const char* LJS_ToCString(JSContext *ctx, JSValueConst val, size_t* psize){
-    if(!JS_IsString(val)) return NULL;  // different from JS_ToCString
-    return JS_ToCStringLen(ctx, psize, val);
-}
-
-static inline bool JS_IsTypedArray(JSContext* ctx, JSValueConst val){
-    return JS_GetTypedArrayType(val) != -1;
-}
-
-
-static inline int JS_GetEnumerableLength(JSContext* ctx, JSValueConst obj, int64_t* plen){
-    JSValue jsobj;
-    int ret = -1;
-    if(JS_IsNumber(jsobj = JS_GetProperty(ctx, obj, JS_ATOM_length))){
-        ret = JS_ToInt64(ctx, plen, jsobj);
-        goto end;
-    }
-    JS_FreeValue(ctx, jsobj);
+static inline const char* get_class_name(JSContext* ctx, JSValue obj) {
+    JSValue constructor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
+    if (JS_IsException(constructor)) return NULL;
     
-    if(JS_IsNumber(jsobj = JS_GetProperty(ctx, obj, JS_ATOM_size))){
-        ret = JS_ToInt64(ctx, plen, jsobj);
-        goto end;
-    }
-
-end:
-    JS_FreeValue(ctx, jsobj);
-    return ret;
+    JSValue name = JS_GetProperty(ctx, constructor, JS_ATOM_name);
+    JS_FreeValue(ctx, constructor);
+    
+    if (JS_IsException(name)) return NULL;
+    
+    const char* result = JS_ToCString(ctx, name);
+    JS_FreeValue(ctx, name);
+    return result;
 }
 
-// measure whether to wrap display into multiple lines
-// useful for Array and Object with many properties
-static bool measure_wrap_display(JSContext *ctx, JSValue val, JSValue visited[MAX_OBJEXT_INLINE_PROP_LEN], int depth, 
-    bool also_proto, bool getset_only) {
-#define MEASURE_SUBELEMENT(el) JSValue value = el; \
-    if(measure_wrap_display(ctx, value, visited, depth + 1, also_proto, false)){ \
-        JS_FreeValue(ctx, value); \
-        return true; \
-    }\
-    JS_FreeValue(ctx, value);
+/* Forward declarations */
+static void format_value(JSContext* ctx, JSValueConst val, int depth, 
+                        JSValue visited[], DynBuf* buf, bool in_container);
 
-    // Too deep?
-    if(depth == MAX_OBJEXT_INLINE_PROP_LEN) return true;
-
-    // check circular reference
-    if(check_circular(ctx, val, visited, depth)) return false;
-
-    // add to visited
-    visited[depth] = val;
-
-    int64_t plen;
-    // if(JS_IsProxy(val) || JS_IsError(ctx, val)) return false;
-    if(also_proto && JS_HasProperty(ctx, val, JS_ATOM_prototype)){
-        MEASURE_SUBELEMENT(JS_GetProperty(ctx, val, JS_ATOM_prototype));
-    }
-
-    // string
-    if(JS_IsString(val)) return false;
+/* Check if value should be displayed inline */
+static bool should_inline(JSContext* ctx, JSValueConst val, JSValue visited[], int depth) {
+    if (depth >= MAX_INLINE_PROPS) return false;
+    if (is_circular(ctx, val, visited, depth)) return true;
     
-    // some special objects
-    if(JS_IsWeakMap(val) || JS_IsWeakSet(val)) return false;
-    // weakref?
-    if (JS_IsWeakRef(val)) {
-        MEASURE_SUBELEMENT(JS_GetWeakRefValue(ctx, val));
-        return false;
+    /* Simple types always inline */
+    if (!JS_IsObject(val)) return true;
+    if (JS_IsNull(val)) return true;
+    
+    /* Special objects */
+    if (JS_IsSymbol(val) || JS_IsRegExp(val) || JS_IsDate(val)) return true;
+    if (JS_IsWeakMap(val) || JS_IsWeakSet(val)) return true;
+    
+    /* Check container size */
+    int64_t len = 0;
+    JSValue len_val = JS_GetProperty(ctx, val, JS_ATOM_length);
+    if (JS_IsNumber(len_val)) {
+        JS_ToInt64(ctx, &len, len_val);
+        JS_FreeValue(ctx, len_val);
+        if (len > MAX_INLINE_PROPS) return false;
+        
+        /* Check element complexity */
+        visited[depth] = val;
+        for (int64_t i = 0; i < len; i++) {
+            JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+            bool inline_elem = should_inline(ctx, elem, visited, depth + 1);
+            JS_FreeValue(ctx, elem);
+            if (!inline_elem) return false;
+        }
+        return true;
     }
-
-    // NULL and many special objects
-    if (JS_IsNull(val) || JS_IsSymbol(val) || JS_IsRegExp(val) || JS_IsDate(val))
-        return false;
-    if (JS_IsPromise(val)) {
-        MEASURE_SUBELEMENT(JS_PromiseResult(ctx, val));
-        return false;
-    }
-
-    if(JS_GetEnumerableLength(ctx, val, &plen) != -1){
-        if(plen > MAX_OBJEXT_INLINE_PROP_LEN) return true;
-        for(int64_t i = 0; i < plen; i++){
-            MEASURE_SUBELEMENT(JS_GetPropertyUint32(ctx, val, i));
-        }
-    }else if(JS_IsObject(val)){
-        // display prototype?
-        // JSValue prototype = JS_GetProperty(ctx, val, JS_ATOM_prototype);
-        // if(!JS_IsException(prototype) ) return true;
-        if(!also_proto){
-            JSValue proto = JS_GetPrototype(ctx, val);
-            if(JS_IsObject(proto) && measure_wrap_display(ctx, proto, visited, depth + 1, false, true)){
-                JS_FreeValue(ctx, proto);
-                return true;                
-            }
-            JS_FreeValue(ctx, proto);
-        }
-
-        JSPropertyEnum *props;
-        uint32_t prop_count;
-        if(-1 == JS_GetOwnPropertyNames(ctx, &props, &prop_count, val, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_PRIVATE_MASK)) return false;
-        if(prop_count > MAX_OBJEXT_INLINE_PROP_LEN){
-            JS_FreePropertyEnum(ctx, props, prop_count);
-            return true;
-        }
-        for(uint32_t i = 0; i < prop_count; i++){
-            JSAtom atom = props[i].atom;
-            if(atom == JS_ATOM_prototype || atom == JS_ATOM_Symbol_species || atom == JS_ATOM___proto__)
-                continue;
-            if(getset_only){
-                JSPropertyDescriptor desc;
-                bool wrap_res = false;
-                if(-1 == JS_GetOwnProperty(ctx, &desc, val, props[i].atom))
-                    continue;
-                if(JS_IsFunction(ctx, desc.getter)){
-                    JSValue desc_val = JS_Call(ctx, desc.getter, val, 0, NULL);
-                    if(measure_wrap_display(ctx, desc_val, visited, depth + 1, false, true)){
-                        wrap_res = true;
-                    }
-                    JS_FreeValue(ctx, desc_val);
-                }
-                JS_FreeValue(ctx, desc.value);
-                JS_FreeValue(ctx, desc.getter);
-                JS_FreeValue(ctx, desc.setter);
-                if(wrap_res) return true;
-            }else{
-                JSValue prop = JS_GetProperty(ctx, val, atom);
-                if(measure_wrap_display(ctx, prop, visited, depth + 1, also_proto, false)){
-                    JS_FreeValue(ctx, prop);
-                    JS_FreePropertyEnum(ctx, props, prop_count);
-                    return true;
-                }
-                JS_FreeValue(ctx, prop);
-            }
-        }
+    JS_FreeValue(ctx, len_val);
+    
+    /* Check object properties */
+    JSPropertyEnum* props = NULL;
+    uint32_t prop_count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, val, 
+                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) == 0) {
+        bool result = prop_count <= MAX_INLINE_PROPS;
         JS_FreePropertyEnum(ctx, props, prop_count);
+        return result;
     }
-    return false;
+    
+    return true;
 }
 
-static inline bool measure_wrap_disp2(JSContext *ctx, JSValue val, bool also_proto){
-    JSValue visited[MAX_OBJEXT_INLINE_PROP_LEN];
-    return measure_wrap_display(ctx, val, visited, 0, also_proto, false);
-}
-
-static void __print_stack(JSContext* ctx, JSValueConst stack, int depth, DynBuf* output) {
-    const char* indent = getBlank(depth);
-    const char* stack_str = LJS_ToCString(ctx, stack, NULL);
-
-    if(!stack_str) return;
-    char* wrap_pos = strchr(stack_str, '\n');
-    while (wrap_pos != NULL) {
-        *wrap_pos = '\0';
-        dbuf_printf(output, "%s%s\n", indent, stack_str);
-        stack_str = wrap_pos + 1;
-        wrap_pos = strchr(stack_str, '\n');
+/* Format Functions */
+static void format_string(JSContext* ctx, JSValueConst val, DynBuf* buf, bool in_container) {
+    const char* str = JS_ToCString(ctx, val);
+    if (!str) {
+        dbuf_putstr(buf, ANSI_RED "String" ANSI_RESET);
+        return;
     }
-    // dbuf_printf(output, "%s%s\n", indent, stack_str);
-    JS_FreeCString(ctx, stack_str);
+    
+    if (in_container) {
+        dbuf_printf(buf, ANSI_GREEN "'%s'" ANSI_RESET, str);
+    } else {
+        dbuf_putstr(buf, str);
+    }
+    JS_FreeCString(ctx, str);
 }
 
-static void print_jserror(JSContext* ctx, JSValue val, int depth, DynBuf* output) {
-    const char* indent = getBlank(depth);
+static void format_number(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    double num;
+    if (JS_ToFloat64(ctx, &num, val) < 0) {
+        dbuf_putstr(buf, ANSI_YELLOW "NaN" ANSI_RESET);
+    } else {
+        dbuf_printf(buf, ANSI_YELLOW "%g" ANSI_RESET, num);
+    }
+}
 
+static void format_function(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
+    const char* name_str = try_get_string(ctx, name);
+    
+    if (JS_IsConstructor(ctx, val)) {
+        dbuf_printf(buf, ANSI_CYAN "[class %s]" ANSI_RESET, 
+                   name_str ? name_str : "anonymous");
+    } else {
+        dbuf_printf(buf, ANSI_CYAN "[Function: %s]" ANSI_RESET, 
+                   name_str ? name_str : "anonymous");
+    }
+    
+    if (name_str) JS_FreeCString(ctx, name_str);
+    JS_FreeValue(ctx, name);
+}
+
+static void format_symbol(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    JSAtom atom = JS_ValueToAtom(ctx, val);
+    const char* desc = JS_AtomToCString(ctx, atom);
+    
+    if (desc && *desc) {
+        dbuf_printf(buf, ANSI_GREEN "Symbol(%s)" ANSI_RESET, desc);
+        JS_FreeCString(ctx, desc);
+    } else {
+        dbuf_putstr(buf, ANSI_GREEN "Symbol()" ANSI_RESET);
+    }
+    JS_FreeAtom(ctx, atom);
+}
+
+static void format_array(JSContext* ctx, JSValueConst val, int depth, 
+                        JSValue visited[], DynBuf* buf) {
+    int64_t len = 0;
+    JSValue len_val = JS_GetProperty(ctx, val, JS_ATOM_length);
+    JS_ToInt64(ctx, &len, len_val);
+    JS_FreeValue(ctx, len_val);
+    
+    if (is_circular(ctx, val, visited, depth)) {
+        dbuf_putstr(buf, ANSI_CYAN "[Circular]" ANSI_RESET);
+        return;
+    }
+    
+    visited[depth] = val;
+    bool inline_display = should_inline(ctx, val, visited, depth);
+    
+    dbuf_putstr(buf, "[ ");
+    
+    int64_t display_count = len > MAX_DISPLAY_PROPS ? MAX_DISPLAY_PROPS : len;
+    for (int64_t i = 0; i < display_count; i++) {
+        if (i > 0) dbuf_putstr(buf, ", ");
+        
+        if (!inline_display && i > 0) {
+            dbuf_printf(buf, "\n%s", get_indent(depth + 1));
+        }
+        
+        JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+        format_value(ctx, elem, depth + 1, visited, buf, true);
+        JS_FreeValue(ctx, elem);
+    }
+    
+    if (len > MAX_DISPLAY_PROPS) {
+        dbuf_printf(buf, ", ... %lld more items", (long long)(len - MAX_DISPLAY_PROPS));
+    }
+    
+    if (!inline_display && display_count > 0) {
+        dbuf_printf(buf, "\n%s", get_indent(depth));
+    }
+    
+    dbuf_putstr(buf, " ]");
+    visited[depth] = JS_NULL;
+}
+
+static void format_object(JSContext* ctx, JSValueConst val, int depth, 
+                         JSValue visited[], DynBuf* buf) {
+    if (is_circular(ctx, val, visited, depth)) {
+        dbuf_putstr(buf, ANSI_CYAN "[Circular]" ANSI_RESET);
+        return;
+    }
+    
+    visited[depth] = val;
+    
+    /* Get class name */
+    const char* class_name = get_class_name(ctx, val);
+    if (class_name) {
+        dbuf_printf(buf, "%s ", class_name);
+        JS_FreeCString(ctx, class_name);
+    }
+    
+    /* Get properties */
+    JSPropertyEnum* props = NULL;
+    uint32_t prop_count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, val,
+                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0) {
+        dbuf_putstr(buf, "{}");
+        visited[depth] = JS_NULL;
+        return;
+    }
+    
+    bool inline_display = should_inline(ctx, val, visited, depth);
+    dbuf_putstr(buf, "{ ");
+    
+    uint32_t display_count = prop_count > MAX_DISPLAY_PROPS ? MAX_DISPLAY_PROPS : prop_count;
+    uint32_t shown = 0;
+    
+    for (uint32_t i = 0; i < display_count; i++) {
+        if (props[i].atom == JS_ATOM_prototype) continue;
+        
+        if (shown > 0) dbuf_putstr(buf, ", ");
+        
+        if (!inline_display && shown > 0) {
+            dbuf_printf(buf, "\n%s", get_indent(depth + 1));
+        }
+        
+        /* Property key */
+        const char* key = JS_AtomToCString(ctx, props[i].atom);
+        dbuf_printf(buf, ANSI_CYAN "%s" ANSI_RESET ": ", key ? key : "");
+        if (key) JS_FreeCString(ctx, key);
+        
+        /* Property value */
+        JSValue prop_val = JS_GetProperty(ctx, val, props[i].atom);
+        format_value(ctx, prop_val, depth + 1, visited, buf, true);
+        JS_FreeValue(ctx, prop_val);
+        
+        shown++;
+    }
+    
+    if (prop_count > MAX_DISPLAY_PROPS) {
+        dbuf_printf(buf, ", ... %u more properties", prop_count - MAX_DISPLAY_PROPS);
+    }
+    
+    if (!inline_display && shown > 0) {
+        dbuf_printf(buf, "\n%s", get_indent(depth));
+    }
+    
+    dbuf_putstr(buf, " }");
+    
+    JS_FreePropertyEnum(ctx, props, prop_count);
+    visited[depth] = JS_NULL;
+}
+
+static void format_error(JSContext* ctx, JSValueConst val, int depth, DynBuf* buf) {
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     JSValue message = JS_GetProperty(ctx, val, JS_ATOM_message);
-    JSValue help = JS_GetPropertyStr(ctx, val, "help");
     JSValue stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
-    const char* name_str = JS_ToCString(ctx, name);
-    const char* message_str = LJS_ToCString(ctx, message, NULL);
     
-    if (JS_IsString(help)) {
-        const char* help_str = JS_ToCString(ctx, help);
-        dbuf_printf(output,
-            ANSI_RED "%s%s" ANSI_RESET ": %s\n" \
-            ANSI_GREEN "%s help: " ANSI_RESET "%s\n",
-            indent ,name_str, message_str, indent, help_str);
-        JS_FreeCString(ctx, help_str);
-    } else {
-        dbuf_printf(output, ANSI_RED "%s%s" ANSI_RESET ": %s\n", indent, name_str, message_str);
+    const char* name_str = JS_ToCString(ctx, name);
+    const char* msg_str = try_get_string(ctx, message);
+    
+    dbuf_printf(buf, ANSI_RED "%s" ANSI_RESET, name_str ? name_str : "Error");
+    if (msg_str) {
+        dbuf_printf(buf, ": %s", msg_str);
     }
-
-    // print stack
-    if (JS_IsString(stack)) __print_stack(ctx, stack, depth, output);
-
-    JS_FreeCString(ctx, name_str);
-    JS_FreeCString(ctx, message_str);
+    
+    if (JS_IsString(stack)) {
+        const char* stack_str = JS_ToCString(ctx, stack);
+        if (stack_str) {
+            dbuf_printf(buf, "\n%s", stack_str);
+            JS_FreeCString(ctx, stack_str);
+        }
+    }
+    
+    if (name_str) JS_FreeCString(ctx, name_str);
+    if (msg_str) JS_FreeCString(ctx, msg_str);
     JS_FreeValue(ctx, name);
     JS_FreeValue(ctx, message);
     JS_FreeValue(ctx, stack);
-    JS_FreeValue(ctx, help);
 }
 
-static void print_jspromise(JSContext* ctx, JSValue val, int depth, JSValue visited[], DynBuf* output) {
+static void format_promise(JSContext* ctx, JSValueConst val, DynBuf* buf) {
     JSPromiseStateEnum state = JS_PromiseState(ctx, val);
-    char* state_str = "unknown";
+    const char* state_str = "pending";
+    
     switch (state) {
-    case JS_PROMISE_PENDING:
-        state_str = "pending";
-        break;
-    case JS_PROMISE_FULFILLED:
-        state_str = "fulfilled";
-        break;
-    case JS_PROMISE_REJECTED:
-        state_str = "rejected";
-        break;
+        case JS_PROMISE_FULFILLED: state_str = "fulfilled"; break;
+        case JS_PROMISE_REJECTED: state_str = "rejected"; break;
+        default: break;
     }
-    dbuf_printf(output, ANSI_MAGENTA "Promise" ANSI_YELLOW "<%s>" ANSI_RESET, state_str);
-
-    if (state != JS_PROMISE_PENDING) {
-        JSValue res = JS_PromiseResult(ctx, val);
-        print_jsvalue(ctx, res, JS_UNDEFINED, depth + 1, visited, output);
-        JS_FreeValue(ctx, res);
-    }
+    
+    dbuf_printf(buf, ANSI_CYAN "Promise" ANSI_RESET " { " ANSI_YELLOW "<%s>" ANSI_RESET " }", state_str);
 }
 
-static void print_jsbuffer(JSContext* ctx, JSValue val, int depth, DynBuf* output) {
-    size_t psize;
-    uint8_t* buf;
+static void format_typed_array(JSContext* ctx, JSValueConst val, int depth, DynBuf* buf) {
+    size_t size = 0;
+    uint8_t* data = NULL;
+    const char* type_name = "TypedArray";
+    
     if (JS_IsArrayBuffer(val)) {
-        buf = JS_GetArrayBuffer(ctx, &psize, val);
-        dbuf_printf(output, ANSI_MAGENTA "ArrayBuffer(" ANSI_BLUE "%zu" ANSI_MAGENTA ") {" ANSI_RESET, psize);
-
-        goto print_buffer;
-    }
-
-    if (JS_IsTypedArray(ctx, val)) {
-        buf = JS_GetUint8Array(ctx, &psize, val);
-
-        dbuf_printf(output, ANSI_MAGENTA "TypedArray(" ANSI_BLUE "%zu" ANSI_MAGENTA ")" ANSI_RESET " {", psize);
-
-print_buffer:
-        if (buf == NULL) {
-            dbuf_putstr(output, ANSI_RED "NULL" ANSI_RESET);
-            return;
-        }
-        const char* indent = getBlank(depth + 1);
-        size_t iend = MIN(psize, 128);
-        for (size_t i = 0; i < iend; i += 16) {
-            dbuf_printf(output, "\n%s", indent);
-            for (int j = 0; j < MIN(psize - i, 16); j++) {
-                dbuf_printf(output, ANSI_BLUE "%02x" ANSI_RESET, buf[i + j]);
-                if(i + j != iend -1) dbuf_putstr(output, ", ");
-            }
-        }
-
-        dbuf_printf(output, "\n%s}", indent + 4);
-
-        return;
-    }
-}
-
-// print JSValue like node.js/deno
-static void print_jsvalue(JSContext *ctx, JSValueConst val, JSValueConst prototype_of, int depth, JSValue visited[], DynBuf* output) {
-    if(depth == 64){        // max depth
-        dbuf_putstr(output, ANSI_RED "..." ANSI_RESET);
-        return;
-    }
-
-    // uninitialed?
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED){
-        dbuf_putstr(output, ANSI_RED "[val: NULL]" ANSI_RESET);
-        return;
-    }
-
-    // weakref?
-    if(JS_IsWeakRef(val)){
-        JSValue value = JS_GetWeakRefValue(ctx, val);
-        if(JS_IsUndefined(value)){
-            dbuf_putstr(output, ANSI_RED "WeakRef<destroyed>" ANSI_RESET);
-            return;
-        }else{
-            dbuf_putstr(output, ANSI_MAGENTA "WeakRef" ANSI_RESET " -> ");
-            val = value;
-			JS_FreeValue(ctx, value);	// will dup value after this
-            goto main;
-        }
-    }
-    // weakset and weakmap is not enumerable
-    if(JS_IsWeakSet(val) || JS_IsWeakMap(val)){
-        dbuf_putstr(output, JS_IsWeakMap(val) ? "WeakMap {}" : "WeakSet []");
-        return;
-    }
-    JS_DupValue(ctx, val); // dup value to avoid GC(eg. 0-ref String)
-
-main:
-    visited[depth] = val;   // record visited value
-    bool obj_showproto = true;
-
-    if (JS_IsUndefined(val)) {
-        dbuf_putstr(output, ANSI_BLUE "undefined" ANSI_RESET);
-    } else if (JS_IsNull(val)) {
-        dbuf_putstr(output, ANSI_BLUE "null" ANSI_RESET);
-    } else if (JS_IsBool(val)) {
-        dbuf_printf(output, ANSI_BOLD "%s" ANSI_RESET, JS_ToBool(ctx, val) ? "true" : "false");
-    } else if (JS_IsNumber(val)) {
-        double num;
-        if(-1 == JS_ToFloat64(ctx, &num, val))
-        dbuf_putstr(output, ANSI_CYAN "NaN" ANSI_RESET);
-        else
-            dbuf_printf(output, ANSI_CYAN "%g" ANSI_RESET, num);
-    } else if (JS_IsBigInt(val)) {
-        const char *str = JS_ToCString(ctx, val);
-        if(str){
-            dbuf_printf(output, ANSI_CYAN "%s" ANSI_RESET ANSI_GREEN "n" ANSI_RESET, str);
-            JS_FreeCString(ctx, str);
-        }else{
-            dbuf_putstr(output, ANSI_RED "BigInt" ANSI_RESET);
-        }
-    } else if (JS_IsString(val)) {
-        const char *str = JS_ToCString(ctx, val);
-        if(str){
-            if(depth == 0)
-                dbuf_putstr(output, str);
-            else
-                dbuf_printf(output, ANSI_GREEN "\"%s\"" ANSI_RESET, str);
-            JS_FreeCString(ctx, str);
-        }else{
-            dbuf_putstr(output, ANSI_RED "String" ANSI_RESET);
-        }
-    } else if (JS_IsFunction(ctx, val)) {
-        // constructor?
-        JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
-        const char *name_str = LJS_ToCString(ctx, name, NULL);
-        if(name_str){
-            if (JS_IsConstructor(ctx, val)){
-                dbuf_printf(output, ANSI_RED ANSI_ITALIC "f" ANSI_RESET ANSI_MAGENTA " class(" ANSI_RESET "%s" ANSI_MAGENTA ")" ANSI_RESET, name_str);
-                obj_showproto = false;
-            } else {
-                dbuf_printf(output, ANSI_RED ANSI_ITALIC "f" ANSI_RESET ANSI_MAGENTA " (" ANSI_RESET "%s" ANSI_MAGENTA ")" ANSI_RESET, name_str);
-            }
-            JS_FreeCString(ctx, name_str);
-        }else{
-            dbuf_putstr(output, ANSI_RED "Function" ANSI_RESET);
-        }
-        JS_FreeValue(ctx, name);
-
-        // Properites
-        JSPropertyEnum *props;
-        uint32_t prop_count;
-        if(-1 != JS_GetOwnPropertyNames(ctx, &props, &prop_count, val, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)){
-        //     dbuf_putstr(output, " {");
-        //     // meraure wrap first
-        //     bool wrap = false;
-        //     if(prop_count >= MAX_OBJECT_PROP_LEN) wrap = true;
-        //     else
-        //         for(uint32_t i = 0; i < prop_count; i++)
-        //             if(measure_wrap_disp2(ctx, JS_GetPropertyNoDup(ctx, val, props[i].atom), false))
-        //                 wrap = true;
-
-        //     const char* indent = getBlank(depth + 1);
-        //     if(wrap) dbuf_printf(output, "\n%s", indent);
-        //     for(uint32_t i = 0; i < MIN(prop_count, MAX_OBJECT_PROP_LEN); i++){
-        //         print_jsvalue(ctx, JS_GetPropertyNoDup(ctx, val, props[i].atom), val, depth + 1, visited, output);
-        //         if(i != prop_count - 1) dbuf_putstr(output, ", ");
-        //         if(i == MAX_OBJECT_PROP_LEN){
-        //             dbuf_printf(output, "\n%s...\n%s", indent, indent + 4);
-        //             break;
-        //         }else if(wrap){
-        //             if(i == MAX_OBJECT_PROP_LEN - 1) dbuf_printf(output, "\n%s", indent + 4);
-        //             else dbuf_printf(output, "\n%s", indent);
-        //         }
-        //     }
-            uint32_t pcount = 0;
-            static const JSAtom ignore_atom_list[] = {
-                JS_ATOM_length,
-                JS_ATOM_name,
-                JS_ATOM_prototype,
-                JS_ATOM_Symbol_species,
-                JS_ATOM_Symbol_toStringTag,
-                JS_ATOM_Symbol_toPrimitive,
-            };
-            for(uint32_t i = 0; i < prop_count; i++){
-                for(int j = 0; j < countof(ignore_atom_list); j++){
-                    if(props[i].atom == ignore_atom_list[j]) goto __function_break;
-                }
-                pcount++;
-__function_break:
-                continue;
-            }
-            JS_FreePropertyEnum(ctx, props, prop_count);
-            if(pcount > 0) goto obj_restart;
-        //     dbuf_printf(output, "%s}", indent - 4);
-        }
-    } else if (JS_IsSymbol(val)) {
-        JSAtom atom = JS_ValueToAtom(ctx, val);
-        const char* str = JS_AtomToCString(ctx, atom);
-        if(str && *str){
-            dbuf_printf(output, ANSI_MAGENTA "Symbol(" ANSI_RESET "%s" ANSI_MAGENTA ")" ANSI_RESET, str);
-            JS_FreeCString(ctx, str);
-        }else{
-            dbuf_putstr(output, ANSI_RED "Symbol" ANSI_RESET);
-        }
-        JS_FreeAtom(ctx, atom);
-    } else if (JS_IsArray(val) || JS_IsSet(val)) {
-        int64_t length;
-        if(-1 == JS_GetEnumerableLength(ctx, val, &length)){
-                dbuf_putstr(output, ANSI_RED "[]" ANSI_RESET);
-            goto end;
-        }
-
-        if(depth >= MAX_DEPTH || check_circular(ctx, val, visited, depth)){
-            dbuf_printf(output, ANSI_RED "ArrayLike(%ld)" ANSI_RESET, (long int)length); // 保留格式化输出
-            goto end;
-        }
-        
-        dbuf_putstr(output, ANSI_GREEN "[ " ANSI_RESET);
-        const char* indent = getBlank(depth + 1);
-        bool wrap_display = measure_wrap_disp2(ctx, val, false);
-        for (uint32_t i = 0; i < length; i++) {
-            if(i != 0) dbuf_putstr(output, ", ");
-            if(wrap_display)
-                dbuf_printf(output, "\n%s", indent);
-            
-            JSValue element = JS_GetPropertyUint32(ctx, val, i);
-            print_jsvalue(ctx, element, JS_UNDEFINED, depth + 1, visited, output);
-            JS_FreeValue(ctx, element);
-
-            if(i == MAX_OBJECT_PROP_LEN){
-                dbuf_printf(output, "\n%s...", indent);
-                break;
-            }
-        }
-        if(wrap_display) dbuf_printf(output, "\n%s", getBlank(depth));
-        dbuf_putstr(output, ANSI_GREEN " ]" ANSI_RESET);
-
-    end:
-        visited[depth] = JS_NULL;
-    } else if (JS_IsObject(val)) {
-        // Error
-        if(JS_IsError(val) && depth == 0){
-            print_jserror(ctx, val, depth, output);
-            goto end;
-        }
-
-        // Promise
-        if(JS_IsPromise(val)){
-            print_jspromise(ctx, val, depth, visited, output);
-            goto end;
-        }
-
-        // TypedArray or ArrayBuffer
-        if(JS_IsArrayBuffer(val) || JS_IsTypedArray(ctx, val)){
-            print_jsbuffer(ctx, val, depth, output);
-            goto end;
-        }
-
-        // cached_object
-        if(check_circular(ctx, val, visited, depth)){
-            dbuf_putstr(output, ANSI_RED "Object<CIRCULAR>" ANSI_RESET);
-            goto end;
-        }
-
-        // print class name
-        JSClassID class_id = JS_GetClassID(val);
-        if(JS_IsRegisteredClass(JS_GetRuntime(ctx), class_id)){
-            const char* class_name = getClassName(ctx, val);
-            if(NULL == class_name){
-                // toStringTag
-                JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
-                if(JS_IsString(tag)){
-                    const char* tag_str = JS_ToCString(ctx, tag);
-                    if(tag_str){
-                        dbuf_printf(output, ANSI_MAGENTA "%s" ANSI_RESET, tag_str);
-                        JS_FreeCString(ctx, tag_str);
-                        JS_FreeValue(ctx, tag);
-                        goto show_content;
-                    }
-                }
-                JS_FreeValue(ctx, tag);
-                dbuf_putstr(output, ANSI_MAGENTA "Object" ANSI_RESET);
-            }else{
-                dbuf_printf(output, ANSI_MAGENTA "%s" ANSI_RESET, class_name);
-                JS_FreeCString(ctx, class_name);
-            }
-            obj_showproto = false;
-        }
-
-show_content:;
-        JSValue proto_str;
-        // Symbol.toPrimitive
-        JSValue valtmp;
-        if(JS_IsFunction(ctx, valtmp = JS_GetPropertyNoDup(ctx, val, JS_ATOM_Symbol_toPrimitive))){
-            JSValue str = JS_NewString(ctx, "string");
-            proto_str = JS_Call(ctx, valtmp, val, 1, (JSValueConst[]){ str });
-            JS_FreeValue(ctx, str);
-        }
-
-        // toString?
-        else if(JS_IsFunction(ctx, valtmp = JS_GetPropertyNoDup(ctx, val, JS_ATOM_toString))){
-            proto_str = JS_Call(ctx, valtmp, val, 0, NULL);
-        }
-
-        // normal
-        else {
-            goto obj_restart;
-        }
-
-        if (JS_IsException(proto_str)) {
-            JS_ResetUncatchableError(ctx);
-        } else {
-            const char* proto_str_str = JS_ToCString(ctx, proto_str);
-            if (proto_str_str) {
-                if (memcmp("[object ", proto_str_str, 8) == 0) {
-                    JS_FreeCString(ctx, proto_str_str);
-                    JS_FreeValue(ctx, proto_str);
-                    goto obj_restart;
-                }
-                if (strlen(proto_str_str) > 100 || strchr(proto_str_str, '\n')) {
-                    dbuf_printf(output, "<<< \n%s\n<<<", proto_str_str);
-                }
-                else {
-                    dbuf_printf(output, "(" ANSI_GREEN " %s " ANSI_RESET ")", proto_str_str);
-                }
-                JS_FreeCString(ctx, proto_str_str);
-            }
-            else {
-                JS_FreeValue(ctx, proto_str);
-                goto obj_restart;
-            }
-
-            goto end1;
-        }
-        JS_FreeValue(ctx, proto_str);
-
-obj_restart:;
-        bool wrap_display = measure_wrap_disp2(ctx, val, obj_showproto);
-        // 读取对象键名
-        JSPropertyEnum *props;
-        uint32_t len;
-        if (-1 == JS_GetOwnPropertyNames(ctx, &props, &len, val, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_PRIVATE_MASK)) {
-            dbuf_putstr(output, ANSI_MAGENTA "Object()" ANSI_RESET);
-            goto end1;
-        }
-        
-        dbuf_putstr(output, ANSI_GREEN " { " ANSI_RESET);
-        const char* indent = getBlank(depth + 1);
-
-        JSValue getter_this = JS_IsUndefined(prototype_of) ? val : prototype_of;
-        for (int i = 0; i < len; i++) {
-            JSPropertyDescriptor desc;
-
-            if(props[i].atom == JS_ATOM_prototype || props[i].atom == JS_ATOM_Symbol_toStringTag){
-                continue;
-            }else if(props[i].atom == JS_ATOM_Symbol_species){
-                const char* cname = getClassName(ctx, val);
-                if(cname){
-                    if(wrap_display)
-                        dbuf_printf(output, ",\n%s" ANSI_RED ANSI_BOLD "[species]" ANSI_RESET ": " ANSI_MAGENTA "%s" ANSI_RESET, indent, cname);
-                    else
-                        dbuf_printf(output, ANSI_RED ", [species]" ANSI_RESET ": " ANSI_MAGENTA "%s" ANSI_RESET, cname);
-                    JS_FreeCString(ctx, cname);
-                }
-                continue;
-            }
-
-            if (-1 == JS_GetOwnProperty(ctx, &desc, val, props[i].atom)) {
-                continue;
-            }
-            
-            if(wrap_display) {
-                dbuf_printf(output, "\n%s", indent);
-            }
-
-            JSValue atom_val = JS_AtomToValue(ctx, props[i].atom);
-            const char *key_str = JS_AtomToCString(ctx, props[i].atom);
-            if(props[i].is_enumerable || !JS_IsSymbol(atom_val))
-                dbuf_printf(output, ANSI_YELLOW "%s" ANSI_RESET ": ", key_str);
-            else if(*key_str)
-                dbuf_printf(output, ANSI_RED "[" ANSI_RESET "%s" ANSI_RED "] " ANSI_RESET ": ", key_str);
-            else
-                dbuf_putstr(output, ANSI_RED "Symbol" ANSI_RESET ": ");
-            JS_FreeCString(ctx, key_str);
-            JS_FreeValue(ctx, atom_val);
-
-            if(desc.flags & JS_PROP_GETSET){
-                if(!JS_IsUndefined(desc.setter)){
-                    dbuf_putstr(output, ANSI_GREEN "set " ANSI_RESET);
-                    JS_FreeValue(ctx, desc.setter);
-                }
-                if(!JS_IsUndefined(desc.getter)){
-                    dbuf_putstr(output, ANSI_GREEN "get" ANSI_RESET);
-                    JSValue getres = JS_Call(ctx, desc.getter, getter_this, 0, NULL);
-
-                    if(JS_IsException(getres)){
-                        JS_ResetUncatchableError(ctx);
-                    }else{
-                        dbuf_putstr(output, "() => ");
-                        print_jsvalue(ctx, getres, JS_UNDEFINED, depth + 1, visited, output);
-                        JS_FreeValue(ctx, getres);
-                    }
-                    JS_FreeValue(ctx, desc.getter);
-                }
-            }else{
-                print_jsvalue(ctx, desc.value, JS_UNDEFINED, depth + 1, visited, output);
-                JS_FreeValue(ctx, desc.value);
-            }
-            
-            if ( i != len - 1 && !(i == len -2 && props[i+1].atom == JS_ATOM_prototype) ) dbuf_putstr(output, ", ");
-            if ( i == MAX_OBJECT_PROP_LEN ){
-                dbuf_printf(output, "\n%s...", indent);
-                break;
-            }
-        }
-
-        if (obj_showproto) {
-			JSClassID class_id = JS_GetClassID(val);
-
-			// Object id=1
-			// fixme: more stable way to judge invisible object?
-			if (class_id == 1){
-				goto shallow_show_proto;
-			}
-
-            JSValue proto = JS_GetPrototype(ctx, val);
-            // Not globalThis.Object and globalThis.Map
-            if (!JS_IsUndefined(proto) && !JS_IsNull(proto) && !JS_IsException(proto)) {
-                dbuf_printf(output, ",\n%s" ANSI_MAGENTA ANSI_BOLD "__proto__" ANSI_RESET ": ", indent);
-                print_jsvalue(ctx, proto, val, depth + 1, visited, output);
-            }
-            JS_FreeValue(ctx, proto);
-        } else {
-shallow_show_proto:;
-            // show get/set properties
-            JSPropertyEnum* prop;
-            uint32_t prop_count;
-            JSValue proto = JS_GetPrototype(ctx, val);
-            if (-1 != JS_GetOwnPropertyNames(ctx, &prop, &prop_count, proto, JS_GPN_STRING_MASK)) {
-                for (int j = 0; j < prop_count; j++) {
-                    if (prop[j].atom == JS_ATOM_constructor || prop[j].atom == JS_ATOM___proto__) continue;
-                    JSPropertyDescriptor desc;
-                    if (-1 != JS_GetOwnProperty(ctx, &desc, proto, prop[j].atom)) {
-                        if (desc.flags & JS_PROP_GETSET) {
-                            if (JS_IsFunction(ctx, desc.getter)) {
-                                // call getter
-                                JSValue getres = JS_Call(ctx, desc.getter, getter_this, 0, NULL);
-                                const char* key_str = JS_AtomToCString(ctx, prop[j].atom);
-                                if (!JS_IsException(getres)) {
-                                    if (wrap_display)
-                                        dbuf_printf(output, ",\n%s" ANSI_MAGENTA "%s" ANSI_RESET ": ", indent, key_str ? key_str : "");
-                                    else
-                                        dbuf_printf(output, ANSI_MAGENTA ", %s" ANSI_RESET ": ", key_str ? key_str : "");
-                                    print_jsvalue(ctx, getres, JS_UNDEFINED, depth + 1, visited, output);
-                                }
-                                if (key_str) JS_FreeCString(ctx, key_str);
-                                JS_FreeValue(ctx, getres);
-                            }
-                            JS_FreeValue(ctx, desc.getter);
-                            JS_FreeValue(ctx, desc.setter);
-                        } else {
-                            JS_FreeValue(ctx, desc.value);
-                        }
-                    }
-                }
-                JS_FreePropertyEnum(ctx, prop, prop_count);
-            }
-            JS_FreeValue(ctx, proto);
-        }
-
-// skip_proto:
-        if(wrap_display) {
-            dbuf_printf(output, "\n%s", indent + 4);
-        } else {
-            dbuf_putstr(output, " ");
-        }
-
-        dbuf_putstr(output, ANSI_GREEN "}" ANSI_RESET);
-        JS_FreePropertyEnum(ctx, props, len);
-
-end1:
-        visited[depth] = JS_NULL;
+        data = JS_GetArrayBuffer(ctx, &size, val);
+        type_name = "ArrayBuffer";
     } else {
-        dbuf_printf(output, ANSI_RED "[value: %d]" ANSI_RESET, JS_VALUE_GET_TAG(val));
+        data = JS_GetUint8Array(ctx, &size, val);
     }
-
-    JS_FreeValue(ctx, val);
+    
+    dbuf_printf(buf, ANSI_MAGENTA "%s" ANSI_RESET "(%zu) [", type_name, size);
+    
+    size_t display_size = size > MAX_BUFFER_DISPLAY ? MAX_BUFFER_DISPLAY : size;
+    for (size_t i = 0; i < display_size; i++) {
+        if (i > 0) dbuf_putstr(buf, " ");
+        dbuf_printf(buf, "%02x", data[i]);
+    }
+    
+    if (size > MAX_BUFFER_DISPLAY) {
+        dbuf_printf(buf, " ... %zu more bytes", size - MAX_BUFFER_DISPLAY);
+    }
+    
+    dbuf_putstr(buf, " ]");
 }
 
-static inline void printval_internal(JSContext *ctx, int argc, JSValueConst *argv, FILE *target_fd) {
-    static JSValue visited[64];
-    bool wrap = false;
+/* Main formatting function */
+static void format_value(JSContext* ctx, JSValueConst val, int depth, 
+                        JSValue visited[], DynBuf* buf, bool in_container) {
+    if (depth >= MAX_DEPTH) {
+        dbuf_putstr(buf, ANSI_RED "[Max depth]" ANSI_RESET);
+        return;
+    }
+    
+    /* Primitives */
+    if (JS_IsUndefined(val)) {
+        dbuf_putstr(buf, ANSI_GRAY "undefined" ANSI_RESET);
+    } else if (JS_IsNull(val)) {
+        dbuf_putstr(buf, ANSI_BOLD "null" ANSI_RESET);
+    } else if (JS_IsBool(val)) {
+        dbuf_printf(buf, ANSI_YELLOW "%s" ANSI_RESET, JS_ToBool(ctx, val) ? "true" : "false");
+    } else if (JS_IsNumber(val)) {
+        format_number(ctx, val, buf);
+    } else if (JS_IsBigInt(val)) {
+        const char* str = JS_ToCString(ctx, val);
+        dbuf_printf(buf, ANSI_YELLOW "%sn" ANSI_RESET, str ? str : "0");
+        if (str) JS_FreeCString(ctx, str);
+    } else if (JS_IsString(val)) {
+        format_string(ctx, val, buf, in_container);
+    } else if (JS_IsSymbol(val)) {
+        format_symbol(ctx, val, buf);
+    } else if (JS_IsFunction(ctx, val)) {
+        format_function(ctx, val, buf);
+    } 
+    /* Special objects */
+    else if (JS_IsError(val)) {
+        format_error(ctx, val, depth, buf);
+    } else if (JS_IsPromise(val)) {
+        format_promise(ctx, val, buf);
+    } else if (JS_IsArrayBuffer(val) || JS_GetTypedArrayType(val) != -1) {
+        format_typed_array(ctx, val, depth, buf);
+    } else if (JS_IsArray(val)) {
+        format_array(ctx, val, depth, visited, buf);
+    } else if (JS_IsObject(val)) {
+        format_object(ctx, val, depth, visited, buf);
+    } else {
+        dbuf_putstr(buf, ANSI_RED "[Unknown]" ANSI_RESET);
+    }
+}
 
-	if(feof(target_fd)) return;
-
-    for(int i = 0; i < argc; i++){
-        if(measure_wrap_disp2(ctx, argv[i], true)){
-            wrap = true;
-            break;
+/* Table formatting helper */
+static void format_table_value(JSContext* ctx, JSValueConst val, DynBuf* buf, size_t max_width) {
+    JSValue visited[MAX_DEPTH];
+    DynBuf temp;
+    dbuf_init2(&temp, JS_GetRuntime(ctx), console_realloc);
+    
+    format_value(ctx, val, 0, visited, &temp, true);
+    
+    /* Truncate if too long */
+    size_t len = temp.size;
+    if (len > max_width) {
+        len = max_width - 3;
+        dbuf_put(buf, temp.buf, len);
+        dbuf_putstr(buf, "...");
+    } else {
+        dbuf_put(buf, temp.buf, len);
+        /* Pad with spaces */
+        for (size_t i = len; i < max_width; i++) {
+            dbuf_putc(buf, ' ');
         }
     }
-    DynBuf output;
-    dbuf_init2(&output, JS_GetRuntime(ctx), dalloc);
-    for(int i = 0; i < argc; i++){
-        JSValue val = argv[i];    
-        print_jsvalue(ctx, val, JS_UNDEFINED, 0, visited, &output);
-        if(JS_IsObject(val)) dbuf_putc(&output, ' ');
-        if(wrap) dbuf_putc(&output, '\n');
-        else dbuf_putc(&output, ' ');
-    }
-    dbuf_putc(&output, '\n');
-	fwrite(output.buf, 1, output.size, target_fd);
-    dbuf_free(&output);
+    
+    dbuf_free(&temp);
 }
 
-// console.log 实现
-static JSValue js_console_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    printval_internal(ctx, argc, argv, stdout);
+/* Console API implementations */
+static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, 
+                              int argc, JSValueConst* argv) {
+    if (argc == 0) {
+        printf("\n");
+        return JS_UNDEFINED;
+    }
+    
+    JSValue visited[MAX_DEPTH];
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_putc(&buf, ' ');
+        format_value(ctx, argv[i], 0, visited, &buf, false);
+    }
+    
+    dbuf_putc(&buf, '\n');
+    fwrite(buf.buf, 1, buf.size, stdout);
+    fflush(stdout);
+    
+    dbuf_free(&buf);
     return JS_UNDEFINED;
 }
 
-// // console.error 实现
-// static JSValue js_console_error(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     fwrite(pstderr, ANSI_RED " error " ANSI_RESET);
-//     printval_internal(ctx, argc, argv, pstderr);
-//     return JS_UNDEFINED;
-// }
-
-// // console.info 实现
-// static JSValue js_console_info(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     print2(pstdout, ANSI_BLUE " info " ANSI_RESET);
-//     printval_internal(ctx, argc, argv, pstdout);
-//     return JS_UNDEFINED;
-// }
-
-// // console.debug 实现
-// static JSValue js_console_debug(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     if(getenv("DEBUG") == NULL){
-//         return JS_UNDEFINED;
-//     }
+static JSValue js_console_error(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+    if (argc == 0) {
+        fprintf(stderr, "\n");
+        return JS_UNDEFINED;
+    }
     
-//     ev_printf(pstdout, ANSI_WHITE " debug " ANSI_RESET);
-//     printval_internal(ctx, argc, argv, pstdout);
-//     return JS_UNDEFINED;
-// }
+    JSValue visited[MAX_DEPTH];
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_putc(&buf, ' ');
+        format_value(ctx, argv[i], 0, visited, &buf, false);
+    }
+    
+    dbuf_putc(&buf, '\n');
+    fwrite(buf.buf, 1, buf.size, stderr);
+    fflush(stderr);
+    
+    dbuf_free(&buf);
+    return JS_UNDEFINED;
+}
 
-// // console.assert 实现
-// static JSValue js_console_assert(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     if(argc < 2){
-//         return LJS_Throw(ctx, EXCEPTION_TYPEERROR, "Assertion failed: at least 2 arguments required, but only %d present", 
-//             "console.assert(condition: any, ...)" , argc);
-//     }
+static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val,
+                               int argc, JSValueConst* argv) {
+    if (argc == 0) {
+        printf(ANSI_YELLOW "Warning\n" ANSI_RESET);
+        return JS_UNDEFINED;
+    }
+    
+    JSValue visited[MAX_DEPTH];
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    dbuf_putstr(&buf, ANSI_YELLOW);
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_putc(&buf, ' ');
+        format_value(ctx, argv[i], 0, visited, &buf, false);
+    }
+    dbuf_putstr(&buf, ANSI_RESET);
+    
+    dbuf_putc(&buf, '\n');
+    fwrite(buf.buf, 1, buf.size, stdout);
+    fflush(stdout);
+    
+    dbuf_free(&buf);
+    return JS_UNDEFINED;
+}
 
-//     if (!JS_ToBool(ctx, argv[0])) {
-//         ev_printf(pstderr, ANSI_RED " assert " ANSI_RESET);
-//         printval_internal(ctx, argc - 1, argv + 1, pstderr);
-//     }
-//     return JS_UNDEFINED;
-// }
+static JSValue js_console_info(JSContext* ctx, JSValueConst this_val,
+                               int argc, JSValueConst* argv) {
+    return js_console_log(ctx, this_val, argc, argv);
+}
 
-// // console.warn 实现
-// static JSValue js_console_warn(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     ev_printf(pstdout, ANSI_YELLOW " warn " ANSI_RESET);
-//     printval_internal(ctx, argc, argv, pstdout);
-//     return JS_UNDEFINED;
-// }
+static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+    if (getenv("DEBUG") == NULL) {
+        return JS_UNDEFINED;
+    }
+    return js_console_log(ctx, this_val, argc, argv);
+}
 
-// // console.clear 实现
-// static JSValue js_console_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-//     ev_printf(pstdout, "\033[2J\033[1;1H");
-//     return JS_UNDEFINED;
-// }
+/* Console.table implementation */
+static JSValue js_console_table(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+    if (argc == 0) {
+        return JS_UNDEFINED;
+    }
+    
+    JSValueConst data = argv[0];
+    
+    /* Only handle arrays and objects */
+    if (!JS_IsArray(data) && !JS_IsObject(data)) {
+        return js_console_log(ctx, this_val, argc, argv);
+    }
+    
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    /* Get columns to display */
+    JSPropertyEnum* cols = NULL;
+    uint32_t col_count = 0;
+    const char** col_names = NULL;
+    size_t* col_widths = NULL;
+    
+    if (JS_IsArray(data)) {
+        /* Array of objects */
+        int64_t len = 0;
+        JSValue len_val = JS_GetProperty(ctx, data, JS_ATOM_length);
+        JS_ToInt64(ctx, &len, len_val);
+        JS_FreeValue(ctx, len_val);
+        
+        if (len == 0 || len > MAX_TABLE_ROWS) {
+            dbuf_putstr(&buf, "Table too large or empty\n");
+            goto end;
+        }
+        
+        /* Get columns from first object */
+        JSValue first = JS_GetPropertyUint32(ctx, data, 0);
+        if (JS_IsObject(first)) {
+            JS_GetOwnPropertyNames(ctx, &cols, &col_count, first,
+                                  JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
+            if (col_count > MAX_TABLE_COLS) col_count = MAX_TABLE_COLS;
+        }
+        JS_FreeValue(ctx, first);
+        
+        if (col_count == 0) {
+            dbuf_putstr(&buf, "No columns found\n");
+            goto end;
+        }
+        
+        /* Allocate column info */
+        col_names = js_malloc(ctx, sizeof(char*) * (col_count + 1));
+        col_widths = js_malloc(ctx, sizeof(size_t) * (col_count + 1));
+        
+        /* Index column */
+        col_names[0] = "(index)";
+        col_widths[0] = strlen(col_names[0]);
+        
+        /* Data columns */
+        for (uint32_t i = 0; i < col_count; i++) {
+            col_names[i + 1] = JS_AtomToCString(ctx, cols[i].atom);
+            col_widths[i + 1] = strlen(col_names[i + 1]);
+        }
+        
+        /* Calculate column widths */
+        for (int64_t row = 0; row < len; row++) {
+            JSValue row_obj = JS_GetPropertyUint32(ctx, data, row);
+            if (!JS_IsObject(row_obj)) {
+                JS_FreeValue(ctx, row_obj);
+                continue;
+            }
+            
+            for (uint32_t col = 0; col < col_count; col++) {
+                JSValue cell = JS_GetProperty(ctx, row_obj, cols[col].atom);
+                
+                DynBuf cell_buf;
+                dbuf_init2(&cell_buf, JS_GetRuntime(ctx), console_realloc);
+                JSValue visited[MAX_DEPTH];
+                format_value(ctx, cell, 0, visited, &cell_buf, true);
+                
+                if (cell_buf.size > col_widths[col + 1]) {
+                    col_widths[col + 1] = cell_buf.size;
+                    if (col_widths[col + 1] > 50) col_widths[col + 1] = 50;
+                }
+                
+                dbuf_free(&cell_buf);
+                JS_FreeValue(ctx, cell);
+            }
+            JS_FreeValue(ctx, row_obj);
+        }
+        
+        /* Print header separator */
+        dbuf_putstr(&buf, "┌─");
+        for (uint32_t i = 0; i <= col_count; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < col_count) dbuf_putstr(&buf, "─┬─");
+        }
+        dbuf_putstr(&buf, "─┐\n");
+        
+        /* Print header */
+        dbuf_putstr(&buf, "│ ");
+        for (uint32_t i = 0; i <= col_count; i++) {
+            dbuf_printf(&buf, ANSI_BOLD "%s" ANSI_RESET, col_names[i]);
+            size_t name_len = strlen(col_names[i]);
+            for (size_t j = name_len; j < col_widths[i]; j++) dbuf_putc(&buf, ' ');
+            if (i < col_count) dbuf_putstr(&buf, " │ ");
+        }
+        dbuf_putstr(&buf, " │\n");
+        
+        /* Print separator */
+        dbuf_putstr(&buf, "├─");
+        for (uint32_t i = 0; i <= col_count; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < col_count) dbuf_putstr(&buf, "─┼─");
+        }
+        dbuf_putstr(&buf, "─┤\n");
+        
+        /* Print rows */
+        for (int64_t row = 0; row < len && row < MAX_TABLE_ROWS; row++) {
+            dbuf_putstr(&buf, "│ ");
+            
+            /* Index column */
+            dbuf_printf(&buf, ANSI_GRAY "%lld" ANSI_RESET, (long long)row);
+            size_t idx_len = snprintf(NULL, 0, "%lld", (long long)row);
+            for (size_t j = idx_len; j < col_widths[0]; j++) dbuf_putc(&buf, ' ');
+            dbuf_putstr(&buf, " │ ");
+            
+            /* Data columns */
+            JSValue row_obj = JS_GetPropertyUint32(ctx, data, row);
+            for (uint32_t col = 0; col < col_count; col++) {
+                JSValue cell = JS_GetProperty(ctx, row_obj, cols[col].atom);
+                format_table_value(ctx, cell, &buf, col_widths[col + 1]);
+                JS_FreeValue(ctx, cell);
+                if (col < col_count - 1) dbuf_putstr(&buf, " │ ");
+            }
+            JS_FreeValue(ctx, row_obj);
+            
+            dbuf_putstr(&buf, " │\n");
+        }
+        
+        /* Print footer */
+        dbuf_putstr(&buf, "└─");
+        for (uint32_t i = 0; i <= col_count; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < col_count) dbuf_putstr(&buf, "─┴─");
+        }
+        dbuf_putstr(&buf, "─┘\n");
+        
+    } else {
+        /* Single object - show key-value pairs */
+        JS_GetOwnPropertyNames(ctx, &cols, &col_count, data,
+                              JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
+        
+        if (col_count == 0 || col_count > MAX_TABLE_ROWS) {
+            dbuf_putstr(&buf, "Table too large or empty\n");
+            goto end;
+        }
+        
+        col_names = js_malloc(ctx, sizeof(char*) * 2);
+        col_widths = js_malloc(ctx, sizeof(size_t) * 2);
+        
+        col_names[0] = "(index)";
+        col_names[1] = "Values";
+        col_widths[0] = strlen(col_names[0]);
+        col_widths[1] = strlen(col_names[1]);
+        
+        /* Calculate widths */
+        for (uint32_t i = 0; i < col_count; i++) {
+            const char* key = JS_AtomToCString(ctx, cols[i].atom);
+            size_t key_len = strlen(key);
+            if (key_len > col_widths[0]) col_widths[0] = key_len;
+            JS_FreeCString(ctx, key);
+            
+            JSValue val = JS_GetProperty(ctx, data, cols[i].atom);
+            DynBuf val_buf;
+            dbuf_init2(&val_buf, JS_GetRuntime(ctx), console_realloc);
+            JSValue visited[MAX_DEPTH];
+            format_value(ctx, val, 0, visited, &val_buf, true);
+            if (val_buf.size > col_widths[1]) {
+                col_widths[1] = val_buf.size;
+                if (col_widths[1] > 50) col_widths[1] = 50;
+            }
+            dbuf_free(&val_buf);
+            JS_FreeValue(ctx, val);
+        }
+        
+        /* Print table */
+        dbuf_putstr(&buf, "┌─");
+        for (int i = 0; i < 2; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < 1) dbuf_putstr(&buf, "─┬─");
+        }
+        dbuf_putstr(&buf, "─┐\n");
+        
+        dbuf_putstr(&buf, "│ ");
+        for (int i = 0; i < 2; i++) {
+            dbuf_printf(&buf, ANSI_BOLD "%s" ANSI_RESET, col_names[i]);
+            size_t name_len = strlen(col_names[i]);
+            for (size_t j = name_len; j < col_widths[i]; j++) dbuf_putc(&buf, ' ');
+            if (i < 1) dbuf_putstr(&buf, " │ ");
+        }
+        dbuf_putstr(&buf, " │\n");
+        
+        dbuf_putstr(&buf, "├─");
+        for (int i = 0; i < 2; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < 1) dbuf_putstr(&buf, "─┼─");
+        }
+        dbuf_putstr(&buf, "─┤\n");
+        
+        for (uint32_t i = 0; i < col_count; i++) {
+            dbuf_putstr(&buf, "│ ");
+            
+            const char* key = JS_AtomToCString(ctx, cols[i].atom);
+            dbuf_printf(&buf, ANSI_CYAN "%s" ANSI_RESET, key);
+            size_t key_len = strlen(key);
+            for (size_t j = key_len; j < col_widths[0]; j++) dbuf_putc(&buf, ' ');
+            JS_FreeCString(ctx, key);
+            
+            dbuf_putstr(&buf, " │ ");
+            
+            JSValue val = JS_GetProperty(ctx, data, cols[i].atom);
+            format_table_value(ctx, val, &buf, col_widths[1]);
+            JS_FreeValue(ctx, val);
+            
+            dbuf_putstr(&buf, " │\n");
+        }
+        
+        dbuf_putstr(&buf, "└─");
+        for (int i = 0; i < 2; i++) {
+            for (size_t j = 0; j < col_widths[i]; j++) dbuf_putstr(&buf, "─");
+            if (i < 1) dbuf_putstr(&buf, "─┴─");
+        }
+        dbuf_putstr(&buf, "─┘\n");
+    }
+    
+end:
+    if (cols) JS_FreePropertyEnum(ctx, cols, col_count);
+    if (col_names) {
+        for (uint32_t i = 1; i < col_count + 1 && col_names[i]; i++) {
+            JS_FreeCString(ctx, col_names[i]);
+        }
+        js_free(ctx, col_names);
+    }
+    if (col_widths) js_free(ctx, col_widths);
+    
+    fwrite(buf.buf, 1, buf.size, stdout);
+    fflush(stdout);
+    dbuf_free(&buf);
+    
+    return JS_UNDEFINED;
+}
 
-// static const JSCFunctionListEntry console_funcs[] = {
-//     JS_CFUNC_DEF("log", 1, js_console_log),
-//     JS_CFUNC_DEF("error", 1, js_console_error),
-//     JS_CFUNC_DEF("info", 1, js_console_info),
-//     JS_CFUNC_DEF("debug", 1, js_console_debug),
-//     JS_CFUNC_DEF("assert", 2, js_console_assert),
-//     JS_CFUNC_DEF("warn", 1, js_console_warn),
-//     JS_CFUNC_DEF("clear", 0, js_console_clear),
-// };
+static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val,
+                                 int argc, JSValueConst* argv) {
+    if (argc == 0 || !JS_ToBool(ctx, argv[0])) {
+        fprintf(stderr, ANSI_RED "Assertion failed" ANSI_RESET);
+        if (argc > 1) {
+            fprintf(stderr, ": ");
+            js_console_error(ctx, this_val, argc - 1, argv + 1);
+        } else {
+            fprintf(stderr, "\n");
+        }
+    }
+    return JS_UNDEFINED;
+}
 
-void tjs__mod_console_init(JSContext *ctx) {
-    // JSValue console = JS_NewObject(ctx);
-    JSValue global = JS_GetGlobalObject(ctx);
-    // JS_SetPropertyFunctionList(ctx, console, console_funcs, countof(console_funcs));
-    // JS_DefinePropertyValueStr(ctx, global, "console", console, JS_PROP_C_W_E);
-    // JS_FreeValue(ctx, global);
-	JSValue jsprint = JS_NewCFunction(ctx, js_console_log, "print", 1);
-	JS_SetPropertyStr(ctx, global, "print", jsprint);
-	JS_FreeValue(ctx, global);
+static JSValue js_console_clear(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+    printf("\033[2J\033[H");
+    fflush(stdout);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val,
+                              int argc, JSValueConst* argv) {
+    if (argc == 0) return JS_UNDEFINED;
+    
+    JSValue visited[MAX_DEPTH];
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    /* Always show full object structure */
+    format_value(ctx, argv[0], 0, visited, &buf, false);
+    
+    dbuf_putc(&buf, '\n');
+    fwrite(buf.buf, 1, buf.size, stdout);
+    fflush(stdout);
+    
+    dbuf_free(&buf);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+    printf(ANSI_GRAY "Trace" ANSI_RESET);
+    
+    if (argc > 0) {
+        printf(": ");
+        js_console_log(ctx, this_val, argc, argv);
+    } else {
+        printf("\n");
+    }
+    
+    /* Print stack trace */
+    JSValue error = JS_NewError(ctx);
+    JSValue stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
+    
+    if (JS_IsString(stack)) {
+        const char* stack_str = JS_ToCString(ctx, stack);
+        if (stack_str) {
+            printf("%s\n", stack_str);
+            JS_FreeCString(ctx, stack_str);
+        }
+    }
+    
+    JS_FreeValue(ctx, stack);
+    JS_FreeValue(ctx, error);
+    
+    return JS_UNDEFINED;
+}
+
+static inline JSValue tjs_get_t_cache(JSContext* ctx, JSValue symbol, JSAtom* atom){
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+    
+    *atom = JS_ATOM_default;
+    if (JS_IsString(symbol)) {
+        *atom = JS_ValueToAtom(ctx, symbol);
+    }
+    
+	JSValue val = JS_GetProperty(ctx, trt->console_time, *atom);
+	if (JS_IsUndefined(val)){
+		val = JS_NewInt32(ctx, 0);
+	}
+
+	return val;
+}
+
+static inline void tjs_set_t_cache(JSContext* ctx, JSAtom atom, JSValue val){
+	JS_SetProperty(ctx, TJS_GetRuntime(ctx)->console_time, atom, val);
+}
+
+static JSValue js_console_count(JSContext* ctx, JSValueConst this_val,
+                                int argc, JSValueConst* argv) {
+
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+    JSAtom atom = JS_ATOM_default;
+	JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+
+    if (JS_IsString(symbol)) {
+        atom = JS_ValueToAtom(ctx, symbol);
+    }
+    
+	JSValue val = JS_GetProperty(ctx, trt->console_count, atom);
+	if (JS_IsUndefined(val)) val = JS_MKVAL(JS_TAG_INT, 1);
+	else val.u.int32++;
+	JS_SetProperty(ctx, trt->console_count, atom, val);
+
+	const char* label = JS_AtomToCString(ctx, atom);
+	printf(ANSI_GRAY "count '%s'" ANSI_BLUE " %d\n", label ? label : "default", val.u.int32);
+	if(label) JS_FreeCString(ctx, label);
+
+	JS_FreeAtom(ctx, atom);
+	JS_FreeValue(ctx, val);	// maybe not necessary
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_countReset(JSContext* ctx, JSValueConst this_val,
+                                     int argc, JSValueConst* argv) {
+    TJSRuntime* trt = TJS_GetRuntime(ctx);
+    JSAtom atom = JS_ATOM_default;
+    JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+
+    if (JS_IsString(symbol)) {
+        atom = JS_ValueToAtom(ctx, symbol);
+    }
+
+    JSValue val = JS_NewInt32(ctx, 0);
+    JS_SetProperty(ctx, trt->console_count, atom, val);
+
+    const char* label = JS_AtomToCString(ctx, atom);
+    printf(ANSI_GRAY "countReset '%s'" ANSI_BLUE " %d\n", 
+           label ? label : "default", val.u.int32);
+    
+    if (label) {
+        JS_FreeCString(ctx, label);
+    }
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, val);
+
+    return JS_UNDEFINED;
+}
+
+
+static JSValue js_console_time(JSContext* ctx, JSValueConst this_val,
+                               int argc, JSValueConst* argv) {
+    JSAtom atom = JS_ATOM_default;
+	JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+	const char* label = NULL;
+
+    if (JS_IsString(symbol)) {
+        atom = JS_ValueToAtom(ctx, symbol);
+		label = JS_ToCString(ctx, symbol);
+    }
+
+	JSValue val = tjs_get_t_cache(ctx, symbol, &atom);
+	size_t prevclk;
+	size_t clk = clock();
+	if (-1 == JS_ToBigUint64(ctx, &prevclk, val)){
+		prevclk = clock();
+		tjs_set_t_cache(ctx, atom, JS_NewBigUint64(ctx, prevclk));
+	}
+    
+	size_t diff_ms = (clk - prevclk) * 1000 / CLOCKS_PER_SEC;
+    printf(ANSI_GRAY "Timer '%s' " ANSI_BLUE " %ldms" ANSI_RESET "\n", label ? label : "default", diff_ms);
+    
+	if (label) {
+		JS_FreeCString(ctx, label);
+		JS_FreeAtom(ctx, atom);
+	}
+    JS_FreeValue(ctx, val);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_timeEnd(JSContext* ctx, JSValueConst this_val,
+                                  int argc, JSValueConst* argv) {
+    JSAtom atom = JS_ATOM_default;
+    JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+    const char* label = NULL;
+
+    if (JS_IsString(symbol)) {
+        atom = JS_ValueToAtom(ctx, symbol);
+        label = JS_ToCString(ctx, symbol);
+    }
+    JSValue val = tjs_get_t_cache(ctx, symbol, &atom);
+    size_t start_clk;
+    if (-1 == JS_ToBigUint64(ctx, &start_clk, val)) {
+        if (label) {
+            JS_FreeCString(ctx, label);
+            JS_FreeAtom(ctx, atom);
+        }
+        return JS_UNDEFINED;
+    }
+
+    size_t end_clk = clock();
+    size_t diff_ms = (end_clk - start_clk) * 1000 / CLOCKS_PER_SEC;
+    printf(ANSI_GRAY "Timer '%s' " ANSI_BLUE " %ldms" ANSI_RESET "\n", 
+           label ? label : "default", diff_ms);
+
+    tjs_set_t_cache(ctx, atom, JS_UNDEFINED);
+
+    if (label) {
+        JS_FreeCString(ctx, label);
+        JS_FreeAtom(ctx, atom);
+    }
+    JS_FreeValue(ctx, val);
+    
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_timeLog(JSContext* ctx, JSValueConst this_val,
+                                 int argc, JSValueConst* argv) {
+    // TJSRuntime* trt = TJS_GetRuntime(ctx);
+    JSAtom atom = JS_ATOM_default;
+    JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+    const char* label = NULL;
+
+    if (JS_IsString(symbol)) {
+        atom = JS_ValueToAtom(ctx, symbol);
+        label = JS_ToCString(ctx, symbol);
+    }
+
+    JSValue val = tjs_get_t_cache(ctx, symbol, &atom);
+    size_t start_clk;
+    if (-1 == JS_ToBigUint64(ctx, &start_clk, val)) {
+        if (label) {
+            JS_FreeCString(ctx, label);
+            JS_FreeAtom(ctx, atom);
+        }
+        return JS_UNDEFINED;
+    }
+
+    size_t current_clk = clock();
+    size_t diff_ms = (current_clk - start_clk) * 1000 / CLOCKS_PER_SEC;
+    printf(ANSI_GRAY "Timer '%s' " ANSI_BLUE " %ldms  " ANSI_RESET, 
+           label ? label : "default", diff_ms);
+    
+    if (argc > 1) {
+        printf(":");
+		js_console_log(ctx, this_val, argc - 1, argv + 1);
+    }
+    printf("\n");
+
+    if (label) {
+        JS_FreeCString(ctx, label);
+        JS_FreeAtom(ctx, atom);
+    }
+    JS_FreeValue(ctx, val);
+    
+    return JS_UNDEFINED;
+}
+static JSValue js_console_timeStamp(JSContext* ctx, JSValueConst this_val,
+                                   int argc, JSValueConst* argv) {
+    const char* label = NULL;
+    JSValue symbol = argc == 0 ? JS_UNDEFINED : argv[0];
+
+    if (JS_IsString(symbol)) {
+        label = JS_ToCString(ctx, symbol);
+    }
+
+    uv_timeval64_t tv;
+    uv_gettimeofday(&tv);
+    time_t now = tv.tv_sec;
+    struct tm* tm_info = localtime(&now);
+    char time_str[20];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf(ANSI_GRAY "Timestamp '%s' " ANSI_BLUE " %s.%03ld" ANSI_RESET "\n",
+           label ? label : "default", time_str, tv.tv_sec * 1000 + tv.tv_usec / 1000);
+
+    if (label) {
+        JS_FreeCString(ctx, label);
+    }
+    
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry console_funcs[] = {
+    JS_CFUNC_DEF("log", 1, js_console_log),
+    JS_CFUNC_DEF("error", 1, js_console_error),
+    JS_CFUNC_DEF("warn", 1, js_console_warn),
+    JS_CFUNC_DEF("info", 1, js_console_info),
+    JS_CFUNC_DEF("debug", 1, js_console_debug),
+    JS_CFUNC_DEF("assert", 2, js_console_assert),
+    JS_CFUNC_DEF("clear", 0, js_console_clear),
+    JS_CFUNC_DEF("dir", 1, js_console_dir),
+    JS_CFUNC_DEF("table", 1, js_console_table),
+    JS_CFUNC_DEF("trace", 0, js_console_trace),
+    JS_CFUNC_DEF("count", 0, js_console_count),
+	JS_CFUNC_DEF("countReset", 0, js_console_countReset),
+    JS_CFUNC_DEF("time", 0, js_console_time),
+    JS_CFUNC_DEF("timeEnd", 0, js_console_timeEnd),
+	JS_CFUNC_DEF("timeLog", 0, js_console_timeLog),
+	JS_CFUNC_DEF("timeStamp", 0, js_console_timeStamp),
+};
+
+/* Module initialization */
+void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
+    /* Create console object */
+    JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }

@@ -1311,6 +1311,7 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     int r = uv_queue_work(tjs_get_loop(ctx), &fr->req, tjs__readfile_work_cb, tjs__readfile_after_work_cb);
     if (r != 0) {
         js_free(ctx, fr->filename);
+		dbuf_free(&fr->dbuf);
         js_free(ctx, fr);
         return tjs_throw_errno(ctx, r);
     }

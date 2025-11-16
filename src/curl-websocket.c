@@ -636,7 +636,7 @@ _cws_dispatch(struct cws_data *priv)
         if (priv->recv.current.used >= sizeof(uint16_t)) {
             uint16_t r;
             memcpy(&r, priv->recv.current.payload, sizeof(uint16_t));
-            ntoh(&r, sizeof(r));
+            _cws_ntoh(&r, sizeof(r));
             if (!cws_close_reason_is_valid(r)) {
                 cws_close(priv->easy, CWS_CLOSE_REASON_PROTOCOL_ERROR, "invalid close reason", SIZE_MAX);
                 r = CWS_CLOSE_REASON_PROTOCOL_ERROR;

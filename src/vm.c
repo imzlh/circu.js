@@ -117,6 +117,7 @@ struct TJSModule {
 
 static const struct TJSModule tjs_modules[] = {
 	{ "algorithm", tjs__mod_algorithm_init },
+	{ "console", tjs__mod_console_init },
 	{ "dns", tjs__mod_dns_init },
 	{ "engine", tjs__mod_engine_init },
 	{ "error", tjs__mod_error_init },
@@ -139,6 +140,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "worker", tjs__mod_worker_init },
 	{ "ws", tjs__mod_ws_init },
 	{ "xhr", tjs__mod_xhr_init },
+	{ "zlib", tjs__mod_zlib_init },
 #ifndef _WIN32
 	{ "posix_socket", tjs__mod_posix_socket_init },
 	{ "posix_ffi", tjs__mod_posix_ffi_init },
@@ -206,17 +208,7 @@ static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue d
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
 							JSValueConst promise, JSValueConst parent_promise,
 							void* opaque) {
-	TJSRuntime *qrt = TJS_GetRuntime(ctx);
-	switch (type){
-		case JS_PROMISE_HOOK_INIT:
-			// save stack trace for unhandled rejections
-			JS_BuildPromiseStack(ctx, promise);
-		break;
-
-		// todo: handle more cases
-		default:
-		break;
-	}
+	// TJSRuntime *qrt = TJS_GetRuntime(ctx);
 
 	// call JS event handler
 	JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]){
@@ -366,11 +358,8 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
 	qrt->builtins.dispatch_event_func =
 	qrt->builtins.message_pipe = JS_UNDEFINED;
-
-	/* Initialize print for debugging */
-#ifdef DEBUG
-	tjs__mod_console_init(ctx);
-#endif
+	qrt->console_count = JS_NewObjectProto(ctx, JS_NULL);
+	qrt->console_time = JS_NewObjectProto(ctx, JS_NULL);
 
     /* end bootstrap */
     JS_FreeValue(ctx, global_obj);
@@ -405,6 +394,10 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	JS_FreeValue(qrt->ctx, qrt->module.metaloader);
 	qrt->module.resolver = qrt->module.loader = 
 	qrt->module.metaloader = JS_UNDEFINED;
+
+	/* remove console.count cache */
+	JS_FreeValue(qrt->ctx, qrt->console_count);
+	JS_FreeValue(qrt->ctx, qrt->console_time);
 
     /* Destroy all timers */
     tjs__destroy_timers(qrt);
@@ -495,11 +488,10 @@ static void uv__prepare_cb(uv_prepare_t *handle) {
 
 void tjs__execute_jobs(JSContext *ctx) {
     JSContext *ctx1;
-	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	// TJSRuntime* trt = TJS_GetRuntime(ctx);
     int err;
 
     /* execute the pending jobs */
-	bool tick = false;
     for (;;) {
         err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (err <= 0) {
@@ -507,9 +499,7 @@ void tjs__execute_jobs(JSContext *ctx) {
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
                 CHECK_NOT_NULL(qrt);
                 TJS_Stop(qrt);
-            } else {
-				tick = true;
-			}
+            }
 
             break;
         }

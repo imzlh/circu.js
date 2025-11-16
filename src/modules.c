@@ -195,7 +195,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 	// try js resolver
 	if(!JS_IsUndefined(trt->module.metaloader)){
 		JSValueConst args[] = { JS_NewString(ctx, module_name), meta_obj };
-		JSValue ret = JS_Call(ctx, trt->module.metaloader, JS_UNDEFINED, 1, args);
+		JSValue ret = JS_Call(ctx, trt->module.metaloader, JS_UNDEFINED, 2, args);
 		JS_FreeValue(ctx, args[0]);
 		JS_FreeValue(ctx, ret);
 		JS_FreeValue(ctx, meta_obj);

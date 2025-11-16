@@ -1,7 +1,6 @@
 [submodule "deps/wasm3"]
 	path = deps/wasm3
 	url = https://github.com/wasm3/wasm3.git
-	branch = main
 [submodule "deps/quickjs"]
 	path = deps/quickjs
 	url = https://github.com/imzlh/quickjs-cjs
