@@ -45,7 +45,7 @@ macro(cpr_option OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
     message(STATUS "  ${OPTION_NAME}: ${${OPTION_NAME}}")
 endmacro()
 
-cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" ON)
+cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
 
@@ -71,7 +71,9 @@ find_package(CURL REQUIRED)
 find_package(llhttp REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(ZLIB)
+find_package(ZLIB REQUIRED)
+find_package(EXPAT REQUIRED)
+find_package(Iconv REQUIRED)
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
@@ -110,25 +112,27 @@ add_library(cjs
     src/mod_sys.c
     src/mod_udp.c
     src/mod_zlib.c
+    src/mod_ssl.c
+    src/mod_xml.c
+    src/mod_text.c
     deps/quickjs/cutils.c
 )
 
 if(UNIX)
     target_sources(cjs PUBLIC 
         src/mod_posix-socket.c
-        src/mod_posix-ffi.c
     )
 endif()
 
-add_library(ffi-test SHARED
-    tests/fixtures/ffi-test-lib.c
-)
+# add_library(ffi-test SHARED
+#     tests/fixtures/ffi-test-lib.c
+# )
 
-add_library(sqlite-test SHARED
-    tests/fixtures/sqlite-test-ext.c
-)
+# add_library(sqlite-test SHARED
+#     tests/fixtures/sqlite-test-ext.c
+# )
 
-target_link_libraries(sqlite-test sqlite3)
+# target_link_libraries(sqlite-test sqlite3)
 
 
 # if(NOT USE_EXTERNAL_FFI AND NOT MINGW AND NOT APPLE)
@@ -167,11 +171,11 @@ set_target_properties(cjs PROPERTIES
     C_STANDARD_REQUIRED ON
 )
 
-string(TOLOWER ${CMAKE_SYSTEM_NAME} cjs_PLATFORM)
+string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(cjs PRIVATE ${cjs_cflags})
 target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(cjs PUBLIC src)
-target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT Iconv::Iconv)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(cjs PRIVATE TJS__HAS_MIMALLOC)

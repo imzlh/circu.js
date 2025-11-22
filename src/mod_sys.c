@@ -161,7 +161,7 @@ static const JSCFunctionListEntry tjs_sys_funcs[] = {
     TJS_CFUNC_DEF("randomUUID", 0, tjs_randomUUID),
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
-    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL)
+    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
 };
 /* clang-format on */
 

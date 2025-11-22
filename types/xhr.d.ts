@@ -17,17 +17,12 @@ declare namespace CModuleXHR {
     /**
      * XMLHttpRequest 对象响应类型常量
      */
-    const enum ResponseType {
-        DEFAULT = '',
-        TEXT = 'text',
-        ARRAY_BUFFER = 'arraybuffer',
-        JSON = 'json'
-    }
-
+    type ResponseType = 'arraybuffer' | 'json' | 'text';
+    
     /**
      * XMLHttpRequest 对象
      */
-    interface XMLHttpRequest {
+    class XMLHttpRequest {
         /**
          * 中止请求
          * @returns 返回 undefined。
@@ -204,18 +199,11 @@ declare namespace CModuleXHR {
         readonly total: number;
     }
 
-    /**
-     * 创建 XMLHttpRequest 对象
-     * @returns 返回一个 Promise，解析为 XMLHttpRequest 对象。
-     */
-    function create(): Promise<XMLHttpRequest>;
-
     // 导出所有内容
     export {
         ReadyState,
         ResponseType,
         XMLHttpRequest,
-        create,
         ProgressEvent
     };
 }

@@ -4,7 +4,7 @@ declare namespace CModuleProcess {
     /**
      * 进程退出码
      */
-    const enum ExitCode {
+    export const enum ExitCode {
         /** 成功退出 */
         SUCCESS = 0,
         /** 通用错误 */
@@ -14,7 +14,7 @@ declare namespace CModuleProcess {
     /**
      * 进程信号
      */
-    const enum ProcessSignal {
+    export const enum Signal {
         /** 终止信号 */
         SIGTERM = 'SIGTERM',
         /** 中断信号 */
@@ -28,15 +28,15 @@ declare namespace CModuleProcess {
     }
 
     /**
-     * 进程配置选项
+     * spawn 配置选项
      */
-    interface ProcessOptions {
-        /** 标准输入文件描述符 */
-        stdin?: number;
-        /** 标准输出文件描述符 */
-        stdout?: number;
-        /** 标准错误文件描述符 */
-        stderr?: number;
+    export interface SpawnOptions {
+        /** 标准输入文件描述符或模式 */
+        stdin?: number | 'inherit' | 'pipe' | 'ignore';
+        /** 标准输出文件描述符或模式 */
+        stdout?: number | 'inherit' | 'pipe' | 'ignore';
+        /** 标准错误文件描述符或模式 */
+        stderr?: number | 'inherit' | 'pipe' | 'ignore';
         /** 工作目录 */
         cwd?: string;
         /** 环境变量 */
@@ -47,84 +47,59 @@ declare namespace CModuleProcess {
         gid?: number;
         /** 是否独立运行 */
         detached?: boolean;
-        /** 是否继承标准输入输出 */
-        stdio?: 'inherit' | 'pipe' | 'ignore';
     }
 
     /**
-     * 子进程对象
+     * 子进程退出信息
      */
-    interface ChildProcess {
-        /**
-         * 进程ID
-         */
+    export interface ExitInfo {
+        exit_status: number;
+        term_signal: string | null;
+    }
+
+    /**
+     * 子进程对象（对应 C 代码中的 Process 类）
+     */
+    export interface ChildProcess {
+        /** 进程ID */
         readonly pid: number;
-
-        /**
-         * 标准输入流（如果配置为管道）
-         */
+        /** 标准输入流（如果配置为 pipe） */
         readonly stdin?: Pipe;
-
-        /**
-         * 标准输出流（如果配置为管道）
-         */
+        /** 标准输出流（如果配置为 pipe） */
         readonly stdout?: Pipe;
-
-        /**
-         * 标准错误流（如果配置为管道）
-         */
+        /** 标准错误流（如果配置为 pipe） */
         readonly stderr?: Pipe;
+        /** 类型标签 */
+        readonly [Symbol.toStringTag]: 'Process';
 
         /**
          * 等待进程退出
-         * @returns 返回一个 Promise，解析为退出码
+         * @returns 返回退出码和终止信号
          */
-        wait(): Promise<number>;
+        wait(): Promise<ExitInfo>;
 
         /**
          * 向进程发送信号
-         * @param signal 要发送的信号
+         * @param signal 要发送的信号，默认 SIGTERM
          */
-        kill(signal?: ProcessSignal | string): void;
-
-        /**
-         * 子进程对象的类型标签
-         */
-        readonly [Symbol.toStringTag]: 'ChildProcess';
+        kill(signal?: Signal | string): void;
     }
 
     /**
-     * 进程模块
+     * 当前进程接口（对应全局 process 对象）
      */
-    interface ProcessModule {
-        /**
-         * 当前进程ID
-         */
+    export interface CurrentProcess {
+        /** 当前进程ID */
         readonly pid: number;
-
-        /**
-         * 父进程ID
-         */
+        /** 父进程ID */
         readonly ppid: number;
-
-        /**
-         * 平台名称
-         */
+        /** 平台名称 */
         readonly platform: string;
-
-        /**
-         * 当前工作目录
-         */
+        /** 当前工作目录 */
         readonly cwd: string;
-
-        /**
-         * 环境变量
-         */
+        /** 环境变量 */
         readonly env: Record<string, string>;
-
-        /**
-         * 进程标题
-         */
+        /** 进程标题 */
         title: string;
 
         /**
@@ -134,46 +109,33 @@ declare namespace CModuleProcess {
         exit(code?: ExitCode | number): never;
 
         /**
-         * 创建子进程
-         * @param command 要执行的命令
-         * @param args 命令参数数组
-         * @param options 进程选项
-         * @returns 返回子进程对象
-         */
-        spawn(command: string, args?: string[], options?: ProcessOptions): ChildProcess;
-
-        /**
-         * 执行命令并返回输出
-         * @param command 要执行的命令
-         * @param options 进程选项
-         * @returns 返回一个 Promise，解析为命令输出
-         */
-        exec(command: string, options?: ProcessOptions): Promise<string>;
-
-        /**
          * 添加信号监听器
-         * @param signal 信号名称
-         * @param listener 信号处理函数
          */
-        on(signal: ProcessSignal | string, listener: () => void): void;
+        on(signal: Signal | string, listener: () => void): void;
 
         /**
          * 移除信号监听器
-         * @param signal 信号名称
-         * @param listener 信号处理函数
          */
-        off(signal: ProcessSignal | string, listener: () => void): void;
+        off(signal: Signal | string, listener: () => void): void;
     }
 
-    // 导出进程模块
-    const process: ProcessModule;
+    /**
+     * 创建子进程
+     */
+    export function spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcess;
 
-    // 导出所有内容
-    export {
-        ExitCode,
-        ProcessSignal,
-        ProcessOptions,
-        ChildProcess,
-        process
-    };
+    /**
+     * 执行命令并返回输出
+     */
+    export function exec(command: string, args?: string[], options?: SpawnOptions): Promise<string>;
+
+    /**
+     * 向指定进程发送信号（全局函数）
+     */
+    export function kill(pid: number, signal?: Signal | string): void;
+
+    /**
+     * 当前进程实例
+     */
+    export const process: CurrentProcess;
 }

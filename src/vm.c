@@ -132,8 +132,10 @@ static const struct TJSModule tjs_modules[] = {
 	{ "signals", tjs__mod_signals_init },
 	{ "sourcemap", tjs__mod_sourcemap_init },
 	{ "sqlite3", tjs__mod_sqlite3_init },
+	{ "ssl", tjs__mod_ssl_init },
 	{ "streams", tjs__mod_streams_init },
 	{ "sys", tjs__mod_sys_init },
+	{ "text", tjs__mod_text_init },
 	{ "timers", tjs__mod_timers_init },
 	{ "udp", tjs__mod_udp_init },
 #ifdef TJS__HAS_WASM
@@ -142,14 +144,14 @@ static const struct TJSModule tjs_modules[] = {
 	{ "worker", tjs__mod_worker_init },
 	{ "ws", tjs__mod_ws_init },
 	{ "xhr", tjs__mod_xhr_init },
+	{ "xml", tjs__mod_xml_init },
 	{ "zlib", tjs__mod_zlib_init },
 #ifndef _WIN32
-	{ "posix_socket", tjs__mod_posix_socket_init },
-	{ "posix_ffi", tjs__mod_posix_ffi_init },
+	{ "posix_socket", tjs__mod_posix_socket_init }
 #endif
 };
 
-JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
+static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
 	JSValue ns = value[0];
 
 	// find name
@@ -180,6 +182,16 @@ JSValue tjs_module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	mod->init(ctx, module_obj);
 	JS_SetPropertyStr(ctx, ns, mod->name, JS_DupValue(ctx, module_obj));
 	return module_obj;
+}
+
+static JSValue tjs__mod_list_init(JSContext* ctx){
+	JSValue obj = JS_NewArray(ctx);
+	for (int i = 0; i < countof(tjs_modules); i ++){
+		const struct TJSModule *m = &tjs_modules[i];
+		JS_SetPropertyUint32(ctx, obj, i, JS_NewString(ctx, m->name));
+	}
+	JS_SetLength(ctx, obj, countof(tjs_modules));
+	return obj;
 }
 
 JSValue tjs__get_args(JSContext *ctx) {
@@ -246,7 +258,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
     }
 
     if (!is_handled) {
-        JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]){
+        JSValue args = JS_NewArrayFrom(ctx, 2, (JSValueConst[]){
 			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
 		});
 
@@ -556,9 +568,10 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 
 		// define use()
 		JSValue cache_obj = JS_NewObjectProto(ctx, JS_NULL);
-		JSValue use_func = JS_NewCFunctionData(ctx, tjs_module_use, 1, 0, 1, (JSValueConst[]) { cache_obj });
+		JSValue use_func = JS_NewCFunctionData(ctx, tjs__module_use, 1, 0, 1, (JSValueConst[]) { cache_obj });
 		JS_FreeValue(ctx, cache_obj);
 		JS_DefinePropertyValueStr(ctx, meta, "use", use_func, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, meta, "module", tjs__mod_list_init(ctx), JS_PROP_C_W_E);
 
 		// end
 		JS_FreeValue(ctx, meta);

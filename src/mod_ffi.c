@@ -84,7 +84,7 @@ SOFTWARE.
 #define FFI_ALIGN(v, a) (((((size_t) (v)) - 1) | ((a) - 1)) + 1)
 
 #pragma region "FFI Helpers"
-// ===================
+
 
 static const char *ffi_strerror(ffi_status status) {
     switch (status) {
@@ -104,7 +104,6 @@ static const char *ffi_strerror(ffi_status status) {
 #pragma endregion "FFI Helpers"
 
 #pragma region "FfiType class definition"
-// =======================================
 typedef struct {
     size_t elemCount;
     JSValue *deps;
@@ -554,7 +553,6 @@ static const JSCFunctionListEntry js_ffi_type_proto_funcs[] = {
 #pragma endregion "FfiType class definition"
 
 #pragma region "UvDlSym class definition"
-// =======================================
 
 static JSClassID js_uv_dlsym_classid;
 
@@ -582,7 +580,6 @@ static const JSCFunctionListEntry js_uv_dlsym_proto_funcs[] = {
 #pragma endregion "UvDlSym class definition"
 
 #pragma region "FfiCif class definition"
-// ======================================
 
 static JSClassID js_ffi_cif_classid;
 typedef struct {
@@ -746,7 +743,6 @@ static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
 #pragma endregion "FfiCif class definition"
 
 #pragma region "UvLib class definition"
-// =====================================
 
 static JSClassID js_uv_lib_classid;
 static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -815,7 +811,6 @@ static const JSCFunctionListEntry js_uv_lib_proto_funcs[] = {
 #pragma endregion "UvLib class definition"
 
 #pragma region "Libc helpers"
-// ===========================
 
 static JSValue js_libc_errno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc != 0) {
@@ -834,7 +829,6 @@ static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSVa
 #pragma endregion "Libc helpers"
 
 #pragma region "other helpers"
-// ============================
 
 static JSValue js_array_buffer_get_ptr(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc <= 0) {
@@ -927,8 +921,6 @@ static JSValue js_deref_ptr(JSContext *ctx, JSValue this_val, int argc, JSValue 
 #pragma endregion "other helpers"
 
 #pragma region "FfiClosure class definition"
-
-// ======================================
 
 static JSClassID js_ffi_closure_classid;
 typedef struct {

@@ -51,9 +51,17 @@ static void tjs_file_finalizer(JSRuntime *rt, JSValue val) {
     }
 }
 
+static void tjs_file_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
+    TJSFile *f = JS_GetOpaque(val, tjs_file_class_id);
+    if (f) {
+        JS_MarkValue(rt, f->path, mark_func);
+	}
+}
+
 static JSClassDef tjs_file_class = {
     "File",
     .finalizer = tjs_file_finalizer,
+	.gc_mark = tjs_file_gc_mark,
 };
 
 static JSClassID tjs_dir_class_id;
@@ -79,7 +87,18 @@ static void tjs_dir_finalizer(JSRuntime *rt, JSValue val) {
     }
 }
 
-static JSClassDef tjs_dir_class = { "Directory", .finalizer = tjs_dir_finalizer };
+static void tjs_dir_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
+    TJSDir *d = JS_GetOpaque(val, tjs_dir_class_id);
+    if (d) {
+        JS_MarkValue(rt, d->path, mark_func);
+    }
+}
+
+static JSClassDef tjs_dir_class = { 
+	"Directory", 
+	.finalizer = tjs_dir_finalizer,
+	.gc_mark = tjs_dir_gc_mark,
+};
 
 static JSClassID tjs_dirent_class_id;
 
@@ -96,7 +115,18 @@ static void tjs_dirent_finalizer(JSRuntime *rt, JSValue val) {
     }
 }
 
-static JSClassDef tjs_dirent_class = { "DirEnt", .finalizer = tjs_dirent_finalizer };
+static void tjs_dirent_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
+    TJSDirEnt *de = JS_GetOpaque(val, tjs_dirent_class_id);
+    if (de) {
+        JS_MarkValue(rt, de->name, mark_func);
+    }
+}
+
+static JSClassDef tjs_dirent_class = { 
+	"DirEnt", 
+	.finalizer = tjs_dirent_finalizer, 
+	.gc_mark = tjs_dirent_gc_mark 
+};
 
 static JSClassID tjs_stat_class_id;
 
@@ -111,7 +141,10 @@ static void tjs_stat_finalizer(JSRuntime *rt, JSValue val) {
     }
 }
 
-static JSClassDef tjs_stat_class = { "StatResult", .finalizer = tjs_stat_finalizer };
+static JSClassDef tjs_stat_class = { 
+	"StatResult", 
+	.finalizer = tjs_stat_finalizer 
+};
 
 typedef struct {
     uv_fs_t req;

@@ -39,6 +39,7 @@
 #include <sqlite3.h>
 #include <stdbool.h>
 #include <uv.h>
+#include <openssl/ssl.h>
 
 enum {
     __JS_ATOM_NULL = JS_ATOM_NULL,
@@ -118,10 +119,12 @@ void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
+void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
+void tjs__mod_text_init(JSContext *ctx, JSValue ns);
+void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
-void tjs__mod_posix_ffi_init(JSContext *ctx, JSValue ns);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);
@@ -160,4 +163,5 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
 // Warn: will not dup, use JS_Dup if you want to keep it alive
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
 JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def);
+SSL_CTX* tjs__sslctx_get(JSContext *ctx, JSValueConst obj);
 #endif

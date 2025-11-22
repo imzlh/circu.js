@@ -4,6 +4,16 @@
  */
 
 declare namespace CModuleServer {
+    export type AddrInfo = {
+        type: 'IPv4' | 'IPv6';
+        address: string;
+        port: number;
+        remoteAddress: string;
+        remotePort: number;
+    } | {
+        type: 'UNIX' | 'unknown';
+    };
+
     /**
      * HTTP request object
      */
@@ -100,6 +110,14 @@ declare namespace CModuleServer {
          * @param res HTTP response object
          */
         onBody?: (req: HttpRequest, res: HttpResponse) => any;
+
+        /**
+         * Called when a new connection is accepted,
+         * to determine if SSL should be used or `false` to close the connection.
+         * @param info local and remote address information
+         * @returns `false` to close the connection, or an `SSLContext` to use SSL.
+         */
+        onAccept?: (info: AddrInfo) => false | CModuleSSL.SSLContext;
     }
 
     /**

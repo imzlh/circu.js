@@ -26,10 +26,12 @@ interface TjsModules {
     zlib: typeof CModuleZLib,
     xhr: typeof CModuleXHR,
     sourcemap: typeof CModuleSourceMap,
+    ssl: typeof CModuleSSL,
+    xml: typeof CModuleXML,
+    text: typeof CModuleText,
 }
 
 interface TjsPosixModules {
-    'posix-ffi': typeof CModulePosixFFI,
     'posix-socket': typeof CModulePosixSocket
 }
 
@@ -53,4 +55,9 @@ interface ImportMeta {
      * Module not found, upgrade your circu.js type definitions?
      */
     use(name: string): null;
+
+    /**
+     * The names of all built-in modules available to this program
+     */
+    module: Array<keyof TjsModules | keyof TjsPosixModules>;
 }

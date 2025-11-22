@@ -94,7 +94,10 @@ declare namespace CModuleStreams {
          * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
          * @returns Promise在连接建立时解析
          */
-        connect(addr: Record<string, any>): Promise<void>;
+        connect(addr: {
+            ip: string;
+            port: number;
+        }): Promise<void>;
 
         /**
          * 绑定到本地地址
