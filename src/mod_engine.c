@@ -125,10 +125,7 @@ static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, J
 static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
     JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
     if(!def) return JS_EXCEPTION;
-
-    JSValue meta = JS_MKPTR(JS_TAG_MODULE, def);
-	// fixme: more efficient way to get meta?
-    return JS_DupValue(ctx, meta);
+    return JS_GetImportMeta(ctx, def);
 }
 
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
