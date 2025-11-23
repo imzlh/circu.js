@@ -12,3 +12,4 @@ types/api/
 test_dir*/
 pnpm-lock.yaml
 *lock.json
+cjs
