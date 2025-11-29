@@ -356,6 +356,6 @@ static const JSCFunctionListEntry js_jsonc_funcs[] = {
 	JS_CFUNC_DEF("parse", 1, jsonc_parse),
 };
 
-static int tjs__mod_jsonc_init(JSContext* ctx, JSValue ns) {
-	return JS_SetPropertyFunctionList(ctx, ns, js_jsonc_funcs, countof(js_jsonc_funcs));
+void tjs__mod_jsonc_init(JSContext* ctx, JSValue ns) {
+	JS_SetPropertyFunctionList(ctx, ns, js_jsonc_funcs, countof(js_jsonc_funcs));
 }
