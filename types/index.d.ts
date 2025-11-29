@@ -30,6 +30,7 @@ interface TjsModules {
     xml: typeof CModuleXML,
     text: typeof CModuleText,
     jsonc: typeof CModuleJsonC,
+    algorithm: typeof CModuleAlgorithm,
 }
 
 interface TjsPosixModules {

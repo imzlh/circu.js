@@ -105,6 +105,18 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
     return flags;
 }
 
+// helper: get u8/arraybuffer buffer
+static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueConst obj){
+	if (JS_GetTypedArrayType(obj) == JS_TYPED_ARRAY_UINT8)
+		return JS_GetUint8Array(ctx, psize, obj);
+	else if (JS_IsArrayBuffer(obj))
+		return JS_GetArrayBuffer(ctx, psize, obj);
+	JSValue ab = JS_GetPropertyStr(ctx, obj, "buffer");
+	uint8_t* r = JS_GetArrayBuffer(ctx, psize, ab);
+	JS_FreeValue(ctx, ab);
+	return r;
+}
+
 /* stat() - get file status */
 static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* path;
@@ -289,7 +301,7 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_EXCEPTION;
     }
     
-    buffer = JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
     if (!buffer) {
         return JS_EXCEPTION;
     }
@@ -343,7 +355,7 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
     
-    buffer = JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
     if (!buffer) {
         return JS_EXCEPTION;
     }
@@ -457,7 +469,7 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
         return JS_EXCEPTION;
     }
     
-    data = JS_GetArrayBuffer(ctx, &data_len, argv[1]);
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
     if (!data) {
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
