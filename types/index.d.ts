@@ -29,6 +29,7 @@ interface TjsModules {
     ssl: typeof CModuleSSL,
     xml: typeof CModuleXML,
     text: typeof CModuleText,
+    jsonc: typeof CModuleJsonC,
 }
 
 interface TjsPosixModules {

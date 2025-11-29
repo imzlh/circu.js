@@ -117,14 +117,15 @@ struct TJSModule {
 
 static const struct TJSModule tjs_modules[] = {
 	{ "algorithm", tjs__mod_algorithm_init },
+	{ "asyncfs", tjs__mod_asyncfs_init },
 	{ "console", tjs__mod_console_init },
 	{ "dns", tjs__mod_dns_init },
 	{ "engine", tjs__mod_engine_init },
 	{ "error", tjs__mod_error_init },
 	{ "ffi", tjs__mod_ffi_init },
-	{ "asyncfs", tjs__mod_asyncfs_init },
 	{ "fs", tjs__mod_fs_init },
 	{ "fswatch", tjs__mod_fswatch_init },
+	{ "jsonc", tjs__mod_jsonc_init },
 	{ "os", tjs__mod_os_init },
 	{ "process", tjs__mod_process_init },
 	{ "pty", tjs__mod_pty_init },

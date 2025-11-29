@@ -122,6 +122,7 @@ void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
+static int tjs__mod_jsonc_init(JSContext* ctx, JSValue ns);
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
