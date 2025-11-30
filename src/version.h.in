@@ -2,6 +2,7 @@
  * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2025 iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,10 +27,10 @@
 #define TJS_VERSION_H
 
 
-#define TJS_VERSION_MAJOR @TJS__VERSION_MAJOR@
-#define TJS_VERSION_MINOR @TJS__VERSION_MINOR@
-#define TJS_VERSION_PATCH @TJS__VERSION_PATCH@
-#define TJS_VERSION_SUFFIX "@TJS__VERSION_SUFFIX@"
+#define TJS_VERSION_MAJOR @CJS__VERSION_MAJOR@
+#define TJS_VERSION_MINOR @CJS__VERSION_MINOR@
+#define TJS_VERSION_PATCH @CJS__VERSION_PATCH@
+#define TJS_VERSION_SUFFIX "@CJS__VERSION_SUFFIX@"
 
 const char* tjs_version(void);
 

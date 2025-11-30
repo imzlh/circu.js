@@ -31,7 +31,7 @@
 #include "utils.h"
 #include "sourcemap.h"
 
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
 #include "wasm.h"
 #endif
 
@@ -68,7 +68,7 @@ struct TJSRuntime {
         CURLM *curlm_h;
         uv_timer_t timer;
     } curl_ctx;
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
     struct {
         IM3Environment env;
     } wasm_ctx;
@@ -103,7 +103,6 @@ void tjs__mod_fs_init(JSContext* ctx, JSValue ns);
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns);
 void tjs__mod_os_init(JSContext *ctx, JSValue ns);
 void tjs__mod_process_init(JSContext *ctx, JSValue ns);
-void tjs__mod_server_init(JSContext *ctx, JSValue ns);
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns);
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns);
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
@@ -123,6 +122,10 @@ void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 void tjs__mod_jsonc_init(JSContext* ctx, JSValue ns);
+
+#ifdef CJS__HAS_LLHTTP
+void tjs__mod_server_init(JSContext *ctx, JSValue ns);
+#endif
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);

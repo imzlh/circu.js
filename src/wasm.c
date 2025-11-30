@@ -23,7 +23,7 @@
  * THE SOFTWARE.
  */
 
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
 
 #include "wasm.h"
 

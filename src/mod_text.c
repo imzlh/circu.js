@@ -202,7 +202,7 @@ static JSValue tjs_text_decoder_constructor(JSContext *ctx, JSValueConst new_tar
     }
     
     decoder->encoding = js_strdup(ctx, encoding);
-    JS_FreeCString(ctx, encoding);
+    if (argc > 0) JS_FreeCString(ctx, encoding);
     
     /* Parse options */
     if (argc > 1 && JS_IsObject(argv[1])) {

@@ -24,10 +24,10 @@ if (CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_definitions(DEBUG)
 endif()
 
-set(TJS__VERSION_MAJOR 25)
-set(TJS__VERSION_MINOR 0)
-set(TJS__VERSION_PATCH 0)
-set(TJS__VERSION_SUFFIX "")
+set(CJS__VERSION_MAJOR 25)
+set(CJS__VERSION_MINOR 0)
+set(CJS__VERSION_PATCH 0)
+set(CJS__VERSION_SUFFIX "")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h"
@@ -68,12 +68,12 @@ if(BUILD_WITH_MIMALLOC)
 endif()
 
 find_package(CURL REQUIRED)
-find_package(llhttp REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv REQUIRED)
+find_package(llhttp) # optional
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
@@ -106,7 +106,6 @@ add_library(cjs
     src/mod_os.c
     src/mod_process.c
     src/mod_pty.c
-    src/mod_server.c
     src/mod_sqlite3.c
     src/mod_streams.c
     src/mod_sys.c
@@ -122,6 +121,14 @@ add_library(cjs
 if(UNIX)
     target_sources(cjs PUBLIC 
         src/mod_posix-socket.c
+    )
+endif()
+
+if(llhttp_FOUND)
+    message(NOTICE "build with http server support with llhttp")
+    add_compile_definitions(CJS__HAS_LLHTTP)
+    target_sources(cjs PUBLIC
+        src/mod_server.c
     )
 endif()
 
@@ -179,12 +186,12 @@ target_include_directories(cjs PUBLIC src)
 target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT Iconv::Iconv)
 
 if (BUILD_WITH_MIMALLOC)
-    target_compile_definitions(cjs PRIVATE TJS__HAS_MIMALLOC)
+    target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
     target_link_libraries(cjs mimalloc-static)
 endif()
 
 if (BUILD_WITH_WASM)
-    target_compile_definitions(cjs PRIVATE TJS__HAS_WASM)
+    target_compile_definitions(cjs PRIVATE CJS__HAS_WASM)
     target_link_libraries(cjs wasm3)
 endif()
 

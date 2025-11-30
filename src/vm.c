@@ -129,7 +129,9 @@ static const struct TJSModule tjs_modules[] = {
 	{ "os", tjs__mod_os_init },
 	{ "process", tjs__mod_process_init },
 	{ "pty", tjs__mod_pty_init },
+#ifdef CJS__HAS_LLHTTP
 	{ "server", tjs__mod_server_init },
+#endif
 	{ "signals", tjs__mod_signals_init },
 	{ "sourcemap", tjs__mod_sourcemap_init },
 	{ "sqlite3", tjs__mod_sqlite3_init },
@@ -139,7 +141,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "text", tjs__mod_text_init },
 	{ "timers", tjs__mod_timers_init },
 	{ "udp", tjs__mod_udp_init },
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
 	{ "wasm", tjs__mod_wasm_init },
 #endif
 	{ "worker", tjs__mod_worker_init },
@@ -397,7 +399,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     JS_FreeValue(ctx, global_obj);
 
     /* WASM */
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
     qrt->wasm_ctx.env = m3_NewEnvironment();
 #endif
 
@@ -452,7 +454,7 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     }
 
     /* Destroy WASM runtime. */
-#ifdef TJS__HAS_WASM
+#ifdef CJS__HAS_WASM
     m3_FreeEnvironment(qrt->wasm_ctx.env);
     qrt->wasm_ctx.env = NULL;
 #endif

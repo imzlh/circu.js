@@ -22,8 +22,8 @@
  * THE SOFTWARE.
  */
 
-#ifndef TJS__HAS_WASM_H
-#define TJS__HAS_WASM_H
+#ifndef CJS__HAS_WASM_H
+#define CJS__HAS_WASM_H
 
 #include <m3_api_wasi.h>
 #include <wasm3.h>
