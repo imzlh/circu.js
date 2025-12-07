@@ -253,7 +253,7 @@ static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int 
                 rng->s128.s[3] = (uint32_t)(rotl32(seed, 33) * 0x9e3779b9);
             }
         } else if (JS_IsArray(argv[0])) {
-			uint64_t length;
+			int64_t length;
 			if (-1 == JS_GetLength(ctx, argv[0], &length)) {
 				js_free(ctx, rng);
 				return JS_ThrowTypeError(ctx, "Invalid seed array. expected: Array<number>");

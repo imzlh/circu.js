@@ -2,6 +2,12 @@
  * Partial support for WebAPI Console.
  */
 declare namespace CModuleConsole {
+
+    /**
+     * non-standard console.inspect() method, returns a string representation of the objects.
+     */
+    export function inspect(...data: any[]): string;
+
     /**
      * The **`console.assert()`** static method writes an error message to the console if the assertion is false.
      *

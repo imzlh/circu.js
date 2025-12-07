@@ -335,6 +335,40 @@ static JSValue tjs_tmpdir(JSContext *ctx, JSValue this_val) {
     return ret;
 }
 
+static JSValue tjs_memory(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
+	uint64_t available = uv_get_available_memory(),
+		total = uv_get_total_memory(),
+		constrained = uv_get_constrained_memory(),
+		rss = uv_get_constrained_memory();
+
+	JSMemoryUsage memory;
+	JS_ComputeMemoryUsage(JS_GetRuntime(ctx), &memory);
+
+	JSValue ret = JS_NewObject(ctx);
+#define PROP(str, val) JS_SetPropertyStr(ctx, ret, str, val)
+	PROP("os.free", JS_NewInt64(ctx, available));
+	PROP("os.total", JS_NewInt64(ctx, total));
+	PROP("os.constrained", JS_NewInt64(ctx, constrained));
+	PROP("os.rss", JS_NewInt64(ctx, rss));
+	PROP("os.used", JS_NewInt64(ctx, total - available));
+
+	PROP("vm.used", JS_NewInt64(ctx, memory.memory_used_size));
+
+	PROP("used", JS_NewInt64(ctx, memory.malloc_size));
+	PROP("limit", JS_NewInt64(ctx, memory.malloc_limit));
+
+	PROP("string.used", JS_NewInt64(ctx, memory.str_size));
+	PROP("string.count", JS_NewInt64(ctx, memory.str_count));
+
+	PROP("buffer.used", JS_NewInt64(ctx, memory.binary_object_size));
+	PROP("buffer.count", JS_NewInt64(ctx, memory.binary_object_count));
+
+	PROP("object.count", JS_NewInt64(ctx, memory.obj_count));
+	PROP("object.used", JS_NewInt64(ctx, memory.obj_size));
+
+	return ret;
+}
+
 static JSValue tjs_random(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     size_t size;
     uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
@@ -537,6 +571,7 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CFUNC_DEF("loadavg", 0, tjs_loadavg),
     TJS_CFUNC_DEF("networkInterfaces", 0, tjs_network_interfaces),
     TJS_CFUNC_DEF("availableParallelism", 0, tjs_availableParallelism),
+	TJS_CFUNC_DEF("memoryUsage", 0, tjs_memory),
     TJS_CGETSET_DEF("cwd", tjs_cwd, NULL),
     TJS_CGETSET_DEF("homeDir", tjs_homedir, NULL),
     TJS_CGETSET_DEF("hostName", tjs_gethostname, NULL),

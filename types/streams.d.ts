@@ -73,6 +73,38 @@ declare namespace CModuleStreams {
         readonly [Symbol.toStringTag]: 'Stream';
     }
 
+    export type AddressInfo = {
+        /**
+         * IP 地址 (如 "127.0.0.1")
+         */
+        ip: string;
+
+        /**
+         * 端口号
+         */
+        port: number;
+    } & ({
+        /**
+         * 地址族类型， IPV4
+         */
+        family: 4;
+    } | {
+        /**
+         * 地址族类型， IPV6
+         */
+        family: 6;
+
+        /**
+         * 流信息
+         */
+        flowInfo: number;
+
+        /**
+         * 地址范围
+         */
+        scopeId: number;
+    })
+
     /**
      * TCP流接口
      */
@@ -81,13 +113,13 @@ declare namespace CModuleStreams {
          * 获取本地套接字地址信息
          * @returns 包含address、port、family等信息的对象
          */
-        getsockname(): Record<string, any>;
+        getsockname(): AddressInfo;
 
         /**
          * 获取远端对端地址信息
          * @returns 包含address、port、family等信息的对象
          */
-        getpeername(): Record<string, any>;
+        getpeername(): AddressInfo;
 
         /**
          * 连接到指定地址
@@ -105,7 +137,10 @@ declare namespace CModuleStreams {
          * @param flags 绑定标志（如TCP_IPV6ONLY）
          * @throws 同步抛出错误
          */
-        bind(addr: Record<string, any>, flags?: number): void;
+        bind(addr: {
+            ip: string;
+            port: number;
+        }): void;
 
         /**
          * 设置TCP keepalive选项

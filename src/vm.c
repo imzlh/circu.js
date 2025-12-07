@@ -118,6 +118,7 @@ struct TJSModule {
 static const struct TJSModule tjs_modules[] = {
 	{ "algorithm", tjs__mod_algorithm_init },
 	{ "asyncfs", tjs__mod_asyncfs_init },
+	{ "crypto", tjs__mod_crypto_init },
 	{ "console", tjs__mod_console_init },
 	{ "dns", tjs__mod_dns_init },
 	{ "engine", tjs__mod_engine_init },

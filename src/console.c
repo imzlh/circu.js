@@ -454,6 +454,27 @@ static void format_table_value(JSContext* ctx, JSValueConst val, DynBuf* buf, si
     dbuf_free(&temp);
 }
 
+static JSValue js_console_inspect(JSContext* ctx, JSValueConst this_val, 
+								 int argc, JSValueConst* argv) {
+	if (argc == 0) {
+        return JS_UNDEFINED;
+    }
+
+	JSValue visited[MAX_DEPTH];
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_putc(&buf, ' ');
+        format_value(ctx, argv[i], 0, visited, &buf, false);
+    }
+    
+    dbuf_putc(&buf, '\n');
+    JSValue ret = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+    dbuf_free(&buf);
+    return ret;
+}
+
 /* Console API implementations */
 static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, 
                               int argc, JSValueConst* argv) {
@@ -1085,6 +1106,9 @@ static const JSCFunctionListEntry console_funcs[] = {
     JS_CFUNC_DEF("timeEnd", 0, js_console_timeEnd),
 	JS_CFUNC_DEF("timeLog", 0, js_console_timeLog),
 	JS_CFUNC_DEF("timeStamp", 0, js_console_timeStamp),
+
+	// non-standard: inspect()
+	JS_CFUNC_DEF("inspect", 1, js_console_inspect),
 };
 
 /* Module initialization */

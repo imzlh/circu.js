@@ -7,11 +7,11 @@
  * USAGE EXAMPLES
  * @example
  * ```ts
- * // Example 1: HTTPS Server with SSLPipe
- * const { SSLContext, SSLPipe } = import.meta.use('ssl');
+ * // Example 1: HTTPS Server with Pipe
+ * const { Context, Pipe } = import.meta.use('ssl');
  * const { TCP } = import.meta.use('streams');
  *
- * const sslContext = new SSLContext({
+ * const Context = new Context({
  *     mode: "server",
  *     cert: "/path/to/cert.pem",
  *     key: "/path/to/key.pem",
@@ -23,7 +23,7 @@
  * server.listen(128);
  *
  * server.accept().then(conn => {
- *     const pipe = new SSLPipe(sslContext);
+ *     const pipe = new Pipe(Context);
  *
  *     conn.read().then(data => {
  *         pipe.feed(data);
@@ -35,10 +35,10 @@
  * });
  *
  * // Example 2: HTTPS Client
- * const { SSLContext, SSLPipe } = import.meta.use('ssl');
+ * const { Context, Pipe } = import.meta.use('ssl');
  * const { TCP } = import.meta.use('streams');
  *
- * const sslContext2 = new SSLContext({
+ * const Context2 = new Context({
  *     mode: "client",
  *     verify: true,
  *     ca: "/etc/ssl/certs/ca-bundle.crt"
@@ -47,7 +47,7 @@
  * const conn2 = new TCP();
  * await conn2.connect("example.com", 443);
  *
- * const pipe2 = new SSLPipe(sslContext2, { servername: "example.com" });
+ * const pipe2 = new Pipe(Context2, { servername: "example.com" });
  *
  * // Start handshake
  * pipe2.doHandshake();
@@ -71,7 +71,7 @@
  * await conn2.write(encrypted2);
  *
  * // Example 3: Generate Self-Signed Certificate
- * const { SSLContext, SSLPipe } = import.meta.use('ssl');
+ * const { Context, Pipe } = import.meta.use('ssl');
  * const { TCP } = import.meta.use('streams');
  *
  * const { cert, key } = createSelfSignedCert({
@@ -82,14 +82,14 @@
  * await writeFile("cert.pem", cert);
  * await writeFile("key.pem", key);
  *
- * const context3 = new SSLContext({
+ * const context3 = new Context({
  *     mode: "server",
  *     cert: "cert.pem",
  *     key: "key.pem"
  * });
  *
  * // Example 4: Inspect Peer Certificate
- * const pipe4 = new SSLPipe(clientContext, { servername: "example.com" });
+ * const pipe4 = new Pipe(clientContext, { servername: "example.com" });
  * // ... perform handshake ...
  *
  * if (pipe4.handshakeComplete) {
@@ -107,9 +107,9 @@
  * }
  *
  * // Example 5: Advanced SSL Context Configuration
- * import { SSLContext } from "@tjs/ssl";
+ * import { Context } from "@tjs/ssl";
  *
- * const context5 = new SSLContext({
+ * const context5 = new Context({
  *     mode: "server",
  *     cert: "cert.pem",
  *     key: "key.pem",
@@ -129,7 +129,7 @@ declare namespace CModuleSSL {
     /**
      * SSL Context Options
      */
-    export interface SSLContextOptions {
+    export interface ContextOptions {
         /** Operation mode: "server" or "client" */
         mode?: "server" | "client";
 
@@ -182,12 +182,12 @@ declare namespace CModuleSSL {
     /**
      * SSL Context - Configuration for SSL/TLS connections
      */
-    export class SSLContext {
+    export class Context {
         /**
          * Create a new SSL context
          * @param options Context configuration
          */
-        constructor(options?: SSLContextOptions);
+        constructor(options?: ContextOptions);
 
         /** Operation mode */
         readonly mode: "server" | "client";
@@ -196,7 +196,7 @@ declare namespace CModuleSSL {
     /**
      * SSL Pipe Options
      */
-    export interface SSLPipeOptions {
+    export interface PipeOptions {
         /** Server name indication (SNI) for client mode */
         servername?: string;
     }
@@ -261,13 +261,13 @@ declare namespace CModuleSSL {
      * Provides memory-based I/O for SSL/TLS handshake and data transfer.
      * Can operate as both client and server.
      */
-    export class SSLPipe {
+    export class Pipe {
         /**
          * Create a new SSL pipe
          * @param context SSL context to use
          * @param options Pipe options
          */
-        constructor(context: SSLContext, options?: SSLPipeOptions);
+        constructor(context: Context, options?: PipeOptions);
 
         /**
          * Feed encrypted data from network to SSL engine

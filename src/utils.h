@@ -143,6 +143,17 @@ int tjs_getsignum(const char *sig_str);
         return TJS_THROW_ARG_ERR(ctx, argno, expected);                                                                \
     }
 
-#endif
-
 void tjs_dbuf_init(JSContext *ctx, DynBuf *s);
+
+static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueConst obj){
+	if (JS_GetTypedArrayType(obj) == JS_TYPED_ARRAY_UINT8)
+		return JS_GetUint8Array(ctx, psize, obj);
+	else if (JS_IsArrayBuffer(obj))
+		return JS_GetArrayBuffer(ctx, psize, obj);
+	JSValue ab = JS_GetPropertyStr(ctx, obj, "buffer");
+	uint8_t* r = JS_GetArrayBuffer(ctx, psize, ab);
+	JS_FreeValue(ctx, ab);
+	return r;
+}
+
+#endif

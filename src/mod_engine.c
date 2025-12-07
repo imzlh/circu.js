@@ -78,7 +78,7 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 	const char *module_name = JS_ToCString(ctx, argv[1]);
 	if(!module_name) module_name = "<module>";
 
-    JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_BACKTRACE_BARRIER);
     if(JS_IsException(compiled)) goto fail;
 
     JS_FreeCString(ctx, source);
@@ -90,11 +90,10 @@ fail:
     return JS_EXCEPTION;
 }
 
-static void js_module_finalizer(JSRuntime *rt, JSValue val) {
-    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque(val, js_module_class_id);
-    if(def) {
-        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_MODULE, def));
-    }
+static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!def) return JS_EXCEPTION;
+	return JS_EvalFunction(ctx, JS_MKPTR(JS_TAG_MODULE, def));
 }
 
 static JSValue js_module_get_ptr(JSContext *ctx, JSValueConst this_val){
@@ -139,13 +138,15 @@ JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def){
 
 static const JSClassDef js_module_class = {
     "Module",
-    .finalizer = js_module_finalizer,
+	// module do not require finalize
+    // .finalizer = js_module_finalizer,
 };
 
 static const JSCFunctionListEntry js_module_proto_funcs[] = {
     JS_CGETSET_DEF("ptr", js_module_get_ptr, NULL),
     JS_CFUNC_DEF("dump", 0, js_module_dump),
-    JS_CGETSET_DEF("meta", js_module_get_meta, NULL)
+    JS_CGETSET_DEF("meta", js_module_get_meta, NULL),
+	JS_CFUNC_DEF("eval", 0, js_module_eval),
 };
 
 static JSValue tjs_setMemoryLimit(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

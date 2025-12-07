@@ -10,9 +10,11 @@ declare namespace CModuleServer {
         port: number;
         remoteAddress: string;
         remotePort: number;
-    } | {
-        type: 'UNIX' | 'unknown';
-    };
+    } 
+    // TODO
+    // | {
+        // type: 'UNIX' | 'unknown';
+    // };
 
     /**
      * HTTP request object
@@ -94,7 +96,7 @@ declare namespace CModuleServer {
          * @param req HTTP request object
          * @param res HTTP response object
          */
-        onRequest: (req: HttpRequest, res: HttpResponse) => any;
+        onRequest: (req: HttpRequest, res: HttpResponse, info: AddrInfo) => any;
 
         /**
          * Handle error events
@@ -109,15 +111,24 @@ declare namespace CModuleServer {
          * @param req HTTP request object
          * @param res HTTP response object
          */
-        onBody?: (req: HttpRequest, res: HttpResponse) => any;
+        onBody?: (req: HttpRequest, res: HttpResponse, info: AddrInfo) => any;
 
         /**
          * Called when a new connection is accepted,
          * to determine if SSL should be used or `false` to close the connection.
          * @param info local and remote address information
-         * @returns `false` to close the connection, or an `SSLContext` to use SSL.
+         * @returns `false` to close the connection, or an `Context` to use SSL.
          */
-        onAccept?: (info: AddrInfo) => false | CModuleSSL.SSLContext;
+        onAccept?: (info: AddrInfo) => false | CModuleSSL.Context;
+
+        /**
+         * Called when the parse process is complete,
+         * after the request headers and body (if present) have been processed.
+         * @param req Request object
+         * @param res Response object
+         * @param info Address information
+         */
+        onComplete?: (req: HttpRequest, res: HttpResponse, info: AddrInfo) => any;
     }
 
     /**

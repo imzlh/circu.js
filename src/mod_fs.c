@@ -34,6 +34,8 @@
 #include <windows.h>
 #include <io.h>
 #include <direct.h>
+#include <winioctl.h>
+#include <fileapi.h>
 #define stat _stat64
 #define fstat _fstat64
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
@@ -50,6 +52,9 @@
 #else
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
 #endif
 
 /* File mode flags using magic */
@@ -103,18 +108,6 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
 #endif
     
     return flags;
-}
-
-// helper: get u8/arraybuffer buffer
-static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueConst obj){
-	if (JS_GetTypedArrayType(obj) == JS_TYPED_ARRAY_UINT8)
-		return JS_GetUint8Array(ctx, psize, obj);
-	else if (JS_IsArrayBuffer(obj))
-		return JS_GetArrayBuffer(ctx, psize, obj);
-	JSValue ab = JS_GetPropertyStr(ctx, obj, "buffer");
-	uint8_t* r = JS_GetArrayBuffer(ctx, psize, ab);
-	JS_FreeValue(ctx, ab);
-	return r;
 }
 
 /* stat() - get file status */
@@ -586,6 +579,522 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
     return JS_UNDEFINED;
 }
 
+/* link() - create hard link */
+static JSValue tjs_syncfs_link(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    const char *existing_path, *new_path;
+    int result;
+    
+    if (argc < 2) {
+        return JS_ThrowSyntaxError(ctx, "Missing string arguments: requires existingPath and newPath");
+    }
+    
+    existing_path = JS_ToCString(ctx, argv[0]);
+    if (!existing_path) return JS_EXCEPTION;
+    
+    new_path = JS_ToCString(ctx, argv[1]);
+    if (!new_path) {
+        JS_FreeCString(ctx, existing_path);
+        return JS_EXCEPTION;
+    }
+    
+    if (strlen(existing_path) == 0 || strlen(new_path) == 0) {
+        JS_FreeCString(ctx, existing_path);
+        JS_FreeCString(ctx, new_path);
+        return JS_ThrowRangeError(ctx, "Paths cannot be empty");
+    }
+
+    // Platform-specific link creation
+#ifdef _WIN32
+    // Windows implementation using CreateHardLink
+    result = CreateHardLinkA(new_path, existing_path, NULL);
+    if (!result) {
+        DWORD error_code = GetLastError();
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Failed to create hard link on Windows. Error code: %lu", error_code);
+        JS_FreeCString(ctx, existing_path);
+        JS_FreeCString(ctx, new_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+#else
+    // Unix-like implementation using link()
+    result = link(existing_path, new_path);
+    if (result != 0) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Failed to create hard link. System error: %s", strerror(errno));
+        JS_FreeCString(ctx, existing_path);
+        JS_FreeCString(ctx, new_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+#endif
+
+    // Clean up and return success
+    JS_FreeCString(ctx, existing_path);
+    JS_FreeCString(ctx, new_path);
+    
+    return JS_UNDEFINED;
+}
+
+/* symlink() - create symbolic link */
+static JSValue tjs_syncfs_symlink(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    const char *target, *path;
+    
+    // Validate argument count
+    if (argc < 2) {
+        return JS_ThrowSyntaxError(ctx, "Missing arguments: requires target and path");
+    }
+    
+    // Extract arguments
+    target = JS_ToCString(ctx, argv[0]);
+    if (!target) {
+        return JS_ThrowTypeError(ctx, "First argument (target) must be a string");
+    }
+    
+    path = JS_ToCString(ctx, argv[1]);
+    if (!path) {
+        JS_FreeCString(ctx, target);
+        return JS_ThrowTypeError(ctx, "Second argument (path) must be a string");
+    }
+    
+    // Validate path lengths
+    if (strlen(target) == 0 || strlen(path) == 0) {
+        JS_FreeCString(ctx, target);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowRangeError(ctx, "Target and path cannot be empty");
+    }
+
+#ifdef _WIN32
+    // Windows implementation using CreateSymbolicLink
+    DWORD flags = 0;
+    BOOL is_directory = FALSE;
+    
+    // Check if we should treat as directory (third argument or auto-detect)
+    if (argc >= 3) {
+        JSValue type_val = argv[2];
+        if (JS_IsString(type_val)) {
+            const char *type_str = JS_ToCString(ctx, type_val);
+            if (type_str) {
+                if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
+                    flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+                    is_directory = TRUE;
+                } else if (strcmp(type_str, "file") == 0) {
+                    flags = 0;
+                    is_directory = FALSE;
+                } else {
+                    JS_FreeCString(ctx, target);
+                    JS_FreeCString(ctx, path);
+                    JS_FreeCString(ctx, type_str);
+                    return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
+                }
+                JS_FreeCString(ctx, type_str);
+            }
+        }
+    } else {
+        // Auto-detect: try to determine if target is a directory
+        DWORD attribs = GetFileAttributesA(target);
+        if (attribs != INVALID_FILE_ATTRIBUTES) {
+            if (attribs & FILE_ATTRIBUTE_DIRECTORY) {
+                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+                is_directory = TRUE;
+            } else {
+                flags = 0;
+                is_directory = FALSE;
+            }
+        } else {
+            // If target doesn't exist, use file extension heuristic
+            const char *last_dot = strrchr(target, '.');
+            const char *last_slash = strrchr(target, '/');
+            if (!last_slash) last_slash = strrchr(target, '\\');
+            
+            if (last_dot && (!last_slash || last_dot > last_slash)) {
+                // Has file extension, treat as file
+                flags = 0;
+                is_directory = FALSE;
+            } else {
+                // No extension or extension before slash, treat as directory
+                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+                is_directory = TRUE;
+            }
+        }
+    }
+    
+    // Convert paths to wide strings for Windows API
+    wchar_t *w_target = NULL;
+    wchar_t *w_path = NULL;
+    int w_target_len = 0, w_path_len = 0;
+    BOOL success = FALSE;
+    
+    do {
+        w_target_len = MultiByteToWideChar(CP_UTF8, 0, target, -1, NULL, 0);
+        w_path_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        
+        if (w_target_len <= 0 || w_path_len <= 0) {
+            break;
+        }
+        
+        w_target = (wchar_t*)malloc(w_target_len * sizeof(wchar_t));
+        w_path = (wchar_t*)malloc(w_path_len * sizeof(wchar_t));
+        
+        if (!w_target || !w_path) {
+            break;
+        }
+        
+        if (MultiByteToWideChar(CP_UTF8, 0, target, -1, w_target, w_target_len) == 0 ||
+            MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, w_path_len) == 0) {
+            break;
+        }
+        
+        // Create the symbolic link
+        success = CreateSymbolicLinkW(w_path, w_target, flags);
+        
+        if (!success) {
+            DWORD error = GetLastError();
+            // Check if we need administrator privileges
+            if (error == ERROR_PRIVILEGE_NOT_HELD) {
+                // Try without the flag (for older Windows versions)
+                success = CreateSymbolicLinkW(w_path, w_target, 0);
+            }
+        }
+    } while (0);
+    
+    // Clean up wide strings
+    if (w_target) free(w_target);
+    if (w_path) free(w_path);
+    
+    if (!success) {
+        DWORD error_code = GetLastError();
+        JS_FreeCString(ctx, target);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Failed to create symbolic link. %s", strerror(error_code));
+    }
+#else
+    // Unix-like implementation using symlink
+    int symlink_result;
+    
+    // For Unix, we can ignore the type parameter as symlink works for both files and directories
+    symlink_result = symlink(target, path);
+    
+    if (symlink_result != 0) {
+        JS_FreeCString(ctx, target);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowPlainError(ctx, "Failed to create symlink. System error: %s", strerror(errno));
+    }
+#endif
+
+    // Clean up and return success
+    JS_FreeCString(ctx, target);
+    JS_FreeCString(ctx, path);
+    
+    return JS_UNDEFINED;
+}
+
+/* readlink() - read symbolic link */
+static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    const char *path;
+    char *link_path = NULL;
+    JSValue result = JS_UNDEFINED;
+    
+    // Validate argument count
+    if (argc < 1) {
+        return JS_ThrowSyntaxError(ctx, "Missing argument: requires path");
+    }
+    
+    // Extract path argument
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) {
+        return JS_ThrowTypeError(ctx, "First argument must be a string");
+    }
+    
+    // Validate path length
+    if (strlen(path) == 0) {
+        JS_FreeCString(ctx, path);
+        return JS_ThrowRangeError(ctx, "Path cannot be empty");
+    }
+
+#ifdef _WIN32
+    // Windows implementation for reading symbolic links
+    HANDLE hFile = NULL;
+    DWORD buffer_size = 4096; // Initial buffer size
+    
+    // Open the symbolic link
+    hFile = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DWORD error_code = GetLastError();
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Cannot open symbolic link. Error code: %lu", error_code);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+    
+    // Allocate buffer for reparse point data
+    BYTE *buffer = (BYTE*)malloc(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    if (!buffer) {
+        CloseHandle(hFile);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Memory allocation failed");
+    }
+    
+    // Read the reparse point data
+    DWORD bytes_returned;
+    BOOL success = DeviceIoControl(
+        hFile,
+        FSCTL_GET_REPARSE_POINT,
+        NULL,
+        0,
+        buffer,
+        MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+        &bytes_returned,
+        NULL
+    );
+    
+    if (success) {
+        PREPARSE_DATA_BUFFER reparse_data = (PREPARSE_DATA_BUFFER)buffer;
+        
+        // Check if it's a symbolic link reparse point
+        if (reparse_data->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+            // Extract the target path from the reparse data
+            WCHAR *substitute_name = reparse_data->SymbolicLinkReparseBuffer.PathBuffer + 
+                                   reparse_data->SymbolicLinkReparseBuffer.SubstituteNameOffset / sizeof(WCHAR);
+            DWORD substitute_name_length = reparse_data->SymbolicLinkReparseBuffer.SubstituteNameLength / sizeof(WCHAR);
+            
+            // Convert wide char to UTF-8
+            int utf8_size = WideCharToMultiByte(CP_UTF8, 0, substitute_name, substitute_name_length, 
+                                              NULL, 0, NULL, NULL);
+            if (utf8_size > 0) {
+                link_path = (char*)malloc(utf8_size + 1);
+                if (link_path) {
+                    WideCharToMultiByte(CP_UTF8, 0, substitute_name, substitute_name_length, 
+                                      link_path, utf8_size, NULL, NULL);
+                    link_path[utf8_size] = '\0';
+                    
+                    // Remove the \\??\\ prefix if present (Windows symlink format)
+                    if (strncmp(link_path, "\\??\\", 4) == 0) {
+                        memmove(link_path, link_path + 4, strlen(link_path + 4) + 1);
+                    }
+                }
+            }
+        }
+    }
+    
+    free(buffer);
+    CloseHandle(hFile);
+    
+    if (!success || !link_path) {
+        DWORD error_code = GetLastError();
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Failed to read symbolic link. Error code: %lu", error_code);
+        JS_FreeCString(ctx, path);
+        if (link_path) free(link_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+#else
+    // Unix-like implementation using readlink
+    size_t buffer_size = 4096; // Initial buffer size
+    ssize_t link_size;
+    
+    // Allocate buffer for the link path
+    link_path = (char*)malloc(buffer_size);
+    if (!link_path) {
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Memory allocation failed");
+    }
+    
+    // Read the symbolic link
+    link_size = readlink(path, link_path, buffer_size - 1);
+    
+    // Handle buffer too small case
+    if (link_size == buffer_size - 1) {
+        // Buffer might be too small, try with larger buffer
+        free(link_path);
+        buffer_size = 65536; // 64KB should be sufficient for most paths
+        link_path = (char*)malloc(buffer_size);
+        if (!link_path) {
+            JS_FreeCString(ctx, path);
+            return JS_ThrowTypeError(ctx, "Memory allocation failed");
+        }
+        link_size = readlink(path, link_path, buffer_size - 1);
+    }
+    
+    if (link_size == -1) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Failed to read symbolic link: %s", strerror(errno));
+        free(link_path);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+    
+    // Null-terminate the string
+    link_path[link_size] = '\0';
+#endif
+
+    // Create JavaScript string from the link path
+    if (link_path) {
+        result = JS_NewString(ctx, link_path);
+        free(link_path);
+    } else {
+        result = JS_NewString(ctx, "");
+    }
+    
+    // Clean up and return result
+    JS_FreeCString(ctx, path);
+    return result;
+}
+
+/* copy(): high-performance file copy */
+static JSValue tjs_syncfs_copy(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    const char *src_path, *dest_path;
+    
+    if (argc < 2) {
+        return JS_ThrowSyntaxError(ctx, "Missing arguments: requires srcPath and destPath");
+    }
+    
+    src_path = JS_ToCString(ctx, argv[0]);
+    if (!src_path) {
+        return JS_ThrowTypeError(ctx, "First argument must be a string");
+    }
+    
+    dest_path = JS_ToCString(ctx, argv[1]);
+    if (!dest_path) {
+        JS_FreeCString(ctx, src_path);
+        return JS_ThrowTypeError(ctx, "Second argument must be a string");
+    }
+    
+    if (strlen(src_path) == 0 || strlen(dest_path) == 0) {
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowRangeError(ctx, "Paths cannot be empty");
+    }
+    
+#ifdef _WIN32
+    // Windows high-performance copy using CopyFileEx with progress callback (NULL for simple copy)
+    result = CopyFileExA(src_path, dest_path, NULL, NULL, NULL, COPY_FILE_FAIL_IF_EXISTS);
+    if (!result) {
+        DWORD error_code = GetLastError();
+        char error_msg[256];
+        
+        if (error_code == ERROR_FILE_EXISTS) {
+            snprintf(error_msg, sizeof(error_msg), "Destination file already exists: %s", dest_path);
+        } else {
+            snprintf(error_msg, sizeof(error_msg), 
+                     "Failed to copy file on Windows. Error code: %lu", error_code);
+        }
+        
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+#else
+    // Unix high-performance copy using sendfile() for efficient kernel-space copying
+    int src_fd = -1, dest_fd = -1;
+    struct stat src_stat;
+    ssize_t bytes_copied;
+    off_t offset = 0;
+    
+    // Open source file (read-only)
+    src_fd = open(src_path, O_RDONLY);
+    if (src_fd == -1) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Cannot open source file: %s", strerror(errno));
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+    
+    // Get source file info
+    if (fstat(src_fd, &src_stat) == -1) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Cannot get source file info: %s", strerror(errno));
+        close(src_fd);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+    
+    // Open destination file (create, write-only, with same permissions as source)
+    dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
+    if (dest_fd == -1) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Cannot create destination file: %s", strerror(errno));
+        close(src_fd);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+    
+    // Use sendfile for efficient zero-copy file transfer (where available)
+    #ifdef __linux__
+        bytes_copied = sendfile(dest_fd, src_fd, &offset, src_stat.st_size);
+    #else
+        // Fallback to read/write for systems without sendfile
+        char buffer[65536]; // 64KB buffer
+        ssize_t bytes_read;
+        bytes_copied = 0;
+        
+        while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+            ssize_t bytes_written = write(dest_fd, buffer, bytes_read);
+            if (bytes_written != bytes_read) {
+                // Write error
+                bytes_copied = -1;
+                break;
+            }
+            bytes_copied += bytes_written;
+        }
+        
+        if (bytes_read == -1) {
+            bytes_copied = -1;
+        }
+    #endif
+    
+    // Close file descriptors
+    close(src_fd);
+    close(dest_fd);
+    
+    // Check if copy was successful
+    if (bytes_copied == -1 || bytes_copied != src_stat.st_size) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), 
+                 "Failed to copy file data: %s", strerror(errno));
+        
+        // Clean up partial destination file on error
+        unlink(dest_path);
+        
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, error_msg);
+    }
+#endif
+
+    // Clean up and return success
+    JS_FreeCString(ctx, src_path);
+    JS_FreeCString(ctx, dest_path);
+    
+    return JS_UNDEFINED;
+}
+
 /* rename() - rename/move file */
 static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char *oldpath, *newpath;
@@ -771,6 +1280,7 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     JS_CFUNC_DEF("write", 4, tjs_syncfs_write),
     JS_CFUNC_DEF("readFile", 1, tjs_syncfs_read_file),
     JS_CFUNC_DEF("writeFile", 3, tjs_syncfs_write_file),
+	JS_CFUNC_DEF("copy", 2, tjs_syncfs_copy),
     
     /* Directory operations */
     JS_CFUNC_DEF("mkdir", 2, tjs_syncfs_mkdir),
@@ -780,11 +1290,14 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     /* File management */
     JS_CFUNC_DEF("unlink", 1, tjs_syncfs_unlink),
     JS_CFUNC_DEF("rename", 2, tjs_syncfs_rename),
+	JS_CFUNC_DEF("link", 2, tjs_syncfs_link),
+	JS_CFUNC_DEF("symlink", 2, tjs_syncfs_symlink),
     
     /* Path operations */
     JS_CFUNC_DEF("realpath", 1, tjs_syncfs_realpath),
     JS_CFUNC_DEF("getcwd", 0, tjs_syncfs_getcwd),
     JS_CFUNC_DEF("chdir", 1, tjs_syncfs_chdir),
+	JS_CFUNC_DEF("readlink", 1, tjs_syncfs_readlink),
     
 #define CCONST(val) JS_PROP_INT32_DEF(#val, val, JS_PROP_CONFIGURABLE)
 

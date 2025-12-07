@@ -166,6 +166,11 @@ declare namespace CModuleEngine {
          * 导出模块为字节码
          */
         dump(): ArrayBuffer;
+
+        /**
+         * 作为模块执行
+         */
+        eval(): Promise;
     }
  
     /**

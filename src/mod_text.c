@@ -148,7 +148,7 @@ static JSValue iconv_convert(JSContext *ctx, iconv_t cd,
         js_free(ctx, outbuf);
         return result;
     } else {
-        JSValue result = JS_NewArrayBufferCopy(ctx, (const uint8_t *)outbuf, total_written);
+        JSValue result = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)outbuf, total_written);
         js_free(ctx, outbuf);
         return result;
     }
@@ -343,7 +343,7 @@ static JSValue tjs_text_encoder_constructor(JSContext *ctx, JSValueConst new_tar
     }
     
     encoder->encoding = js_strdup(ctx, encoding);
-    JS_FreeCString(ctx, encoding);
+    if(argc > 0) JS_FreeCString(ctx, encoding);
     
     /* Create iconv descriptor */
     encoder->cd = iconv_open(encoder->encoding, "UTF-8");

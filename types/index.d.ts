@@ -13,7 +13,6 @@ interface TjsModules {
     os: typeof CModuleOS,
     process: typeof CModuleProcess,
     pty: typeof CModulePty,
-    server: typeof CModuleServer,
     signal: typeof CModuleSignals,
     sqlite3: typeof CModuleSQLite3,
     streams: typeof CModuleStreams,
@@ -31,10 +30,13 @@ interface TjsModules {
     text: typeof CModuleText,
     jsonc: typeof CModuleJsonC,
     algorithm: typeof CModuleAlgorithm,
+    ws: typeof CModuleWS,
 }
 
-interface TjsPosixModules {
-    'posix-socket': typeof CModulePosixSocket
+interface TJSOptionalModules {
+    'posix-socket': typeof CModulePosixSocket,
+    'wasm': typeof CModuleWASM,
+    'server': typeof CModuleServer,
 }
 
 interface ImportMeta {
@@ -51,7 +53,7 @@ interface ImportMeta {
      * @param name The name of the module to load (e.g. "posix-ffi")
      * @returns The corresponding module object or null if module not found
      */
-    use<K extends keyof TjsPosixModules>(name: K): TjsPosixModules[K] | null;
+    use<K extends keyof TJSOptionalModules>(name: K): TJSOptionalModules[K] | null;
 
     /**
      * Module not found, upgrade your circu.js type definitions?
@@ -61,5 +63,5 @@ interface ImportMeta {
     /**
      * The names of all built-in modules available to this program
      */
-    module: Array<keyof TjsModules | keyof TjsPosixModules>;
+    module: Array<keyof TjsModules | keyof TJSOptionalModules>;
 }

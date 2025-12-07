@@ -115,6 +115,7 @@ add_library(cjs
     src/mod_xml.c
     src/mod_text.c
     src/mod_jsonc.c
+    src/mod_crypto.c
     deps/quickjs/cutils.c
 )
 

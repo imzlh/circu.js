@@ -69,6 +69,42 @@ declare namespace CModuleOS {
         readonly scopeId?: number;
     }
 
+    interface MemoryUsage {
+        /** 操作系统可用内存 */
+        "os.free": number;
+        /** 操作系统总内存 */
+        "os.total": number;
+        /** 操作系统受限内存 */
+        "os.constrained": number;
+        /** 进程常驻内存大小 */
+        "os.rss": number;
+        /** 操作系统已用内存 */
+        "os.used": number;
+        
+        /** 虚拟机已用内存 */
+        "vm.used": number;
+        
+        /** 堆内存使用量 */
+        "used": number;
+        /** 堆内存限制 */
+        "limit": number;
+        
+        /** 字符串使用量 */
+        "string.used": number;
+        /** 字符串数量 */
+        "string.count": number;
+        
+        /** 缓冲区使用量 */
+        "buffer.used": number;
+        /** 缓冲区数量 */
+        "buffer.count": number;
+        
+        /** 对象数量 */
+        "object.count": number;
+        /** 对象使用量 */
+        "object.used": number;
+    }
+
     /**
      * 系统负载平均值
      * @example [1.5, 1.2, 0.8] // 1分钟, 5分钟, 15分钟平均值
@@ -205,6 +241,12 @@ declare namespace CModuleOS {
             irq: number;
         };
     }>;
+
+    /**
+     * 注意：这是一个getter属性
+     * 获取JS/OS内存信息（同步）
+     */
+    function memoryUsage(): MemoryUsage;
 
     /**
      * 获取系统负载平均值（同步）

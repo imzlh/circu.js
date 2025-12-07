@@ -10,7 +10,7 @@ import fetch from "../polyfill/fetch.js";
 
 // 导入所需模块
 const { createServer } = use('server');
-const { SSLContext, createSelfSignedCert } = use('ssl');
+const { Context, createSelfSignedCert } = use('ssl');
 const { writeFile, unlink } = use('fs');
 const { TCP } = use('streams');
 const { setTimeout } = use('timers');
@@ -330,7 +330,7 @@ async function testSSL() {
         await writeFile('test-key.pem', new TextEncoder().encode(key));
         
         // 创建 SSL 上下文
-        const sslContext = new SSLContext({
+        const Context = new Context({
             mode: "server",
             cert: 'test-cert.pem',
             key: 'test-key.pem',
@@ -343,7 +343,7 @@ async function testSSL() {
             
             onAccept: (info) => {
                 console.log('新连接接受:', info);
-                return sslContext; // 使用 SSL
+                return Context; // 使用 SSL
             },
             
             onRequest: (req, res) => {
