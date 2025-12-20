@@ -1,9 +1,5 @@
 declare namespace CModuleXHR {
     /**
-     * XMLHttpRequest 模块
-     */
-
-    /**
      * XMLHttpRequest 对象状态常量
      */
     const enum ReadyState {
@@ -16,9 +12,17 @@ declare namespace CModuleXHR {
 
     /**
      * XMLHttpRequest 对象响应类型常量
+     * @nonstandard 增加了"stream"类型用于流式响应
      */
-    type ResponseType = 'arraybuffer' | 'json' | 'text';
+    type ResponseType = 'arraybuffer' | 'json' | 'text' | 'stream';
     
+    /**
+     * 上传数据拉取函数类型
+     * @nonstandard 用于流式上传
+     * @returns 返回一个Promise，resolve为Uint8Array数据块或null(EOF)
+     */
+    type PullFunction = () => Promise<Uint8Array | ArrayBuffer | null>;
+
     /**
      * XMLHttpRequest 对象
      */
@@ -53,10 +57,28 @@ declare namespace CModuleXHR {
 
         /**
          * 发送请求
-         * @param data 请求数据（可选）
+         * @param data 请求数据（可选），可以是字符串、ArrayBuffer或拉取函数
+         * @nonstandard 支持传入PullFunction实现流式上传
          * @returns 返回 undefined。
+         * 
+         * @example
+         * // 流式上传示例
+         * xhr.send(async () => {
+         *   const chunk = await readNextChunk();
+         *   return chunk || null; // null表示上传结束
+         * });
          */
-        send(data?: string | ArrayBuffer): void;
+        send(data?: string | ArrayBuffer | Uint8Array | PullFunction): void;
+
+        /**
+         * @nonstandard 暂停传输
+         */
+        pause(): void;
+        
+        /**
+         * @nonstandard 恢复传输
+         */
+        resume(): void;
 
         /**
          * 设置请求头
@@ -81,13 +103,13 @@ declare namespace CModuleXHR {
 
         /**
          * 获取响应数据
-         * @returns 返回响应数据。
+         * @returns 返回响应数据。当responseType为'stream'时此属性为null。
          */
         readonly response: string | ArrayBuffer | any;
 
         /**
          * 获取响应文本
-         * @returns 返回响应文本。
+         * @returns 返回响应文本。当responseType为'stream'时此属性为null。
          */
         readonly responseText: string;
 
@@ -174,6 +196,19 @@ declare namespace CModuleXHR {
         ontimeout: ((event: undefined) => void) | undefined;
 
         /**
+         * 流式响应体数据块事件处理函数
+         * @nonstandard 仅在responseType为'stream'时触发
+         * @param chunk - Uint8Array数据块
+         * 
+         * @example
+         * xhr.responseType = 'stream';
+         * xhr.onbody = (chunk) => {
+         *   processChunk(chunk); // 立即处理，内存不累积
+         * };
+         */
+        onbody: ((chunk: Uint8Array) => void) | undefined;
+
+        /**
          * XMLHttpRequest 对象的类型标签
          */
         readonly [Symbol.toStringTag]: 'XMLHttpRequest';
@@ -203,6 +238,7 @@ declare namespace CModuleXHR {
     export {
         ReadyState,
         ResponseType,
+        PullFunction, // 导出类型
         XMLHttpRequest,
         ProgressEvent
     };

@@ -4,7 +4,7 @@
 
 const { use } = import.meta;
 const console = use('console');
-const { onEvent } = use('engine');
+const { onEvent, onModule } = use('engine');
 const { args, version, platform, exePath, loadModule } = use('sys');
 const { exit } = use('os');
 const { realpath } = use('fs');
@@ -32,6 +32,12 @@ onEvent((name, data) => {
     }
 });
 
+onModule({
+    init(name, meta) {
+        Object.assign(meta, import.meta);
+    }
+})
+
 if (args.length < 2) {
     console.log(`Usage: ${exePath} <script.js>
 Run a circu.js test suite script.`);
@@ -47,7 +53,7 @@ globalThis.assert = (value, message) => {
 globalThis.test = async (name, fn) => {
     console.log(`Running test: ${name}`);
     try {
-        fn();
+        await fn();
         console.log(`✓ Test ${name} passed`);
     } catch (error) {
         console.error(`❌ Test ${name} failed:`, error);

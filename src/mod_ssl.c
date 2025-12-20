@@ -1095,6 +1095,7 @@ void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
     JSValue context_ctor = JS_NewCFunction2(ctx, tjs_ssl_context_constructor,
                                            "Context", 1,
                                            JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, context_ctor, context_proto);
     JS_SetPropertyStr(ctx, ns, "Context", context_ctor);
     
     /* Register SSLPipe */
@@ -1109,6 +1110,7 @@ void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
     JSValue pipe_ctor = JS_NewCFunction2(ctx, tjs_ssl_pipe_constructor,
                                         "Pipe", 2,
                                         JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, pipe_ctor, pipe_proto);
     JS_SetPropertyStr(ctx, ns, "Pipe", pipe_ctor);
     
     /* Register utility functions */

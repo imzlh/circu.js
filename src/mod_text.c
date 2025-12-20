@@ -529,6 +529,7 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JSValue decoder_ctor = JS_NewCFunction2(ctx, tjs_text_decoder_constructor,
                                            "TextDecoder", 2,
                                            JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, decoder_ctor, decoder_proto);
     JS_SetPropertyStr(ctx, ns, "Decoder", decoder_ctor);
     
     /* Register TextEncoder */
@@ -543,6 +544,7 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JSValue encoder_ctor = JS_NewCFunction2(ctx, tjs_text_encoder_constructor,
                                            "TextEncoder", 1,
                                            JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, encoder_ctor, encoder_proto);
     JS_SetPropertyStr(ctx, ns, "Encoder", encoder_ctor);
     
     /* Register utility functions */

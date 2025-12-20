@@ -594,6 +594,13 @@ static const JSCFunctionListEntry tjs_sqlite3_funcs[] = {
     TJS_CONST(SQLITE_OPEN_CREATE),
     TJS_CONST(SQLITE_OPEN_READONLY),
     TJS_CONST(SQLITE_OPEN_READWRITE),
+	TJS_CONST(SQLITE_OPEN_MEMORY),
+	TJS_CONST(SQLITE_OPEN_URI),
+	TJS_CONST(SQLITE_OPEN_NOMUTEX),
+    TJS_CONST(SQLITE_OPEN_FULLMUTEX),
+    TJS_CONST(SQLITE_OPEN_SHAREDCACHE),
+    TJS_CONST(SQLITE_OPEN_PRIVATECACHE),
+	TJS_CONST(SQLITE_OPEN_NOFOLLOW)
 };
 
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns) {
@@ -609,8 +616,5 @@ void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns) {
     JS_NewClass(rt, tjs_sqlite3_stmt_class_id, &tjs_sqlite3_stmt_class);
     JS_SetClassProto(ctx, tjs_sqlite3_stmt_class_id, JS_NULL);
 
-    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
-    JS_SetPropertyFunctionList(ctx, obj, tjs_sqlite3_funcs, countof(tjs_sqlite3_funcs));
-
-    JS_DefinePropertyValueStr(ctx, ns, "sqlite3", obj, JS_PROP_C_W_E);
+    JS_SetPropertyFunctionList(ctx, ns, tjs_sqlite3_funcs, countof(tjs_sqlite3_funcs));
 }

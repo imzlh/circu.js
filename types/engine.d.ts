@@ -41,39 +41,28 @@ declare namespace CModuleEngine {
      * 引擎版本信息
      */
     interface EngineVersions {
-        /**
-         * QuickJS 引擎版本
-         */
+        /** QuickJS 引擎版本 */
         quickjs: string;
-
-        /**
-         * circu.js 自身版本
-         */
+        /** txiki.js 自身版本 */
         tjs: string;
-
-        /**
-         * libuv 版本
-         */
+        /** libuv 版本 */
         uv: string;
-
-        /**
-         * libcurl 版本（如可用）
-         */
-        curl?: string;
-
-        /**
-         * WASM3 版本（如可用）
-         */
-        wasm3?: string;
-
-        /**
-         * SQLite3 版本
-         */
+        /** libcurl 版本 */
+        curl: string;
+        /** SQLite3 版本 */
         sqlite3: string;
+        /** zlib 版本 */
+        zlib: string;
+        /** OpenSSL 版本 */
+        openssl: string;
+        /** Expat XML 解析器版本 */
+        expat: string;
 
-        /**
-         * mimalloc 版本（如可用）
-         */
+        /** 若编译时包含 llhttp，则存在 */
+        llhttp?: string;
+        /** 若编译时包含 wasm3，则存在 */
+        wasm3?: string;
+        /** 若编译时包含 mimalloc，则存在（值为 number） */
         mimalloc?: number;
     }
 
@@ -128,7 +117,7 @@ declare namespace CModuleEngine {
      */
     export const versions: EngineVersions;
 
-    
+
     /**
      * 类似于`new TextEncoder().encode(str)`
      * 编码为buffer
@@ -142,7 +131,7 @@ declare namespace CModuleEngine {
      * @param buffer 包含文本的buffer
      */
     export function decodeString(buffer: Uint8Array | ArrayBuffer): string;
-    
+
     /**
      * (不安全，谨慎使用) 模块类
      */
@@ -172,7 +161,7 @@ declare namespace CModuleEngine {
          */
         eval(): Promise;
     }
- 
+
     /**
      * 设置虚拟机选项
      * @param options 选项对象
@@ -195,10 +184,10 @@ declare namespace CModuleEngine {
         init?: (name: string, importMeta: Record<string, any>) => void;
     }): void;
 
-        /**
-         * 事件接收器函数，返回true表示事件已处理，否则可能被底层处理，如退出
-         */
-    export function onEvent(cb: 
+    /**
+     * 事件接收器函数，返回true表示事件已处理，否则可能被底层处理，如退出
+     */
+    export function onEvent(cb:
         <T extends keyof GlobalEvents>(eventName: T, eventData: GlobalEvents[T]) => boolean
     ): void;
 }

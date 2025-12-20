@@ -99,4 +99,11 @@ declare namespace CModuleSQLite3 {
     export const SQLITE_OPEN_READONLY: number;
     export const SQLITE_OPEN_READWRITE: number;
     export const SQLITE_OPEN_CREATE: number;
+    export const SQLITE_OPEN_MEMORY: number;
+    export const SQLITE_OPEN_NOMUTEX: number;
+    export const SQLITE_OPEN_FULLMUTEX: number;
+    export const SQLITE_OPEN_SHAREDCACHE: number;
+    export const SQLITE_OPEN_PRIVATECACHE: number;
+    export const SQLITE_OPEN_URI: number;
+    export const SQLITE_OPEN_NOFOLLOW: number;
 }

@@ -1062,6 +1062,7 @@ static const JSCFunctionListEntry funcs[] = {
 #define CLASS_CREATE_CONSTRUCTOR(ctx, name, ns, constructor)                                                           \
     JSValue name##_constructor =                                                                                       \
         JS_NewCFunction2(ctx, constructor, name##_class.class_name, 1, JS_CFUNC_constructor, 0);                       \
+	JS_SetConstructor(ctx, name##_constructor, name##_proto);                                                      \
     JS_DefinePropertyValueStr(ctx,                                                                                     \
                               ns,                                                                                      \
                               name##_class.class_name,                                                                 \

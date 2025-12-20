@@ -780,31 +780,17 @@ static const JSCFunctionListEntry posix_ns_funcs[] = {
     TJS_CFUNC_DEF("checksum", 1, tjs_posix_checksum),
 };
 
-
-static JSValue tjs__mod_posix_socket_init_js(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSRuntime *rt = JS_GetRuntime(ctx);
+void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns) {
+	JSRuntime *rt = JS_GetRuntime(ctx);
 
     JS_NewClassID(rt, &tjs_sock_classid);
     JS_NewClass(rt, tjs_sock_classid, &tjs_sock_class);
     JSValue tjs_sock_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, tjs_sock_proto, tjs_sock_proto_funcs, countof(tjs_sock_proto_funcs));
     JS_SetClassProto(ctx, tjs_sock_classid, tjs_sock_proto);
-
-    JSValue posixSocketNs = JS_NewObject(ctx);
-    JS_DefinePropertyValueStr(ctx,
-                              posixSocketNs,
-                              TJS_SOCK_CLASS_NAME "Proto",
-                              JS_DupValue(ctx, tjs_sock_proto),
-                              JS_PROP_ENUMERABLE);
-    JS_SetPropertyFunctionList(ctx, posixSocketNs, posix_ns_funcs, countof(posix_ns_funcs));
+    JS_SetPropertyFunctionList(ctx, ns, posix_ns_funcs, countof(posix_ns_funcs));
     JSValue tjs_sock_constructor =
         JS_NewCFunction2(ctx, tjs_sock_create, TJS_SOCK_CLASS_NAME, 3, JS_CFUNC_constructor, 0);
-    JS_DefinePropertyValueStr(ctx, posixSocketNs, TJS_SOCK_CLASS_NAME, tjs_sock_constructor, JS_PROP_C_W_E);
-
-    return posixSocketNs;
-}
-
-void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns) {
-    JSValue func = JS_NewCFunction(ctx, tjs__mod_posix_socket_init_js, "posixSocketLoad", 0);
-    JS_SetPropertyStr(ctx, ns, "posixSocketLoad", func);
+	JS_SetConstructor(ctx, tjs_sock_constructor, tjs_sock_proto);
+    JS_DefinePropertyValueStr(ctx, ns, TJS_SOCK_CLASS_NAME, tjs_sock_constructor, JS_PROP_C_W_E);
 }

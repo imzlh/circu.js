@@ -2498,9 +2498,11 @@ void tjs__mod_crypto_init(JSContext* ctx, JSValue ns) {
         sizeof(tjs_gcm_proto_funcs) / sizeof(JSCFunctionListEntry));
     JS_SetClassProto(ctx, tjs_gcm_class_id, proto);
     
+	/* GCM constructor */
     JSValue gcm_ctor = JS_NewCFunction2(ctx, tjs_gcm_constructor, "GCM", 3, 
         JS_CFUNC_constructor, 0);
     JS_SetConstructor(ctx, gcm_ctor, proto);
+	JS_SetPropertyStr(ctx, ns, "GCM", gcm_ctor);
     
     /* Set crypto functions */
     JS_SetPropertyFunctionList(ctx, ns, tjs_crypto_funcs, countof(tjs_crypto_funcs));

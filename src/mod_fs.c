@@ -49,12 +49,37 @@
 #define mkdir(path, mode) _mkdir(path)
 #define rmdir _rmdir
 #define unlink _unlink
+typedef int64_t fs_off_t;
+static int64_t fs_pread(int fd, void *buf, int64_t len, int64_t off)
+{
+    OVERLAPPED ov = {0};
+    ov.Offset     = (DWORD)(off & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD rd = 0;
+    if (!ReadFile((HANDLE)_get_osfhandle(fd), buf, (DWORD)len, &rd, &ov))
+        return -1;
+    return rd;
+}
+static int64_t fs_pwrite(int fd, const void *buf, int64_t len, int64_t off)
+{
+    OVERLAPPED ov = {0};
+    ov.Offset     = (DWORD)(off & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD wr = 0;
+    if (!WriteFile((HANDLE)_get_osfhandle(fd), buf, (DWORD)len, &wr, &ov))
+        return -1;
+    return wr;
+}
 #else
+typedef off_t fs_off_t;
+#define fs_pread pread
+#define fs_pwrite pwrite
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #endif
 
 /* File mode flags using magic */
@@ -104,11 +129,68 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
     }
     
 #ifdef _WIN32
-    flags |= O_BINARY;  /* Always binary mode on Windows */
+    flags |= O_BINARY | O_NOINHERIT;  /* Always binary mode on Windows */
 #endif
     
     return flags;
 }
+
+static JSValue fs_throw(JSContext* ctx, const char* msg){
+	const char* err = strerror(errno);
+	JSValue err_obj = JS_NewError(ctx);
+	char errmsg[1024];
+	snprintf(errmsg, sizeof(errmsg), "%s: %s", msg, err);
+	JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_message, JS_NewString(ctx, errmsg), JS_PROP_C_W_E);
+	JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, err_obj, "code", JS_NewString(ctx, err), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, err_obj, "errno", JS_NewInt32(ctx, errno), JS_PROP_C_W_E);
+	return JS_Throw(ctx, err_obj);
+}
+#ifdef _WIN32
+static const char *errnoname(DWORD w)
+{
+    switch (w) {
+    case ERROR_FILE_NOT_FOUND:      return "ENOENT";
+    case ERROR_PATH_NOT_FOUND:      return "ENOENT";
+    case ERROR_ACCESS_DENIED:       return "EACCES";
+    case ERROR_SHARING_VIOLATION:   return "EBUSY";
+    case ERROR_LOCK_VIOLATION:      return "EWOULDBLOCK";
+    case ERROR_ALREADY_EXISTS:      return "EEXIST";
+    case ERROR_FILE_EXISTS:         return "EEXIST";
+    default:                        return "UNKNOWN";
+    }
+}
+static JSValue fs_throw2(JSContext *ctx, const char *msg)
+{
+    JSValue err_obj = JS_NewError(ctx);
+    char errmsg[512] = {0};
+
+    DWORD winerr = GetLastError();
+    if (winerr == 0) winerr = ERROR_GEN_FAILURE;
+    char *winmsg = NULL;
+    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                   FORMAT_MESSAGE_FROM_SYSTEM |
+                   FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, winerr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                   (char *)&winmsg, 0, NULL);
+    snprintf(errmsg, sizeof(errmsg), "%s: %s", msg,
+             winmsg ? winmsg : "Unknown error");
+    LocalFree(winmsg);
+
+    JS_DefinePropertyValueStr(ctx, err_obj, "code",
+        JS_NewString(ctx, errnoname(winerr)), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, err_obj, "errno",
+        JS_NewInt32(ctx, winerr), JS_PROP_C_W_E);
+
+    JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_message,
+        JS_NewString(ctx, errmsg), JS_PROP_C_W_E);
+    JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_name,
+        JS_NewString(ctx, "IOError"), JS_PROP_C_W_E);
+    return JS_Throw(ctx, err_obj);
+}
+#define THROW2(msg) return fs_throw2(ctx, msg);
+#endif
+#define THROW(msg) return fs_throw(ctx, msg);
 
 /* stat() - get file status */
 static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -128,7 +210,7 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "stat failed: %s", strerror(errno));
+        THROW("stat");
     }
     
     JSValue obj = JS_NewObject(ctx);
@@ -176,7 +258,7 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "lstat failed: %s", strerror(errno));
+        THROW("lstat");
     }
     
     JSValue obj = JS_NewObject(ctx);
@@ -253,7 +335,7 @@ static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, 
     JS_FreeCString(ctx, path);
     
     if (fd < 0) {
-        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
+        THROW("open");
     }
     
     return JS_NewInt32(ctx, fd);
@@ -272,7 +354,7 @@ static JSValue tjs_syncfs_close(JSContext* ctx, JSValueConst this_val, int argc,
     }
     
     if (close(fd) < 0) {
-        return JS_ThrowInternalError(ctx, "close failed: %s", strerror(errno));
+        THROW("close");
     }
     
     return JS_UNDEFINED;
@@ -283,11 +365,9 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
     int32_t fd;
     size_t buf_size;
     uint8_t* buffer;
-    int32_t length = -1;
-    int32_t offset = 0;
     
     if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "read() requires at least 2 arguments: fd and buffer");
+        return JS_ThrowTypeError(ctx, "read() requires 2 arguments: fd and buffer");
     }
     
     if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
@@ -299,34 +379,34 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_EXCEPTION;
     }
     
-    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt32(ctx, &offset, argv[2]) < 0) {
-            return JS_EXCEPTION;
+    // Simple blocking read with EAGAIN/EINTR handling
+    ssize_t bytes_read;
+    while (1) {
+        bytes_read = read(fd, buffer, buf_size);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#ifndef _WIN32
+                // Wait for data to be available
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(fd, &readfds);
+                
+                int ret = select(fd + 1, &readfds, NULL, NULL, NULL);
+                if (ret < 0) {
+                    if (errno == EINTR) continue;
+                    THROW("select");
+                }
+                continue;
+#else
+                THROW("read");
+#endif
+            }
+            THROW("read");
         }
-    }
-    
-    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
-        if (JS_ToInt32(ctx, &length, argv[3]) < 0) {
-            return JS_EXCEPTION;
-        }
-    }
-    
-    if (offset < 0 || offset > (int32_t)buf_size) {
-        return JS_ThrowRangeError(ctx, "offset out of bounds");
-    }
-    
-    if (length < 0) {
-        length = buf_size - offset;
-    }
-    
-    if (offset + length > (int32_t)buf_size) {
-        return JS_ThrowRangeError(ctx, "length out of bounds");
-    }
-    
-    ssize_t bytes_read = read(fd, buffer + offset, length);
-    
-    if (bytes_read < 0) {
-        return JS_ThrowInternalError(ctx, "read failed: %s", strerror(errno));
+        break;
     }
     
     return JS_NewInt32(ctx, bytes_read);
@@ -337,11 +417,9 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
     int32_t fd;
     size_t buf_size;
     const uint8_t* buffer;
-    int32_t length = -1;
-    int32_t offset = 0;
     
     if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "write() requires at least 2 arguments: fd and buffer");
+        return JS_ThrowTypeError(ctx, "write() requires 2 arguments: fd and buffer");
     }
     
     if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
@@ -353,37 +431,137 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
     
-    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt32(ctx, &offset, argv[2]) < 0) {
-            return JS_EXCEPTION;
+    // Write all data, handling EINTR and EAGAIN
+    ssize_t total_written = 0;
+    while (total_written < (ssize_t)buf_size) {
+        ssize_t n = write(fd, buffer + total_written, buf_size - total_written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#ifndef _WIN32
+                fd_set writefds;
+                FD_ZERO(&writefds);
+                FD_SET(fd, &writefds);
+                
+                int ret = select(fd + 1, NULL, &writefds, NULL, NULL);
+                if (ret < 0) {
+                    if (errno == EINTR) continue;
+                    THROW("select");
+                }
+                continue;
+#else
+                THROW("write");
+#endif
+            }
+            THROW("write");
         }
+        total_written += n;
     }
     
-    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
-        if (JS_ToInt32(ctx, &length, argv[3]) < 0) {
-            return JS_EXCEPTION;
-        }
+    return JS_NewInt32(ctx, total_written);
+}
+
+/* pread() - positional read */
+static JSValue tjs_syncfs_pread(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    size_t buf_size;
+    uint8_t* buffer;
+    int64_t offset;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "pread() requires 3 arguments: fd, buffer, and offset");
     }
     
-    if (offset < 0 || offset > (int32_t)buf_size) {
-        return JS_ThrowRangeError(ctx, "offset out of bounds");
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
     }
     
-    if (length < 0) {
-        length = buf_size - offset;
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
+        return JS_EXCEPTION;
     }
     
-    if (offset + length > (int32_t)buf_size) {
-        return JS_ThrowRangeError(ctx, "length out of bounds");
+    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
+        return JS_EXCEPTION;
     }
     
-    ssize_t bytes_written = write(fd, buffer + offset, length);
+    ssize_t bytes_read = fs_pread(fd, buffer, buf_size, offset);
+    
+    if (bytes_read < 0) {
+        THROW("pread");
+    }
+    
+    return JS_NewInt32(ctx, bytes_read);
+}
+
+/* pwrite() - positional write */
+static JSValue tjs_syncfs_pwrite(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    size_t buf_size;
+    const uint8_t* buffer;
+    int64_t offset;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "pwrite() requires 3 arguments: fd, buffer, and offset");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    ssize_t bytes_written = fs_pwrite(fd, buffer, buf_size, offset);
     
     if (bytes_written < 0) {
-        return JS_ThrowInternalError(ctx, "write failed: %s", strerror(errno));
+        THROW("pwrite");
     }
     
     return JS_NewInt32(ctx, bytes_written);
+}
+
+/* setBlocking() - set fd to blocking/non-blocking mode */
+static JSValue tjs_syncfs_set_blocking(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    int blocking = 1;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "setBlocking() requires 2 arguments: fd and blocking");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    blocking = JS_ToBool(ctx, argv[1]);
+    
+#ifndef _WIN32
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        THROW("fcntl");
+    }
+    
+    if (blocking) {
+        flags &= ~O_NONBLOCK;
+    } else {
+        flags |= O_NONBLOCK;
+    }
+    
+    if (fcntl(fd, F_SETFL, flags) == -1) {
+        THROW("fcntl");
+    }
+#endif
+    
+    return JS_UNDEFINED;
 }
 
 /* readFile() - read entire file */
@@ -407,13 +585,13 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     );
     if (fd < 0) {
         JS_FreeCString(ctx, path);
-        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
+        THROW("open");
     }
     
     if (fstat(fd, &st) < 0) {
         close(fd);
         JS_FreeCString(ctx, path);
-        return JS_ThrowInternalError(ctx, "fstat failed: %s", strerror(errno));
+        THROW("fstat");
     }
     
     JS_FreeCString(ctx, path);
@@ -425,18 +603,17 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         return JS_EXCEPTION;
     }
     
-    ssize_t total_read = 0;
-    while (total_read < (ssize_t)size) {
-        ssize_t n = read(fd, buf + total_read, size - total_read);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+    ssize_t n, total_read = 0;
+	while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
+		if (n < 0) {
+			if (errno == EINTR) continue;
             js_free(ctx, buf);
             close(fd);
-            return JS_ThrowInternalError(ctx, "read failed: %s", strerror(errno));
-        }
-        if (n == 0) break;
-        total_read += n;
-    }
+            THROW("read");
+       	}
+		total_read += n;
+		if (total_read == size) break;
+	}
     
     close(fd);
     
@@ -483,7 +660,7 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
     JS_FreeCString(ctx, path);
     
     if (fd < 0) {
-        return JS_ThrowInternalError(ctx, "open failed: %s", strerror(errno));
+        THROW("open");
     }
     
     ssize_t total_written = 0;
@@ -492,7 +669,7 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
         if (n < 0) {
             if (errno == EINTR) continue;
             close(fd);
-            return JS_ThrowInternalError(ctx, "write failed: %s", strerror(errno));
+            THROW("write");
         }
         total_written += n;
     }
@@ -527,7 +704,7 @@ static JSValue tjs_syncfs_mkdir(JSContext* ctx, JSValueConst this_val, int argc,
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "mkdir failed: %s", strerror(errno));
+        THROW("mkdir");
     }
     
     return JS_UNDEFINED;
@@ -550,7 +727,7 @@ static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc,
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "rmdir failed: %s", strerror(errno));
+        THROW("rmdir");
     }
     
     return JS_UNDEFINED;
@@ -573,7 +750,7 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "unlink failed: %s", strerror(errno));
+        THROW("unlink");
     }
     
     return JS_UNDEFINED;
@@ -1119,7 +1296,7 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
     JS_FreeCString(ctx, newpath);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "rename failed: %s", strerror(errno));
+        THROW("rename");
     }
     
     return JS_UNDEFINED;
@@ -1147,7 +1324,7 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     JS_FreeCString(ctx, path);
     
     if (handle == INVALID_HANDLE_VALUE) {
-        return JS_ThrowInternalError(ctx, "opendir failed");
+        THROW2("opendir")
     }
     
     JSValue arr = JS_NewArray(ctx);
@@ -1166,7 +1343,7 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     JS_FreeCString(ctx, path);
     
     if (!dir) {
-        return JS_ThrowInternalError(ctx, "opendir failed: %s", strerror(errno));
+        THROW("opendir");
     }
     
     JSValue arr = JS_NewArray(ctx);
@@ -1187,64 +1364,192 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
 }
 
 /* realpath() - resolve canonical path */
-static JSValue tjs_syncfs_realpath(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    const char* path;
-    
-    if (argc < 1) {
+static JSValue tjs_syncfs_realpath(JSContext *ctx,
+                                   JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    const char *path;
+
+    if (argc < 1)
         return JS_ThrowTypeError(ctx, "realpath() requires 1 argument: path");
-    }
-    
+
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
-    
+    if (!path) return JS_EXCEPTION;
+
 #ifdef _WIN32
-    char resolved[MAX_PATH];
-    DWORD ret = GetFullPathNameA(path, MAX_PATH, resolved, NULL);
+    HANDLE hFile = CreateFileA(path,
+                               0,	// query only
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL,
+                               OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS,
+                               NULL);
     JS_FreeCString(ctx, path);
-    
-    if (ret == 0 || ret > MAX_PATH) {
-        return JS_ThrowInternalError(ctx, "realpath failed");
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2(ctx, "realpath");
     }
-    
-    return JS_NewString(ctx, resolved);
+
+    /* 2. get final path (resolved symlinks, ., and ..) */
+    char buf[MAX_PATH * 4];
+    DWORD len = GetFinalPathNameByHandleA(hFile, buf, sizeof(buf),
+                                          VOLUME_NAME_DOS);
+    CloseHandle(hFile);
+    if (len == 0 || len >= sizeof(buf)) {
+        SetLastError(len == 0 ? ERROR_GEN_FAILURE : ERROR_INSUFFICIENT_BUFFER);
+        THROW2(ctx, "realpath");
+    }
+
+    const char *out = buf;
+	// UNC path: \\?\UNC\server\share\file.txt -> \\server\share\file.txt
+    if (strncmp(out, "\\\\?\\", 4) == 0) {
+        out += 4;
+        if (strncmp(out, "UNC\\", 4) == 0) {
+            out += 2;
+            *(--out) = '\\';
+        }
+    }
+    return JS_NewString(ctx, out);
 #else
     char resolved[PATH_MAX];
-    char* result = realpath(path, resolved);
+    char *ret = realpath(path, resolved);
     JS_FreeCString(ctx, path);
-    
-    if (!result) {
-        return JS_ThrowInternalError(ctx, "realpath failed: %s", strerror(errno));
+    if (!ret) {
+        THROW("realpath");
     }
-    
     return JS_NewString(ctx, resolved);
 #endif
 }
 
-/* getcwd() - get current working directory */
-static JSValue tjs_syncfs_getcwd(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    char buf[4096];
+/* flock() - advisory file locking */
+static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    int32_t operation;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "flock() requires 2 arguments: fd and operation");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &operation, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
     
 #ifdef _WIN32
-    if (!_getcwd(buf, sizeof(buf))) {
-        return JS_ThrowInternalError(ctx, "getcwd failed");
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("flock")
+    }
+    
+    OVERLAPPED overlapped = {0};
+    DWORD flags = 0;
+    
+    // LOCK_SH = 1, LOCK_EX = 2, LOCK_UN = 8, LOCK_NB = 4
+    if (operation & 8) { // LOCK_UN
+        if (!UnlockFileEx(hFile, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+            THROW2("unlock")
+        }
+    } else {
+        if (operation & 2) { // LOCK_EX
+            flags = LOCKFILE_EXCLUSIVE_LOCK;
+        }
+        if (operation & 4) { // LOCK_NB
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        
+        if (!LockFileEx(hFile, flags, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+            if (GetLastError() == ERROR_LOCK_VIOLATION && (operation & 4)) {
+                errno = EWOULDBLOCK;
+            }
+            THROW("lock")
+        }
     }
 #else
-    if (!getcwd(buf, sizeof(buf))) {
-        return JS_ThrowInternalError(ctx, "getcwd failed: %s", strerror(errno));
+    if (flock(fd, operation) < 0) {
+        THROW("flock");
     }
 #endif
     
-    return JS_NewString(ctx, buf);
+    return JS_UNDEFINED;
 }
 
-/* chdir() - change current working directory */
-static JSValue tjs_syncfs_chdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    const char* path;
+/* fsync() - synchronize file data to disk */
+static JSValue tjs_syncfs_fsync(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
     
     if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "chdir() requires 1 argument: path");
+        return JS_ThrowTypeError(ctx, "fsync() requires 1 argument: fd");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("fsync")
+    }
+    
+    if (!FlushFileBuffers(hFile)) {
+        THROW2("fsync")
+    }
+#else
+    if (fsync(fd) < 0) {
+        THROW("fsync");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* fdatasync() - synchronize file data (not metadata) to disk */
+static JSValue tjs_syncfs_fdatasync(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "fdatasync() requires 1 argument: fd");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    // Windows doesn't distinguish between fsync and fdatasync
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("fdatasync")
+    }
+    
+    if (!FlushFileBuffers(hFile)) {
+        THROW2("fdatasync")
+    }
+#else
+    #ifdef __APPLE__
+        // macOS doesn't have fdatasync, use fcntl F_FULLFSYNC
+        if (fcntl(fd, F_FULLFSYNC) < 0) {
+            THROW("fdatasync");
+        }
+    #else
+        if (fdatasync(fd) < 0) {
+            THROW("fdatasync");
+        }
+    #endif
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* truncate() - truncate file to specified length */
+static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int64_t length;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "truncate() requires 2 arguments: path and length");
     }
     
     path = JS_ToCString(ctx, argv[0]);
@@ -1252,15 +1557,311 @@ static JSValue tjs_syncfs_chdir(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
     
+    if (JS_ToInt64(ctx, &length, argv[1]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
 #ifdef _WIN32
-    int ret = _chdir(path);
+    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    JS_FreeCString(ctx, path);
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("truncate")
+    }
+    
+    LARGE_INTEGER li;
+    li.QuadPart = length;
+    
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) || !SetEndOfFile(hFile)) {
+        CloseHandle(hFile);
+        THROW2("truncate")
+    }
+    
+    CloseHandle(hFile);
 #else
-    int ret = chdir(path);
+    int ret = truncate(path, length);
+    JS_FreeCString(ctx, path);
+    
+    if (ret < 0) {
+        THROW("truncate");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* ftruncate() - truncate open file to specified length */
+static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    int64_t length;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "ftruncate() requires 2 arguments: fd and length");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt64(ctx, &length, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("ftruncate")
+    }
+    
+    LARGE_INTEGER li;
+    li.QuadPart = length;
+    
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) || !SetEndOfFile(hFile)) {
+        THROW2("ftruncate")
+    }
+#else
+    if (ftruncate(fd, length) < 0) {
+        THROW("ftruncate");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* chmod() - change file permissions */
+static JSValue tjs_syncfs_chmod(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int32_t mode;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "chmod() requires 2 arguments: path and mode");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    int ret = _chmod(path, mode);
+#else
+    int ret = chmod(path, mode);
 #endif
     JS_FreeCString(ctx, path);
     
     if (ret < 0) {
-        return JS_ThrowInternalError(ctx, "chdir failed: %s", strerror(errno));
+        THROW("chmod");
+    }
+    
+    return JS_UNDEFINED;
+}
+
+/* fchmod() - change permissions of open file */
+static JSValue tjs_syncfs_fchmod(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    int32_t mode;
+    
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "fchmod() requires 2 arguments: fd and mode");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    // Windows doesn't support fchmod directly, limited support
+    return JS_ThrowInternalError(ctx, "fchmod not supported on Windows");
+#else
+    if (fchmod(fd, mode) < 0) {
+        THROW("fchmod");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* chown() - change file owner and group */
+static JSValue tjs_syncfs_chown(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int32_t uid, gid;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "chown() requires 3 arguments: path, uid, gid");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &uid, argv[1]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &gid, argv[2]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    JS_FreeCString(ctx, path);
+    return JS_ThrowInternalError(ctx, "chown not supported on Windows");
+#else
+    int ret = chown(path, uid, gid);
+    JS_FreeCString(ctx, path);
+    
+    if (ret < 0) {
+        THROW("chown");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* fchown() - change owner of open file */
+static JSValue tjs_syncfs_fchown(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd, uid, gid;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "fchown() requires 3 arguments: fd, uid, gid");
+    }
+    
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &uid, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToInt32(ctx, &gid, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    return JS_ThrowInternalError(ctx, "fchown not supported on Windows");
+#else
+    if (fchown(fd, uid, gid) < 0) {
+        THROW("fchown");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* utimes() - change file access and modification times */
+static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    double atime, mtime;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "utimes() requires 3 arguments: path, atime, mtime");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) {
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
+    if (JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(path, FILE_WRITE_ATTRIBUTES, 
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    JS_FreeCString(ctx, path);
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        THROW2("utimes failed: cannot open file");
+    }
+    
+    FILETIME ft_atime, ft_mtime;
+    ULARGE_INTEGER ul;
+    
+    // Convert Unix timestamp (seconds since 1970) to Windows FILETIME (100ns since 1601)
+    ul.QuadPart = (ULONGLONG)((atime + 11644473600.0) * 10000000.0);
+    ft_atime.dwLowDateTime = ul.LowPart;
+    ft_atime.dwHighDateTime = ul.HighPart;
+    
+    ul.QuadPart = (ULONGLONG)((mtime + 11644473600.0) * 10000000.0);
+    ft_mtime.dwLowDateTime = ul.LowPart;
+    ft_mtime.dwHighDateTime = ul.HighPart;
+    
+    if (!SetFileTime(hFile, NULL, &ft_atime, &ft_mtime)) {
+        CloseHandle(hFile);
+        THROW2("utimes")
+    }
+    
+    CloseHandle(hFile);
+#else
+    struct timeval times[2];
+    times[0].tv_sec = (time_t)atime;
+    times[0].tv_usec = (suseconds_t)((atime - times[0].tv_sec) * 1000000);
+    times[1].tv_sec = (time_t)mtime;
+    times[1].tv_usec = (suseconds_t)((mtime - times[1].tv_sec) * 1000000);
+    
+    int ret = utimes(path, times);
+    JS_FreeCString(ctx, path);
+    
+    if (ret < 0) {
+        THROW("utimes");
+    }
+#endif
+    
+    return JS_UNDEFINED;
+}
+
+/* access() - check file accessibility */
+static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    int32_t mode = 0; // F_OK by default
+    
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "access() requires at least 1 argument: path");
+    }
+    
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) {
+        return JS_EXCEPTION;
+    }
+    
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+    }
+    
+#ifdef _WIN32
+    int ret = _access(path, mode);
+#else
+    int ret = access(path, mode);
+#endif
+    JS_FreeCString(ctx, path);
+    
+    if (ret < 0) {
+        THROW("access");
     }
     
     return JS_UNDEFINED;
@@ -1276,8 +1877,10 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     /* File operations */
     JS_CFUNC_DEF("open", 3, tjs_syncfs_open),
     JS_CFUNC_DEF("close", 1, tjs_syncfs_close),
-    JS_CFUNC_DEF("read", 4, tjs_syncfs_read),
-    JS_CFUNC_DEF("write", 4, tjs_syncfs_write),
+    JS_CFUNC_DEF("read", 2, tjs_syncfs_read),
+	JS_CFUNC_DEF("pread", 3, tjs_syncfs_pread),
+    JS_CFUNC_DEF("write", 2, tjs_syncfs_write),
+	JS_CFUNC_DEF("pwrite", 3, tjs_syncfs_pwrite),
     JS_CFUNC_DEF("readFile", 1, tjs_syncfs_read_file),
     JS_CFUNC_DEF("writeFile", 3, tjs_syncfs_write_file),
 	JS_CFUNC_DEF("copy", 2, tjs_syncfs_copy),
@@ -1292,23 +1895,45 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     JS_CFUNC_DEF("rename", 2, tjs_syncfs_rename),
 	JS_CFUNC_DEF("link", 2, tjs_syncfs_link),
 	JS_CFUNC_DEF("symlink", 2, tjs_syncfs_symlink),
+
+	/* File locking and synchronization */
+    JS_CFUNC_DEF("flock", 2, tjs_syncfs_flock),
+    JS_CFUNC_DEF("fsync", 1, tjs_syncfs_fsync),
+    JS_CFUNC_DEF("fdatasync", 1, tjs_syncfs_fdatasync),
+    
+    /* File size manipulation */
+    JS_CFUNC_DEF("truncate", 2, tjs_syncfs_truncate),
+    JS_CFUNC_DEF("ftruncate", 2, tjs_syncfs_ftruncate),
+    
+    /* Permissions and ownership */
+    JS_CFUNC_DEF("chmod", 2, tjs_syncfs_chmod),
+    JS_CFUNC_DEF("fchmod", 2, tjs_syncfs_fchmod),
+    JS_CFUNC_DEF("chown", 3, tjs_syncfs_chown),
+    JS_CFUNC_DEF("fchown", 3, tjs_syncfs_fchown),
+    
+    /* Time manipulation */
+    JS_CFUNC_DEF("utimes", 3, tjs_syncfs_utimes),
+    
+    /* Access checks */
+    JS_CFUNC_DEF("access", 2, tjs_syncfs_access),
+
+	/* blocking mode operations */
+    JS_CFUNC_DEF("setBlocking", 2, tjs_syncfs_set_blocking),
     
     /* Path operations */
     JS_CFUNC_DEF("realpath", 1, tjs_syncfs_realpath),
-    JS_CFUNC_DEF("getcwd", 0, tjs_syncfs_getcwd),
-    JS_CFUNC_DEF("chdir", 1, tjs_syncfs_chdir),
 	JS_CFUNC_DEF("readlink", 1, tjs_syncfs_readlink),
     
 #define CCONST(val) JS_PROP_INT32_DEF(#val, val, JS_PROP_CONFIGURABLE)
 
     /* Constants - file open flags */
-	CCONST(O_RDONLY),
-	CCONST(O_WRONLY),
-	CCONST(O_RDWR),
-	CCONST(O_CREAT),
-	CCONST(O_EXCL),
-	CCONST(O_TRUNC),
-	CCONST(O_APPEND),
+	CCONST(OPEN_RDONLY),
+	CCONST(OPEN_WRONLY),
+	CCONST(OPEN_RDWR),
+	CCONST(OPEN_CREAT),
+	CCONST(OPEN_EXCL),
+	CCONST(OPEN_TRUNC),
+	CCONST(OPEN_APPEND),
     
     /* Constants - file modes */
 	CCONST(S_IFMT),
@@ -1326,6 +1951,17 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
 	CCONST(S_IROTH),
 	CCONST(S_IWOTH),
 	CCONST(S_IXOTH),
+
+	CCONST(LOCK_SH),  // Shared lock (1)
+    CCONST(LOCK_EX),  // Exclusive lock (2)
+    CCONST(LOCK_NB),  // Non-blocking (4)
+    CCONST(LOCK_UN),  // Unlock (8)
+    
+    /* Access mode constants */
+    CCONST(F_OK),     // File exists
+    CCONST(R_OK),     // Read permission
+    CCONST(W_OK),     // Write permission
+    CCONST(X_OK),     // Execute permission
 
 #undef CCONST
 };

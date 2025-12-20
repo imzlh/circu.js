@@ -956,6 +956,7 @@ void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
 
     /* TCP object */
     obj = JS_NewCFunction2(ctx, tjs_tcp_constructor, "TCP", 1, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_DefinePropertyValueStr(ctx, ns, "TCP", obj, JS_PROP_C_W_E);
 
     /* TTY class */
@@ -967,6 +968,7 @@ void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
 
     /* TTY object */
     obj = JS_NewCFunction2(ctx, tjs_tty_constructor, "TTY", 1, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_DefinePropertyValueStr(ctx, ns, "TTY", obj, JS_PROP_C_W_E);
 
     /* Pipe class */
@@ -978,6 +980,7 @@ void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
 
     /* Pipe object */
     obj = JS_NewCFunction2(ctx, tjs_pipe_constructor, "Pipe", 1, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_DefinePropertyValueStr(ctx, ns, "Pipe", obj, JS_PROP_C_W_E);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_streams_funcs, countof(tjs_streams_funcs));

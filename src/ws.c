@@ -294,6 +294,7 @@ void tjs__mod_ws_init(JSContext *ctx, JSValue ns) {
 
     /* WebSocket object */
     obj = JS_NewCFunction2(ctx, tjs_ws_constructor, "WebSocket", 2, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_SetPropertyFunctionList(ctx, obj, tjs_ws_class_funcs, countof(tjs_ws_class_funcs));
     JS_DefinePropertyValueStr(ctx, ns, "WebSocket", obj, JS_PROP_C_W_E);
 }

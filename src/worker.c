@@ -552,6 +552,7 @@ void tjs__mod_worker_init(JSContext *ctx, JSValue ns) {
 
     /* Worker object */
     obj = JS_NewCFunction2(ctx, tjs_worker_constructor, "Worker", 2, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_DefinePropertyValueStr(ctx, ns, "Worker", obj, JS_PROP_C_W_E);
 
     /* MessagePipe class */

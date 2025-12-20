@@ -2,13 +2,10 @@
  * txiki.js syncfs module type definitions
  * Synchronous filesystem operations for IO-intensive scripts and module loading
  * Cross-platform: POSIX + Windows
- */
-
-
-/**
- * Example: Read and write files
+ * 
+ * @example Read and write files
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * // Read entire file
  * const content = fs.readFile('input.txt');
@@ -20,7 +17,7 @@
  * ```
  * @example  Check file existence and stats
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * if (fs.exists('file.txt')) {
  *   const stats = fs.stat('file.txt');
@@ -32,7 +29,7 @@
  * ```
  * @example  Low-level file operations
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * // Open file for reading
  * const fd = fs.open('data.bin', 'r');
@@ -40,6 +37,8 @@
  * // Read into buffer
  * const buffer = new Uint8Array(1024);
  * const bytesRead = fs.read(fd, buffer);
+ * // or positioned read
+ * const bytesRead = fs.pread(fd, buffer, 100, 1024);
  * console.log(`Read ${bytesRead} bytes`);
  * 
  * // Close file
@@ -47,7 +46,7 @@
  * ```
  * @example  Write file in chunks
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * const fd = fs.open('output.bin', 'w', 0o644);
  * 
@@ -56,12 +55,14 @@
  * 
  * fs.write(fd, chunk1);
  * fs.write(fd, chunk2);
+ * // or positioned write
+ * fs.pwrite(fd, chunk1, 100);
  * 
  * fs.close(fd);
  * ```
  * @example  Directory operations
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * // Create directory
  * fs.mkdir('mydir', 0o755);
@@ -77,7 +78,7 @@
  * ```
  * @example  File management
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * // Rename/move file
  * fs.rename('old.txt', 'new.txt');
@@ -85,24 +86,9 @@
  * // Delete file
  * fs.unlink('temp.txt');
  * ```
- * @example  Path operations
- * ```typescript
- * import * as fs from '@tjs/syncfs';
- * 
- * // Get current directory
- * const cwd = fs.getcwd();
- * console.log(`Working directory: ${cwd}`);
- * 
- * // Resolve absolute path
- * const absPath = fs.realpath('../file.txt');
- * console.log(`Absolute path: ${absPath}`);
- * 
- * // Change directory
- * fs.chdir('/tmp');
- * ```
  * @example  Custom module loader using syncfs
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function loadModule(path: string): any {
  *   // Resolve absolute path
@@ -127,7 +113,7 @@
  * ```
  * @example  File copy implementation
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function copyFile(src: string, dest: string): void {
  *   const data = fs.readFile(src);
@@ -139,7 +125,7 @@
  * ```
  * @example  Directory tree walker
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function walkDir(dir: string, callback: (path: string, stats: Stats) => void): void {
  *   const entries = fs.readdir(dir);
@@ -163,7 +149,7 @@
  * ```
  * @example  Atomic file write
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function writeFileAtomic(path: string, data: ArrayBuffer | Uint8Array): void {
  *   const tmpPath = `${path}.tmp`;
@@ -180,7 +166,7 @@
  * ```
  * @example  Check write permissions
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function canWrite(path: string): boolean {
  *   try {
@@ -194,7 +180,7 @@
  * ```
  * @example  Read file with specific encoding
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function readTextFile(path: string, encoding: string = 'utf-8'): string {
  *   const buffer = fs.readFile(path);
@@ -206,7 +192,7 @@
  * ```
  * @example  Safe directory creation (recursive)
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * function mkdirRecursive(path: string, mode: number = 0o777): void {
  *   const parts = path.split('/').filter(p => p);
@@ -227,7 +213,7 @@
  * ```
  * @example Use with flags constants
  * ```typescript
- * import * as fs from '@tjs/syncfs';
+ * const fs = import.meta.use('fs')
  * 
  * // Open with explicit flags
  * const fd = fs.open('file.bin', fs.O_RDWR | fs.O_CREAT, 0o644);
@@ -237,6 +223,15 @@
  * 
  * fs.close(fd);
  * ```
+ * @example Blocking STDIN read
+ * ```typescript
+ * const fs = import.meta.use('fs')
+ * 
+ * fs.setBlocking(0, true); // Set stdin to blocking mode
+ * const buffer = new Uint8Array(1024);
+ * const bytesRead = fs.read(0, buffer);
+ * console.log(`Read ${bytesRead} bytes`);
+ * ```
  */
 declare namespace CModuleFS {
     // ============================================================================
@@ -244,25 +239,19 @@ declare namespace CModuleFS {
     // ============================================================================
 
     /** Open for reading only */
-    export const O_RDONLY: number;
-
+    export const OPEN_RDONLY: number;
     /** Open for writing only */
-    export const O_WRONLY: number;
-
+    export const OPEN_WRONLY: number;
     /** Open for reading and writing */
-    export const O_RDWR: number;
-
+    export const OPEN_RDWR: number;
     /** Create file if it doesn't exist */
-    export const O_CREAT: number;
-
+    export const OPEN_CREAT: number;
     /** Error if O_CREAT and file exists */
-    export const O_EXCL: number;
-
+    export const OPEN_EXCL: number;
     /** Truncate file to zero length */
-    export const O_TRUNC: number;
-
+    export const OPEN_TRUNC: number;
     /** Append to file */
-    export const O_APPEND: number;
+    export const OPEN_APPEND: number;
 
     // ============================================================================
     // File Mode Constants
@@ -270,48 +259,60 @@ declare namespace CModuleFS {
 
     /** File type mask */
     export const S_IFMT: number;
-
     /** Regular file */
     export const S_IFREG: number;
-
     /** Directory */
     export const S_IFDIR: number;
-
     /** User read/write/execute */
     export const S_IRWXU: number;
-
     /** User read permission */
     export const S_IRUSR: number;
-
     /** User write permission */
     export const S_IWUSR: number;
-
     /** User execute permission */
     export const S_IXUSR: number;
-
     /** Group read/write/execute */
     export const S_IRWXG: number;
-
     /** Group read permission */
     export const S_IRGRP: number;
-
     /** Group write permission */
     export const S_IWGRP: number;
-
     /** Group execute permission */
     export const S_IXGRP: number;
-
     /** Other read/write/execute */
     export const S_IRWXO: number;
-
     /** Other read permission */
     export const S_IROTH: number;
-
     /** Other write permission */
     export const S_IWOTH: number;
-
     /** Other execute permission */
     export const S_IXOTH: number;
+
+    // ============================================================================
+    // File Locking Constants
+    // ============================================================================
+
+    /** Shared lock */
+    export const LOCK_SH: number;
+    /** Exclusive lock */
+    export const LOCK_EX: number;
+    /** Non-blocking lock */
+    export const LOCK_NB: number;
+    /** Unlock */
+    export const LOCK_UN: number;
+
+    // ============================================================================
+    // Access Mode Constants
+    // ============================================================================
+
+    /** File exists */
+    export const F_OK: number;
+    /** Read permission */
+    export const R_OK: number;
+    /** Write permission */
+    export const W_OK: number;
+    /** Execute permission */
+    export const X_OK: number;
 
     // ============================================================================
     // Types
@@ -323,49 +324,34 @@ declare namespace CModuleFS {
     export interface Stats {
         /** Device ID */
         dev: number;
-
         /** Inode number */
         ino: number;
-
         /** File mode (permissions and type) */
         mode: number;
-
         /** Number of hard links */
         nlink: number;
-
         /** User ID of owner */
         uid: number;
-
         /** Group ID of owner */
         gid: number;
-
         /** Device ID (if special file) */
         rdev: number;
-
         /** Total size in bytes */
         size: number;
-
         /** Block size for filesystem I/O */
         blksize: number;
-
         /** Number of 512B blocks allocated */
         blocks: number;
-
         /** Last access time (milliseconds since epoch) */
         atime: number;
-
         /** Last modification time (milliseconds since epoch) */
         mtime: number;
-
         /** Last status change time (milliseconds since epoch) */
         ctime: number;
-
         /** Check if this is a regular file */
         isFile: boolean;
-
         /** Check if this is a directory */
         isDirectory: boolean;
-
         /** Check if this is a symbolic link */
         isSymbolicLink: boolean;
     }
@@ -436,37 +422,66 @@ declare namespace CModuleFS {
      * Read data from file descriptor into buffer
      * @param fd - File descriptor
      * @param buffer - Buffer to read into
-     * @param offset - Offset in buffer to start writing (default: 0)
-     * @param length - Number of bytes to read (default: buffer.length - offset)
      * @returns Number of bytes actually read
      * @throws Error if read fails
      */
     export function read(
         fd: number,
         buffer: ArrayBuffer | Uint8Array,
-        offset?: number,
-        length?: number
+    ): number;
+
+    /**
+     * Read data from file descriptor into buffer at specified offset
+     * @param fd - File descriptor
+     * @param buffer - Buffer to read into
+     * @param offset - Offset in buffer to start reading
+     * @returns Number of bytes actually read
+     * @throws Error if read fails
+     */
+    export function pread(
+        fd: number,
+        buffer: ArrayBuffer | Uint8Array,
+        offset: number
     ): number;
 
     /**
      * Write data from buffer to file descriptor
      * @param fd - File descriptor
      * @param buffer - Buffer to write from
-     * @param offset - Offset in buffer to start reading (default: 0)
-     * @param length - Number of bytes to write (default: buffer.length - offset)
      * @returns Number of bytes actually written
      * @throws Error if write fails
      */
     export function write(
         fd: number,
+        buffer: ArrayBuffer | Uint8Array
+    ): number;
+
+    /**
+     * Write data from buffer to file descriptor at specified offset
+     * @param fd - File descriptor
+     * @param buffer - Buffer to write from
+     * @param offset - Offset in buffer to start writing
+     * @returns Number of bytes actually written
+     * @throws Error if write fails
+     */
+    export function pwrite(
+        fd: number,
         buffer: ArrayBuffer | Uint8Array,
-        offset?: number,
-        length?: number
+        offset: number
     ): number;
 
     // ============================================================================
     // High-Level File Operations
     // ============================================================================
+
+    /**
+     * Set file blocking mode (non-blocking/blocking)
+     * Note that this is a no-op on Windows.
+     * @param fd - File descriptor
+     * @param blocking - true for blocking mode, false for non-blocking mode
+     * @throws Error if operation fails (not supported on Windows)
+     */
+    export function setBlocking(fd: number, blocking: boolean): void;
 
     /**
      * Read entire file synchronously
@@ -490,15 +505,15 @@ declare namespace CModuleFS {
     ): void;
 
     /**
-     * Read entire file synchronously with specific encoding
-     * <br>
-     * High-performance using Windows/Linux OS-level copy
-     * @param path - File path
-     * @param encoding - Encoding to use (default: 'utf-8')
-     * @returns File contents as string
-     * @throws Error if file doesn't exist or read fails
+     * High-performance file copy (OS-level optimization)
+     * @param srcPath - Source file path
+     * @param destPath - Destination file path
+     * @throws Error if copy fails
      */
-    export function copy(path: string, dest: string): void;
+    export function copy(
+        srcPath: string,
+        destPath: string
+    ): void;
 
     // ============================================================================
     // Directory Operations
@@ -547,18 +562,129 @@ declare namespace CModuleFS {
     export function rename(oldPath: string, newPath: string): void;
 
     /**
-     * Link a file (creates a new name for an existing file)
-     * @param path - File path
-     * @param newPath - New file path
+     * Create a hard link
+     * @param existingPath - Existing file path
+     * @param newPath - New hard link path
+     * @throws Error if operation fails
      */
-    export function link(path: string, newPath: string): void;
+    export function link(existingPath: string, newPath: string): void;
 
     /**
-     * Create a symbolic link (creates a new file that points to an existing file)
-     * @param path - File path
-     * @param newPath - Symlink path
+     * Create a symbolic link
+     * @param targetPath - Target file/directory path
+     * @param linkPath - Symlink path
+     * @throws Error if operation fails
      */
-    export function symlink(path: string, newPath: string): void;
+    export function symlink(targetPath: string, linkPath: string): void;
+
+    // ============================================================================
+    // File Locking and Synchronization
+    // ============================================================================
+
+    /**
+     * Apply/remove an advisory lock on an open file
+     * @param fd - File descriptor
+     * @param operation - Lock operation (LOCK_SH/LOCK_EX + LOCK_NB, or LOCK_UN)
+     * @throws Error if lock operation fails
+     */
+    export function flock(fd: number, operation: number): void;
+
+    /**
+     * Synchronize file data to disk (flush all buffers)
+     * @param fd - File descriptor
+     * @throws Error if synchronization fails
+     */
+    export function fsync(fd: number): void;
+
+    /**
+     * Synchronize file data (not metadata) to disk
+     * @param fd - File descriptor
+     * @throws Error if synchronization fails
+     */
+    export function fdatasync(fd: number): void;
+
+    // ============================================================================
+    // File Size Manipulation
+    // ============================================================================
+
+    /**
+     * Truncate file to specified length
+     * @param path - File path
+     * @param length - New file length in bytes
+     * @throws Error if truncate fails
+     */
+    export function truncate(path: string, length: number): void;
+
+    /**
+     * Truncate open file to specified length
+     * @param fd - File descriptor
+     * @param length - New file length in bytes
+     * @throws Error if truncate fails
+     */
+    export function ftruncate(fd: number, length: number): void;
+
+    // ============================================================================
+    // Permissions and Ownership
+    // ============================================================================
+
+    /**
+     * Change file permissions
+     * @param path - File path
+     * @param mode - New permissions (e.g., 0o755)
+     * @throws Error if chmod fails
+     */
+    export function chmod(path: string, mode: number): void;
+
+    /**
+     * Change permissions of open file
+     * @param fd - File descriptor
+     * @param mode - New permissions (e.g., 0o755)
+     * @throws Error if fchmod fails (not supported on Windows)
+     */
+    export function fchmod(fd: number, mode: number): void;
+
+    /**
+     * Change file owner and group
+     * @param path - File path
+     * @param uid - User ID
+     * @param gid - Group ID
+     * @throws Error if chown fails (not supported on Windows)
+     */
+    export function chown(path: string, uid: number, gid: number): void;
+
+    /**
+     * Change owner of open file
+     * @param fd - File descriptor
+     * @param uid - User ID
+     * @param gid - Group ID
+     * @throws Error if fchown fails (not supported on Windows)
+     */
+    export function fchown(fd: number, uid: number, gid: number): void;
+
+    // ============================================================================
+    // Time Manipulation
+    // ============================================================================
+
+    /**
+     * Change file access and modification times
+     * @param path - File path
+     * @param atime - Access time (seconds since epoch)
+     * @param mtime - Modification time (seconds since epoch)
+     * @throws Error if utimes fails
+     */
+    export function utimes(path: string, atime: number, mtime: number): void;
+
+    // ============================================================================
+    // Access Checks
+    // ============================================================================
+
+    /**
+     * Check file accessibility
+     * @param path - File path
+     * @param mode - Accessibility check (F_OK/R_OK/W_OK/X_OK combination)
+     * @throws Error if file is not accessible
+     */
+    export function access(path: string, mode?: number): void;
 
     // ============================================================================
     // Path Operations
@@ -573,23 +699,10 @@ declare namespace CModuleFS {
     export function realpath(path: string): string;
 
     /**
-     * Get current working directory
-     * @returns Absolute path of current directory
-     * @throws Error if getcwd fails
-     */
-    export function getcwd(): string;
-
-    /**
-     * Change current working directory
-     * @param path - Directory path
-     * @throws Error if directory doesn't exist or change fails
-     */
-    export function chdir(path: string): void;
-
-    /**
-     * read symbolic link contents
+     * Read symbolic link contents
      * @param path - Symbolic link path
      * @returns Target path of symbolic link
+     * @throws Error if readlink fails
      */
     export function readlink(path: string): string;
 }

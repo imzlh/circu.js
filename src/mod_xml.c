@@ -386,7 +386,7 @@ void tjs__mod_xml_init(JSContext *ctx, JSValue ns) {
     JSValue constructor = JS_NewCFunction2(ctx, tjs_xml_parser_constructor,
                                           "XMLParser", 1,
                                           JS_CFUNC_constructor, 0);
-    
+    JS_SetConstructor(ctx, constructor, proto);
     JS_SetPropertyStr(ctx, ns, "XMLParser", constructor);
     JS_SetPropertyFunctionList(ctx, ns, tjs_xml_funcs, countof(tjs_xml_funcs));
     

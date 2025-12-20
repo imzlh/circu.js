@@ -431,6 +431,7 @@ void tjs__mod_udp_init(JSContext *ctx, JSValue ns) {
 
     /* UDP object */
     obj = JS_NewCFunction2(ctx, tjs_udp_constructor, "UDP", 1, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_DefinePropertyValueStr(ctx, ns, "UDP", obj, JS_PROP_C_W_E);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_udp_funcs, countof(tjs_udp_funcs));

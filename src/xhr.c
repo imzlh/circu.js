@@ -2,6 +2,7 @@
  * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2025 iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,8 +29,7 @@
 #include <ctype.h>
 #include <string.h>
 
-
-enum {
+typedef enum {
     XHR_EVENT_ABORT = 0,
     XHR_EVENT_ERROR,
     XHR_EVENT_LOAD,
@@ -38,23 +38,30 @@ enum {
     XHR_EVENT_PROGRESS,
     XHR_EVENT_READY_STATE_CHANGED,
     XHR_EVENT_TIMEOUT,
+	XHR_EVENT_BODY,
     XHR_EVENT_MAX,
-};
+} XhrEventType;
 
-enum {
+typedef enum {
     XHR_RSTATE_UNSENT = 0,
     XHR_RSTATE_OPENED,
     XHR_RSTATE_HEADERS_RECEIVED,
     XHR_RSTATE_LOADING,
     XHR_RSTATE_DONE,
-};
+} XhrRstate;
 
-enum {
-    XHR_RTYPE_DEFAULT = 0,
+typedef enum {
+	XHR_RTYPE_STREAM = 0,
     XHR_RTYPE_TEXT,
     XHR_RTYPE_ARRAY_BUFFER,
-    XHR_RTYPE_JSON,
-};
+    XHR_RTYPE_JSON
+} XhrRtype;
+
+typedef struct {
+	JSValue response;
+	JSValue response_text;
+	DynBuf bbuf;
+} XhrResult;
 
 typedef struct {
     JSContext *ctx;
@@ -63,28 +70,53 @@ typedef struct {
     CURL *curl_h;
     CURLM *curlm_h;
     struct curl_slist *slist;
-    bool sent;
-    bool async;
-    bool withCredentials;
-    unsigned long timeout;
-    short response_type;
-    unsigned short ready_state;
+    
+	bool sent: 1;
+    bool async: 1;
+    bool withCredentials: 1;
+	XhrRtype response_type: 5;
+	XhrRstate ready_state: 8;
+    
+	uint32_t timeout;
+    
     struct {
         char *raw;
         JSValue status;
         JSValue status_text;
     } status;
-    struct {
-        JSValue url;
-        JSValue headers;
-        JSValue response;
-        JSValue response_text;
-        DynBuf hbuf;
-        DynBuf bbuf;
-    } result;
+
+	// temp data. after Promise.then
+	struct {
+		JSValue data;
+		size_t offset;
+		JSValue pull_func;
+	} upload;
+
+	JSValue url;
+	JSValue headers;
+	DynBuf hbuf;
+
+	// maybe NULL if streaming body is set
+    XhrResult* result;
 } TJSXhr;
 
+#define SHOULD_NOT_STREAMING(x) if (!x->result) return JS_NULL;
+
 static JSClassID tjs_xhr_class_id;
+
+static void free_result_obj(JSRuntime *rt, XhrResult *result) {
+	JS_FreeValueRT(rt, result->response);
+	JS_FreeValueRT(rt, result->response_text);
+	dbuf_free(&result->bbuf);
+	js_free_rt(rt, result);
+}
+
+static void create_result_obj(JSContext* ctx, TJSXhr* x) {
+	x->result = js_malloc(ctx, sizeof(XhrResult));
+	tjs_dbuf_init(ctx, &x->result->bbuf);
+	x->result->response = JS_NULL;
+	x->result->response_text = JS_NULL;
+}
 
 static void tjs_xhr_finalizer(JSRuntime *rt, JSValue val) {
     TJSXhr *x = JS_GetOpaque(val, tjs_xhr_class_id);
@@ -106,12 +138,12 @@ static void tjs_xhr_finalizer(JSRuntime *rt, JSValue val) {
         }
         JS_FreeValueRT(rt, x->status.status);
         JS_FreeValueRT(rt, x->status.status_text);
-        JS_FreeValueRT(rt, x->result.url);
-        JS_FreeValueRT(rt, x->result.headers);
-        JS_FreeValueRT(rt, x->result.response);
-        JS_FreeValueRT(rt, x->result.response_text);
-        dbuf_free(&x->result.hbuf);
-        dbuf_free(&x->result.bbuf);
+        JS_FreeValueRT(rt, x->url);
+        JS_FreeValueRT(rt, x->headers);
+		JS_FreeValueRT(rt, x->upload.data);
+		JS_FreeValueRT(rt, x->upload.pull_func);
+		if(x->result) free_result_obj(rt, x->result);
+		dbuf_free(&x->hbuf);
         js_free_rt(rt, x);
     }
 }
@@ -124,10 +156,14 @@ static void tjs_xhr_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
         }
         JS_MarkValue(rt, x->status.status, mark_func);
         JS_MarkValue(rt, x->status.status_text, mark_func);
-        JS_MarkValue(rt, x->result.url, mark_func);
-        JS_MarkValue(rt, x->result.headers, mark_func);
-        JS_MarkValue(rt, x->result.response, mark_func);
-        JS_MarkValue(rt, x->result.response_text, mark_func);
+        JS_MarkValue(rt, x->url, mark_func);
+        JS_MarkValue(rt, x->headers, mark_func);
+		if (x->result) {
+			JS_MarkValue(rt, x->result->response, mark_func);
+			JS_MarkValue(rt, x->result->response_text, mark_func);
+		}
+		JS_MarkValue(rt, x->upload.data, mark_func);
+		JS_MarkValue(rt, x->upload.pull_func, mark_func);
     }
 }
 
@@ -164,7 +200,7 @@ static void curl__done_cb(CURLcode result, void *arg) {
     char *done_url = NULL;
     curl_easy_getinfo(easy_handle, CURLINFO_EFFECTIVE_URL, &done_url);
     if (done_url) {
-        x->result.url = JS_NewString(x->ctx, done_url);
+        x->url = JS_NewString(x->ctx, done_url);
     }
 
     if (x->slist) {
@@ -205,10 +241,104 @@ static void curlm__done_cb(CURLMsg *message, void *arg) {
     x->curl_h = NULL;
 }
 
+// streaming body: then callback
+static JSValue js__promise_then(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* data){
+	TJSXhr *x = JS_VALUE_GET_PTR(data[0]);
+	if (!x) return JS_EXCEPTION;
+
+	// read data from buffer
+	JSValue ret = JS_DupValue(ctx, argv[0]);
+	if (JS_GetTypedArrayType(ret) != -1) {
+		JSValue tmp = JS_GetPropertyStr(ctx, ret, "buffer");
+		if (JS_IsException(tmp)) goto error;
+		JS_FreeValue(ctx, ret);
+		ret = tmp;
+	}
+	else if (!JS_IsNull(ret) && !JS_IsArrayBuffer(ret)) {
+		goto error;
+	}
+
+	// save buffer to result
+	x->upload.data = ret;
+	x->upload.offset = 0;
+
+	// resume curl
+	curl_easy_pause(x->curl_h, CURLPAUSE_CONT);
+	return JS_UNDEFINED;
+
+error:
+	JS_ThrowTypeError(x->ctx, "pull function must return a ArrayBuffer or TypedArray");
+	JSValue errobj = JS_GetException(x->ctx);
+	maybe_emit_event(x, XHR_EVENT_ERROR, errobj);
+	JS_FreeValue(x->ctx, ret);
+	return errobj;
+}
+
+static size_t curl__upload_cb(char *buffer, size_t _size, size_t nitems, void *userdata) {
+	TJSXhr *x = userdata;
+	CHECK_NOT_NULL(x);
+	size_t size = _size * nitems;
+	if (!JS_IsUndefined(x->upload.data)) {
+		// null: EOF
+		if (JS_IsNull(x->upload.data)) {
+			return 0;
+		}
+		// feed to curl
+		size_t bsize;
+		const uint8_t* data = JS_GetArrayBuffer(x->ctx, &bsize, x->upload.data);
+		size_t copysize = MIN(bsize - x->upload.offset, size);
+		memcpy(buffer, data + x->upload.offset, copysize);
+		if (copysize + x->upload.offset < bsize) {
+			x->upload.offset += copysize;
+			return copysize;
+		} else {
+			JS_FreeValue(x->ctx, x->upload.data);
+			x->upload.data = JS_UNDEFINED;
+			x->upload.offset = 0;
+			return copysize;
+		}
+	}
+
+	// no data available, call pull function
+	if (JS_IsUndefined(x->upload.pull_func))
+		return CURL_READFUNC_ABORT;
+	// XXX: this should be XHR obj, not undefined
+	JSValue ret = JS_Call(x->ctx, x->upload.pull_func, JS_UNDEFINED, 0, NULL);
+	if (!JS_IsPromise(ret)) {
+		if (!JS_IsException(ret))
+			JS_ThrowTypeError(x->ctx, "pull function must return a Promise");
+		JSValue errobj = JS_GetException(x->ctx);
+		maybe_emit_event(x, XHR_EVENT_ERROR, errobj);
+		JS_FreeValue(x->ctx, ret);
+		JS_FreeValue(x->ctx, errobj);
+		return -1;
+	}
+	
+	// same as: ret.then(js__promise_then)
+	JSValue then_cb = JS_NewCFunctionData(x->ctx, js__promise_then, 1, 0, 1, (JSValueConst[]){ JS_MKPTR(JS_TAG_INT, x) });
+	JSValue then_func = JS_GetProperty(x->ctx, ret, JS_ATOM_then);
+	JS_FreeValue(x->ctx, JS_Call(x->ctx, then_func, ret, 1, (JSValueConst[]){ then_cb }));
+	JS_FreeValue(x->ctx, ret);
+	JS_FreeValue(x->ctx, then_func);
+	JS_FreeValue(x->ctx, then_cb);
+	return CURL_READFUNC_PAUSE;
+}
+
 static size_t curl__data_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
     TJSXhr *x = userdata;
     CHECK_NOT_NULL(x);
 
+	// stream: not required to buffer the response
+	if (x->response_type == XHR_RTYPE_STREAM) {
+		JSValue buf = JS_NewUint8ArrayCopy(x->ctx, (void*)ptr, size * nmemb);
+		if (JS_IsException(buf)) {
+			return -1;
+		}
+		maybe_emit_event(x, XHR_EVENT_BODY, buf);
+		return size * nmemb;
+	}
+
+	CHECK_NOT_NULL(x->result);
     if (x->ready_state == XHR_RSTATE_HEADERS_RECEIVED) {
         x->ready_state = XHR_RSTATE_LOADING;
         maybe_emit_event(x, XHR_EVENT_READY_STATE_CHANGED, JS_UNDEFINED);
@@ -216,7 +346,7 @@ static size_t curl__data_cb(char *ptr, size_t size, size_t nmemb, void *userdata
 
     size_t realsize = size * nmemb;
 
-    if (dbuf_put(&x->result.bbuf, (const uint8_t *) ptr, realsize)) {
+    if (dbuf_put(&x->result->bbuf, (const uint8_t *) ptr, realsize)) {
         return -1;
     }
 
@@ -230,7 +360,7 @@ static size_t curl__header_cb(char *ptr, size_t size, size_t nmemb, void *userda
     TJSXhr *x = userdata;
     CHECK_NOT_NULL(x);
 
-    DynBuf *hbuf = &x->result.hbuf;
+    DynBuf *hbuf = &x->hbuf;
     size_t realsize = size * nmemb;
     if (strncmp(status_line, ptr, sizeof(status_line) - 1) == 0) {
         if (hbuf->size == 0) {
@@ -318,12 +448,9 @@ static JSValue tjs_xhr_constructor(JSContext *ctx, JSValue new_target, int argc,
     }
 
     x->ctx = ctx;
-    x->result.url = JS_NULL;
-    x->result.headers = JS_NULL;
-    x->result.response = JS_NULL;
-    x->result.response_text = JS_NULL;
-    tjs_dbuf_init(ctx, &x->result.hbuf);
-    tjs_dbuf_init(ctx, &x->result.bbuf);
+	x->result = NULL;
+    x->url = JS_NULL;
+    x->headers = JS_NULL;
     x->ready_state = XHR_RSTATE_UNSENT;
     x->status.raw = NULL;
     x->status.status = JS_UNDEFINED;
@@ -332,6 +459,11 @@ static JSValue tjs_xhr_constructor(JSContext *ctx, JSValue new_target, int argc,
     x->sent = false;
     x->async = true;
     x->withCredentials = false;
+	x->response_type = XHR_RTYPE_TEXT;
+	x->upload.data = JS_UNDEFINED;
+	x->upload.pull_func = JS_UNDEFINED;
+	tjs_dbuf_init(ctx, &x->hbuf);
+	create_result_obj(ctx, x);
 
     for (int i = 0; i < XHR_EVENT_MAX; i++) {
         x->events[i] = JS_UNDEFINED;
@@ -396,29 +528,30 @@ static JSValue tjs_xhr_response_get(JSContext *ctx, JSValue this_val) {
     if (!x) {
         return JS_EXCEPTION;
     }
-    DynBuf *bbuf = &x->result.bbuf;
+	SHOULD_NOT_STREAMING(x);
+	
+    DynBuf *bbuf = &x->result->bbuf;
     if (bbuf->size == 0) {
         return JS_NULL;
     }
-    if (JS_IsNull(x->result.response)) {
+    if (JS_IsNull(x->result->response)) {
         switch (x->response_type) {
-            case XHR_RTYPE_DEFAULT:
             case XHR_RTYPE_TEXT:
-                x->result.response = JS_NewStringLen(ctx, (char *) bbuf->buf, bbuf->size);
+                x->result->response = JS_NewStringLen(ctx, (char *) bbuf->buf, bbuf->size);
                 break;
             case XHR_RTYPE_ARRAY_BUFFER:
-                x->result.response = JS_NewArrayBufferCopy(ctx, bbuf->buf, bbuf->size);
+                x->result->response = JS_NewArrayBufferCopy(ctx, bbuf->buf, bbuf->size);
                 break;
             case XHR_RTYPE_JSON:
                 // It's necessary to null-terminate the string passed to JS_ParseJSON.
                 dbuf_putc(bbuf, '\0');
-                x->result.response = JS_ParseJSON(ctx, (char *) bbuf->buf, bbuf->size - 1, "<xhr>");
+                x->result->response = JS_ParseJSON(ctx, (char *) bbuf->buf, bbuf->size - 1, "<xhr>");
                 break;
             default:
                 abort();
         }
     }
-    return JS_DupValue(ctx, x->result.response);
+    return JS_DupValue(ctx, x->result->response);
 }
 
 static JSValue tjs_xhr_responsetext_get(JSContext *ctx, JSValue this_val) {
@@ -426,14 +559,16 @@ static JSValue tjs_xhr_responsetext_get(JSContext *ctx, JSValue this_val) {
     if (!x) {
         return JS_EXCEPTION;
     }
-    DynBuf *bbuf = &x->result.bbuf;
+	
+	SHOULD_NOT_STREAMING(x);
+    DynBuf *bbuf = &x->result->bbuf;
     if (bbuf->size == 0) {
         return JS_NULL;
     }
-    if (JS_IsNull(x->result.response_text)) {
-        x->result.response_text = JS_NewStringLen(ctx, (char *) bbuf->buf, bbuf->size);
+    if (JS_IsNull(x->result->response_text)) {
+        x->result->response_text = JS_NewStringLen(ctx, (char *) bbuf->buf, bbuf->size);
     }
-    return JS_DupValue(ctx, x->result.response_text);
+    return JS_DupValue(ctx, x->result->response_text);
 }
 
 static JSValue tjs_xhr_responsetype_get(JSContext *ctx, JSValue this_val) {
@@ -442,14 +577,14 @@ static JSValue tjs_xhr_responsetype_get(JSContext *ctx, JSValue this_val) {
         return JS_EXCEPTION;
     }
     switch (x->response_type) {
-        case XHR_RTYPE_DEFAULT:
-            return JS_NewString(ctx, "");
         case XHR_RTYPE_TEXT:
             return JS_NewString(ctx, "text");
         case XHR_RTYPE_ARRAY_BUFFER:
             return JS_NewString(ctx, "arraybuffer");
         case XHR_RTYPE_JSON:
             return JS_NewString(ctx, "json");
+		case XHR_RTYPE_STREAM:
+			return JS_NewString(ctx, "stream");
         default:
             abort();
     }
@@ -459,28 +594,49 @@ static JSValue tjs_xhr_responsetype_set(JSContext *ctx, JSValue this_val, JSValu
     static const char array_buffer[] = "arraybuffer";
     static const char json[] = "json";
     static const char text[] = "text";
+	static const char stream[] = "stream";
 
     TJSXhr *x = tjs_xhr_get(ctx, this_val);
     if (!x) {
         return JS_EXCEPTION;
     }
 
-    if (x->ready_state >= XHR_RSTATE_LOADING) {
-        JS_Throw(ctx, JS_NewString(ctx, "InvalidStateError"));
-    }
-
-    const char *v = JS_ToCString(ctx, value);
+	size_t strlen;
+    const char *v = JS_ToCStringLen(ctx, &strlen, value);
     if (v) {
-        if (strncmp(array_buffer, v, sizeof(array_buffer) - 1) == 0) {
+		if (strncmp(stream, v, sizeof(stream) - 1) == 0) {
+			if (x->response_type != XHR_RTYPE_STREAM) {
+				// after changing the response type, we need to reset the response object
+				if (x->result->bbuf.size > 0) {
+					JSValue buf = JS_NewUint8ArrayCopy(ctx, x->result->bbuf.buf, x->result->bbuf.size);
+					maybe_emit_event(x, XHR_EVENT_BODY, buf);
+				}
+				free_result_obj(JS_GetRuntime(ctx), x->result);
+				x->result = NULL;
+			}
+			x->response_type = XHR_RTYPE_STREAM;
+			goto then;	// skip loading check
+		}
+
+		if (x->ready_state >= XHR_RSTATE_LOADING) {
+			return JS_ThrowTypeError(ctx, "InvalidStateError: body has already been consumed as stream");
+		}
+		if (!x->result) {
+			create_result_obj(ctx, x);
+		}
+		if (strlen == 0) {
+			x->response_type = XHR_RTYPE_TEXT; // default
+		} else if (strncmp(array_buffer, v, sizeof(array_buffer) - 1) == 0) {
             x->response_type = XHR_RTYPE_ARRAY_BUFFER;
         } else if (strncmp(json, v, sizeof(json) - 1) == 0) {
             x->response_type = XHR_RTYPE_JSON;
         } else if (strncmp(text, v, sizeof(text) - 1) == 0) {
             x->response_type = XHR_RTYPE_TEXT;
-        } else if (strlen(v) == 0) {
-            x->response_type = XHR_RTYPE_DEFAULT;
         }
-        JS_FreeCString(ctx, v);
+		
+		// XXX: throw exception if the response type is not supported?
+then:
+		JS_FreeCString(ctx, v);
     }
 
     return JS_UNDEFINED;
@@ -491,7 +647,7 @@ static JSValue tjs_xhr_responseurl_get(JSContext *ctx, JSValue this_val) {
     if (!x) {
         return JS_EXCEPTION;
     }
-    return JS_DupValue(ctx, x->result.url);
+    return JS_DupValue(ctx, x->url);
 }
 
 static JSValue tjs_xhr_status_get(JSContext *ctx, JSValue this_val) {
@@ -597,14 +753,14 @@ static JSValue tjs_xhr_getallresponseheaders(JSContext *ctx, JSValue this_val, i
     if (!x) {
         return JS_EXCEPTION;
     }
-    DynBuf *hbuf = &x->result.hbuf;
+    DynBuf *hbuf = &x->hbuf;
     if (hbuf->size == 0) {
         return JS_NULL;
     }
-    if (JS_IsNull(x->result.headers)) {
-        x->result.headers = JS_NewStringLen(ctx, (char *) hbuf->buf, hbuf->size - 1);  // Skip trailing null byte.
+    if (JS_IsNull(x->headers)) {
+        x->headers = JS_NewStringLen(ctx, (char *) hbuf->buf, hbuf->size - 1);  // Skip trailing null byte.
     }
-    return JS_DupValue(ctx, x->result.headers);
+    return JS_DupValue(ctx, x->headers);
 }
 
 static JSValue tjs_xhr_getresponseheader(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -612,7 +768,7 @@ static JSValue tjs_xhr_getresponseheader(JSContext *ctx, JSValue this_val, int a
     if (!x) {
         return JS_EXCEPTION;
     }
-    DynBuf *hbuf = &x->result.hbuf;
+    DynBuf *hbuf = &x->hbuf;
     if (hbuf->size == 0) {
         return JS_NULL;
     }
@@ -679,7 +835,6 @@ static JSValue tjs_xhr_open(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     // TODO: support username and password.
-
     if (x->ready_state == XHR_RSTATE_DONE) {
         if (x->slist) {
             curl_slist_free_all(x->slist);
@@ -692,19 +847,16 @@ static JSValue tjs_xhr_open(JSContext *ctx, JSValue this_val, int argc, JSValue 
         }
         JS_FreeValue(ctx, x->status.status);
         JS_FreeValue(ctx, x->status.status_text);
-        JS_FreeValue(ctx, x->result.url);
-        JS_FreeValue(ctx, x->result.headers);
-        JS_FreeValue(ctx, x->result.response);
-        JS_FreeValue(ctx, x->result.response_text);
-        dbuf_free(&x->result.hbuf);
-        dbuf_free(&x->result.bbuf);
-
-        tjs_dbuf_init(ctx, &x->result.hbuf);
-        tjs_dbuf_init(ctx, &x->result.bbuf);
-        x->result.url = JS_NULL;
-        x->result.headers = JS_NULL;
-        x->result.response = JS_NULL;
-        x->result.response_text = JS_NULL;
+        JS_FreeValue(ctx, x->url);
+        JS_FreeValue(ctx, x->headers);
+		dbuf_free(&x->hbuf);
+		if (x->result) {
+			free_result_obj(JS_GetRuntime(ctx), x->result);
+			create_result_obj(ctx, x);
+		}
+        tjs_dbuf_init(ctx, &x->hbuf);
+        x->url = JS_NULL;
+        x->headers = JS_NULL;
         x->ready_state = XHR_RSTATE_UNSENT;
         x->status.raw = NULL;
         x->status.status = JS_UNDEFINED;
@@ -770,7 +922,14 @@ static JSValue tjs_xhr_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
             }
             curl_easy_setopt(x->curl_h, CURLOPT_POSTFIELDSIZE_LARGE, size);
             curl_easy_setopt(x->curl_h, CURLOPT_COPYPOSTFIELDS, buf);
-        }
+        } else if (JS_IsFunction(ctx, arg)) {
+			// streaming: pull func
+			x->upload.pull_func = JS_DupValue(ctx, arg);
+			curl_easy_setopt(x->curl_h, CURLOPT_READFUNCTION, curl__upload_cb);
+			curl_easy_setopt(x->curl_h, CURLOPT_READDATA, x);
+			curl_easy_setopt(x->curl_h, CURLOPT_POSTFIELDSIZE_LARGE, -1L);
+			curl_easy_setopt(x->curl_h, CURLOPT_UPLOAD, 1L);
+		}
         curl_easy_setopt(x->curl_h, CURLOPT_COOKIELIST, "RELOAD");
         curl_easy_setopt(x->curl_h, CURLOPT_HTTPHEADER, x->slist);
         if (x->async) {
@@ -782,6 +941,30 @@ static JSValue tjs_xhr_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
         x->sent = true;
     }
     return JS_UNDEFINED;
+}
+
+static JSValue tjs_xhr_pause(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	TJSXhr* x = tjs_xhr_get(ctx, this_val);
+	if (!x) {
+		return JS_EXCEPTION;
+	}
+	if (!x->curl_h) {
+		return JS_ThrowTypeError(ctx, "not sending");
+	}
+	curl_easy_pause(x->curl_h, CURLPAUSE_ALL);
+	return JS_UNDEFINED;
+}
+
+static JSValue tjs_xhr_resume(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	TJSXhr* x = tjs_xhr_get(ctx, this_val);
+	if (!x) {
+		return JS_EXCEPTION;
+	}
+	if (!x->curl_h) {
+		return JS_ThrowTypeError(ctx, "not sending");
+	}
+	curl_easy_pause(x->curl_h, CURLPAUSE_CONT);
+	return JS_UNDEFINED;
 }
 
 static JSValue tjs_xhr_setrequestheader(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -831,6 +1014,7 @@ static const JSCFunctionListEntry tjs_xhr_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("onprogress", tjs_xhr_event_get, tjs_xhr_event_set, XHR_EVENT_PROGRESS),
     JS_CGETSET_MAGIC_DEF("onreadystatechange", tjs_xhr_event_get, tjs_xhr_event_set, XHR_EVENT_READY_STATE_CHANGED),
     JS_CGETSET_MAGIC_DEF("ontimeout", tjs_xhr_event_get, tjs_xhr_event_set, XHR_EVENT_TIMEOUT),
+	JS_CGETSET_MAGIC_DEF("onbody", tjs_xhr_event_get, tjs_xhr_event_set, XHR_EVENT_BODY),
     JS_CGETSET_DEF("readyState", tjs_xhr_readystate_get, NULL),
     JS_CGETSET_DEF("response", tjs_xhr_response_get, NULL),
     JS_CGETSET_DEF("responseText", tjs_xhr_responsetext_get, NULL),
@@ -849,6 +1033,8 @@ static const JSCFunctionListEntry tjs_xhr_proto_funcs[] = {
     TJS_CFUNC_DEF("send", 1, tjs_xhr_send),
     TJS_CFUNC_DEF("setRequestHeader", 2, tjs_xhr_setrequestheader),
     TJS_CFUNC_DEF("setCookieJar", 1, tjs_xhr_set_cookiejar),
+	TJS_CFUNC_DEF("pause", 0, tjs_xhr_pause),
+	TJS_CFUNC_DEF("resume", 0, tjs_xhr_resume),
 };
 
 void tjs__mod_xhr_init(JSContext *ctx, JSValue ns) {
@@ -864,6 +1050,7 @@ void tjs__mod_xhr_init(JSContext *ctx, JSValue ns) {
 
     /* XHR object */
     obj = JS_NewCFunction2(ctx, tjs_xhr_constructor, "XMLHttpRequest", 1, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, obj, proto);
     JS_SetPropertyFunctionList(ctx, obj, tjs_xhr_class_funcs, countof(tjs_xhr_class_funcs));
     JS_DefinePropertyValueStr(ctx, ns, "XMLHttpRequest", obj, JS_PROP_C_W_E);
 }

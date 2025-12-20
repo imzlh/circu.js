@@ -148,7 +148,7 @@ declare namespace CModuleServer {
      * @returns HTTP server instance
      * @example Basic HTTP server
      * ```typescript
-     * import { createServer } from 'http';
+     * const { createServer } = import.meta.use('server');
      * 
      * const server = createServer({
      *   port: 8080,
@@ -171,6 +171,7 @@ declare namespace CModuleServer {
      * 
      * @example Streaming response
      * ```typescript
+     * const { createServer } = import.meta.use('server');
      * const server = createServer({
      *   port: 8080,
      *   onRequest: (req, res) => {
@@ -193,6 +194,7 @@ declare namespace CModuleServer {
      * 
      * @example Server-Sent Events
      * ```typescript
+     * const { createServer } = import.meta.use('server');
      * const server = createServer({
      *   port: 8080,
      *   onRequest: (req, res) => {
@@ -217,8 +219,8 @@ declare namespace CModuleServer {
      * 
      * @example WebSocket upgrade (manual implementation)
      * ```typescript
-     * import { createServer } from 'http';
-     * import { createHash } from 'crypto';
+     * const { createServer } = import.meta.use('server');
+     * const { hash } = import.meta.use('crypto');
      * 
      * const server = createServer({
      *   port: 8080,
@@ -267,6 +269,7 @@ declare namespace CModuleServer {
      * 
      * @example POST request with body
      * ```typescript
+     * const { createServer } = import.meta.use('server');
      * const server = createServer({
      *   port: 8080,
      *   onRequest: (req, res) => {

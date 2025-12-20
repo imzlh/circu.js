@@ -131,6 +131,7 @@ if(llhttp_FOUND)
     target_sources(cjs PUBLIC
         src/mod_server.c
     )
+    target_link_libraries(cjs llhttp)
 endif()
 
 # add_library(ffi-test SHARED
@@ -173,6 +174,14 @@ endif()
     find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
     target_include_directories(cjs PRIVATE ${FFI_INCLUDE_DIR})
     target_link_libraries(cjs ${FFI_LIB})
+
+    file(READ "${FFI_INCLUDE_DIR}/ffi.h" FFI_HEADER)
+    string(FIND "${FFI_HEADER}" "FFI_BAD_ARGTYPE" FFI_HAS_BAD_ARGTYPE)
+
+    # old versions of libffi don't have FFI_BAD_ARGTYPE
+    if(FFI_HAS_BAD_ARGTYPE EQUAL -1)
+        add_definitions(-DFFI_BAD_ARGTYPE=3)
+    endif()
 # endif()
 
 set_target_properties(cjs PROPERTIES
@@ -184,7 +193,8 @@ string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(cjs PRIVATE ${cjs_cflags})
 target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(cjs PUBLIC src)
-target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl llhttp OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT Iconv::Iconv)
+# libutil is required for openpty
+target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT Iconv::Iconv util)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
