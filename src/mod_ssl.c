@@ -32,6 +32,13 @@ static bool ssl_initialized = false;
     return JS_ThrowTypeError(ctx, "SSL error in %s: %s", operation, buf); \
 } while(0)
 
+#define CHECK_SSL_ERR(ssl, ret) do { \
+	int err = SSL_get_error(ssl, ret); \
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) { \
+        return JS_NULL; \
+    } \
+} while(0)
+
 /* Macro for common SSL context configuration */
 #define SET_SSL_CTX_OPTION(ctx, ssl_ctx, option, value) do { \
     if ((value)) { \
@@ -40,6 +47,8 @@ static bool ssl_initialized = false;
         SSL_CTX_clear_options(ssl_ctx, option); \
     } \
 } while(0)
+
+#define cstr(ctx, val) JS_IsString(val) ? JS_ToCString(ctx, val) : NULL
 
 /* Constants for SSL modes */
 typedef enum {
@@ -172,7 +181,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     /* Parse mode */
     JSValue mode_val = JS_GetPropertyStr(ctx, options, "mode");
-    const char *mode_str = JS_ToCString(ctx, mode_val);
+    const char *mode_str = cstr(ctx, mode_val);
     if (mode_str) {
         ssl_ctx->mode = strcmp(mode_str, "server") == 0 ? TJS_SSL_MODE_SERVER : TJS_SSL_MODE_CLIENT;
         JS_FreeCString(ctx, mode_str);
@@ -183,7 +192,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     /* Parse SSL version */
     JSValue version_val = JS_GetPropertyStr(ctx, options, "version");
-    const char *version = JS_ToCString(ctx, version_val);
+    const char *version = cstr(ctx, version_val);
     const SSL_METHOD *method = get_ssl_method(version, ssl_ctx->mode);
     if (version) JS_FreeCString(ctx, version);
     JS_FreeValue(ctx, version_val);
@@ -204,8 +213,8 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     /* Set min/max version */
     JSValue min_ver_val = JS_GetPropertyStr(ctx, options, "minVersion");
     JSValue max_ver_val = JS_GetPropertyStr(ctx, options, "maxVersion");
-    const char *min_ver = JS_ToCString(ctx, min_ver_val);
-    const char *max_ver = JS_ToCString(ctx, max_ver_val);
+    const char *min_ver = cstr(ctx, min_ver_val);
+    const char *max_ver = cstr(ctx, max_ver_val);
     set_tls_version_range(ssl_ctx->ssl_ctx, min_ver, max_ver);
     if (min_ver) JS_FreeCString(ctx, min_ver);
     if (max_ver) JS_FreeCString(ctx, max_ver);
@@ -215,8 +224,8 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     /* Certificate and key */
     JSValue cert_val = JS_GetPropertyStr(ctx, options, "cert");
     JSValue key_val = JS_GetPropertyStr(ctx, options, "key");
-    const char *cert = JS_ToCString(ctx, cert_val);
-    const char *key = JS_ToCString(ctx, key_val);
+    const char *cert = cstr(ctx, cert_val);
+    const char *key = cstr(ctx, key_val);
     
     if (cert) {
         ssl_ctx->cert_file = js_strdup(ctx, cert);
@@ -250,7 +259,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     /* CA file */
     JSValue ca_val = JS_GetPropertyStr(ctx, options, "ca");
-    const char *ca = JS_ToCString(ctx, ca_val);
+    const char *ca = cstr(ctx, ca_val);
     if (ca) {
         ssl_ctx->ca_file = js_strdup(ctx, ca);
         int ret = SSL_CTX_load_verify_locations(ssl_ctx->ssl_ctx, ca, NULL);
@@ -267,7 +276,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     /* Ciphers */
     JSValue ciphers_val = JS_GetPropertyStr(ctx, options, "ciphers");
-    const char *ciphers = JS_ToCString(ctx, ciphers_val);
+    const char *ciphers = cstr(ctx, ciphers_val);
     if (ciphers) {
         ssl_ctx->ciphers = js_strdup(ctx, ciphers);
         SSL_CTX_set_cipher_list(ssl_ctx->ssl_ctx, ciphers);
@@ -321,7 +330,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         
         for (int32_t i = 0; i < len && alpn_list_len < sizeof(alpn_list) - 1; i++) {
             JSValue proto_val = JS_GetPropertyUint32(ctx, alpn_val, i);
-            const char *proto = JS_ToCString(ctx, proto_val);
+            const char *proto = cstr(ctx, proto_val);
             if (proto) {
                 size_t proto_len = strlen(proto);
                 if (alpn_list_len + proto_len + 1 < sizeof(alpn_list)) {
@@ -351,7 +360,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     /* DH parameters */
     JSValue dhparam_val = JS_GetPropertyStr(ctx, options, "dhparam");
-    const char *dhparam = JS_ToCString(ctx, dhparam_val);
+    const char *dhparam = cstr(ctx, dhparam_val);
 if (dhparam) {
     BIO *bio = BIO_new_file(dhparam, "r");
     if (bio) {
@@ -375,7 +384,7 @@ if (dhparam) {
     
     /* ECDH curve */
     JSValue ecdh_val = JS_GetPropertyStr(ctx, options, "ecdhCurve");
-    const char *ecdh_curve = JS_ToCString(ctx, ecdh_val);
+    const char *ecdh_curve = cstr(ctx, ecdh_val);
     if (ecdh_curve) {
         SSL_CTX_set_ecdh_auto(ssl_ctx->ssl_ctx, 1);
         JS_FreeCString(ctx, ecdh_curve);
@@ -505,7 +514,7 @@ static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
         /* Parse options for client */
         if (argc > 1 && JS_IsObject(argv[1])) {
             JSValue hostname_val = JS_GetPropertyStr(ctx, argv[1], "servername");
-            const char *hostname = JS_ToCString(ctx, hostname_val);
+            const char *hostname = cstr(ctx, hostname_val);
             if (hostname) {
                 pipe->hostname = js_strdup(ctx, hostname);
                 SSL_set_tlsext_host_name(pipe->ssl, hostname);
@@ -563,11 +572,8 @@ static JSValue tjs_ssl_pipe_read(JSContext *ctx, JSValueConst this_val,
         return result;
     } else {
         js_free(ctx, buf);
-        int err = SSL_get_error(pipe->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            return JS_NULL;
-        }
-        return JS_ThrowTypeError(ctx, "SSL_read error: %d", err);
+		CHECK_SSL_ERR(pipe->ssl, ret);
+        SSL_THROW_ERROR(ctx, "SSL_read");
     }
 }
 
@@ -594,11 +600,8 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
     if (ret > 0) {
         return JS_NewInt32(ctx, ret);
     } else {
-        int err = SSL_get_error(pipe->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            return JS_NewInt32(ctx, 0);
-        }
-        return JS_ThrowTypeError(ctx, "SSL_write error: %d", err);
+		CHECK_SSL_ERR(pipe->ssl, ret);
+		SSL_THROW_ERROR(ctx, "SSL_write");
     }
 }
 
@@ -652,7 +655,7 @@ static JSValue tjs_ssl_pipe_do_handshake(JSContext *ctx, JSValueConst this_val,
     }
     
     pipe->handshake_state = TJS_SSL_HANDSHAKE_ERROR;
-    return JS_ThrowTypeError(ctx, "SSL handshake error: %d", err);
+	SSL_THROW_ERROR(ctx, "SSL_do_handshake");
 }
 
 /* pipe.shutdown() - Shutdown SSL connection */
@@ -916,10 +919,10 @@ static JSValue tjs_ssl_get_cipher_list(JSContext *ctx, JSValueConst this_val,
 /* loadPEM(data, type) - Load certificate or key from PEM */
 static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
-    const char *data = JS_ToCString(ctx, argv[0]);
+    const char *data = cstr(ctx, argv[0]);
     if (!data) return JS_EXCEPTION;
     
-    const char *type = argc > 1 ? JS_ToCString(ctx, argv[1]) : "certificate";
+    const char *type = argc > 1 ? cstr(ctx, argv[1]) : "certificate";
     
     BIO *bio = BIO_new_mem_buf(data, -1);
     JS_FreeCString(ctx, data);
@@ -983,7 +986,7 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
     
     /* Parse options */
     JSValue cn_val = JS_GetPropertyStr(ctx, options, "commonName");
-    const char *cn = JS_ToCString(ctx, cn_val);
+    const char *cn = cstr(ctx, cn_val);
     if (!cn) cn = "localhost";
     
     JSValue days_val = JS_GetPropertyStr(ctx, options, "days");

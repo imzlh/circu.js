@@ -118,6 +118,9 @@ struct TJSModule {
 static const struct TJSModule tjs_modules[] = {
 	{ "algorithm", tjs__mod_algorithm_init },
 	{ "asyncfs", tjs__mod_asyncfs_init },
+#ifdef CJS__HAS_CURL
+	{ "curl", tjs__mod_curl_init },
+#endif
 	{ "crypto", tjs__mod_crypto_init },
 	{ "console", tjs__mod_console_init },
 	{ "dns", tjs__mod_dns_init },
@@ -126,28 +129,26 @@ static const struct TJSModule tjs_modules[] = {
 	{ "ffi", tjs__mod_ffi_init },
 	{ "fs", tjs__mod_fs_init },
 	{ "fswatch", tjs__mod_fswatch_init },
+	{ "http", tjs__mod_http_init },
 	{ "jsonc", tjs__mod_jsonc_init },
 	{ "os", tjs__mod_os_init },
 	{ "process", tjs__mod_process_init },
 	{ "pty", tjs__mod_pty_init },
-#ifdef CJS__HAS_LLHTTP
-	{ "server", tjs__mod_server_init },
-#endif
 	{ "signals", tjs__mod_signals_init },
 	{ "sourcemap", tjs__mod_sourcemap_init },
 	{ "sqlite3", tjs__mod_sqlite3_init },
 	{ "ssl", tjs__mod_ssl_init },
 	{ "streams", tjs__mod_streams_init },
 	{ "sys", tjs__mod_sys_init },
+#ifdef CJS__HAS_ICONV
 	{ "text", tjs__mod_text_init },
+#endif
 	{ "timers", tjs__mod_timers_init },
 	{ "udp", tjs__mod_udp_init },
 #ifdef CJS__HAS_WASM
 	{ "wasm", tjs__mod_wasm_init },
 #endif
 	{ "worker", tjs__mod_worker_init },
-	{ "ws", tjs__mod_ws_init },
-	{ "xhr", tjs__mod_xhr_init },
 	{ "xml", tjs__mod_xml_init },
 	{ "zlib", tjs__mod_zlib_init },
 #ifndef _WIN32
@@ -228,7 +229,6 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
 
 	MappingResult res = js_get_source_mapping(qrt->module.mapctx, name, *line, *col);
 	if (res.found){
-		// FIXME: function name is not available to overwrite
 		*line = res.original_line;
 		*col = res.original_column;
 	}
@@ -419,9 +419,6 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     uv_close((uv_handle_t *) &qrt->jobs.idle, NULL);
     uv_close((uv_handle_t *) &qrt->jobs.check, NULL);
     uv_close((uv_handle_t *) &qrt->stop, NULL);
-    if (qrt->curl_ctx.curlm_h) {
-        uv_close((uv_handle_t *) &qrt->curl_ctx.timer, NULL);
-    }
 
 	/* Free module loader */
 	JS_FreeValue(qrt->ctx, qrt->module.resolver);
@@ -447,12 +444,6 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	qrt->builtins.message_pipe = JS_UNDEFINED;
     JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
-
-    /* Destroy CURLM handle. */
-    if (qrt->curl_ctx.curlm_h) {
-        curl_multi_cleanup(qrt->curl_ctx.curlm_h);
-        qrt->curl_ctx.curlm_h = NULL;
-    }
 
     /* Destroy WASM runtime. */
 #ifdef CJS__HAS_WASM
@@ -482,8 +473,6 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 }
 
 void TJS_Initialize(int argc, char **argv) {
-    curl_global_init(CURL_GLOBAL_ALL);
-
     CHECK_EQ(0, uv_replace_allocator(tjs__malloc, tjs__realloc, tjs__calloc, tjs__free));
 
     tjs__argc = argc;

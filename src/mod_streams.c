@@ -161,9 +161,9 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
     }
     s->read.b.tarray = JS_DupValue(ctx, argv[0]);
     s->read.b.data = buf;
@@ -211,9 +211,9 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
 
     size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
     }
 
     /* First try to do the write inline */
@@ -235,7 +235,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
 
     TJSWriteReq *wr = js_malloc(ctx, sizeof(*wr));
     if (!wr) {
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     }
 
     wr->req.data = wr;
@@ -281,7 +281,7 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
 
     TJSShutdownReq *sr = js_malloc(ctx, sizeof(*sr));
     if (!sr) {
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     }
     sr->req.data = sr;
 
@@ -384,7 +384,7 @@ static JSValue tjs_stream_listen(JSContext *ctx, JSValue this_val, int argc, JSV
     uint32_t backlog = 511;
     if (!JS_IsUndefined(argv[0])) {
         if (JS_ToUint32(ctx, &backlog, argv[0])) {
-            return JS_EXCEPTION;
+            return JS_ThrowTypeError(ctx, "backlog must be an integer");
         }
     }
     int r = uv_listen(&s->h.stream, (int) backlog, uv__stream_connection_cb);
@@ -415,7 +415,7 @@ static JSValue tjs_stream_set_blocking(JSContext *ctx, JSValue this_val, int arg
 
     int blocking;
     if ((blocking = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "blocking must be a boolean");
     }
 
     int r = uv_stream_set_blocking(&s->h.stream, blocking);
@@ -511,7 +511,7 @@ static JSValue tjs_new_tcp(JSContext *ctx, int af) {
 static JSValue tjs_tcp_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
     int af = AF_UNSPEC;
     if (!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "address family must be an integer");
     }
     return tjs_new_tcp(ctx, af);
 }
@@ -553,12 +553,12 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     int r;
     r = tjs_obj2addr(ctx, argv[0], &ss);
     if (r != 0) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "invalid address");
     }
 
     TJSConnectReq *cr = js_malloc(ctx, sizeof(*cr));
     if (!cr) {
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     }
     cr->req.data = cr;
 
@@ -581,12 +581,12 @@ static JSValue tjs_tcp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue 
     int r;
     r = tjs_obj2addr(ctx, argv[0], &ss);
     if (r != 0) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "invalid address");
     }
 
     int flags = 0;
     if (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "flags must be an integer");
     }
 
     r = uv_tcp_bind(&t->h.tcp, (struct sockaddr *) &ss, flags);
@@ -605,12 +605,12 @@ static JSValue tjs_tcp_keepalive(JSContext *ctx, JSValue this_val, int argc, JSV
 
     int enable;
     if ((enable = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "enable must be a boolean");
     }
 
     int delay;
     if (JS_ToInt32(ctx, &delay, argv[1])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "delay must be an integer");
     }
 
     int r = uv_tcp_keepalive(&t->h.tcp, enable, delay);
@@ -629,7 +629,7 @@ static JSValue tjs_tcp_nodelay(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int enable;
     if ((enable = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "enable must be a boolean");
     }
 
     int r = uv_tcp_nodelay(&t->h.tcp, enable);
@@ -667,11 +667,11 @@ static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc,
     int fd, r, readable;
 
     if (JS_ToInt32(ctx, &fd, argv[0])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "fd must be an integer");
     }
 
     if ((readable = JS_ToBool(ctx, argv[1])) == -1) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "readable must be a boolean");
     }
 
     obj = JS_NewObjectClass(ctx, tjs_tty_class_id);
@@ -707,7 +707,7 @@ static JSValue tjs_tty_setMode(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int mode;
     if (JS_ToInt32(ctx, &mode, argv[0])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "mode must be an integer");
     }
 
     int r = uv_tty_set_mode(&s->h.tty, mode);
@@ -834,13 +834,13 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
     }
 
     TJSConnectReq *cr = js_malloc(ctx, sizeof(*cr));
     if (!cr) {
         JS_FreeCString(ctx, name);
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     }
     cr->req.data = cr;
 
@@ -867,7 +867,7 @@ static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
     }
 
     int r = uv_pipe_bind2(&t->h.pipe, name, len, 0);
@@ -887,7 +887,7 @@ static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int fd;
     if (JS_ToInt32(ctx, &fd, argv[0])) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "fd must be an integer");
     }
 
     int r = uv_pipe_open(&t->h.pipe, fd);

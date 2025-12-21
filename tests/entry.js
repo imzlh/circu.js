@@ -22,6 +22,7 @@ onEvent((name, data) => {
             return true;    // prevent duplicate error messages
         }
 
+        if (in_test) return;    // no log
         const [promise, error] = data;
         if (error instanceof Error && promise.stack?.trim()) {
             error.stack += `\n    ---- eventloop ---- \n    ${promise.stack}`;
@@ -45,24 +46,35 @@ Run a circu.js test suite script.`);
 }
 
 // simple polyfill
+let in_test = false;
 globalThis.assert = (value, message) => {
     if (!value) {
         throw new Error(message ?? "Assertion failed");
     }
 };
 globalThis.test = async (name, fn) => {
-    console.log(`Running test: ${name}`);
+    if (typeof name == 'function') fn = name, name = fn.name;
+    if(name) console.log(`Running test: ${name}`);
+    in_test = true;
     try {
         await fn();
         console.log(`✓ Test ${name} passed`);
     } catch (error) {
         console.error(`❌ Test ${name} failed:`, error);
         exit(1);
+    } finally {
+        in_test = false;
     }
 };
 globalThis.panic = (message) => {
     console.error('Panic:', message);
     exit(1);
+};
+globalThis.assertEquals = (actual, expected, message) => {
+    if (actual !== expected) {
+        console.error('assertEquals failed:', expected, actual);
+        throw new Error(message ?? `Expected ${expected}, got ${actual}`);
+    }
 };
 
 const [, script] = args;
@@ -73,3 +85,4 @@ if (!script || !script.endsWith(".js")) {
 console.log("Test suite, tjs", version, "on", platform);
 console.log("Loading script:", realpath(script));
 await loadModule(script);
+console.log("🎉 " + script.split('/').at(-1).split('.').at(0) + ": All tests passed!")

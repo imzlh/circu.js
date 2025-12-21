@@ -40,10 +40,8 @@
 #include <mimalloc.h>
 #endif
 
-#ifdef CJS__HAS_LLHTTP
 #include <llhttp.h>
 #define LLHTTP_VERSION STRINGIFY(LLHTTP_VERSION_MAJOR) "." STRINGIFY(LLHTTP_VERSION_MINOR) "." STRINGIFY(LLHTTP_VERSION_PATCH)
-#endif
 
 static JSValue tjs_gc_run(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JS_RunGC(JS_GetRuntime(ctx));
@@ -84,18 +82,19 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
     size_t len;
     const char *source = JS_ToCStringLen(ctx, &len, argv[0]);
     if(!source) return JS_EXCEPTION;
-	const char *module_name = JS_ToCString(ctx, argv[1]);
-	if(!module_name) module_name = "<module>";
+	const char *_mname = JS_ToCString(ctx, argv[1]);
+	const char *module_name = _mname;
+	if(!_mname) module_name = "<module>";
 
     JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_BACKTRACE_BARRIER);
     if(JS_IsException(compiled)) goto fail;
 
     JS_FreeCString(ctx, source);
-    JS_FreeCString(ctx, module_name);
+    if(_mname) JS_FreeCString(ctx, _mname);
     return module_new(ctx, (JSModuleDef*)JS_VALUE_GET_PTR(compiled));
 fail:
     JS_FreeCString(ctx, source);
-    JS_FreeCString(ctx, module_name);
+    if(_mname) JS_FreeCString(ctx, _mname);
     return JS_EXCEPTION;
 }
 
@@ -359,15 +358,12 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, versions, "quickjs", JS_NewString(ctx, JS_GetVersion()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "tjs", JS_NewString(ctx, tjs_version()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "uv", JS_NewString(ctx, uv_version_string()), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, versions, "curl", JS_NewString(ctx, curl_version()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "sqlite3", JS_NewString(ctx, sqlite3_libversion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "zlib", JS_NewString(ctx, zlibVersion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "openssl", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "expat", JS_NewString(ctx, XML_ExpatVersion()), JS_PROP_C_W_E);
 
-#ifdef CJS__HAS_LLHTTP
 	JS_DefinePropertyValueStr(ctx, versions, "llhttp", JS_NewString(ctx, LLHTTP_VERSION), JS_PROP_C_W_E);
-#endif
 #ifdef CJS__HAS_WASM
     JS_DefinePropertyValueStr(ctx, versions, "wasm3", JS_NewString(ctx, M3_VERSION), JS_PROP_C_W_E);
 #endif

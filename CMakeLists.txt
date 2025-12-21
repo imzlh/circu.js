@@ -48,6 +48,7 @@ endmacro()
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
+cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
@@ -67,20 +68,20 @@ if(BUILD_WITH_MIMALLOC)
     add_subdirectory(deps/mimalloc EXCLUDE_FROM_ALL)
 endif()
 
-find_package(CURL REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
-find_package(Iconv REQUIRED)
+find_package(Iconv)  # optional
 find_package(llhttp) # optional
+if (BUILD_WITH_CURL)
+    find_package(CURL REQUIRED)
+endif()
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_library(cjs
-    src/curl-utils.c
-    src/curl-websocket.c
     src/binary.c
     src/error.c
     src/mem.c
@@ -92,8 +93,6 @@ add_library(cjs
     src/vm.c
     src/wasm.c
     src/worker.c
-    src/ws.c
-    src/xhr.c
     src/console.c
     src/sourcemap.c
     src/mod_algorithm.c
@@ -113,9 +112,9 @@ add_library(cjs
     src/mod_zlib.c
     src/mod_ssl.c
     src/mod_xml.c
-    src/mod_text.c
     src/mod_jsonc.c
     src/mod_crypto.c
+    src/mod_http.c
     deps/quickjs/cutils.c
 )
 
@@ -126,12 +125,32 @@ if(UNIX)
 endif()
 
 if(llhttp_FOUND)
-    message(NOTICE "build with http server support with llhttp")
-    add_compile_definitions(CJS__HAS_LLHTTP)
-    target_sources(cjs PUBLIC
-        src/mod_server.c
-    )
     target_link_libraries(cjs llhttp)
+else()
+    message(NOTICE "build with llhttp github repo")
+    FetchContent_Declare(llhttp
+        URL "https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.3.0.tar.gz")
+
+    set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+    set(LLHTTP_BUILD_STATIC_LIBS ON CACHE INTERNAL "")
+    FetchContent_MakeAvailable(llhttp)
+
+    # Link with the llhttp_static target
+    target_link_libraries(${EXAMPLE_PROJECT_NAME} ${PROJECT_LIBRARIES} llhttp_static ${PROJECT_NAME})
+endif()
+
+if (Iconv_FOUND)
+    add_compile_definitions(CJS__HAS_ICONV)
+    target_sources(cjs PUBLIC src/mod_text.c)
+    target_link_libraries(cjs Iconv::Iconv)
+else()
+    message(NOTICE "build without iconv")
+endif()
+
+if (BUILD_WITH_CURL AND CURL_FOUND)
+    add_compile_definitions(CJS__HAS_CURL)
+    target_sources(cjs PUBLIC src/mod_curl.c)
+    target_link_libraries(cjs CURL::libcurl)
 endif()
 
 # add_library(ffi-test SHARED
@@ -194,7 +213,7 @@ target_compile_options(cjs PRIVATE ${cjs_cflags})
 target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(cjs PUBLIC src)
 # libutil is required for openpty
-target_link_libraries(cjs qjs uv sqlite3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT Iconv::Iconv util)
+target_link_libraries(cjs qjs uv sqlite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT util)
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)

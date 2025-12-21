@@ -19,11 +19,11 @@ declare namespace CModuleDNS {
     export interface GetAddrInfoOptions {
         /**
          * 地址族类型
-         * - 4 表示 IPv4 (对应 AF_INET)
-         * - 6 表示 IPv6 (对应 AF_INET6)
-         * - 0 表示自动选择 (对应 AF_UNSPEC)
+         * - `os.AF_INET`   对应 IPv4
+         * - `os.AF_INET6`  对应 IPv6
+         * - `os.AF_UNSPEC` 自动选择
          */
-        family: 4 | 6 | 0;
+        family: number;
 
         /**
          * DNS服务器

@@ -23,20 +23,19 @@ interface TjsModules {
     crypto: typeof CModuleCrypto,
     console: typeof CModuleConsole,
     zlib: typeof CModuleZLib,
-    xhr: typeof CModuleXHR,
     sourcemap: typeof CModuleSourceMap,
     ssl: typeof CModuleSSL,
     xml: typeof CModuleXML,
-    text: typeof CModuleText,
     jsonc: typeof CModuleJsonC,
     algorithm: typeof CModuleAlgorithm,
-    ws: typeof CModuleWS,
+    http: typeof CModuleHTTP,
 }
 
 interface TJSOptionalModules {
     'posix-socket': typeof CModulePosixSocket,
     'wasm': typeof CModuleWASM,
-    'server': typeof CModuleServer,
+    'text': typeof CModuleText,
+    'curl': typeof CModuleCURL
 }
 
 interface ImportMeta {

@@ -64,10 +64,6 @@ struct TJSRuntime {
     uv_async_t stop;
     bool is_worker;
     bool freeing;
-    struct {
-        CURLM *curlm_h;
-        uv_timer_t timer;
-    } curl_ctx;
 #ifdef CJS__HAS_WASM
     struct {
         IM3Environment env;
@@ -111,24 +107,26 @@ void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
-void tjs__mod_ws_init(JSContext *ctx, JSValue ns);
-void tjs__mod_xhr_init(JSContext *ctx, JSValue ns);
+void tjs__mod_http_init(JSContext *ctx, JSValue ns);
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
-void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 void tjs__mod_jsonc_init(JSContext* ctx, JSValue ns);
 
-#ifdef CJS__HAS_LLHTTP
-void tjs__mod_server_init(JSContext *ctx, JSValue ns);
+#ifdef CJS__HAS_CURL
+void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
 #endif
 
 #ifndef _WIN32
 void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
+#endif
+
+#ifdef CJS__HAS_ICONV
+void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);

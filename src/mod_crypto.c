@@ -1564,7 +1564,7 @@ static JSValue tjs_gcm_update(JSContext *ctx, JSValueConst this_val,
     }
     
     // Allocate output buffer
-    uint8_t *out_data = js_malloc(ctx, in_len);
+    uint8_t *out_data = js_malloc(ctx, in_len +1);
     if (!out_data) {
         return JS_EXCEPTION;
     }
@@ -2273,7 +2273,7 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     
     size_t str_len = strlen(str);
     int out_len = (str_len / 4) * 3;
-    uint8_t* out = js_malloc(ctx, out_len);
+    uint8_t* out = js_malloc(ctx, out_len +1);
     if (!out) {
         JS_FreeCString(ctx, str);
         return JS_EXCEPTION;
@@ -2348,7 +2348,7 @@ static JSValue tjs_crypto_hex_decode(JSContext* ctx, JSValueConst this_val, int 
     }
     
     size_t out_len = str_len / 2;
-    uint8_t* out = js_malloc(ctx, out_len);
+    uint8_t* out = js_malloc(ctx, out_len +1);	// avoid 0byte-alloc
     if (!out) {
         JS_FreeCString(ctx, str);
         return JS_EXCEPTION;
