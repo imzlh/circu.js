@@ -2,7 +2,7 @@ declare namespace CModulePty {
     /**
      * 打开 PTY 的选项
      */
-    interface OpenptyOptions {
+    export interface OpenptyOptions {
         /**
          * 列数（可选，默认为 80）
          */
@@ -39,7 +39,7 @@ declare namespace CModulePty {
      * @param options 打开 PTY 的选项
      * @returns 返回包含文件描述符和进程ID的对象
      */
-    function openpty(options?: OpenptyOptions): Promise<{
+    export function openpty(options?: OpenptyOptions): Promise<{
         /**
          * 文件描述符
          */
@@ -62,11 +62,5 @@ declare namespace CModulePty {
      * @param cols 列数
      * @param rows 行数
      */
-    function resize(fd: number | bigint, cols: number, rows: number): Promise<void>;
-
-    // 导出所有内容
-    export {
-        openpty,
-        resize
-    };
+    export function resize(fd: number | bigint, cols: number, rows: number): Promise<void>;
 }

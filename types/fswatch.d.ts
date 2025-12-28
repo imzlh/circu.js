@@ -2,17 +2,12 @@ declare namespace CModuleFSWatch {
     /**
      * 文件系统事件类型枚举
      */
-    const enum FsEvent {
-        /** 文件被重命名 */
-        RENAME = 'rename',
-        /** 文件内容被更改 */
-        CHANGE = 'change'
-    }
+    export type FsEvent = 'rename' | 'change'; 
 
     /**
      * 文件系统监视器对象
      */
-    interface FsWatcher {
+    export interface FsWatcher {
         /**
          * 关闭文件系统监视器。
          * @returns 返回一个 Promise，解析为 undefined。
@@ -36,12 +31,5 @@ declare namespace CModuleFSWatch {
      * @param callback 事件处理回调函数。
      * @returns 返回一个 Promise，解析为 FsWatcher 对象。
      */
-    function watch(path: string, callback: (filename: string, event: FsEvent) => void): Promise<FsWatcher>;
-
-    // 导出所有内容
-    export {
-        FsEvent,
-        FsWatcher,
-        watch
-    };
+    export function watch(path: string, callback: (filename: string, event: FsEvent) => void): Promise<FsWatcher>;
 }

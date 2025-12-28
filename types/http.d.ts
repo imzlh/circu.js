@@ -15,13 +15,13 @@
  * const headers: Record<string, string> = {};
  * let currentHeader = '';
  * 
- * parser.onHeaderField = (ev, buf, off, len) => {
+ * parser.onHeaderField = (buf, off, len) => {
  *   currentHeader = new TextDecoder().decode(
  *     buf.slice(off, off + len)
  *   ).toLowerCase();
  * };
  * 
- * parser.onHeaderValue = (ev, buf, off, len) => {
+ * parser.onHeaderValue = (buf, off, len) => {
  *   headers[currentHeader] = new TextDecoder().decode(
  *     buf.slice(off, off + len)
  *   );
@@ -31,7 +31,7 @@
  *   console.log('New chunk detected');
  * };
  * 
- * parser.onBody = (ev, buf, off, len) => {
+ * parser.onBody = (buf, off, len) => {
  *   chunks.push(new TextDecoder().decode(
  *     buf.slice(off, off + len)
  *   ));
@@ -136,13 +136,11 @@ declare namespace CModuleHTTP {
     /**
      * Event callback signature
      * 
-     * @param event - Event type enum value
      * @param buffer - Original buffer passed to execute()
      * @param offset - Byte offset into buffer
      * @param length - Byte length of data
      */
     export type HttpCallback = (
-        event: number,
         buffer: BufferSource,
         offset: number,
         length: number
@@ -183,7 +181,7 @@ declare namespace CModuleHTTP {
          * const parser = new Parser(RESPONSE);
          * let body = '';
          * 
-         * parser.onBody = (ev, buf, off, len) => {
+         * parser.onBody = (buf, off, len) => {
          *   body += new TextDecoder().decode(
          *     buf.slice(off, off + len)
          *   );

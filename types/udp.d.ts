@@ -2,7 +2,7 @@ declare namespace CModuleUDP {
     /**
      * UDP 对象
      */
-    interface UDP {
+    export interface UDP {
         /**
          * 关闭 UDP 连接
          * @returns 返回一个 Promise，解析为 undefined。
@@ -83,22 +83,15 @@ declare namespace CModuleUDP {
      * @param af 地址族（如 AF_UNSPEC, AF_INET, AF_INET6）
      * @returns 返回一个 Promise，解析为 UDP 对象。
      */
-    function create(af?: number): Promise<UDP>;
+    export function create(af?: number): Promise<UDP>;
 
     /**
-     * 常量定义
+     * 只监听IPv6而不接受映射后的IPv4地址
      */
-    const enum Constants {
-        /** 使用 IPv6 */
-        UDP_IPV6ONLY = 1,
-        /** 重用地址 */
-        UDP_REUSEADDR = 2
-    }
+    export const UDP_IPV6ONLY: number;
 
-    // 导出所有内容
-    export {
-        UDP,
-        create,
-        Constants
-    };
+    /**
+     * 复用端口
+     */
+    export const UDP_REUSEADDR: number;
 }

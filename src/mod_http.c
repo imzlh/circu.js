@@ -118,7 +118,6 @@ static inline bool tjs_llhttp_critical_event(TJSLlhttpEvent ev) {
 		case EV_HEADER_FIELD:
 		case EV_HEADER_VALUE:
 		case EV_BODY:
-		case EV_CHUNK_HEADER:
 			return true;
 		default:
 			return false;
@@ -155,18 +154,16 @@ static int tjs_llhttp_emit(TJSLlhttpParser* p, TJSLlhttpEvent ev, const char* at
 		}
 	}
 
-	JSValue argv[4];
-	argv[0] = JS_NewInt32(ctx, (int32_t) ev);
-	argv[1] = JS_DupValue(ctx, p->current_buf);
-	argv[2] = JS_NewUint32(ctx, (uint32_t) off);
-	argv[3] = JS_NewUint32(ctx, (uint32_t) length);
+	JSValue argv[] = {
+		JS_DupValue(ctx, p->current_buf),
+		JS_NewUint32(ctx, (uint32_t) off),
+		JS_NewUint32(ctx, (uint32_t) length)
+	};
 
-	JSValue ret = JS_Call(ctx, on_event, JS_UNDEFINED, 4, argv);
+	JSValue ret = JS_Call(ctx, on_event, JS_UNDEFINED, countof(argv), argv);
 
-	JS_FreeValue(ctx, argv[0]);
-	JS_FreeValue(ctx, argv[1]);
-	JS_FreeValue(ctx, argv[2]);
-	JS_FreeValue(ctx, argv[3]);
+	for (int i = 0; i < countof(argv); i++)
+		JS_FreeValue(ctx, argv[i]);
 
 	if (JS_IsException(ret)) {
 		JS_FreeValue(ctx, ret);

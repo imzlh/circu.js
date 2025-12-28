@@ -2,7 +2,7 @@ declare namespace CModuleEngine {
     type Promise = globalThis.Promise<any>;
     type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
 
-    enum PromiseState {
+    export enum PromiseState {
         CONSTRUCT,
         BEFORE_THEN,
         AFTER_THEN,
@@ -13,6 +13,7 @@ declare namespace CModuleEngine {
         unhandledrejection: [this: Promise, error: Error | any],
         exit: [exitCode: number],
         promise: [this: Promise, state: PromiseState, parent: Promise],
+        jobexception: [error: Error | any],
     }
 
     /**
@@ -190,4 +191,10 @@ declare namespace CModuleEngine {
     export function onEvent(cb:
         <T extends keyof GlobalEvents>(eventName: T, eventData: GlobalEvents[T]) => boolean
     ): void;
+
+    /**
+     * 直接获取Promise的结果，若Promise未完成，则返回null
+     * @param promise 获取的Promise
+     */
+    export function promiseResult<T>(promise: globalThis.Promise<T>): T | null;
 }

@@ -330,6 +330,28 @@ typerr:
 	return str;
 }
 
+static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int argc, JSValueConst* argv) {
+	if (argc == 0 || !JS_IsPromise(promise)) {
+		return JS_ThrowTypeError(ctx, "argument must be a Promise");
+	}
+
+	JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
+	switch (state) {
+		case JS_PROMISE_PENDING:
+		return JS_NULL;
+
+		case JS_PROMISE_FULFILLED:
+			JSValue res = JS_PromiseResult(ctx, promise);
+		return res;
+
+		case JS_PROMISE_REJECTED:
+			JSValue err = JS_PromiseResult(ctx, promise);
+		return JS_Throw(ctx, err);
+
+		default: abort();
+	}
+}
+
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
@@ -341,6 +363,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
+	TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),
 };
 
 /* clang-format off */
@@ -350,6 +373,13 @@ static const JSCFunctionListEntry tjs_gc_funcs[] = {
     TJS_CFUNC_DEF("getThreshold", 0, tjs_gc_getThreshold)
 };
 /* clang-format on */
+
+static const JSCFunctionListEntry tjs_promise_enum[] = {
+	TJS_CONST2("CONSTRUCT", JS_PROMISE_HOOK_INIT),
+	TJS_CONST2("FULFILLED", JS_PROMISE_HOOK_RESOLVE),
+	TJS_CONST2("BEFORE_THEN", JS_PROMISE_HOOK_BEFORE),
+	TJS_CONST2("AFTER_THEN", JS_PROMISE_HOOK_AFTER)
+};
 
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, tjs_engine_funcs, countof(tjs_engine_funcs));
@@ -376,6 +406,11 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, ns, "gc", gc, JS_PROP_C_W_E);
 
     JS_DefinePropertyValueStr(ctx, ns, "versions", versions, JS_PROP_C_W_E);
+
+	// enum PromiseState
+	JSValue promise_enum = JS_NewObject(ctx);
+	JS_SetPropertyFunctionList(ctx, promise_enum, tjs_promise_enum, countof(tjs_promise_enum));
+	JS_DefinePropertyValueStr(ctx, ns, "PromiseState", promise_enum, JS_PROP_C_W_E);
 	
 	// class Module
 	JS_NewClassID(JS_GetRuntime(ctx), &js_module_class_id);

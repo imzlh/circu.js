@@ -29,6 +29,14 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+#else
+    #include <sys/types.h>
+    #include <sys/wait.h>
+    #include <errno.h>
+#endif
 
 static JSClassID tjs_process_class_id;
 
@@ -142,6 +150,68 @@ static JSValue tjs_process_wait(JSContext *ctx, JSValue this_val, int argc, JSVa
     } else {
         return TJS_InitPromise(ctx, &p->status.result);
     }
+}
+
+static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    TJSProcess *p = tjs_process_get(ctx, this_val);
+    if (!p)
+        return JS_EXCEPTION;
+
+    if (p->status.exited) {
+        JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+        JS_DefinePropertyValueStr(ctx, obj, "exit_status",
+                                  JS_NewInt32(ctx, p->status.exit_status),
+                                  JS_PROP_C_W_E);
+        JSValue term_sig = p->status.term_signal == 0
+                               ? JS_NULL
+                               : JS_NewString(ctx, tjs_getsig(p->status.term_signal));
+        JS_DefinePropertyValueStr(ctx, obj, "term_signal", term_sig, JS_PROP_C_W_E);
+        return obj;
+    }
+
+    int exitCode = 0;
+    int termSig  = 0;
+
+#ifdef _WIN32
+    DWORD winStatus;
+    if (WaitForSingleObject(p->process.process, INFINITE) != WAIT_OBJECT_0)
+        return JS_ThrowTypeError(ctx, "WaitForSingleObject failed");
+
+    if (!GetExitCodeProcess(p->process.process, &winStatus))
+        return JS_ThrowTypeError(ctx, "GetExitCodeProcess failed");
+
+    exitCode = (int)winStatus;
+    termSig  = 0;
+#else
+    int stat;
+    if (waitpid(p->process.pid, &stat, 0) == -1)
+        return JS_ThrowTypeError(ctx, "waitpid failed");
+
+    if (WIFEXITED(stat)) {
+        exitCode = WEXITSTATUS(stat);
+        termSig  = 0;
+    } else if (WIFSIGNALED(stat)) {
+        exitCode = 128 + WTERMSIG(stat);
+        termSig  = WTERMSIG(stat);
+    } else {
+        return JS_ThrowTypeError(ctx, "unexpected child status");
+    }
+#endif
+
+    p->status.exited      = 1;
+    p->status.exit_status = exitCode;
+    p->status.term_signal = termSig;
+
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    JS_DefinePropertyValueStr(ctx, obj, "exit_status",
+                              JS_NewInt32(ctx, exitCode),
+                              JS_PROP_C_W_E);
+    JSValue term_sig_val = termSig == 0
+                               ? JS_NULL
+                               : JS_NewString(ctx, tjs_getsig(termSig));
+    JS_DefinePropertyValueStr(ctx, obj, "term_signal", term_sig_val, JS_PROP_C_W_E);
+    return obj;
 }
 
 static JSValue tjs_process_pid_get(JSContext *ctx, JSValue this_val) {
@@ -591,6 +661,7 @@ static JSValue tjs_kill(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
 static const JSCFunctionListEntry tjs_process_proto_funcs[] = {
     TJS_CFUNC_DEF("kill", 1, tjs_process_kill),
     TJS_CFUNC_DEF("wait", 0, tjs_process_wait),
+	TJS_CFUNC_DEF("waitSync", 0, tjs_process_wait_sync),
     JS_CGETSET_DEF("pid", tjs_process_pid_get, NULL),
     JS_CGETSET_MAGIC_DEF("stdin", tjs_process_stdio_get, NULL, 0),
     JS_CGETSET_MAGIC_DEF("stdout", tjs_process_stdio_get, NULL, 1),

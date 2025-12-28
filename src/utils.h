@@ -150,17 +150,14 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 		return JS_GetUint8Array(ctx, psize, obj);
 	else if (JS_IsArrayBuffer(obj))
 		return JS_GetArrayBuffer(ctx, psize, obj);
-	JSValue ab = JS_GetPropertyStr(ctx, obj, "buffer");
-	JSValue offset = JS_GetPropertyStr(ctx, obj, "byteOffset");
-	uint64_t offset_num;
-	if (-1 == JS_ToBigUint64(ctx, &offset_num, offset))
-		offset_num = 0;
-	uint8_t* r = JS_GetArrayBuffer(ctx, psize, ab);
-	JS_FreeValue(ctx, ab);
-	JS_FreeValue(ctx, offset);
-	// apply offset for views
-	if (r) r += offset_num;
-	return r;
+
+	size_t poffset, plen, pbytes_per_element;
+	JSValue arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
+	if (JS_IsException(arrbuf))
+		return NULL;
+	*psize = plen * pbytes_per_element;
+	size_t __psize;
+	return JS_GetArrayBuffer(ctx, &__psize, arrbuf);
 }
 
 #endif

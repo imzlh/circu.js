@@ -2,30 +2,43 @@ declare namespace CModuleProcess {
     type Pipe = CModuleStreams.Pipe;
 
     /**
-     * 进程退出码
-     */
-    export const enum ExitCode {
-        /** 成功退出 */
-        SUCCESS = 0,
-        /** 通用错误 */
-        FAILURE = 1
-    }
-
-    /**
      * 进程信号
      */
-    export const enum Signal {
-        /** 终止信号 */
-        SIGTERM = 'SIGTERM',
-        /** 中断信号 */
-        SIGINT = 'SIGINT',
-        /** 退出信号 */
-        SIGQUIT = 'SIGQUIT',
-        /** 挂起信号 */
-        SIGHUP = 'SIGHUP',
-        /** 终止信号（不可捕获） */
-        SIGKILL = 'SIGKILL'
-    }
+    export type Signal =
+        | 'SIGHUP'
+        | 'SIGINT'
+        | 'SIGQUIT'
+        | 'SIGILL'
+        | 'SIGTRAP'
+        | 'SIGABRT'
+        | 'SIGBUS'
+        | 'SIGFPE'
+        | 'SIGKILL'
+        | 'SIGUSR1'
+        | 'SIGSEGV'
+        | 'SIGUSR2'
+        | 'SIGPIPE'
+        | 'SIGALRM'
+        | 'SIGTERM'
+        | 'SIGSTKFLT'
+        | 'SIGCHLD'
+        | 'SIGCONT'
+        | 'SIGSTOP'
+        | 'SIGTSTP'
+        | 'SIGBREAK'
+        | 'SIGTTIN'
+        | 'SIGTTOU'
+        | 'SIGURG'
+        | 'SIGXCPU'
+        | 'SIGXFSZ'
+        | 'SIGVTALRM'
+        | 'SIGPROF'
+        | 'SIGWINCH'
+        | 'SIGPOLL'
+        | 'SIGLOST'
+        | 'SIGPWR'
+        | 'SIGINFO'
+        | 'SIGSYS';
 
     /**
      * spawn 配置选项
@@ -79,10 +92,16 @@ declare namespace CModuleProcess {
         wait(): Promise<ExitInfo>;
 
         /**
+         * 阻塞，等待进程退出
+         * @returns 返回退出码和终止信号
+         */
+        waitSync(): ExitInfo;
+
+        /**
          * 向进程发送信号
          * @param signal 要发送的信号，默认 SIGTERM
          */
-        kill(signal?: Signal | string): void;
+        kill(signal?: Signal): void;
     }
 
     /**
@@ -106,17 +125,17 @@ declare namespace CModuleProcess {
          * 退出当前进程
          * @param code 退出码
          */
-        exit(code?: ExitCode | number): never;
+        exit(code?: number): never;
 
         /**
          * 添加信号监听器
          */
-        on(signal: Signal | string, listener: () => void): void;
+        on(signal: Signal , listener: () => void): void;
 
         /**
          * 移除信号监听器
          */
-        off(signal: Signal | string, listener: () => void): void;
+        off(signal: Signal , listener: () => void): void;
     }
 
     /**
@@ -132,7 +151,7 @@ declare namespace CModuleProcess {
     /**
      * 向指定进程发送信号（全局函数）
      */
-    export function kill(pid: number, signal?: Signal | string): void;
+    export function kill(pid: number, signal?: Signal ): void;
 
     /**
      * 当前进程实例

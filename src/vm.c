@@ -207,7 +207,7 @@ JSValue tjs__get_args(JSContext *ctx) {
     return args;
 }
 
-static JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data) {
+JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
@@ -273,7 +273,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
             tjs_dump_error(ctx);
             goto fail;
         } else {
-            if (!JS_ToBool(ctx, ret)) {
+            if (!JS_IsEqual(ctx, ret, JS_FALSE)) {
             // The event wasn't cancelled or not handled(true), maybe abort.
             fail:;
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
@@ -515,17 +515,23 @@ static void uv__prepare_cb(uv_prepare_t *handle) {
 
 void tjs__execute_jobs(JSContext *ctx) {
     JSContext *ctx1;
-	// TJSRuntime* trt = TJS_GetRuntime(ctx);
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
     int err;
+
+	assert(trt != NULL);
 
     /* execute the pending jobs */
     for (;;) {
         err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (err <= 0) {
             if (err < 0) {
-                TJSRuntime *qrt = TJS_GetRuntime(ctx);
-                CHECK_NOT_NULL(qrt);
-                TJS_Stop(qrt);
+				JSValue err = JS_GetException(ctx1);
+				JSValue retv = tjs__dispatch_event(ctx, "jobexception", err);
+				JS_FreeValue(ctx, err);
+				if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+					TJS_Stop(trt);
+				}
+				JS_FreeValue(ctx, retv);
             }
 
             break;
@@ -643,11 +649,6 @@ int TJS_Run(TJSRuntime *qrt) {
         uv__maybe_idle(qrt);
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
     } while (r == 0 && JS_IsJobPending(qrt->rt));
-
-    if (JS_HasException(qrt->ctx)) {
-        // tjs_dump_error(qrt->ctx);
-        ret = 1;
-    }
 
     return ret;
 }

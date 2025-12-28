@@ -35,7 +35,7 @@ declare namespace CModuleWASM {
          * @example
          * ```ts
          * // 调用无参数函数
-         * const version = instance.callFunction('getVersion');
+         * const version = instance.callFunction('version');
          * 
          * // 调用带参数函数（add(5, 3)）
          * const sum = instance.callFunction('add', 5, 3);

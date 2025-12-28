@@ -166,4 +166,6 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
 JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def);
 SSL_CTX* tjs__sslctx_get(JSContext *ctx, JSValueConst obj);
+
+JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data);
 #endif

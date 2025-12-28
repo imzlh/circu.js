@@ -535,13 +535,13 @@ static JSValue tjs_ssl_pipe_feed(JSContext *ctx, JSValueConst this_val,
     if (!pipe) return JS_EXCEPTION;
     
     size_t size;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) {
         JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
         if (JS_IsException(buffer)) {
             return JS_ThrowTypeError(ctx, "Argument must be ArrayBuffer or TypedArray");
         }
-        buf = JS_GetArrayBuffer(ctx, &size, buffer);
+        buf = JS_GetAnyBuffer(ctx, &size, buffer);
         JS_FreeValue(ctx, buffer);
         if (!buf) return JS_EXCEPTION;
     }
@@ -584,13 +584,13 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
     if (!pipe) return JS_EXCEPTION;
     
     size_t size;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) {
         JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
         if (JS_IsException(buffer)) {
             return JS_ThrowTypeError(ctx, "Argument must be ArrayBuffer or TypedArray");
         }
-        buf = JS_GetArrayBuffer(ctx, &size, buffer);
+        buf = JS_GetAnyBuffer(ctx, &size, buffer);
         JS_FreeValue(ctx, buffer);
         if (!buf) return JS_EXCEPTION;
     }
@@ -630,7 +630,7 @@ static JSValue tjs_ssl_pipe_get_output(JSContext *ctx, JSValueConst this_val,
     return JS_NULL;
 }
 
-/* pipe.doHandshake() - Perform handshake step */
+/* pipe.handshake() - Perform handshake step */
 static JSValue tjs_ssl_pipe_do_handshake(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
@@ -668,9 +668,8 @@ static JSValue tjs_ssl_pipe_shutdown(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
-/* pipe.getPeerCertificate() - Get peer certificate info */
-static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst this_val,
-                                                   int argc, JSValueConst *argv) {
+/* pipe.certificate() - Get peer certificate info */
+static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
     
@@ -772,9 +771,8 @@ static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst th
     return cert_obj;
 }
 
-/* pipe.getVersion() - Get SSL/TLS version */
-static JSValue tjs_ssl_pipe_get_version(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv) {
+/* pipe.version() - Get SSL/TLS version */
+static JSValue tjs_ssl_pipe_get_version(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
     
@@ -782,9 +780,8 @@ static JSValue tjs_ssl_pipe_get_version(JSContext *ctx, JSValueConst this_val,
     return JS_NewString(ctx, version);
 }
 
-/* pipe.getCipher() - Get current cipher */
-static JSValue tjs_ssl_pipe_get_cipher(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv) {
+/* pipe.cipher() - Get current cipher */
+static JSValue tjs_ssl_pipe_get_cipher(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
     
@@ -811,9 +808,8 @@ static JSValue tjs_ssl_pipe_get_cipher(JSContext *ctx, JSValueConst this_val,
     return cipher_obj;
 }
 
-/* pipe.getALPNProtocol() - Get negotiated ALPN protocol */
-static JSValue tjs_ssl_pipe_get_alpn_protocol(JSContext *ctx, JSValueConst this_val,
-                                                int argc, JSValueConst *argv) {
+/* pipe.alpnProtocol() - Get negotiated ALPN protocol */
+static JSValue tjs_ssl_pipe_get_alpn_protocol(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
     
@@ -830,8 +826,7 @@ static JSValue tjs_ssl_pipe_get_alpn_protocol(JSContext *ctx, JSValueConst this_
 }
 
 /* pipe.verifyResult() - Get certificate verification result */
-static JSValue tjs_ssl_pipe_verify_result(JSContext *ctx, JSValueConst this_val,
-                                           int argc, JSValueConst *argv) {
+static JSValue tjs_ssl_pipe_verify_result(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
     
@@ -865,39 +860,40 @@ static JSValue tjs_ssl_pipe_get_is_server(JSContext *ctx, JSValueConst this_val)
 
 static const JSCFunctionListEntry tjs_ssl_pipe_proto_funcs[] = {
     JS_CFUNC_DEF("feed", 1, tjs_ssl_pipe_feed),
-    JS_CFUNC_DEF("read", 1, tjs_ssl_pipe_read),
+	JS_CFUNC_DEF("getOutput", 0, tjs_ssl_pipe_get_output),
+    
+	JS_CFUNC_DEF("read", 1, tjs_ssl_pipe_read),
     JS_CFUNC_DEF("write", 1, tjs_ssl_pipe_write),
-    JS_CFUNC_DEF("getOutput", 0, tjs_ssl_pipe_get_output),
-    JS_CFUNC_DEF("doHandshake", 0, tjs_ssl_pipe_do_handshake),
+    
+    JS_CFUNC_DEF("handshake", 0, tjs_ssl_pipe_do_handshake),
     JS_CFUNC_DEF("shutdown", 0, tjs_ssl_pipe_shutdown),
-    JS_CFUNC_DEF("getPeerCertificate", 0, tjs_ssl_pipe_get_peer_certificate),
-    JS_CFUNC_DEF("getVersion", 0, tjs_ssl_pipe_get_version),
-    JS_CFUNC_DEF("getCipher", 0, tjs_ssl_pipe_get_cipher),
-    JS_CFUNC_DEF("getALPNProtocol", 0, tjs_ssl_pipe_get_alpn_protocol),
-    JS_CFUNC_DEF("verifyResult", 0, tjs_ssl_pipe_verify_result),
+	
+    JS_CGETSET_DEF("certificate", tjs_ssl_pipe_get_peer_certificate, NULL),
+    JS_CGETSET_DEF("version", tjs_ssl_pipe_get_version, NULL),
+    JS_CGETSET_DEF("cipher", tjs_ssl_pipe_get_cipher, NULL),
+    JS_CGETSET_DEF("alpnProtocol", tjs_ssl_pipe_get_alpn_protocol, NULL),
+    JS_CGETSET_DEF("verifyResult", tjs_ssl_pipe_verify_result, NULL),
     JS_CGETSET_DEF("handshakeComplete", tjs_ssl_pipe_get_handshake_complete, NULL),
     JS_CGETSET_DEF("isServer", tjs_ssl_pipe_get_is_server, NULL),
 };
 
 #pragma region Utility Functions
 /* getOpenSSLVersion() */
-static JSValue tjs_ssl_get_openssl_version(JSContext *ctx, JSValueConst this_val,
-                                            int argc, JSValueConst *argv) {
-    return JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION));
+static int tjs__ssl_openssl_version(JSContext *ctx, JSValueConst ns) {
+    return JS_SetPropertyStr(ctx, ns, "version", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)));
 }
 
-/* getCipherList() */
-static JSValue tjs_ssl_get_cipher_list(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv) {
+/* cipherList() */
+static int tjs__ssl_cipher_list(JSContext *ctx, JSValueConst ns) {
     SSL_CTX *tmp_ctx = SSL_CTX_new(TLS_method());
     if (!tmp_ctx) {
-        return JS_NewArray(ctx);
+        return JS_SetPropertyStr(ctx, ns, "ciphers", JS_NewArray(ctx));
     }
     
     SSL *tmp_ssl = SSL_new(tmp_ctx);
     if (!tmp_ssl) {
         SSL_CTX_free(tmp_ctx);
-        return JS_NewArray(ctx);
+		return JS_SetPropertyStr(ctx, ns, "ciphers", JS_NewArray(ctx));
     }
     
     JSValue arr = JS_NewArray(ctx);
@@ -913,7 +909,7 @@ static JSValue tjs_ssl_get_cipher_list(JSContext *ctx, JSValueConst this_val,
     SSL_free(tmp_ssl);
     SSL_CTX_free(tmp_ctx);
     
-    return arr;
+    return JS_SetPropertyStr(ctx, ns, "ciphers", arr);
 }
 
 /* loadPEM(data, type) - Load certificate or key from PEM */
@@ -1078,8 +1074,6 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
 }
 
 static const JSCFunctionListEntry tjs_ssl_funcs[] = {
-    JS_CFUNC_DEF("getOpenSSLVersion", 0, tjs_ssl_get_openssl_version),
-    JS_CFUNC_DEF("getCipherList", 0, tjs_ssl_get_cipher_list),
     JS_CFUNC_DEF("loadPEM", 2, tjs_ssl_load_pem),
     JS_CFUNC_DEF("createSelfSignedCert", 1, tjs_ssl_create_self_signed_cert),
 };
@@ -1118,4 +1112,8 @@ void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
     
     /* Register utility functions */
     JS_SetPropertyFunctionList(ctx, ns, tjs_ssl_funcs, countof(tjs_ssl_funcs));
+
+	/* OpenSSL version and config */
+	tjs__ssl_openssl_version(ctx, ns);
+	tjs__ssl_cipher_list(ctx, ns);
 }

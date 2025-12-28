@@ -27,7 +27,7 @@
  *
  *     conn.read().then(data => {
  *         pipe.feed(data);
- *         pipe.doHandshake();
+ *         pipe.handshake();
  *
  *         const output = pipe.getOutput();
  *         if (output) conn.write(output);
@@ -50,7 +50,7 @@
  * const pipe2 = new Pipe(Context2, { servername: "example.com" });
  *
  * // Start handshake
- * pipe2.doHandshake();
+ * pipe2.handshake();
  * const handshake2 = pipe2.getOutput();
  * if (handshake2) await conn2.write(handshake2);
  *
@@ -58,7 +58,7 @@
  * while (!pipe2.handshakeComplete) {
  *     const response2 = await conn2.read();
  *     pipe2.feed(response2);
- *     pipe2.doHandshake();
+ *     pipe2.handshake();
  *
  *     const output2 = pipe2.getOutput();
  *     if (output2) await conn2.write(output2);
@@ -93,7 +93,7 @@
  * // ... perform handshake ...
  *
  * if (pipe4.handshakeComplete) {
- *     const cert4 = pipe4.getPeerCertificate();
+ *     const cert4 = pipe4.certificate;
  *     console.log("Subject:", cert4.subject);
  *     console.log("Issuer:", cert4.issuer);
  *     console.log("Valid:", cert4.validFrom, "to", cert4.validTo);
@@ -300,7 +300,7 @@ declare namespace CModuleSSL {
          * Perform one step of SSL/TLS handshake
          * @returns true if handshake is complete, false if more data needed
          */
-        doHandshake(): boolean;
+        handshake(): boolean;
 
         /**
          * Initiate SSL/TLS connection shutdown
@@ -312,25 +312,25 @@ declare namespace CModuleSSL {
          * Get peer certificate information
          * @returns Certificate info or null if not available
          */
-        getPeerCertificate(): CertificateInfo | null;
+        readonly certificate: CertificateInfo | null;
 
         /**
          * Get negotiated SSL/TLS version
          * @returns Version string (e.g., "TLSv1.3")
          */
-        getVersion(): string;
+        readonly version: string;
 
         /**
          * Get current cipher information
          * @returns Cipher info or null if not established
          */
-        getCipher(): CipherInfo | null;
+        cipher(): CipherInfo | null;
 
         /**
          * Get negotiated ALPN protocol
          * @returns Protocol name or null if not negotiated
          */
-        getALPNProtocol(): string | null;
+        alpnProtocol(): string | null;
 
         /**
          * Get peer certificate verification result
@@ -379,12 +379,12 @@ declare namespace CModuleSSL {
     /**
      * Get OpenSSL version string
      */
-    export function getOpenSSLVersion(): string;
+    export const version: string;
 
     /**
      * Get list of available cipher suites
      */
-    export function getCipherList(): string[];
+    export const ciphers: string[];
 
     /**
      * Load and parse PEM data
