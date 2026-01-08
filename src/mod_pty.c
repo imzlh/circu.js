@@ -184,8 +184,9 @@ static JSValue tjs_pty_openpty(JSContext *ctx, JSValueConst this_val, int argc, 
     hConPtyOut = INVALID_HANDLE_VALUE;
     
     /* Return object */
+	int fd = _open_osfhandle(hPipeOut, 0);
     ret_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, ret_obj, "fd", JS_NewInt64(ctx, (intptr_t)hPipeOut));
+    JS_SetPropertyStr(ctx, ret_obj, "fd", JS_NewInt32(ctx, fd));
     JS_SetPropertyStr(ctx, ret_obj, "pid", JS_NewInt64(ctx, pi.dwProcessId));
     JS_SetPropertyStr(ctx, ret_obj, "pty", JS_NewInt64(ctx, (intptr_t)hPC));
     

@@ -18,7 +18,8 @@ set(CMAKE_C_STANDARD 11)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-list(APPEND cjs_cflags -Wall -g)
+# disable #pragma region warning for GCC
+list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror)
 if (CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
     add_compile_definitions(DEBUG)
@@ -66,6 +67,14 @@ if(BUILD_WITH_MIMALLOC)
     option(MI_BUILD_OBJECT "" OFF)
     option(MI_BUILD_TESTS "" OFF)
     add_subdirectory(deps/mimalloc EXCLUDE_FROM_ALL)
+endif()
+
+# some old gcc don't have thread.h but have _Thread_local keyword
+include(CheckIncludeFile)
+check_include_file(threads.h HAVE_THREADS_H)
+if(NOT HAVE_THREADS_H)
+    add_compile_definitions(L_NO_THREADS_H)
+    add_compile_definitions(thread_local=_Thread_local)
 endif()
 
 find_package(SQLite3 REQUIRED)

@@ -135,62 +135,92 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
     return flags;
 }
 
-static JSValue fs_throw(JSContext* ctx, const char* msg){
-	const char* err = strerror(errno);
-	JSValue err_obj = JS_NewError(ctx);
-	char errmsg[1024];
-	snprintf(errmsg, sizeof(errmsg), "%s: %s", msg, err);
-	JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_message, JS_NewString(ctx, errmsg), JS_PROP_C_W_E);
-	JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, err_obj, "code", JS_NewString(ctx, err), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, err_obj, "errno", JS_NewInt32(ctx, errno), JS_PROP_C_W_E);
-	return JS_Throw(ctx, err_obj);
-}
 #ifdef _WIN32
-static const char *errnoname(DWORD w)
-{
-    switch (w) {
-    case ERROR_FILE_NOT_FOUND:      return "ENOENT";
-    case ERROR_PATH_NOT_FOUND:      return "ENOENT";
-    case ERROR_ACCESS_DENIED:       return "EACCES";
-    case ERROR_SHARING_VIOLATION:   return "EBUSY";
-    case ERROR_LOCK_VIOLATION:      return "EWOULDBLOCK";
-    case ERROR_ALREADY_EXISTS:      return "EEXIST";
-    case ERROR_FILE_EXISTS:         return "EEXIST";
-    default:                        return "UNKNOWN";
+static int crt2uv(int crt_err) {
+    switch (crt_err) {
+#define UV(crt, uv) case crt: return uv;
+        UV(ENOENT, UV_ENOENT)
+        UV(EACCES, UV_EACCES)
+        UV(EEXIST, UV_EEXIST)
+        UV(ENOTDIR, UV_ENOTDIR)
+        UV(EISDIR, UV_EISDIR)
+        UV(EINVAL, UV_EINVAL)
+        UV(ENOSPC, UV_ENOSPC)
+        UV(EIO, UV_EIO)
+        UV(EBUSY, UV_EBUSY)
+        UV(ENOMEM, UV_ENOMEM)
+        UV(EMFILE, UV_EMFILE)
+        UV(ENFILE, UV_ENFILE)
+        UV(EROFS, UV_EROFS)
+        UV(EPIPE, UV_EPIPE)
+        
+        UV(EAGAIN, UV_EAGAIN)
+        UV(EWOULDBLOCK, UV_EAGAIN)
+        UV(EINTR, UV_EINTR)
+        
+        UV(ENOTSOCK, UV_ENOTSOCK)
+        UV(EDESTADDRREQ, UV_EDESTADDRREQ)
+        UV(EMSGSIZE, UV_EMSGSIZE)
+        UV(EPROTOTYPE, UV_EPROTOTYPE)
+        UV(ENOPROTOOPT, UV_ENOPROTOOPT)
+        UV(EPROTONOSUPPORT, UV_EPROTONOSUPPORT)
+        UV(ESOCKTNOSUPPORT, UV_ESOCKTNOSUPPORT)
+        UV(EOPNOTSUPP, UV_EOPNOTSUPP)
+        UV(EPFNOSUPPORT, UV_EPFNOSUPPORT)
+        UV(EAFNOSUPPORT, UV_EAFNOSUPPORT)
+        UV(EADDRINUSE, UV_EADDRINUSE)
+        UV(EADDRNOTAVAIL, UV_EADDRNOTAVAIL)
+        UV(ENETDOWN, UV_ENETDOWN)
+        UV(ENETUNREACH, UV_ENETUNREACH)
+        UV(ENETRESET, UV_ENETRESET)
+        UV(ECONNABORTED, UV_ECONNABORTED)
+        UV(ECONNRESET, UV_ECONNRESET)
+        UV(ENOBUFS, UV_ENOBUFS)
+        UV(EISCONN, UV_EISCONN)
+        UV(ENOTCONN, UV_ENOTCONN)
+        UV(ESHUTDOWN, UV_ESHUTDOWN)
+        UV(ETIMEDOUT, UV_ETIMEDOUT)
+        UV(ECONNREFUSED, UV_ECONNREFUSED)
+        UV(EHOSTDOWN, UV_EHOSTDOWN)
+        UV(EHOSTUNREACH, UV_EHOSTUNREACH)
+        UV(EALREADY, UV_EALREADY)
+        UV(EINPROGRESS, UV_EINPROGRESS)
+        
+        UV(ELOOP, UV_ELOOP)
+        UV(ENAMETOOLONG, UV_ENAMETOOLONG)
+        UV(ENOTEMPTY, UV_ENOTEMPTY)
+        UV(EUSERS, UV_EUSERS)
+        UV(EDQUOT, UV_EDQUOT)
+        UV(ESTALE, UV_ESTALE)
+        UV(EREMOTE, UV_EREMOTE)
+        UV(EBADF, UV_EBADF)
+        UV(EFAULT, UV_EFAULT)
+        UV(ESPIPE, UV_ESPIPE)
+        UV(E2BIG, UV_E2BIG)
+        UV(ENXIO, UV_ENXIO)
+        UV(ECHILD, UV_ECHILD)
+        UV(EDEADLK, UV_EDEADLK)
+        UV(ENOLCK, UV_ENOLCK)
+        UV(ENOSYS, UV_ENOSYS)
+        UV(ENOMSG, UV_ENOMSG)
+        UV(EIDRM, UV_EIDRM)
+        UV(EILSEQ, UV_EILSEQ)
+        UV(EOVERFLOW, UV_EOVERFLOW)
+        UV(ECANCELED, UV_ECANCELED)
+        
+        default:
+            return uv_translate_sys_error(crt_err);
+#undef UV
     }
 }
-static JSValue fs_throw2(JSContext *ctx, const char *msg)
-{
-    JSValue err_obj = JS_NewError(ctx);
-    char errmsg[512] = {0};
 
-    DWORD winerr = GetLastError();
-    if (winerr == 0) winerr = ERROR_GEN_FAILURE;
-    char *winmsg = NULL;
-    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
-                   FORMAT_MESSAGE_FROM_SYSTEM |
-                   FORMAT_MESSAGE_IGNORE_INSERTS,
-                   NULL, winerr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                   (char *)&winmsg, 0, NULL);
-    snprintf(errmsg, sizeof(errmsg), "%s: %s", msg,
-             winmsg ? winmsg : "Unknown error");
-    LocalFree(winmsg);
-
-    JS_DefinePropertyValueStr(ctx, err_obj, "code",
-        JS_NewString(ctx, errnoname(winerr)), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, err_obj, "errno",
-        JS_NewInt32(ctx, winerr), JS_PROP_C_W_E);
-
-    JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_message,
-        JS_NewString(ctx, errmsg), JS_PROP_C_W_E);
-    JS_DefinePropertyValue(ctx, err_obj, JS_ATOM_name,
-        JS_NewString(ctx, "IOError"), JS_PROP_C_W_E);
-    return JS_Throw(ctx, err_obj);
-}
-#define THROW2(msg) return fs_throw2(ctx, msg);
+#define THROW(msg) return tjs_throw_errno(ctx, crt2uv(errno));
+#define THROW2(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
+#else
+#define THROW(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+#define THROW2(msg) abort();	// windows only, should never happen
 #endif
-#define THROW(msg) return fs_throw(ctx, msg);
+
 
 /* stat() - get file status */
 static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {

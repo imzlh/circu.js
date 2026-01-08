@@ -25,6 +25,10 @@
 #include "private.h"
 #include "utils.h"
 
+static JSCFunctionListEntry tjs__uv_errno[] = {
+#define MAP_FN(name, __) TJS_CONST2(#name, UV_ ## name),
+	UV_ERRNO_MAP(MAP_FN)
+};
 
 JSValue tjs_new_error(JSContext *ctx, int err) {
     char buf[256];
@@ -33,11 +37,12 @@ JSValue tjs_new_error(JSContext *ctx, int err) {
 
     JSValue obj;
     obj = JS_NewError(ctx);
-    JS_DefinePropertyValueStr(ctx, obj, "message", JS_NewString(ctx, buf), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+	JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, JS_NewString(ctx, buf), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValueStr(ctx,
                               obj,
                               "code",
-                              JS_NewString(ctx, uv_err_name(err)),
+                              JS_NewInt32(ctx, err),
                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     return obj;
 }
@@ -59,8 +64,32 @@ JSValue tjs_throw_errno(JSContext *ctx, int err) {
     return JS_Throw(ctx, obj);
 }
 
+JSValue tjs__error_strerr(JSContext *ctx, JSValueConst this_val, int argc, JSValue *argv){
+	uint32_t err;
+	if (argc == 0 || -1 == JS_ToUint32(ctx, &err, argv[0])) {
+		err = errno;
+	}
+
+	const char *msg = uv_strerror(err);
+	const char *name = uv_err_name(err);
+	if (msg == NULL || name == NULL) {
+		return JS_ThrowTypeError(ctx, "strerror: invalid error code");
+	}
+
+	char buf[256];
+	int len = snprintf(buf, sizeof(buf), "%s: %s", name, msg);
+	return JS_NewStringLen(ctx, buf, len);
+}
+
+JSCFunctionListEntry tjs__error_funcs[] = {
+	JS_CFUNC_DEF2("Error", 1, tjs_error_constructor, JS_CFUNC_constructor),
+	JS_CFUNC_DEF("strerror", 0, tjs__error_strerr)
+};
+
 void tjs__mod_error_init(JSContext *ctx, JSValue ns) {
-    /* Error object */
-    JSValue error_obj = JS_NewCFunction2(ctx, tjs_error_constructor, "Error", 1, JS_CFUNC_constructor, 0);
-    JS_DefinePropertyValueStr(ctx, ns, "Error", error_obj, JS_PROP_C_W_E);
+	JS_SetPropertyFunctionList(ctx, ns, tjs__error_funcs, countof(tjs__error_funcs));
+
+	JSValue uv_errno_obj = JS_NewObject(ctx);
+	JS_SetPropertyFunctionList(ctx, uv_errno_obj, tjs__uv_errno, countof(tjs__uv_errno));
+	JS_DefinePropertyValueStr(ctx, ns, "errno", uv_errno_obj, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 }

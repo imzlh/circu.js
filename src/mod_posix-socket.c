@@ -599,7 +599,7 @@ static JSValue tjs_sock_sockaddr_inet(JSContext *ctx, JSValue this_val, int argc
     int ret = tjs_obj2addr(ctx, argv[0], addrSS);
     if (ret < -1) {
         js_free(ctx, addrSS);
-        return JS_ThrowTypeError(ctx, "invalid address object");
+        return tjs_throw_errno(ctx, uv_translate_sys_error(ret));
     }
     // but we only need sockaddr_in, so realloc it to the needed size
     struct sockaddr *addr = js_realloc(ctx, addrSS, sizeof(struct sockaddr));

@@ -35,11 +35,11 @@ SOFTWARE.
 #if UINTPTR_MAX == UINT32_MAX
 #define JS_TO_UINTPTR_T(ctx, pres, val)                                                                                \
     {                                                                                                                  \
-        uint64_t v;                                                                                                    \
-        JS_ToBigInt64(ctx, &v, val);                                                                                   \
-        *(uint32_t *) (pres) = (uint32_t) v;                                                                           \
+        uint32_t v;                                                                                                    \
+        JS_ToUint32(ctx, &v, val);                                                                                   	\
+        memcpy(pres, &v, sizeof(v));                                                                    				\
     }
-#define JS_NEW_UINTPTR_T(ctx, val) JS_NewBigUint64(ctx, (int32_t) (val))
+#define JS_NEW_UINTPTR_T(ctx, val) JS_NewUint32(ctx, (uint32_t) (val))
 #define ffi_type_ptr               ffi_type_uint32
 #elif UINTPTR_MAX == UINT64_MAX
 #define JS_TO_UINTPTR_T(ctx, pres, val) JS_ToBigInt64(ctx, (int64_t *) (pres), val)
@@ -524,7 +524,7 @@ static JSValue js_ffi_type_from_buffer(JSContext *ctx, JSValue this_val, int arg
     }
     size_t typesz = ffi_type_get_sz(type->ffi_type);
     if (bufsz != typesz) {
-        JS_ThrowRangeError(ctx, "expected buffer to be of size %lu", typesz);
+        JS_ThrowRangeError(ctx, "expected buffer to be of size %zu", typesz);
         return JS_EXCEPTION;
     }
     JSValue val = JS_UNDEFINED;
@@ -840,7 +840,7 @@ static JSValue js_array_buffer_get_ptr(JSContext *ctx, JSValue this_val, int arg
     if (!buf) {
         return JS_EXCEPTION;
     }
-    return JS_NEW_UINTPTR_T(ctx, (uint64_t) buf);
+    return JS_NEW_UINTPTR_T(ctx, buf);
 }
 
 static JSValue js_get_cstring(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

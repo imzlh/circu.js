@@ -13,7 +13,7 @@ interface TjsModules {
     os: typeof CModuleOS,
     process: typeof CModuleProcess,
     pty: typeof CModulePty,
-    signal: typeof CModuleSignals,
+    signals: typeof CModuleSignals,
     sqlite3: typeof CModuleSQLite3,
     streams: typeof CModuleStreams,
     sys: typeof CModuleSys,

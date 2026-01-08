@@ -290,7 +290,7 @@ void help(void) {
 		   "-b binary   compile opcode into tjs binary\n"
 		   "-e			create only. only used when -b and binary has no attached source code\n"
 		   "\n",
-           JS_version());
+           JS_GetVersion());
     exit(1);
 }
 

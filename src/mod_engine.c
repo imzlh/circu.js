@@ -122,8 +122,13 @@ static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, J
     JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
     if(!def) return JS_EXCEPTION;
 
+	int flags = JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE;
+	if (argc != 0 && -1 == JS_ToInt32(ctx, &flags, argv[0])) {
+		return JS_ThrowTypeError(ctx, "invalid flags. expect number mask or undefined");
+	}
+
     size_t len = 0;
-    uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, def), JS_WRITE_OBJ_BYTECODE);
+    uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, def), flags);
     if(!data) return JS_EXCEPTION;
 
     return JS_NewArrayBuffer(ctx, data, len, free_js_malloc, NULL, false);
@@ -202,7 +207,14 @@ static JSValue tjs_compile(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
 static JSValue tjs_serialize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     size_t len = 0;
-    int flags = JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_STRIP_SOURCE;
+    int flags = JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE;
+
+	if (argc == 0) return JS_ThrowTypeError(ctx, "missing argument");
+
+	if (argc >= 2 && -1 == JS_ToInt32(ctx, &flags, argv[1])) {
+		return JS_ThrowTypeError(ctx, "invalid flags. expect number mask or undefined");
+	}
+
     uint8_t *buf = JS_WriteObject(ctx, &len, argv[0], flags);
     if (!buf) {
         return JS_EXCEPTION;
@@ -336,16 +348,16 @@ static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int arg
 	}
 
 	JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
+	JSValue err;
 	switch (state) {
 		case JS_PROMISE_PENDING:
 		return JS_NULL;
 
 		case JS_PROMISE_FULFILLED:
-			JSValue res = JS_PromiseResult(ctx, promise);
-		return res;
+		return JS_PromiseResult(ctx, promise);
 
 		case JS_PROMISE_REJECTED:
-			JSValue err = JS_PromiseResult(ctx, promise);
+			err = JS_PromiseResult(ctx, promise);
 		return JS_Throw(ctx, err);
 
 		default: abort();
@@ -364,6 +376,13 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
 	TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),
+
+	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),
+	TJS_CONST2("DUMP_NODEBUG", JS_WRITE_OBJ_STRIP_DEBUG),
+	TJS_CONST2("DUMP_NOSOURCE", JS_WRITE_OBJ_STRIP_SOURCE),
+	TJS_CONST2("DUMP_DEEP", JS_WRITE_OBJ_REFERENCE),
+	TJS_CONST2("DUMP_LOCAL", JS_WRITE_OBJ_SAB),
+	TJS_CONST2("DUMP_DEFAULT", JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE),
 };
 
 /* clang-format off */

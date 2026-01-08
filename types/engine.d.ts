@@ -2,6 +2,37 @@ declare namespace CModuleEngine {
     type Promise = globalThis.Promise<any>;
     type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
 
+    /**
+     * dump function opcode
+     */
+    export const DUMP_BYTECODE: number;
+
+    /**
+     * disable debug info in dump function
+     */
+    export const DUMP_NODEBUG: number;
+
+    /**
+     * disable source code in dump function
+     */
+    export const DUMP_NOSOURCE: number;
+
+    /**
+     * deep dump object to handle complex objects
+     */
+    export const DUMP_DEEP: number;
+
+    /**
+     * USE with cautious, dump shared array buffer
+     * will cause memory access error if program died
+     */
+    export const DUMP_LOCAL: number;
+
+    /**
+     * default dump, include bytecode, deep dump
+     */
+    export const DUMP_DEFAULT: number;
+
     export enum PromiseState {
         CONSTRUCT,
         BEFORE_THEN,
@@ -90,9 +121,10 @@ declare namespace CModuleEngine {
     /**
      * 序列化 JavaScript 对象为字节码
      * @param obj 要序列化的对象
+     * @param flag 序列化选项，默认为 `DUMP_DEFAULT`
      * @returns 序列化后的字节码
      */
-    export function serialize(obj: any): Uint8Array;
+    export function serialize(obj: any, flag?: number): Uint8Array;
 
     /**
      * 反序列化字节码为 JavaScript 对象
@@ -154,8 +186,9 @@ declare namespace CModuleEngine {
 
         /**
          * 导出模块为字节码
+         * @param flag 序列化选项，默认为 `DUMP_DEFAULT`
          */
-        dump(): ArrayBuffer;
+        dump(flag?: number): ArrayBuffer;
 
         /**
          * 作为模块执行
