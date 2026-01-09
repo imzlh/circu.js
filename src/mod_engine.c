@@ -292,6 +292,10 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 		JS_FreeValue(ctx, trt->module.metaloader);
 		trt->module.metaloader = valtmp;
 	});
+	IFOPT2("attrchk", JS_IsFunction, {
+		JS_FreeValue(ctx, trt->module.attrchecker);
+		trt->module.attrchecker = valtmp;
+	});
 
 	return JS_UNDEFINED;
 }
@@ -323,7 +327,7 @@ static JSValue tjs_encodeString(JSContext *ctx, JSValue this_val, int argc, JSVa
 static JSValue tjs_decodeString(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
 	if(argc == 0){
 typerr:
-		return JS_ThrowTypeError(ctx, "argument must be an ArrayBuffer");
+		return JS_ThrowTypeError(ctx, "argument must be an ArrayBuffer or Uint8Array");
 	}
 
 	uint8_t* buf = NULL;
@@ -341,6 +345,51 @@ typerr:
 	JSValue str = JS_NewStringLen(ctx, (char*)buf, buflen);
 	return str;
 }
+
+static JSValue tjs_encodeU16String(JSContext* ctx, JSValue this_val, int argc, JSValue* argv){
+	if(argc == 0 || !JS_IsString(argv[0])){
+		return JS_ThrowTypeError(ctx, "argument must be a string");
+	}
+
+	size_t strlen;
+	const uint16_t* str = JS_ToCStringLenUTF16(ctx, &strlen, argv[0]);
+	JSValue buffer = JS_NewArrayBufferCopy(ctx, (const uint8_t*)str, strlen *2);
+	JS_FreeCStringUTF16(ctx, str);
+
+	// to Uint16Array
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue u16arrctor = JS_GetPropertyStr(ctx, global, "Uint16Array");	
+	if (!JS_IsFunction(ctx, u16arrctor)) {
+		JS_FreeValue(ctx, u16arrctor);
+		JS_FreeValue(ctx, global);
+		JS_FreeValue(ctx, buffer);
+		return JS_ThrowTypeError(ctx, "Uint16Array constructor not found");
+	}
+	JSValue u16arr = JS_Call(ctx, u16arrctor, u16arrctor, 1, (JSValueConst[]) { buffer });
+	JS_FreeValue(ctx, buffer);
+	JS_FreeValue(ctx, u16arrctor);
+	JS_FreeValue(ctx, global);
+
+	return u16arr;
+}
+
+static JSValue tjs_decodeU16String(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
+	if(argc == 0){
+typerr:
+		return JS_ThrowTypeError(ctx, "argument must be an ArrayBuffer or Uint16Array");
+	}
+
+	size_t buflen;
+	uint8_t* u8 = JS_GetAnyBuffer(ctx, &buflen, argv[0]);
+	if (!u8){
+		goto typerr;
+	}
+
+	size_t u16len = buflen /2;
+	JSValue str = JS_NewStringUTF16(ctx, (uint16_t*)u8, u16len);
+	return str;
+}
+
 
 static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int argc, JSValueConst* argv) {
 	if (argc == 0 || !JS_IsPromise(promise)) {
@@ -374,7 +423,9 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
 	TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
+	TJS_CFUNC_DEF("encodeU16String", 1, tjs_encodeU16String),
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
+	TJS_CFUNC_DEF("decodeU16String", 1, tjs_decodeU16String),
 	TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),
 
 	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),

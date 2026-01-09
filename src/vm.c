@@ -371,9 +371,9 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     qrt->stop.data = qrt;
 
     /* loader for ES modules */
-    JS_SetModuleLoaderFunc(rt, tjs_module_normalizer, tjs_module_loader, qrt);
+    JS_SetModuleLoaderFunc2(rt, tjs__module_normalizer, tjs__module_loader, tjs__module_checkattr, qrt);
 	qrt->module.resolver = qrt->module.loader = 
-	qrt->module.metaloader = JS_UNDEFINED;
+	qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
 
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
@@ -424,8 +424,10 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	JS_FreeValue(qrt->ctx, qrt->module.resolver);
 	JS_FreeValue(qrt->ctx, qrt->module.loader);
 	JS_FreeValue(qrt->ctx, qrt->module.metaloader);
+	JS_FreeValue(qrt->ctx, qrt->module.attrchecker);
+
 	qrt->module.resolver = qrt->module.loader = 
-	qrt->module.metaloader = JS_UNDEFINED;
+	qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
 
 	/* remove console.count cache */
 	JS_FreeValue(qrt->ctx, qrt->builtins.concount);

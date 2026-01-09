@@ -166,6 +166,22 @@ declare namespace CModuleEngine {
     export function decodeString(buffer: Uint8Array | ArrayBuffer): string;
 
     /**
+     * 类似于`new TextEncoder('utf-16').encode(str)`
+     * 编码为buffer，注意是`Uint16Array`，每个字符占用2个字节
+     * @param str 文本
+     */
+    export function encodeU16String(str: string): Uint16Array;
+
+    /**
+     * 类似于`new TextDecoder('utf-16').decode(buffer)` 
+     * 解码为文本
+     * 
+     * **注意** 虽然Circu.js支持传入`Uint8Array`且效果一致，但是为了区分不建议这么做
+     * @param buffer 包含文本的buffer
+     */
+    export function decodeU16String(buffer: Uint16Array | ArrayBuffer): string;
+
+    /**
      * (不安全，谨慎使用) 模块类
      */
     export class Module {
@@ -209,13 +225,20 @@ declare namespace CModuleEngine {
 
         /**
          * 模块解析器函数
+         * **NOTE**: qjs-ng支持了import attribute，可以从`attr`中获取import attribute列表
          */
-        resolve?: (name: string, parent: string) => string;
+        resolve?: (name: string, parent: string, attr: Record<string, any>) => string;
 
         /**
          * 模块初始化函数
          */
         init?: (name: string, importMeta: Record<string, any>) => void;
+
+        /**
+         * import attribute 内容检查函数
+         * 只检查是否支持，完整检查应该在`resolve`中进行
+         */
+        attrchk?: (attr: Record<string, any>) => void;
     }): void;
 
     /**

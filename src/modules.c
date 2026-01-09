@@ -72,7 +72,22 @@ JSModuleDef *tjs__load_http(JSContext *ctx, const char *url) {
 	return NULL;
 }
 
-JSModuleDef *tjs_module_loader(JSContext *ctx, const char *module_name, void *opaque) {
+int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes){
+	// by default, we will not check attributes for better capability
+	TJSRuntime *trt = TJS_GetRuntime(ctx);
+	if(!JS_IsUndefined(trt->module.attrchecker)){
+		JSValueConst args[] = { attributes };
+		JSValue ret = JS_Call(ctx, trt->module.attrchecker, JS_UNDEFINED, 1, args);
+		if(JS_IsException(ret)){
+			JS_FreeValue(ctx, ret);
+			return -1;	// pass-through exception
+		}
+		JS_FreeValue(ctx, ret);
+	}
+	return 0;
+}
+
+JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *opaque, JSValueConst attributes) {
     static const char http[] = "http://";
     static const char https[] = "https://";
     static const char json_tpl_start[] = "export default JSON.parse(`";
@@ -86,9 +101,9 @@ JSModuleDef *tjs_module_loader(JSContext *ctx, const char *module_name, void *op
 
 	// try JS loader
 	if(!JS_IsUndefined(trt->module.loader)){
-		JSValueConst args[] = { JS_NewString(ctx, module_name) };
-		JSValue ret = JS_Call(ctx, trt->module.loader, JS_UNDEFINED, 1, args);
-		JS_FreeValue(ctx, args[0]);
+		JSValueConst args[] = { JS_NewString(ctx, module_name), attributes };
+		JSValue ret = JS_Call(ctx, trt->module.loader, JS_UNDEFINED, 2, args);
+		JS_FreeValue(ctx, args[0]);	// args[1] owned by qjs
 		if (JS_IsString(ret)) {
 			size_t strlen;
 			const char *str = JS_ToCStringLen(ctx, &strlen, ret);
@@ -262,7 +277,7 @@ static inline void tjs__normalize_pathsep(const char *name) {
 #endif
 }
 
-char *tjs_module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
+char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
 #if 0
     printf("normalize: %s %s\n", base_name, name);
 #endif
