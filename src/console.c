@@ -742,6 +742,17 @@ static void format_set(JSContext* ctx, JSValueConst val, int depth,
     visit_pop(stack);
 }
 
+static void format_module(JSContext* ctx, JSValue val, int depth, VisitStack* stack, DynBuf* buf) {
+	JSAtom nsname = JS_GetModuleName(ctx, JS_VALUE_GET_PTR(val));
+	const char* name = JS_AtomToCString(ctx, nsname);
+	dbuf_printf(buf, "Module(%s) ", name);
+	JS_FreeAtom(ctx, nsname);
+	if (name) JS_FreeCString(ctx, name);
+
+	JSValue ns = JS_GetModuleNamespace(ctx, JS_VALUE_GET_PTR(val));
+	format_object(ctx, ns, depth, stack, buf);
+}
+
 /* Main formatting function */
 static void format_value(JSContext* ctx, JSValueConst val, int depth, 
                         VisitStack* stack, DynBuf* buf, bool in_container) {
@@ -749,47 +760,88 @@ static void format_value(JSContext* ctx, JSValueConst val, int depth,
         dbuf_putstr(buf, ANSI_RED "[Max depth exceeded]" ANSI_RESET);
         return;
     }
-    
-    /* Primitives */
-    if (JS_IsUndefined(val)) {
-        dbuf_putstr(buf, ANSI_GRAY "undefined" ANSI_RESET);
-    } else if (JS_IsNull(val)) {
-        dbuf_putstr(buf, ANSI_DIM "null" ANSI_RESET);
-    } else if (JS_IsBool(val)) {
-        dbuf_printf(buf, ANSI_YELLOW "%s" ANSI_RESET, JS_ToBool(ctx, val) ? "true" : "false");
-    } else if (JS_IsNumber(val)) {
-        format_number(ctx, val, buf);
-    } else if (JS_IsBigInt(val)) {
-        const char* str = JS_ToCString(ctx, val);
-        dbuf_printf(buf, ANSI_YELLOW "%sn" ANSI_RESET, str ? str : "0");
-        if (str) JS_FreeCString(ctx, str);
-    } else if (JS_IsString(val)) {
-        format_string(ctx, val, buf, in_container);
-    } else if (JS_IsSymbol(val)) {
-        format_symbol(ctx, val, buf);
-    } else if (JS_IsFunction(ctx, val)) {
-        format_function(ctx, val, buf);
-    } 
-    /* Special objects - check BEFORE generic object */
-    else if (JS_IsError(val)) {
-        format_error(ctx, val, depth, buf);
-    } else if (JS_IsPromise(val)) {
-        format_promise(ctx, val, buf);
-    } else if (JS_IsArrayBuffer(val)) {
-        format_array_buffer(ctx, val, buf);
-    } else if (JS_GetTypedArrayType(val) != -1) {
-        format_typed_array(ctx, val, depth, stack, buf);
-    } else if (JS_IsArray(val)) {
-        format_array(ctx, val, depth, stack, buf);
-    } else if (JS_IsMap(val)) {
-        format_map(ctx, val, depth, stack, buf);
-    } else if (JS_IsSet(val)) {
-        format_set(ctx, val, depth, stack, buf);
-    } else if (JS_IsObject(val)) {
-        format_object(ctx, val, depth, stack, buf);
-    } else {
-        dbuf_putstr(buf, ANSI_RED "[Unknown type]" ANSI_RESET);
-    }
+
+	switch (JS_VALUE_GET_TAG(val)) {
+		case JS_TAG_BIG_INT:
+		case JS_TAG_SHORT_BIG_INT:
+		{
+			const char* str = JS_ToCString(ctx, val);
+			dbuf_printf(buf, ANSI_YELLOW "%sn" ANSI_RESET, str ? str : "0");
+			if (str) JS_FreeCString(ctx, str);
+		}
+		break;
+
+		case JS_TAG_UNDEFINED:
+			dbuf_putstr(buf, ANSI_GRAY "undefined" ANSI_RESET);
+		break;
+
+		case JS_TAG_BOOL:
+			dbuf_printf(buf, ANSI_YELLOW "%s" ANSI_RESET, JS_ToBool(ctx, val) ? "true" : "false");
+		break;
+
+		case JS_TAG_NULL:
+		case JS_TAG_UNINITIALIZED:
+			dbuf_putstr(buf, ANSI_DIM "null" ANSI_RESET);
+		break;
+
+		case JS_TAG_INT:
+		case JS_TAG_FLOAT64:
+			format_number(ctx, val, buf);
+		break;
+
+		case JS_TAG_STRING:
+			format_string(ctx, val, buf, in_container);
+		break;
+
+		case JS_TAG_MODULE:
+			format_module(ctx, val, depth, stack, buf);
+		break;
+
+		case JS_TAG_FUNCTION_BYTECODE:
+			dbuf_putstr(buf, ANSI_RED "[opcode]" ANSI_RESET);
+		break;
+
+		case JS_TAG_OBJECT:
+			if (JS_IsSymbol(val)) {
+				format_symbol(ctx, val, buf);
+			} else if (JS_IsFunction(ctx, val)) {
+				format_function(ctx, val, buf);
+			}
+			/* Special objects - check BEFORE generic object */
+			else if (JS_IsError(val)) {
+				format_error(ctx, val, depth, buf);
+			} else if (JS_IsPromise(val)) {
+				format_promise(ctx, val, buf);
+			} else if (JS_IsArrayBuffer(val)) {
+				format_array_buffer(ctx, val, buf);
+			} else if (JS_GetTypedArrayType(val) != -1) {
+				format_typed_array(ctx, val, depth, stack, buf);
+			} else if (JS_IsArray(val)) {
+				format_array(ctx, val, depth, stack, buf);
+			} else if (JS_IsMap(val)) {
+				format_map(ctx, val, depth, stack, buf);
+			} else if (JS_IsSet(val)) {
+				format_set(ctx, val, depth, stack, buf);
+			} else {
+				format_object(ctx, val, depth, stack, buf);
+			}
+		break;
+
+		case JS_TAG_EXCEPTION:
+			dbuf_putstr(buf, ANSI_RED "[Exception]" ANSI_RESET);
+		break;
+		
+		default:
+			if (JS_VALUE_IS_NAN(val)) {
+				dbuf_putstr(buf, ANSI_CYAN "NaN" ANSI_RESET);
+			} else {
+				dbuf_printf(buf, ANSI_RED "[Unknown tag: %d]" ANSI_RESET, JS_VALUE_GET_TAG(val));
+			}
+		break;
+	}
+
+	// clean up exception
+	JS_FreeValue(ctx, JS_GetException(ctx));
 }
 
 static JSValue js_console_inspect(JSContext* ctx, JSValueConst this_val, 

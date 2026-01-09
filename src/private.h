@@ -60,6 +60,7 @@ struct TJSRuntime {
         uv_check_t check;
         uv_idle_t idle;
         uv_prepare_t prepare;
+		bool paused;
     } jobs;
     uv_async_t stop;
     bool is_worker;

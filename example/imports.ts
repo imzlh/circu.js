@@ -1,1 +1,0 @@
-export { URL } from "../node_modules/whatwg-url/index";

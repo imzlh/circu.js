@@ -627,6 +627,10 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     JS_FreeCString(ctx, path);
     
     size_t size = st.st_size;
+	if (size == 0) {
+		return JS_NewArrayBufferCopy(ctx, NULL, 0);
+	}
+
     uint8_t* buf = js_malloc(ctx, size);
     if (!buf) {
         close(fd);
@@ -944,8 +948,8 @@ static JSValue tjs_syncfs_symlink(JSContext *ctx, JSValueConst this_val,
             break;
         }
         
-        w_target = (wchar_t*)malloc(w_target_len * sizeof(wchar_t));
-        w_path = (wchar_t*)malloc(w_path_len * sizeof(wchar_t));
+        w_target = (wchar_t*)js_malloc(ctx, w_target_len * sizeof(wchar_t));
+        w_path = (wchar_t*)js_malloc(ctx, w_path_len * sizeof(wchar_t));
         
         if (!w_target || !w_path) {
             break;
@@ -970,8 +974,8 @@ static JSValue tjs_syncfs_symlink(JSContext *ctx, JSValueConst this_val,
     } while (0);
     
     // Clean up wide strings
-    if (w_target) free(w_target);
-    if (w_path) free(w_path);
+    if (w_target) js_free(ctx, w_target);
+    if (w_path) js_free(ctx, w_path);
     
     if (!success) {
         DWORD error_code = GetLastError();
@@ -1051,7 +1055,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     }
     
     // Allocate buffer for reparse point data
-    BYTE *buffer = (BYTE*)malloc(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    BYTE *buffer = (BYTE*)js_malloc(ctx, MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
     if (!buffer) {
         CloseHandle(hFile);
         JS_FreeCString(ctx, path);
@@ -1085,7 +1089,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
             int utf8_size = WideCharToMultiByte(CP_UTF8, 0, substitute_name, substitute_name_length, 
                                               NULL, 0, NULL, NULL);
             if (utf8_size > 0) {
-                link_path = (char*)malloc(utf8_size + 1);
+                link_path = (char*)js_malloc(ctx, utf8_size + 1);
                 if (link_path) {
                     WideCharToMultiByte(CP_UTF8, 0, substitute_name, substitute_name_length, 
                                       link_path, utf8_size, NULL, NULL);
@@ -1100,7 +1104,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
         }
     }
     
-    free(buffer);
+    js_free(ctx, buffer);
     CloseHandle(hFile);
     
     if (!success || !link_path) {
@@ -1109,7 +1113,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
         snprintf(error_msg, sizeof(error_msg), 
                  "Failed to read symbolic link. Error code: %lu", error_code);
         JS_FreeCString(ctx, path);
-        if (link_path) free(link_path);
+        if (link_path) js_free(ctx, link_path);
         return JS_ThrowTypeError(ctx, error_msg);
     }
 #else
@@ -1118,7 +1122,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     ssize_t link_size;
     
     // Allocate buffer for the link path
-    link_path = (char*)malloc(buffer_size);
+    link_path = (char*)js_malloc(ctx, buffer_size);
     if (!link_path) {
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, "Memory allocation failed");
@@ -1130,9 +1134,9 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     // Handle buffer too small case
     if (link_size == buffer_size - 1) {
         // Buffer might be too small, try with larger buffer
-        free(link_path);
+        js_free(ctx, link_path);
         buffer_size = 65536; // 64KB should be sufficient for most paths
-        link_path = (char*)malloc(buffer_size);
+        link_path = (char*)js_malloc(ctx, buffer_size);
         if (!link_path) {
             JS_FreeCString(ctx, path);
             return JS_ThrowTypeError(ctx, "Memory allocation failed");
@@ -1156,7 +1160,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     // Create JavaScript string from the link path
     if (link_path) {
         result = JS_NewString(ctx, link_path);
-        free(link_path);
+        js_free(ctx, link_path);
     } else {
         result = JS_NewString(ctx, "");
     }

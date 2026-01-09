@@ -414,9 +414,45 @@ static JSValue tjs_pty_resize(JSContext *ctx, JSValueConst this_val, int argc, J
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_pty_get_slave_name(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc != 1) {
+        return JS_ThrowTypeError(ctx, "getSlaveName requires 1 argument: master file descriptor");
+    }
+    
+    int32_t fd;
+    if (JS_ToInt32(ctx, &fd, argv[0])) {
+        return JS_EXCEPTION;
+    }
+    
+    if (fd < 0) {
+        return JS_ThrowTypeError(ctx, "Invalid file descriptor");
+    }
+    
+#ifdef _WIN32
+    /* Windows: Return ConPTY handle identifier */
+    intptr_t os_handle = _get_osfhandle(fd);
+    if (os_handle == -1) {
+        return JS_ThrowInternalError(ctx, "Invalid file descriptor");
+    }
+    
+    char buf[64];
+    snprintf(buf, sizeof(buf), "conpty-%p", (void*)os_handle);
+    return JS_NewString(ctx, buf);
+#else
+    /* Unix: Return actual slave device path */
+    char *slave_name = ttyname(fd);
+    if (!slave_name) {
+        return JS_ThrowInternalError(ctx, "Not a valid PTY master descriptor: %s", strerror(errno));
+    }
+    
+    return JS_NewString(ctx, slave_name);
+#endif
+}
+
 static const JSCFunctionListEntry tjs_pty_funcs[] = {
     TJS_CFUNC_DEF("openpty", 1, tjs_pty_openpty),
     TJS_CFUNC_DEF("resize", 3, tjs_pty_resize),
+    TJS_CFUNC_DEF("ptsname", 1, tjs_pty_get_slave_name),
 };
 
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns) {

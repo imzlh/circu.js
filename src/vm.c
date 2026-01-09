@@ -521,7 +521,7 @@ void tjs__execute_jobs(JSContext *ctx) {
 	assert(trt != NULL);
 
     /* execute the pending jobs */
-    for (;;) {
+    while (!trt->jobs.paused) {
         err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (err <= 0) {
             if (err < 0) {

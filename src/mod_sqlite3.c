@@ -175,7 +175,7 @@ static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSVa
 }
 
 static JSValue tjs_sqlite3_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, argv[0]);
+    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
@@ -192,14 +192,14 @@ static JSValue tjs_sqlite3_close(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, argv[0]);
+    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
     }
 
-    const char *zFile = JS_ToCString(ctx, argv[1]);
-    const char *zProc = JS_IsUndefined(argv[2]) ? NULL : JS_ToCString(ctx, argv[2]);
+    const char *zFile = JS_ToCString(ctx, argv[0]);
+    const char *zProc = JS_IsUndefined(argv[1]) ? NULL : JS_ToCString(ctx, argv[1]);
 
     if (!zFile) {
         return JS_EXCEPTION;
@@ -222,13 +222,13 @@ static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int 
 }
 
 static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, argv[0]);
+    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
     }
 
-    const char *sql = JS_ToCString(ctx, argv[1]);
+    const char *sql = JS_ToCString(ctx, argv[0]);
 
     if (!sql) {
         return JS_EXCEPTION;
@@ -246,13 +246,13 @@ static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSVa
 }
 
 static JSValue tjs_sqlite3_prepare(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, argv[0]);
+    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
     }
 
-    const char *sql = JS_ToCString(ctx, argv[1]);
+    const char *sql = JS_ToCString(ctx, argv[0]);
 
     if (!sql) {
         return JS_EXCEPTION;
@@ -276,17 +276,17 @@ static JSValue tjs_sqlite3_prepare(JSContext *ctx, JSValue this_val, int argc, J
 }
 
 static JSValue tjs_sqlite3_in_transaction(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, argv[0]);
+    TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
     }
 
-    return JS_NewBool(ctx, !sqlite3_get_autocommit(h->handle));
+    return JS_NewBool(ctx, sqlite3_get_autocommit(h->handle) == 0);
 }
 
 static JSValue tjs_sqlite3_stmt_finalize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, argv[0]);
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
@@ -309,7 +309,7 @@ static JSValue tjs_sqlite3_stmt_finalize(JSContext *ctx, JSValue this_val, int a
 }
 
 static JSValue tjs_sqlite3_stmt_expand(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, argv[0]);
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
@@ -509,7 +509,7 @@ static JSValue tjs__sqlite3_bind_params(JSContext *ctx, sqlite3_stmt *stmt, JSVa
 }
 
 static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, argv[0]);
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
@@ -524,8 +524,8 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
         return tjs_throw_sqlite3_errno(ctx, r);
     }
 
-    if (argc == 2) {
-        JSValue params = argv[1];
+    if (argc == 1) {
+        JSValue params = argv[0];
 
         if (JS_IsException(tjs__sqlite3_bind_params(ctx, h->stmt, params))) {
             return JS_EXCEPTION;
@@ -549,7 +549,7 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
 }
 
 static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, argv[0]);
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
     if (!h) {
         return JS_EXCEPTION;
@@ -564,8 +564,8 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
         return tjs_throw_sqlite3_errno(ctx, r);
     }
 
-    if (argc == 2) {
-        JSValue params = argv[1];
+    if (argc == 1) {
+        JSValue params = argv[0];
 
         if (JS_IsException(tjs__sqlite3_bind_params(ctx, h->stmt, params))) {
             return JS_EXCEPTION;
@@ -580,17 +580,23 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
     return JS_UNDEFINED;
 }
 
+static const JSCFunctionListEntry tjs_sqlite3_proto_funcs[] = {
+    TJS_CFUNC_DEF("close", 0, tjs_sqlite3_close),
+    TJS_CFUNC_DEF("loadExtension", 2, tjs_sqlite3_load_extension),
+    TJS_CFUNC_DEF("exec", 1, tjs_sqlite3_exec),
+    TJS_CFUNC_DEF("prepare", 1, tjs_sqlite3_prepare),
+    TJS_CFUNC_DEF("inTransaction", 0, tjs_sqlite3_in_transaction),
+};
+
+static const JSCFunctionListEntry tjs_sqlite3_stmt_proto_funcs[] = {
+    TJS_CFUNC_DEF("finalize", 0, tjs_sqlite3_stmt_finalize),
+    TJS_CFUNC_DEF("expand", 0, tjs_sqlite3_stmt_expand),
+    TJS_CFUNC_DEF("all", 1, tjs_sqlite3_stmt_all),
+    TJS_CFUNC_DEF("run", 1, tjs_sqlite3_stmt_run),
+};
+
 static const JSCFunctionListEntry tjs_sqlite3_funcs[] = {
     TJS_CFUNC_DEF("open", 2, tjs_sqlite3_open),
-    TJS_CFUNC_DEF("load_extension", 3, tjs_sqlite3_load_extension),
-    TJS_CFUNC_DEF("close", 1, tjs_sqlite3_close),
-    TJS_CFUNC_DEF("exec", 2, tjs_sqlite3_exec),
-    TJS_CFUNC_DEF("prepare", 2, tjs_sqlite3_prepare),
-    TJS_CFUNC_DEF("in_transaction", 1, tjs_sqlite3_in_transaction),
-    TJS_CFUNC_DEF("stmt_finalize", 1, tjs_sqlite3_stmt_finalize),
-    TJS_CFUNC_DEF("stmt_expand", 1, tjs_sqlite3_stmt_expand),
-    TJS_CFUNC_DEF("stmt_all", 2, tjs_sqlite3_stmt_all),
-    TJS_CFUNC_DEF("stmt_run", 2, tjs_sqlite3_stmt_run),
     TJS_CONST(SQLITE_OPEN_CREATE),
     TJS_CONST(SQLITE_OPEN_READONLY),
     TJS_CONST(SQLITE_OPEN_READWRITE),
@@ -609,12 +615,16 @@ void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns) {
     /* Handle object */
     JS_NewClassID(rt, &tjs_sqlite3_class_id);
     JS_NewClass(rt, tjs_sqlite3_class_id, &tjs_sqlite3_class);
-    JS_SetClassProto(ctx, tjs_sqlite3_class_id, JS_NULL);
+    JSValue handle_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, handle_proto, tjs_sqlite3_proto_funcs, countof(tjs_sqlite3_proto_funcs));
+    JS_SetClassProto(ctx, tjs_sqlite3_class_id, handle_proto);
 
     /* Statement object */
     JS_NewClassID(rt, &tjs_sqlite3_stmt_class_id);
     JS_NewClass(rt, tjs_sqlite3_stmt_class_id, &tjs_sqlite3_stmt_class);
-    JS_SetClassProto(ctx, tjs_sqlite3_stmt_class_id, JS_NULL);
+    JSValue stmt_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, stmt_proto, tjs_sqlite3_stmt_proto_funcs, countof(tjs_sqlite3_stmt_proto_funcs));
+    JS_SetClassProto(ctx, tjs_sqlite3_stmt_class_id, stmt_proto);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_sqlite3_funcs, countof(tjs_sqlite3_funcs));
 }

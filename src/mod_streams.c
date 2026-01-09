@@ -28,9 +28,68 @@
 
 #include <string.h>
 
+#define UV_RUN(sync_req) {					\
+	TJSRuntime* trt = TJS_GetRuntime(ctx); 	\
+	trt->jobs.paused = true;				\
+    while (!sync_req.done) {				\
+        uv_run(&trt->loop, UV_RUN_ONCE);	\
+    }										\
+	trt->jobs.paused = false;				\
+}
 
 /* Forward declarations */
 static JSValue tjs_new_tcp(JSContext *ctx, int af);
+
+/* Generic sync operation context */
+typedef struct {
+    bool done;
+    int status;
+} tjs_uv_sync_ctx_t;
+
+/* Sync read context */
+typedef struct {
+    bool done;
+    ssize_t nread;
+    uv_buf_t uvbuf;
+} tjs_uv_sync_read_ctx_t;
+
+/* Sync write context */
+typedef struct {
+    uv_write_t req;
+    bool done;
+    int status;
+    uv_buf_t uvbuf;
+} tjs_sync_write_ctx_t;
+
+/* Sync connect context */
+typedef struct {
+    uv_connect_t req;
+    bool done;
+    int status;
+} tjs_uv_sync_connect_ctx_t;
+
+/* Utility functions for synchronous operations */
+static void __attribute__((unused)) tjs_uv_sync_init(tjs_uv_sync_ctx_t* ctx);
+static int __attribute__((unused)) tjs_uv_sync_wait_for_completion(tjs_uv_sync_ctx_t* ctx, JSContext* js_ctx);
+
+/* Callback function declarations for stream operations are in mod_streams.c */
+
+/* Implementation */
+
+static void tjs_uv_sync_init(tjs_uv_sync_ctx_t* ctx) {
+    ctx->done = false;
+    ctx->status = 0;
+}
+
+static int tjs_uv_sync_wait_for_completion(tjs_uv_sync_ctx_t* ctx, JSContext* js_ctx) {
+    while (!ctx->done) {
+        int ret = uv_run(tjs_get_loop(js_ctx), UV_RUN_ONCE);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return ctx->status;
+}
 
 
 /* Stream */
@@ -182,6 +241,68 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     return TJS_InitPromise(ctx, &s->read.result);
 }
 
+// Forward declarations for sync callback functions are now in uv_sync.h
+
+// Sync callback function declarations
+static void tjs_uv_sync_connect_cb(uv_connect_t *req, int status);
+static void uv__sync_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf);
+static void tjs_uv_sync_write_cb(uv_write_t *req, int status);
+
+static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    JSClassID class_id;
+    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
+    if (!s) {
+        return JS_EXCEPTION;
+    }
+
+    size_t size;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
+    if (!buf) {
+        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
+    }
+
+	// queueing?
+	if (TJS_IsPromisePending(ctx, &s->read.result)) {
+		return tjs_throw_errno(ctx, UV_EBUSY);
+	}
+
+    // Create a sync request structure using our abstract type
+    tjs_uv_sync_read_ctx_t sync_req;
+    
+    sync_req.done = 0;
+    sync_req.nread = 0;
+    sync_req.uvbuf = uv_buf_init((char *)buf, size);
+    
+    s->read.b.data = buf;
+    s->read.b.len = size;
+	s->read.b.tarray = JS_MKPTR(JS_TAG_INT, &sync_req);
+    
+    int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__sync_read_cb);
+    if (r != 0) {
+		s->read.b.data = NULL;
+		s->read.b.len = 0;
+		s->read.b.tarray = JS_UNDEFINED;
+        return tjs_throw_errno(ctx, r);
+    }
+    
+    // Run the event loop until the read completes using our abstract function
+	UV_RUN(sync_req);
+
+	s->read.b.data = NULL;
+	s->read.b.len = 0;
+	s->read.b.tarray = JS_UNDEFINED;
+	
+    if (sync_req.nread < 0) {
+        if (sync_req.nread == UV_EOF) {
+            return JS_NULL;
+        } else {
+            return tjs_throw_errno(ctx, sync_req.nread);
+        }
+    }
+    
+    return JS_NewInt32(ctx, sync_req.nread);
+}
+
 static void uv__stream_write_cb(uv_write_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
@@ -250,6 +371,53 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
 
     return TJS_InitPromise(ctx, &wr->result);
+}
+
+static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    JSClassID class_id;
+    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
+    if (!s) {
+        return JS_EXCEPTION;
+    }
+
+    size_t size;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
+    if (!buf) {
+        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
+    }
+
+    /* First try to do the write inline */
+    int r;
+    uv_buf_t b;
+    b = uv_buf_init((char *) buf, size);
+    r = uv_try_write(&s->h.stream, &b, 1);
+
+    if (r >= 0) {
+        return JS_NewInt64(ctx, r);
+    }
+
+    /* For sync write, we need to use a different approach when try_write fails */
+    /* Create a sync request structure using our abstract type */
+    tjs_sync_write_ctx_t sync_req;
+    
+    sync_req.done = 0;
+    sync_req.status = 0;
+    sync_req.uvbuf = uv_buf_init((char *) buf, size);
+    sync_req.req.data = &sync_req;
+    
+    r = uv_write(&sync_req.req, &s->h.stream, &sync_req.uvbuf, 1, tjs_uv_sync_write_cb);
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+    
+    /* Run the event loop until the write completes using our abstract function */
+    UV_RUN(sync_req);
+    
+    if (sync_req.status < 0) {
+        return tjs_throw_errno(ctx, sync_req.status);
+    }
+    
+    return JS_NewInt64(ctx, size);
 }
 
 static void uv__stream_shutdown_cb(uv_shutdown_t *req, int status) {
@@ -332,6 +500,31 @@ static void uv__stream_connect_cb(uv_connect_t *req, int status) {
     TJS_SettlePromise(ctx, &cr->result, is_reject, 1, &arg);
 
     js_free(ctx, cr);
+}
+
+// Sync callback function implementations
+static void tjs_uv_sync_connect_cb(uv_connect_t *req, int status) {
+    tjs_uv_sync_connect_ctx_t *sync = (tjs_uv_sync_connect_ctx_t*)req;
+    sync->status = status;
+    sync->done = 1;
+}
+
+static void uv__sync_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
+    TJSStream *s = handle->data;
+    if (s) {
+        tjs_uv_sync_read_ctx_t *sync = JS_VALUE_GET_PTR(s->read.b.tarray);
+        
+        sync->nread = nread;
+        sync->done = 1;
+        
+        uv_read_stop(handle);
+    }
+}
+
+static void tjs_uv_sync_write_cb(uv_write_t *req, int status) {
+    tjs_sync_write_ctx_t *sync = (tjs_sync_write_ctx_t*)req;
+    sync->status = status;
+    sync->done = 1;
 }
 
 static void uv__stream_connection_cb(uv_stream_t *handle, int status) {
@@ -569,6 +762,40 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     return TJS_InitPromise(ctx, &cr->result);
+}
+
+static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *t = tjs_tcp_get(ctx, this_val);
+    if (!t) {
+        return JS_EXCEPTION;
+    }
+
+    struct sockaddr_storage ss;
+    int r;
+    r = tjs_obj2addr(ctx, argv[0], &ss);
+    if (r != 0) {
+        return JS_ThrowTypeError(ctx, "invalid address");
+    }
+
+    // Create a sync request structure using our abstract type
+    tjs_uv_sync_connect_ctx_t sync_req;
+    
+    sync_req.done = 0;
+    sync_req.req.data = &sync_req;
+    
+    r = uv_tcp_connect(&sync_req.req, &t->h.tcp, (struct sockaddr *) &ss, tjs_uv_sync_connect_cb);
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+    
+    // Run the event loop until the connection completes using our abstract function
+    UV_RUN(sync_req);
+    
+    if (sync_req.status != 0) {
+        return tjs_throw_errno(ctx, sync_req.status);
+    }
+    
+    return JS_UNDEFINED;
 }
 
 static JSValue tjs_tcp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -854,6 +1081,44 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     return TJS_InitPromise(ctx, &cr->result);
 }
 
+static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *t = tjs_pipe_get(ctx, this_val);
+    if (!t) {
+        return JS_EXCEPTION;
+    }
+
+    if (!JS_IsString(argv[0])) {
+        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
+    }
+
+    size_t len;
+    const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!name) {
+        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
+    }
+
+    // Create a sync request structure using our abstract type
+    tjs_uv_sync_connect_ctx_t sync_req;
+    
+    sync_req.done = 0;
+    sync_req.req.data = &sync_req;
+    
+    int r = uv_pipe_connect2(&sync_req.req, &t->h.pipe, name, len, 0, tjs_uv_sync_connect_cb);
+    JS_FreeCString(ctx, name);
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+    
+    // Run the event loop until the connection completes using our abstract function
+    UV_RUN(sync_req);
+    
+    if (sync_req.status != 0) {
+        return tjs_throw_errno(ctx, sync_req.status);
+    }
+    
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) {
@@ -906,7 +1171,9 @@ static const JSCFunctionListEntry tjs_stream_proto_funcs[] = {
     TJS_CFUNC_DEF("setBlocking", 1, tjs_stream_set_blocking),
     TJS_CFUNC_DEF("close", 0, tjs_stream_close),
     TJS_CFUNC_DEF("read", 1, tjs_stream_read),
+    TJS_CFUNC_DEF("readSync", 1, tjs_stream_read_sync),
     TJS_CFUNC_DEF("write", 1, tjs_stream_write),
+    TJS_CFUNC_DEF("writeSync", 1, tjs_stream_write_sync),
     TJS_CFUNC_DEF("fileno", 0, tjs_stream_fileno),
 };
 /* clang-format on */
@@ -915,6 +1182,7 @@ static const JSCFunctionListEntry tjs_tcp_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getsockname", 0, tjs_tcp_getsockpeername, 0),
     JS_CFUNC_MAGIC_DEF("getpeername", 0, tjs_tcp_getsockpeername, 1),
     TJS_CFUNC_DEF("connect", 1, tjs_tcp_connect),
+    TJS_CFUNC_DEF("connectSync", 1, tjs_tcp_connect_sync),
     TJS_CFUNC_DEF("bind", 2, tjs_tcp_bind),
     TJS_CFUNC_DEF("setKeepAlive", 2, tjs_tcp_keepalive),
     TJS_CFUNC_DEF("setNoDelay", 1, tjs_tcp_nodelay),
@@ -930,13 +1198,14 @@ static const JSCFunctionListEntry tjs_pipe_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getsockname", 0, tjs_pipe_getsockpeername, 0),
     JS_CFUNC_MAGIC_DEF("getpeername", 0, tjs_pipe_getsockpeername, 1),
     TJS_CFUNC_DEF("connect", 1, tjs_pipe_connect),
+    TJS_CFUNC_DEF("connectSync", 1, tjs_pipe_connect_sync),
     TJS_CFUNC_DEF("bind", 1, tjs_pipe_bind),
 };
 
 static const JSCFunctionListEntry tjs_streams_funcs[] = {
     TJS_UVCONST(TCP_IPV6ONLY),
     TJS_UVCONST(TTY_MODE_NORMAL),
-    TJS_UVCONST(TTY_MODE_RAW),
+    TJS_UVCONST(TTY_MODE_RAW)
 };
 
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {

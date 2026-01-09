@@ -14,13 +14,75 @@ declare namespace CModuleWASM {
         /** 导出名称 */
         name: string;
         /** 导出类型（当前仅支持函数） */
-        kind: "function"; // 未来可扩展: "function" | "global" | "memory" | "table"
+        kind: "function" | "global" | "memory" | "table";
     }
 
     /** WASM 模块对象（不透明句柄） */
     interface Module {
         // 内部持有解析后的模块数据
         // 通过 moduleExports() 获取导出信息
+    }
+
+    /** WASM 内存对象 */
+    interface Memory {
+        /**
+         * 获取内存的 ArrayBuffer 视图
+         * @returns ArrayBuffer 或 null（如果内存未初始化）
+         */
+        buffer(): ArrayBuffer | null;
+
+        /**
+         * 增加内存页数
+         * @param delta - 要增加的页数（每页 64KB）
+         * @returns 增长前的页数
+         * @throws {WasmError} 当增长失败时抛出 RuntimeError
+         */
+        grow(delta: number): number;
+    }
+
+    /** WASM 表格对象 */
+    interface Table {
+        /**
+         * 获取表格中的元素
+         * @param index - 元素索引
+         * @returns 表格元素
+         * @throws {RangeError} 当索引超出范围时抛出
+         * @throws {WasmError} 当获取失败时抛出 RuntimeError
+         */
+        get(index: number): any;
+
+        /**
+         * 设置表格中的元素
+         * @param index - 元素索引
+         * @param value - 要设置的值
+         * @throws {RangeError} 当索引超出范围时抛出
+         * @throws {WasmError} 当设置失败时抛出 RuntimeError
+         */
+        set(index: number, value: any): void;
+
+        /**
+         * 获取表格大小
+         * @returns 表格元素数量
+         */
+        size(): number;
+    }
+
+    /** WASM 全局变量对象 */
+    interface Global {
+        /**
+         * 获取全局变量的值
+         * @returns 全局变量的当前值
+         * @throws {WasmError} 当获取失败时抛出 RuntimeError
+         */
+        value(): number | bigint;
+
+        /**
+         * 设置全局变量的值
+         * @param value - 要设置的值
+         * @throws {TypeError} 当尝试设置不可变全局变量时抛出
+         * @throws {WasmError} 当设置失败时抛出 RuntimeError
+         */
+        setValue(value: number | bigint): void;
     }
 
     /** WASM 实例对象（可执行环境） */
@@ -59,6 +121,24 @@ declare namespace CModuleWASM {
          * ```
          */
         linkWasi(): void;
+
+        /**
+         * 获取实例的内存对象
+         * @returns 内存对象或 null
+         */
+        memory(): Memory | null;
+
+        /**
+         * 获取实例的表格对象
+         * @returns 表格对象或 null
+         */
+        table(): Table | null;
+
+        /**
+         * 获取实例的全局变量数组
+         * @returns 全局变量数组
+         */
+        globals(): Global[];
     }
 
     // ===========================================================================
@@ -95,7 +175,7 @@ declare namespace CModuleWASM {
      * ```ts
      * const exports = CModuleWASM.moduleExports(module);
      * console.log(exports);
-     * // [{ name: "add", kind: "function" }, { name: "mul", kind: "function" }]
+     * // [{ name: "add", kind: "function" }, { name: "memory", kind: "memory" }]
      * ```
      */
     function moduleExports(module: Module): ExportEntry[];
@@ -113,4 +193,51 @@ declare namespace CModuleWASM {
      * ```
      */
     function buildInstance(module: Module): Instance;
+
+    /**
+     * 创建 WASM 内存对象
+     * @param descriptor - 内存描述符 { initial: number, maximum?: number }
+     * @returns 内存对象
+     * @throws {WasmError} 当创建失败时抛出 RuntimeError
+     * 
+     * @example
+     * ```ts
+     * // 创建初始大小为 1 页（64KB），最大为 10 页的内存
+     * const memory = CModuleWASM.createMemory({ initial: 1, maximum: 10 });
+     * const buffer = memory.buffer();
+     * ```
+     */
+    function createMemory(descriptor: { initial: number; maximum?: number }): Memory;
+
+    /**
+     * 创建 WASM 表格对象
+     * @param descriptor - 表格描述符 { element: string, initial: number, maximum?: number }
+     * @returns 表格对象
+     * @throws {WasmError} 当创建失败时抛出 RuntimeError
+     * 
+     * @example
+     * ```ts
+     * // 创建初始大小为 10，最大为 20 的函数引用表格
+     * const table = CModuleWASM.createTable({ element: "anyfunc", initial: 10, maximum: 20 });
+     * ```
+     */
+    function createTable(descriptor: { element: string; initial: number; maximum?: number }): Table;
+
+    /**
+     * 创建 WASM 全局变量对象
+     * @param descriptor - 全局变量描述符 { value: string, mutable?: boolean }
+     * @param initialValue - 初始值（可选）
+     * @returns 全局变量对象
+     * @throws {WasmError} 当创建失败时抛出 RuntimeError
+     * 
+     * @example
+     * ```ts
+     * // 创建可变的 i32 类型全局变量，初始值为 42
+     * const global = CModuleWASM.createGlobal({ value: "i32", mutable: true }, 42);
+     * console.log(global.value()); // 42
+     * global.setValue(100);
+     * console.log(global.value()); // 100
+     * ```
+     */
+    function createGlobal(descriptor: { value: string; mutable?: boolean }, initialValue?: number | bigint): Global;
 }

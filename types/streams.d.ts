@@ -58,6 +58,20 @@ declare namespace CModuleStreams {
         read(buffer: Uint8Array): Promise<number | null>;
 
         /**
+         * 同步读取数据
+         * @param buffer 用于存储数据的Uint8Array缓冲区
+         * @returns 实际读取的字节数，或null(EOF)
+         */
+        readSync(buffer: Uint8Array): number | null;
+
+        /**
+         * 同步写入数据
+         * @param buffer 包含要写入数据的Uint8Array
+         * @returns 实际写入的字节数
+         */
+        writeSync(buffer: Uint8Array): number;
+
+        /**
          * 向流中写入数据
          * @param buffer 包含要写入数据的Uint8Array
          * @returns Promise解析为实际写入的字节数
@@ -132,6 +146,16 @@ declare namespace CModuleStreams {
         }): Promise<void>;
 
         /**
+         * 同步连接到指定地址
+         * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
+         * @throws 同步抛出错误
+         */
+        connectSync(addr: {
+            ip: string;
+            port: number;
+        }): void;
+
+        /**
          * 绑定到本地地址
          * @param addr 地址对象
          * @param flags 绑定标志（如TCP_IPV6ONLY）
@@ -180,6 +204,13 @@ declare namespace CModuleStreams {
      * Pipe流接口（Unix域套接字/命名管道）
      */
     export interface Pipe extends Stream {
+        /**
+         * 同步连接到指定Pipe
+         * @param name Pipe路径或名称
+         * @throws 同步抛出错误
+         */
+        connectSync(name: string): void;
+
         /**
          * 用现有文件描述符初始化Pipe
          * @param fd 文件描述符
