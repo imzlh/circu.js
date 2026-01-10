@@ -1,243 +1,357 @@
+/**
+ * WebAssembly API Type Definitions
+ * Complete WebAssembly namespace with all standard APIs
+ * 
+ * @example
+ * // Basic usage
+ * const wasmCode = new Uint8Array([...]);
+ * const module = new WebAssembly.Module(wasmCode);
+ * const instance = new WebAssembly.Instance(module);
+ * console.log(instance.exports.add(1, 2)); // 3
+ */
+
 declare namespace CModuleWASM {
-    // ===========================================================================
-    // 类型定义
-    // ===========================================================================
-
-    /** WASM 运行时错误接口 */
-    interface WasmError extends Error {
-        /** WASM 特定错误类型 */
-        wasmError: "CompileError" | "LinkError" | "RuntimeError";
-    }
-
-    /** 模块导出项描述 */
-    interface ExportEntry {
-        /** 导出名称 */
-        name: string;
-        /** 导出类型（当前仅支持函数） */
-        kind: "function" | "global" | "memory" | "table";
-    }
-
-    /** WASM 模块对象（不透明句柄） */
-    interface Module {
-        // 内部持有解析后的模块数据
-        // 通过 moduleExports() 获取导出信息
-    }
-
-    /** WASM 内存对象 */
-    interface Memory {
+    /**
+     * Represents a compiled WebAssembly module
+     */
+    class Module {
         /**
-         * 获取内存的 ArrayBuffer 视图
-         * @returns ArrayBuffer 或 null（如果内存未初始化）
+         * Creates a new WebAssembly module from binary code
+         * @param buffer - The binary WebAssembly code
+         * @throws {CompileError} If the buffer is not valid WASM
+         * 
+         * @example
+         * const wasmCode = new Uint8Array([0x00, 0x61, 0x73, 0x6d, ...]);
+         * const module = new WebAssembly.Module(wasmCode);
          */
-        buffer(): ArrayBuffer | null;
+        constructor(buffer: ArrayBuffer | ArrayBufferView);
 
         /**
-         * 增加内存页数
-         * @param delta - 要增加的页数（每页 64KB）
-         * @returns 增长前的页数
-         * @throws {WasmError} 当增长失败时抛出 RuntimeError
+         * Get all exported items from the module
+         * @param module - The module to inspect
+         * @returns Array of export descriptors
+         * 
+         * @example
+         * const exports = WebAssembly.Module.exports(module);
+         * // [
+         * //   { name: "add", kind: "function" },
+         * //   { name: "memory", kind: "memory" }
+         * // ]
+         */
+        static exports(module: Module): ModuleExportDescriptor[];
+
+        /**
+         * Get all imported items required by the module
+         * @param module - The module to inspect
+         * @returns Array of import descriptors
+         * 
+         * @example
+         * const imports = WebAssembly.Module.imports(module);
+         * // [
+         * //   { module: "env", name: "log", kind: "function" }
+         * // ]
+         */
+        static imports(module: Module): ModuleImportDescriptor[];
+
+        /**
+         * Get custom sections from the module
+         * @param module - The module to inspect
+         * @param sectionName - Name of the custom section
+         * @returns Array of custom section data
+         * 
+         * @example
+         * const nameSections = WebAssembly.Module.customSections(module, "name");
+         */
+        static customSections(module: Module, sectionName: string): ArrayBuffer[];
+
+        readonly byteLength: number;
+    }
+
+    /**
+     * Represents an instantiated WebAssembly module
+     */
+    class Instance {
+        /**
+         * Creates a new WebAssembly instance
+         * @param module - The compiled module
+         * @param importObject - Object containing imported functions/memory/tables/globals
+         * @throws {LinkError} If imports cannot be satisfied
+         * @throws {RuntimeError} If instantiation fails
+         * 
+         * @example
+         * const module = new WebAssembly.Module(wasmCode);
+         * const imports = {
+         *   env: {
+         *     log: (x: number) => console.log(x)
+         *   }
+         * };
+         * const instance = new WebAssembly.Instance(module, imports);
+         * instance.exports.main();
+         */
+        constructor(module: Module, importObject?: ImportObject);
+
+        /**
+         * Exported functions, memory, tables, and globals
+         * 
+         * @example
+         * const add = instance.exports.add as (a: number, b: number) => number;
+         * console.log(add(5, 3)); // 8
+         */
+        readonly exports: Exports;
+    }
+
+    /**
+     * Represents WebAssembly linear memory
+     */
+    class Memory {
+        /**
+         * Creates a new WebAssembly memory
+         * @param descriptor - Memory configuration
+         * @throws {RangeError} If initial > maximum
+         * 
+         * @example
+         * const memory = new WebAssembly.Memory({ initial: 1, maximum: 10 });
+         * const buffer = memory.buffer;
+         * const view = new Uint32Array(buffer);
+         */
+        constructor(descriptor: MemoryDescriptor);
+
+        /**
+         * The ArrayBuffer backing this memory
+         * 
+         * @example
+         * const buffer = memory.buffer;
+         * const bytes = new Uint8Array(buffer);
+         * bytes[0] = 42;
+         */
+        readonly buffer: ArrayBuffer;
+
+        /**
+         * Grow memory by specified number of pages
+         * @param delta - Number of pages to add (each page is 64KB)
+         * @returns Previous size in pages
+         * @throws {RangeError} If growth exceeds maximum
+         * 
+         * @example
+         * const oldPages = memory.grow(1);
+         * console.log(oldPages); // 1
+         * console.log(memory.buffer.byteLength); // 131072 (2 pages)
          */
         grow(delta: number): number;
+
+        readonly shared?: boolean;
     }
 
-    /** WASM 表格对象 */
-    interface Table {
+    /**
+     * Represents a WebAssembly table
+     */
+    class Table {
         /**
-         * 获取表格中的元素
-         * @param index - 元素索引
-         * @returns 表格元素
-         * @throws {RangeError} 当索引超出范围时抛出
-         * @throws {WasmError} 当获取失败时抛出 RuntimeError
-         */
-        get(index: number): any;
-
-        /**
-         * 设置表格中的元素
-         * @param index - 元素索引
-         * @param value - 要设置的值
-         * @throws {RangeError} 当索引超出范围时抛出
-         * @throws {WasmError} 当设置失败时抛出 RuntimeError
-         */
-        set(index: number, value: any): void;
-
-        /**
-         * 获取表格大小
-         * @returns 表格元素数量
-         */
-        size(): number;
-    }
-
-    /** WASM 全局变量对象 */
-    interface Global {
-        /**
-         * 获取全局变量的值
-         * @returns 全局变量的当前值
-         * @throws {WasmError} 当获取失败时抛出 RuntimeError
-         */
-        value(): number | bigint;
-
-        /**
-         * 设置全局变量的值
-         * @param value - 要设置的值
-         * @throws {TypeError} 当尝试设置不可变全局变量时抛出
-         * @throws {WasmError} 当设置失败时抛出 RuntimeError
-         */
-        setValue(value: number | bigint): void;
-    }
-
-    /** WASM 实例对象（可执行环境） */
-    interface Instance {
-        /**
-         * 调用 WASM 实例中导出的函数
-         * @param name - 函数名称
-         * @param args - 参数列表（支持 number 和 bigint）
-         * @returns 单个返回值或返回值数组
-         * @throws {WasmError} 当函数不存在、参数无效或调用失败时抛出 RuntimeError
+         * Creates a new WebAssembly table
+         * @param descriptor - Table configuration
+         * @throws {RangeError} If initial > maximum
          * 
          * @example
-         * ```ts
-         * // 调用无参数函数
-         * const version = instance.callFunction('version');
-         * 
-         * // 调用带参数函数（add(5, 3)）
-         * const sum = instance.callFunction('add', 5, 3);
-         * 
-         * // 处理多返回值
-         * const results = instance.callFunction('swap', 10, 20);
-         * ```
+         * const table = new WebAssembly.Table({
+         *   element: "funcref",
+         *   initial: 10,
+         *   maximum: 20
+         * });
          */
-        callFunction(name: string, ...args: (number | bigint)[]): number | bigint | (number | bigint)[];
+        constructor(descriptor: TableDescriptor);
 
         /**
-         * 为实例链接 WASI（WebAssembly System Interface）支持
-         * 提供文件系统、环境变量、时钟等系统调用能力
-         * @throws {WasmError} 当链接失败时抛出 LinkError
+         * Current size of the table
          * 
          * @example
-         * ```ts
-         * // 链接 WASI 后，模块可使用系统接口
-         * instance.linkWasi();
-         * instance.callFunction('_start'); // 调用 WASI 程序入口
-         * ```
+         * console.log(table.length); // 10
          */
-        linkWasi(): void;
+        readonly length: number;
 
         /**
-         * 获取实例的内存对象
-         * @returns 内存对象或 null
+         * Get element at index
+         * @param index - Table index
+         * @returns The element (function or null)
+         * @throws {RangeError} If index out of bounds
+         * 
+         * @example
+         * const func = table.get(0);
+         * if (func) func();
          */
-        memory(): Memory | null;
+        get(index: number): Function | null;
 
         /**
-         * 获取实例的表格对象
-         * @returns 表格对象或 null
+         * Set element at index
+         * @param index - Table index
+         * @param value - Function or null
+         * @throws {RangeError} If index out of bounds
+         * @throws {TypeError} If value type mismatch
+         * 
+         * @example
+         * table.set(0, myFunction);
+         * table.set(1, null);
          */
-        table(): Table | null;
+        set(index: number, value: Function | null): void;
 
         /**
-         * 获取实例的全局变量数组
-         * @returns 全局变量数组
+         * Grow table by specified number of elements
+         * @param delta - Number of elements to add
+         * @param init - Initial value for new elements (default: null)
+         * @returns Previous size
+         * @throws {RangeError} If growth exceeds maximum
+         * 
+         * @example
+         * const oldSize = table.grow(5);
+         * console.log(oldSize); // 10
+         * console.log(table.length); // 15
          */
-        globals(): Global[];
+        grow(delta: number, init?: Function | null): number;
     }
 
-    // ===========================================================================
-    // 核心函数
-    // ===========================================================================
+    /**
+     * Represents a WebAssembly global variable
+     */
+    class Global {
+        /**
+         * Creates a new WebAssembly global
+         * @param descriptor - Global configuration
+         * @param value - Initial value
+         * 
+         * @example
+         * const global = new WebAssembly.Global(
+         *   { value: "i32", mutable: true },
+         *   42
+         * );
+         * console.log(global.value); // 42
+         * global.value = 100;
+         */
+        constructor(descriptor: GlobalDescriptor, value?: any);
+
+        /**
+         * Get or set the global value
+         * 
+         * @example
+         * const g = new WebAssembly.Global({ value: "f64", mutable: true }, 3.14);
+         * console.log(g.value); // 3.14
+         * g.value = 2.71;
+         */
+        value: any;
+
+        /**
+         * Get the value (same as .value property)
+         * 
+         * @example
+         * const val = global.valueOf();
+         */
+        valueOf(): any;
+    }
 
     /**
-     * 解析 WASM 字节码为可处理的模块对象
-     * @param buffer - WASM 字节码（ArrayBuffer 或任意 TypedArray）
-     * @returns 解析后的模块对象
-     * @throws {WasmError} 当解析失败时抛出 CompileError
+     * Compile a WebAssembly module asynchronously
+     * @param buffer - Binary WebAssembly code
+     * @returns Promise resolving to compiled Module
+     * @throws {CompileError} If compilation fails
      * 
      * @example
-     * ```ts
-     * // 从 fetch 加载
-     * const response = await fetch('module.wasm');
-     * const buffer = await response.arrayBuffer();
-     * const module = CModuleWASM.parseModule(buffer);
-     * 
-     * // 从文件系统加载（Node.js）
-     * import { readFileSync } from 'fs';
-     * const buffer = readFileSync('module.wasm');
-     * const module = CModuleWASM.parseModule(buffer);
-     * ```
+     * const wasmCode = await fetch('module.wasm').then(r => r.arrayBuffer());
+     * const module = await WebAssembly.compile(wasmCode);
      */
-    function parseModule(buffer: ArrayBuffer | ArrayBufferView): Module;
+    function compile(buffer: ArrayBuffer | ArrayBufferView): Promise<Module>;
 
     /**
-     * 获取 WASM 模块的所有导出项
-     * @param module - 模块对象
-     * @returns 导出项数组，包含函数名称和类型
+     * Instantiate a WebAssembly module asynchronously
+     * @param buffer - Binary WebAssembly code or compiled Module
+     * @param importObject - Object containing imports
+     * @returns Promise resolving to { module, instance } or just instance
+     * @throws {CompileError} If compilation fails
+     * @throws {LinkError} If linking fails
      * 
      * @example
-     * ```ts
-     * const exports = CModuleWASM.moduleExports(module);
-     * console.log(exports);
-     * // [{ name: "add", kind: "function" }, { name: "memory", kind: "memory" }]
-     * ```
+     * // From buffer
+     * const { module, instance } = await WebAssembly.instantiate(wasmCode, imports);
+     * 
+     * // From module
+     * const instance = await WebAssembly.instantiate(module, imports);
      */
-    function moduleExports(module: Module): ExportEntry[];
+    function instantiate(
+        buffer: ArrayBuffer | ArrayBufferView | Module,
+        importObject?: ImportObject
+    ): Promise<WebAssemblyInstantiatedSource | Instance>;
 
     /**
-     * 从模块构建可执行的 WASM 实例
-     * @param module - 模块对象
-     * @returns 可调用函数的 WASM 实例
-     * @throws {WasmError} 当构建失败时抛出 LinkError
+     * Validate WebAssembly binary
+     * @param buffer - Binary WebAssembly code
+     * @returns true if valid, false otherwise
      * 
      * @example
-     * ```ts
-     * const instance = CModuleWASM.buildInstance(module);
-     * const result = instance.callFunction('add', 1, 2);
-     * ```
+     * const isValid = WebAssembly.validate(wasmCode);
+     * if (isValid) {
+     *   const module = new WebAssembly.Module(wasmCode);
+     * }
      */
-    function buildInstance(module: Module): Instance;
+    function validate(buffer: ArrayBuffer | ArrayBufferView): boolean;
 
-    /**
-     * 创建 WASM 内存对象
-     * @param descriptor - 内存描述符 { initial: number, maximum?: number }
-     * @returns 内存对象
-     * @throws {WasmError} 当创建失败时抛出 RuntimeError
-     * 
-     * @example
-     * ```ts
-     * // 创建初始大小为 1 页（64KB），最大为 10 页的内存
-     * const memory = CModuleWASM.createMemory({ initial: 1, maximum: 10 });
-     * const buffer = memory.buffer();
-     * ```
-     */
-    function createMemory(descriptor: { initial: number; maximum?: number }): Memory;
+    // Utility functions (non-standard)
+    function isModule(obj: any): obj is Module;
+    function isInstance(obj: any): obj is Instance;
+    function isMemory(obj: any): obj is Memory;
+    function isTable(obj: any): obj is Table;
+    function isGlobal(obj: any): obj is Global;
 
-    /**
-     * 创建 WASM 表格对象
-     * @param descriptor - 表格描述符 { element: string, initial: number, maximum?: number }
-     * @returns 表格对象
-     * @throws {WasmError} 当创建失败时抛出 RuntimeError
-     * 
-     * @example
-     * ```ts
-     * // 创建初始大小为 10，最大为 20 的函数引用表格
-     * const table = CModuleWASM.createTable({ element: "anyfunc", initial: 10, maximum: 20 });
-     * ```
-     */
-    function createTable(descriptor: { element: string; initial: number; maximum?: number }): Table;
+    // Exception types
+    class CompileError extends Error {
+        constructor(message?: string);
+    }
 
-    /**
-     * 创建 WASM 全局变量对象
-     * @param descriptor - 全局变量描述符 { value: string, mutable?: boolean }
-     * @param initialValue - 初始值（可选）
-     * @returns 全局变量对象
-     * @throws {WasmError} 当创建失败时抛出 RuntimeError
-     * 
-     * @example
-     * ```ts
-     * // 创建可变的 i32 类型全局变量，初始值为 42
-     * const global = CModuleWASM.createGlobal({ value: "i32", mutable: true }, 42);
-     * console.log(global.value()); // 42
-     * global.setValue(100);
-     * console.log(global.value()); // 100
-     * ```
-     */
-    function createGlobal(descriptor: { value: string; mutable?: boolean }, initialValue?: number | bigint): Global;
+    class LinkError extends Error {
+        constructor(message?: string);
+    }
+
+    class RuntimeError extends Error {
+        constructor(message?: string);
+    }
+
+    // Type definitions
+    interface MemoryDescriptor {
+        initial: number;
+        maximum?: number;
+        shared?: boolean;
+    }
+
+    interface TableDescriptor {
+        element: "funcref" | "anyfunc" | "externref";
+        initial: number;
+        maximum?: number;
+    }
+
+    interface GlobalDescriptor {
+        value: "i32" | "i64" | "f32" | "f64";
+        mutable?: boolean;
+    }
+
+    interface ModuleExportDescriptor {
+        name: string;
+        kind: "function" | "table" | "memory" | "global";
+    }
+
+    interface ModuleImportDescriptor {
+        module: string;
+        name: string;
+        kind: "function" | "table" | "memory" | "global";
+    }
+
+    interface ImportObject {
+        [moduleName: string]: {
+            [itemName: string]: any;
+        };
+    }
+
+    interface Exports {
+        [name: string]: Function | Memory | Table | Global;
+    }
+
+    interface WebAssemblyInstantiatedSource {
+        module: Module;
+        instance: Instance;
+    }
 }

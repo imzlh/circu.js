@@ -1,0 +1,410 @@
+--- a/src/wasm.c
++++ b/src/wasm.c
+@@ -1,5 +1,5 @@
+ /*
+- * txiki.js - WASM module implementation using wasm3
++ * txiki.js - WebAssembly module implementation using wasm3
+  * Provides WebAssembly API compatible interface
+  */
+ 
+@@ -7,6 +7,7 @@
+ 
+ #if defined(TJS_HAVE_WASM)
+ 
++#include <string.h>
+ #include "wasm3.h"
+ #include "m3_env.h"
+ 
+@@ -17,6 +18,9 @@
+ #define TJS_WASM_PAGE_SIZE       65536
+ 
+ #define TJS_WASM_CHECK_INSTANCE(i) \
++    do { if (!(i)) return JS_ThrowTypeError(ctx, "Invalid WebAssembly object"); } while(0)
++
++#define TJS_WASM_CHECK_MODULE(m) \
+     do { if (!(m)) return JS_ThrowTypeError(ctx, "Invalid WebAssembly object"); } while(0)
+ 
+ #define TJS_WASM_THROW_IF(ctx, cond, type msg) \
+@@ -25,9 +29,6 @@
+ #define TJS_WASM_THROW_M3(ctx, type, r) \
+     do { if (r) return tjs__wasm_throw(ctx, type, r); } while(0)
+ 
+-#define TJS_WASM_CHECK_MODULE(m) \
+-    do { if (!(m)) return JS_ThrowTypeError(ctx, "Invalid WebAssembly object"); } while(0)
+-
+ typedef enum {
+     TJS_WASM_ERR_COMPILE = 0,
+     TJS_WASM_ERR_LINK,
+@@ -41,11 +42,11 @@ static const char *tjs_wasm_error_names[] = {
+ 
+ #pragma endregion
+ 
+-#pragma region Type Definitions
++#pragma region Class IDs and Type Definitions
+ 
+-static JSClassID tjs_wasm_module_class_id;
+-static JSClassID tjs_wasm_instance_class_id;
+-static JSClassID tjs_wasm_memory_class_id;
++static JSClassID tjs_wasm_module_class_id = 0;
++static JSClassID tjs_wasm_instance_class_id = 0;
++static JSClassID tjs_wasm_memory_class_id = 0;
+ static JSClassID tjs_wasm_table_class_id = 0;
+ static JSClassID tjs_wasm_global_class_id = 0;
+ 
+@@ -75,6 +76,7 @@ typedef struct {
+     uint32_t maximum;
+     bool has_max;
+     bool shared;
++    bool external;  // true if runtime is owned by instance
+ } TJSWasmMemory;
+ 
+ typedef struct {
+@@ -95,6 +97,18 @@ typedef struct {
+ 
+ #pragma endregion
+ 
++#pragma region Forward Declarations
++
++static JSValue tjs__wasm_throw(JSContext *ctx, TJSWasmErrorType type, const char *msg);
++static JSValue tjs__wasm_value_to_js(JSContext *ctx, M3ValueType type, const void *ptr);
++static int tjs__wasm_js_to_value(JSContext *ctx, JSValue val, M3ValueType type, void *ptr);
++static M3ValueType tjs__wasm_parse_type(const char *str);
++static const char *tjs__wasm_type_to_string(M3ValueType type);
++static int tjs__wasm_link_imports(JSContext *ctx, TJSWasmInstance *inst, JSValue imports);
++static JSValue tjs__wasm_build_exports(JSContext *ctx, TJSWasmInstance *inst);
++
++#pragma endregion
++
+ #pragma region Utility Functions
+ 
+ static inline TJSRuntime *tjs__get_runtime(JSContext *ctx) {
+@@ -187,6 +201,7 @@ static void tjs_wasm_module_finalizer(JSRuntime *rt, JSValue val) {
+     TJSWasmModule *m = JS_GetOpaque(val, tjs_wasm_module_class_id);
+     if (m) {
+         if (m->module && !m->parsed)
++            // Only free if not loaded into a runtime
+             m3_FreeModule(m->module);
+         js_free_rt(rt, m->data.bytes);
+         js_free_rt(rt, m);
+@@ -198,7 +213,7 @@ static JSClassDef tjs_wasm_module_class = {
+     .finalizer = tjs_wasm_module_finalizer,
+ };
+ 
+-static TJSWasmModule *tjs__wasm_module_get(JSContext *ctx, JSValue obj) {
++static inline TJSWasmModule *tjs__wasm_module_get(JSContext *ctx, JSValue obj) {
+     return JS_GetOpaque2(ctx, obj, tjs_wasm_module_class_id);
+ }
+ 
+@@ -296,7 +311,7 @@ static JSValue tjs_wasm_module_customsections(JSContext *ctx, JSValue this_val,
+     TJSWasmModule *m = tjs__wasm_module_get(ctx, argv[0]);
+     TJS_WASM_CHECK_MODULE(m);
+     
+-    const char *name = JS_ToCString(ctx, argv[1]);
++    const char *name = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+     if (!name)
+         return JS_EXCEPTION;
+     
+@@ -314,7 +329,8 @@ static void tjs_wasm_memory_finalizer(JSRuntime *rt, JSValue val) {
+     TJSWasmMemory *m = JS_GetOpaque(val, tjs_wasm_memory_class_id);
+     if (m) {
+-        if (m->runtime)
++        // Only free runtime if we own it (not external)
++        if (m->runtime && !m->external)
+             m3_FreeRuntime(m->runtime);
+         js_free_rt(rt, m);
+     }
+     
+@@ -325,7 +341,7 @@ static JSClassDef tjs_wasm_memory_class = {
+     .finalizer = tjs_wasm_memory_finalizer,
+ };
+ 
+-static TJSWasmMemory *tjs__wasm_memory_get(JSContext *ctx, JSValue obj) {
++static inline TJSWasmMemory *tjs__wasm_memory_get(JSContext *ctx, JSValue obj) {
+     return JS_GetOpaque2(ctx, obj, tjs_wasm_memory_class_id);
+ }
+ 
+@@ -385,6 +401,7 @@ static JSValue tjs_wasm_memory_buffer_get(JSContext *ctx, JSValue this_val) {
+     TJSWasmMemory *m = tjs__wasm_memory_get(ctx, this_val);
+     TJS_WASM_CHECK_INSTANCE(m);
+     
++    if (!m->runtime) return JS_NewArrayBuffer(ctx, NULL, 0, NULL, NULL, false);
+     uint32_t size;
+     uint8_t *data = m3_GetMemory(m->runtime, &size, 0);
+     if (!data)
+@@ -400,6 +417,8 @@ static JSValue tjs_wasm_memory_grow(JSContext *ctx, JSValue this_val,
+     
+     uint32_t delta;
+     if (JS_ToUint32(ctx, &delta, argv[0]))
+         return JS_EXCEPTION;
+     
++    if (!m->runtime) return JS_NewInt32(ctx, -1);
++    
+     uint32_t old_size;
+     m3_GetMemory(m->runtime, &old_size, 0);
+     uint32_t old_pages = old_size / TJS_WASM_PAGE_SIZE;
+@@ -408,7 +427,12 @@ static JSValue tjs_wasm_memory_grow(JSContext *ctx, JSValue this_val,
+         return tjs__wasm_throw(ctx, TJS_WASM_ERR_RANGE, "Cannot grow beyond maximum");
+     }
+     
+-    M3Result r = m3_ResizeMemory(m->runtime, old_pages + delta);
++    // wasm3 doesn't have m3_ResizeMemory, use ResizeMemory from m3_env.h
++    M3Result r = ResizeMemory(m->runtime, old_pages + delta);
+     if (r)
+         return JS_NewInt32(ctx, -1);
+     
+@@ -430,7 +450,7 @@ static JSClassDef tjs_wasm_table_class = {
+     .finalizer = tjs_wasm_table_finalizer,
+ };
+ 
+-static TJSWasmTable *tjs__wasm_table_get(JSContext *ctx, JSValue obj) {
++static inline TJSWasmTable *tjs__wasm_table_get(JSContext *ctx, JSValue obj) {
+     return JS_GetOpaque2(ctx, obj, tjs_wasm_table_class_id);
+ }
+ 
+@@ -567,7 +587,7 @@ static JSClassDef tjs_wasm_global_class = {
+     .finalizer = tjs_wasm_global_finalizer,
+ };
+ 
+-static TJSWasmGlobal *tjs__wasm_global_get(JSContext *ctx, JSValue obj) {
++static inline TJSWasmGlobal *tjs__wasm_global_get(JSContext *ctx, JSValue obj) {
+     return JS_GetOpaque2(ctx, obj, tjs_wasm_global_class_id);
+ }
+ 
+@@ -665,7 +685,7 @@ static JSClassDef tjs_wasm_instance_class = {
+     .gc_mark = tjs_wasm_instance_mark,
+ };
+ 
+-static TJSWasmInstance *tjs__wasm_instance_get(JSContext *ctx, JSValue obj) {
++static inline TJSWasmInstance *tjs__wasm_instance_get(JSContext *ctx, JSValue obj) {
+     return JS_GetOpaque2(ctx, obj, tjs_wasm_instance_class_id);
+ }
+ 
+@@ -695,6 +715,7 @@ typedef struct {
+     TJSWasmInstance *instance;
+     IM3Function func;
+ } TJSWasmFuncData;
++static JSClassID tjs_wasm_func_data_class_id = 0;
+ 
+ static JSValue tjs__wasm_call_func(JSContext *ctx, JSValue this_val,
+                                    int argc, JSValue *argv, int magic, JSValue *func_data) {
+@@ -746,7 +767,7 @@ static JSValue tjs__wasm_call_func(JSContext *ctx, JSValue this_val,
+ }
+ 
+ static void tjs__wasm_func_data_finalizer(JSRuntime *rt, JSValue val) {
+-    TJSWasmFuncData *data = JS_GetOpaque(val, 0);
++    TJSWasmFuncData *data = JS_GetOpaque(val, tjs_wasm_func_data_class_id);
+     js_free_rt(rt, data);
+ }
+ 
+@@ -756,8 +777,13 @@ static JSValue tjs__wasm_wrap_function(JSContext *ctx, TJSWasmInstance *inst,
+     if (!data)
+         return JS_EXCEPTION;
+     
++    // Initialize class if needed
++    if (tjs_wasm_func_data_class_id == 0) {
++        JS_NewClassID(JS_GetRuntime(ctx), &tjs_wasm_func_data_class_id);
++    }
++    
+     data->instance = inst;
+     data->func = func;
+     
+-    JSValue data_val = JS_NewObjectClass(ctx, 0);
++    JSValue data_val = JS_NewObjectClass(ctx, tjs_wasm_func_data_class_id);
+     JS_SetOpaque(data_val, data);
+     
+     return JS_NewCFunctionData(ctx, tjs__wasm_call_func, 0, 0, 1, &data_val);
+@@ -793,6 +819,7 @@ static JSValue tjs__wasm_build_exports(JSContext *ctx, TJSWasmInstance *inst) {
+         if (!JS_IsException(mem_obj)) {
+             TJSWasmMemory *m = tjs__wasm_memory_get(ctx, mem_obj);
+             m->runtime = inst->runtime;
++            m->external = true;  // Mark as external, don't free runtime
+             JS_DefinePropertyValueStr(ctx, exports, "memory", mem_obj, JS_PROP_C_W_E);
+             inst->memory = JS_DupValue(ctx, mem_obj);
+         }
+@@ -817,6 +844,7 @@ static JSValue tjs_wasm_instance_exports_get(JSContext *ctx, JSValue this_val) {
+ 
+ #pragma region Import Linking
+ 
++// Import function data structure
+ typedef struct {
+     JSContext *ctx;
+     JSValue func;
+@@ -832,6 +860,7 @@ static void tjs__wasm_import_func_free(TJSWasmImportFunc *data) {
+     }
+ }
+ 
++// Trampoline for calling JS functions from WASM
+ static m3ApiRawFunction(tjs__wasm_import_trampoline) {
+     TJSWasmImportFunc *data = (TJSWasmImportFunc *)_ctx;
+     if (!data || JS_IsUndefined(data->func))
+@@ -876,7 +905,7 @@ static m3ApiRawFunction(tjs__wasm_import_trampoline) {
+     m3ApiSuccess();
+ }
+ 
+-static int tjs__wasm_link_imports(JSContext *ctx, TJSWasmInstance *inst, 
++static int tjs__wasm_link_imports(JSContext *ctx, TJSWasmInstance *inst,
+                                   JSValue imports) {
+     if (JS_IsUndefined(imports) || JS_IsNull(imports))
+         return 0;
+@@ -1003,7 +1032,7 @@ static JSValue tjs_wasm_compile(JSContext *ctx, JSValue this_val,
+     return promise;
+ }
+ 
+-static JSValue tjs_wasm_instantiate(JSContext *ctx, JSValue this_val,
++static JSValue tjs_wasm_instantiate(JSContext *ctx, JSValue this_val, 
+                                     int argc, JSValue *argv) {
+     JSValue promise, resolving_funcs[2];
+     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+@@ -1011,7 +1040,7 @@ static JSValue tjs_wasm_instantiate(JSContext *ctx, JSValue this_val,
+         return promise;
+     
+     JSValue module;
+-    bool is_buffer = false;
++    bool is_buffer = true;
+     
+     if (JS_GetOpaque(argv[0], tjs_wasm_module_class_id)) {
+         module = JS_DupValue(ctx, argv[0]);
+@@ -1073,6 +1102,10 @@ static const JSCFunctionListEntry tjs_wasm_module_proto_funcs[] = {
+     // Module prototype is empty per spec
+ };
+ 
++static const JSCFunctionListEntry tjs_wasm_module_static_funcs[] = {
++    TJS_CFUNC_DEF("exports", 1, tjs_wasm_module_exports),
++    TJS_CFUNC_DEF("imports", 1, tjs_wasm_module_imports),
++    TJS_CFUNC_DEF("customSections", 2, tjs_wasm_module_customsections),
+ };
+ 
+ static const JSCFunctionListEntry tjs_wasm_instance_proto_funcs[] = {
+@@ -1099,6 +1132,18 @@ static const JSCFunctionListEntry tjs_wasm_funcs[] = {
+     TJS_CFUNC_DEF("validate", 1, tjs_wasm_validate),
+ };
+ 
++// Helper macro for class initialization
++#define TJS_WASM_INIT_CLASS(ctx, ns, name, class_id, class_def, ctor, ctor_len, \
++                            proto_funcs, proto_len, static_funcs, static_len) \
++    do { \
++        JSRuntime *rt = JS_GetRuntime(ctx); \
++        JS_NewClassID(rt, &class_id); \
++        JS_NewClass(rt, class_id, &class_def); \
++        JSValue proto = JS_NewObject(ctx); \
++        JS_SetPropertyFunctionList(ctx, proto, proto_funcs, proto_len); \
++        JS_SetClassProto(ctx, class_id, proto); \
++        JSValue constructor = JS_NewCFunction2(ctx, ctor, name, ctor_len, \
++                                               JS_CFUNC_constructor, 0); \
++        if (static_funcs && static_len > 0) \
++            JS_SetPropertyFunctionList(ctx, constructor, static_funcs, static_len); \
++        JS_DefinePropertyValueStr(ctx, ns, name, constructor, JS_PROP_C_W_E); \
++    } while(0)
++
+ #pragma endregion
+ 
+ #pragma region Initialization
+ 
+ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns) {
+     TJSRuntime *qrt = TJS_GetRuntime(ctx);
++    JSRuntime *rt = JS_GetRuntime(ctx);
+     
+     if (!qrt->wasm_ctx.env)
+         qrt->wasm_ctx.env = m3_NewEnvironment();
+     
+     JSValue wasm = JS_NewObject(ctx);
+     
+-    // Module class
+-    JS_NewClassID(&tjs_wasm_module_class_id);
+-    JS_NewClass(JS_GetRuntime(ctx), tjs_wasm_module_class_id, &tjs_wasm_module_class);
+-    
+-    JSValue module_proto = JS_NewObject(ctx);
+-    JS_SetPropertyFunctionList(ctx, module_proto, 
+-        tjs_wasm_module_proto_funcs, countof(tjs_wasm_module_proto_funcs));
+-    JS_SetClassProto(ctx, tjs_wasm_module_class_id, module_proto);
+-    
+-    JSValue module_ctor = JS_NewCFunction2(ctx, tjs_wasm_module_constructor, 
+-        "Module", 1, JS_CFUNC_constructor, 0);
+-    JS_SetPropertyFunctionList(ctx, module_ctor,
+-        tjs_wasm_module_static_funcs, countof(tjs_wasm_module_static_funcs));
+-    JS_DefinePropertyValueStr(ctx, wasm, "Module", module_ctor, JS_PROP_C_W_E);
+-    
+-    // Instance class
+-    JS_NewClassID(&tjs_wasm_instance_class_id);
+-    JS_NewClass(JS_GetRuntime(ctx), tjs_wasm_instance_class_id, &tjs_wasm_instance_class);
+-    
+-    JSValue instance_proto = JS_NewObject(ctx);
+-    JS_SetPropertyFunctionList(ctx, instance_proto,
+-        tjs_wasm_instance_proto_funcs, countof(tjs_wasm_instance_proto_funcs));
+-    JS_SetClassProto(ctx, tjs_wasm_instance_class_id, instance_proto);
+-    
+-    JSValue instance_ctor = JS_NewCFunction2(ctx, tjs_wasm_instance_constructor,
+-        "Instance", 1, JS_CFUNC_constructor, 0);
+-    JS_DefinePropertyValueStr(ctx, wasm, "Instance", instance_ctor, JS_PROP_C_W_E);
+-    
+-    // Memory class
+-    JS_NewClassID(&tjs_wasm_memory_class_id);
+-    JS_NewClass(JS_GetRuntime(ctx), tjs_wasm_memory_class_id, &tjs_wasm_memory_class);
+-    
+-    JSValue memory_proto = JS_NewObject(ctx);
+-    JS_SetPropertyFunctionList(ctx, memory_proto,
+-        tjs_wasm_memory_proto_funcs, countof(tjs_wasm_memory_proto_funcs));
+-    JS_SetClassProto(ctx, tjs_wasm_memory_class_id, memory_proto);
+-    
+-    JSValue memory_ctor = JS_NewCFunction2(ctx, tjs_wasm_memory_constructor,
+-        "Memory", 1, JS_CFUNC_constructor, 0);
+-    JS_DefinePropertyValueStr(ctx, wasm, "Memory", memory_ctor, JS_PROP_C_W_E);
+-    
+-    // Table class
+-    JS_NewClassID(&tjs_wasm_table_class_id);
+-    JS_NewClass(JS_GetRuntime(ctx), tjs_wasm_table_class_id, &tjs_wasm_table_class);
+-    
+-    JSValue table_proto = JS_NewObject(ctx);
+-    JS_SetPropertyFunctionList(ctx, table_proto,
+-        tjs_wasm_table_proto_funcs, countof(tjs_wasm_table_proto_funcs));
+-    JS_SetClassProto(ctx, tjs_wasm_table_class_id, table_proto);
+-    
+-    JSValue table_ctor = JS_NewCFunction2(ctx, tjs_wasm_table_constructor,
+-        "Table", 1, JS_CFUNC_constructor, 0);
+-    JS_DefinePropertyValueStr(ctx, wasm, "Table", table_ctor, JS_PROP_C_W_E);
+-    
+-    // Global class
+-    JS_NewClassID(&tjs_wasm_global_class_id);
+-    JS_NewClass(JS_GetRuntime(ctx), tjs_wasm_global_class_id, &tjs_wasm_global_class);
+-    
+-    JSValue global_proto = JS_NewObject(ctx);
+-    JS_SetPropertyFunctionList(ctx, global_proto,
+-        tjs_wasm_global_proto_funcs, countof(tjs_wasm_global_proto_funcs));
+-    JS_SetClassProto(ctx, tjs_wasm_global_class_id, global_proto);
+-    
+-    JSValue global_ctor = JS_NewCFunction2(ctx, tjs_wasm_global_constructor,
+-        "Global", 1, JS_CFUNC_constructor, 0);
+-    JS_DefinePropertyValueStr(ctx, wasm, "Global", global_ctor, JS_PROP_C_W_E);
++    // Initialize all classes using helper macro
++    TJS_WASM_INIT_CLASS(ctx, wasm, "Module",
++        tjs_wasm_module_class_id, tjs_wasm_module_class,
++        tjs_wasm_module_constructor, 1,
++        tjs_wasm_module_proto_funcs, countof(tjs_wasm_module_proto_funcs),
++        tjs_wasm_module_static_funcs, countof(tjs_wasm_module_static_funcs));
++    
++    TJS_WASM_INIT_CLASS(ctx, wasm, "Instance",
++        tjs_wasm_instance_class_id, tjs_wasm_instance_class,
++        tjs_wasm_instance_constructor, 1,
++        tjs_wasm_instance_proto_funcs, countof(tjs_wasm_instance_proto_funcs),
++        NULL, 0);
++    
++    TJS_WASM_INIT_CLASS(ctx, wasm, "Memory",
++        tjs_wasm_memory_class_id, tjs_wasm_memory_class,
++        tjs_wasm_memory_constructor, 1,
++        tjs_wasm_memory_proto_funcs, countof(tjs_wasm_memory_proto_funcs),
++        NULL, 0);
++    
++    TJS_WASM_INIT_CLASS(ctx, wasm, "Table",
++        tjs_wasm_table_class_id, tjs_wasm_table_class,
++        tjs_wasm_table_constructor, 1,
++        tjs_wasm_table_proto_funcs, countof(tjs_wasm_table_proto_funcs),
++        NULL, 0);
++    
++    TJS_WASM_INIT_CLASS(ctx, wasm, "Global",
++        tjs_wasm_global_class_id, tjs_wasm_global_class,
++        tjs_wasm_global_constructor, 1,
++        tjs_wasm_global_proto_funcs, countof(tjs_wasm_global_proto_funcs),
++        NULL, 0);
+     
+     // Top-level functions
+     JS_SetPropertyFunctionList(ctx, wasm, tjs_wasm_funcs, countof(tjs_wasm_funcs));

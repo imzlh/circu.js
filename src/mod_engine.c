@@ -36,6 +36,8 @@
 #include <expat.h>
 #include <zlib.h>
 
+#include "../deps/quickjs/list.h"
+
 #ifdef CJS__HAS_MIMALLOC
 #include <mimalloc.h>
 #endif
@@ -67,11 +69,36 @@ static JSValue tjs_gc_getThreshold(JSContext *ctx, JSValue this_val, int argc, J
 
 // fixme: thread_local?
 static JSClassID js_module_class_id;
+typedef struct {
+	struct list_head local_def;
+	JSModuleDef* def;
+} tjs_module_t;
+
+typedef struct {
+	void* var;
+	JSAtom atom;
+	struct list_head list;
+} tjs_module_export_t;
 
 static inline JSValue module_new(JSContext* ctx, JSModuleDef* def){
     JSValue obj = JS_NewObjectClass(ctx, js_module_class_id);
-    JS_SetOpaque(obj, def);
+	tjs_module_t* mt = js_malloc(ctx, sizeof(tjs_module_t));
+	init_list_head(&mt->local_def);
+    mt->def = def;
+    JS_SetOpaque(obj, mt);
     return obj;
+}
+
+static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
+	if (argc == 0 || !JS_IsString(argv[0])){
+		return JS_ThrowTypeError(ctx, "createModule() requires 1 argument");
+    }
+
+	const char* name = JS_ToCString(ctx, argv[0]);
+    if(!name) return JS_EXCEPTION;
+    JSModuleDef* m = JS_NewCModule2(ctx, name);
+    if(!m) return JS_EXCEPTION;
+    return module_new(ctx, m);
 }
 
 static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
@@ -99,19 +126,70 @@ fail:
 }
 
 static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-	JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
-	if(!def) return JS_EXCEPTION;
-	return JS_EvalFunction(ctx, JS_MKPTR(JS_TAG_MODULE, def));
+	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!mt) return JS_EXCEPTION;
+	return JS_EvalFunction(ctx, JS_MKPTR(JS_TAG_MODULE, mt->def));
+}
+
+static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
+    tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if(!mt) return JS_EXCEPTION;
+    if(argc < 2 || !JS_IsString(argv[0])){
+		return JS_ThrowTypeError(ctx, "export() requires 2 argument: export_name: string, value: any");
+    }
+
+    const char *export_name = JS_ToCString(ctx, argv[0]);
+    if(!export_name) return JS_EXCEPTION;
+	JSAtom name = JS_NewAtom(ctx, export_name);
+    void* def = JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
+    JS_FreeCString(ctx, export_name);
+    if(!def) return JS_EXCEPTION;
+
+	// add to list
+	tjs_module_export_t* me = js_malloc(ctx, sizeof(tjs_module_export_t));
+	me->atom = name;
+	me->var = def;
+	list_add_tail(&me->list, &mt->local_def);
+
+    return JS_UNDEFINED;
+}
+
+static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
+	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!mt) return JS_EXCEPTION;
+	if (argc == 0 || !JS_IsString(argv[0]))
+		return JS_ThrowTypeError(ctx, "unref() requires 1 argument: name");
+
+	const char* name = JS_ToCString(ctx, argv[0]);
+    if(!name) return JS_EXCEPTION;
+	JSAtom name_atom = JS_NewAtom(ctx, name);
+
+	// find in exports
+	struct list_head* pos;
+	list_for_each(pos, &mt->local_def){
+		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
+		if(name_atom == me->atom){
+			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
+			JS_FreeAtom(ctx, me->atom);
+			list_del(&me->list);
+			js_free(ctx, me);
+			return JS_UNDEFINED;
+		}
+	}
+
+    return JS_ThrowTypeError(ctx, "export not found: %s", name);
 }
 
 static JSValue js_module_get_ptr(JSContext *ctx, JSValueConst this_val){
+	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!mt) return JS_EXCEPTION;
     return 
 #if __SIZEOF_POINTER__ == 8
     JS_NewInt64
 #else
     JS_NewInt32
 #endif
-    (ctx, (uintptr_t)JS_GetOpaque(this_val, js_module_class_id));
+    (ctx, (uintptr_t)mt->def);
 }
 
 static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
@@ -119,8 +197,8 @@ static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
 }
 
 static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
-    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
-    if(!def) return JS_EXCEPTION;
+    tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if(!mt) return JS_EXCEPTION;
 
 	int flags = JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE;
 	if (argc != 0 && -1 == JS_ToInt32(ctx, &flags, argv[0])) {
@@ -128,31 +206,53 @@ static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, J
 	}
 
     size_t len = 0;
-    uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, def), flags);
+    uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, mt->def), flags);
     if(!data) return JS_EXCEPTION;
 
     return JS_NewArrayBuffer(ctx, data, len, free_js_malloc, NULL, false);
 }
 
 static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
-    JSModuleDef *def = (JSModuleDef*)JS_GetOpaque2(ctx, this_val, js_module_class_id);
-    if(!def) return JS_EXCEPTION;
-    return JS_GetImportMeta(ctx, def);
+    tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if(!mt) return JS_EXCEPTION;
+    return JS_GetImportMeta(ctx, mt->def);
 }
 
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
-    JSModuleDef* def = (JSModuleDef*)JS_GetOpaque(this_val, js_module_class_id);
-    return def;
+    tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    return mt->def;
 }
 
-JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def){
-	return module_new(ctx, def);
+JSValue tjs__new_module(JSContext* ctx, JSModuleDef* mt){
+	return module_new(ctx, mt);
 }
+
+static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
+	tjs_module_t* mt = JS_GetOpaque(obj, js_module_class_id);
+	if(!mt) return;
+	
+	// here we should free var
+	struct list_head *pos, *tmp;
+	list_for_each_safe(pos, tmp, &mt->local_def){
+		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
+		JS_FreeModuleExport(rt, me->var);
+		JS_FreeAtomRT(rt, me->atom);
+		js_free_rt(rt, me);
+	}
+
+	js_free_rt(rt, mt);
+}
+
+// static void js_module_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func){
+// 	tjs_module_t* mt = JS_GetOpaque(val, js_module_class_id);
+// 	if (!mt) return;
+// 	JS_MarkValue(rt, JS_MKPTR(JS_TAG_MODULE, mt->def), mark_func);
+// }
 
 static const JSClassDef js_module_class = {
     "Module",
-	// module do not require finalize
-    // .finalizer = js_module_finalizer,
+    .finalizer = js_module_finalizer,
+	// .gc_mark = js_module_mark
 };
 
 static const JSCFunctionListEntry js_module_proto_funcs[] = {
@@ -160,6 +260,8 @@ static const JSCFunctionListEntry js_module_proto_funcs[] = {
     JS_CFUNC_DEF("dump", 0, js_module_dump),
     JS_CGETSET_DEF("meta", js_module_get_meta, NULL),
 	JS_CFUNC_DEF("eval", 0, js_module_eval),
+	JS_CFUNC_DEF("export", 0, js_module_export),
+	JS_CFUNC_DEF("unref", 0, js_module_unref),
 };
 
 static JSValue tjs_setMemoryLimit(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -491,4 +593,8 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 	JSValue ctor = JS_NewCFunction2(ctx, js_module_constructor, "Module", 2, JS_CFUNC_constructor, 0);
 	JS_SetConstructor(ctx, ctor, proto);
 	JS_DefinePropertyValue(ctx, ns, JS_ATOM_Module, ctor, JS_PROP_C_W_E);
+
+	// Module.create
+	JSValue mcreate = JS_NewCFunction(ctx, js_module_static_create, "create", 1);
+	JS_DefinePropertyValueStr(ctx, ctor, "create", mcreate, JS_PROP_C_W_E);
 }

@@ -186,6 +186,11 @@ declare namespace CModuleEngine {
      */
     export class Module {
         /**
+         * 创建一个新的C模块实例
+         */
+        static create(name: string): Module;
+
+        /**
          * 将传入的模块内容编译
          */
         constructor(content: string, filename: string);
@@ -210,6 +215,20 @@ declare namespace CModuleEngine {
          * 作为模块执行
          */
         eval(): Promise;
+
+        /**
+         * (适用于`from`创建的模块) 增加导出成员
+         * @param name 导出成员名称
+         * @param value 导出成员值
+         */
+        export(name: string, value: any): void;
+
+        /**
+         * (适用于`from`创建的模块和`export`导出的模块) 移除导出成员
+         * (注意：如果被其他模块引用，不会消失。只适用于没被使用的元素)
+         * @param name 导出成员名称
+         */
+        unref(name: string): void;
     }
 
     /**

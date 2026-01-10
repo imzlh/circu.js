@@ -48,7 +48,7 @@ endmacro()
 
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
-cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
+cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
 cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
@@ -231,7 +231,7 @@ endif()
 
 if (BUILD_WITH_WASM)
     target_compile_definitions(cjs PRIVATE CJS__HAS_WASM)
-    target_link_libraries(cjs wasm3)
+    target_link_libraries(cjs m3)
 endif()
 
 add_executable(cjs-cli

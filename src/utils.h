@@ -157,7 +157,9 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 		return NULL;
 	*psize = plen * pbytes_per_element;
 	size_t __psize;
-	return JS_GetArrayBuffer(ctx, &__psize, arrbuf);
+	void* ret = JS_GetArrayBuffer(ctx, &__psize, arrbuf);
+	JS_FreeValue(ctx, arrbuf);
+	return ret + poffset;
 }
 
 #endif
