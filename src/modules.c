@@ -199,9 +199,6 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 
     module_name_atom = JS_GetModuleName(ctx, m);
     module_name = JS_AtomToCString(ctx, module_name_atom);
-#if DEBUG
-    fprintf(stdout, "XXX loaded module: %s\n", module_name);
-#endif
     JS_FreeAtom(ctx, module_name_atom);
     if (!module_name) {
         return -1;

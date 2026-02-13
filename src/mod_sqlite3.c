@@ -2,6 +2,7 @@
  * circu.js
  *
  * Copyright (c) 2023-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2025-2026 iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -597,17 +598,18 @@ static const JSCFunctionListEntry tjs_sqlite3_stmt_proto_funcs[] = {
 
 static const JSCFunctionListEntry tjs_sqlite3_funcs[] = {
     TJS_CFUNC_DEF("open", 2, tjs_sqlite3_open),
-    TJS_CONST(SQLITE_OPEN_CREATE),
-    TJS_CONST(SQLITE_OPEN_READONLY),
-    TJS_CONST(SQLITE_OPEN_READWRITE),
-	TJS_CONST(SQLITE_OPEN_MEMORY),
-	TJS_CONST(SQLITE_OPEN_URI),
-	TJS_CONST(SQLITE_OPEN_NOMUTEX),
-    TJS_CONST(SQLITE_OPEN_FULLMUTEX),
-    TJS_CONST(SQLITE_OPEN_SHAREDCACHE),
-    TJS_CONST(SQLITE_OPEN_PRIVATECACHE),
-	TJS_CONST(SQLITE_OPEN_NOFOLLOW)
+    TJS_CONST2("O_CREATE", SQLITE_OPEN_CREATE),
+    TJS_CONST2("O_READONLY", SQLITE_OPEN_READONLY),
+    TJS_CONST2("O_READWRITE", SQLITE_OPEN_READWRITE),
+	TJS_CONST2("O_MEMORY", SQLITE_OPEN_MEMORY),
+	TJS_CONST2("O_URL", SQLITE_OPEN_URI),
+	TJS_CONST2("O_NOMUTEX", SQLITE_OPEN_NOMUTEX),
+    TJS_CONST2("O_FULLMUTEX", SQLITE_OPEN_FULLMUTEX),
+    TJS_CONST2("O_SHAREDCACHE", SQLITE_OPEN_SHAREDCACHE),
+    TJS_CONST2("O_PRIVATECACHE", SQLITE_OPEN_PRIVATECACHE),
+	TJS_CONST2("O_NOFOLLOW", SQLITE_OPEN_NOFOLLOW)
 };
+
 
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);

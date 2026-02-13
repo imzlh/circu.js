@@ -462,7 +462,8 @@ static void format_object(JSContext* ctx, JSValueConst val, int depth,
     bool inline_display = should_inline(ctx, val, stack, depth);
     dbuf_putstr(buf, inline_display ? " { " : " {\n");
 
-    uint32_t display_count = (valid_count > MAX_DISPLAY_PROPS) ? MAX_DISPLAY_PROPS : valid_count;
+	// avoid 1/2 rest
+    uint32_t display_count = (valid_count > MAX_DISPLAY_PROPS +2) ? MAX_DISPLAY_PROPS : valid_count;
     uint32_t shown = 0;
 
     for (uint32_t i = 0; i < prop_count && shown < display_count; i++) {

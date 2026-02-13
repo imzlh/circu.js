@@ -131,6 +131,17 @@ static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, J
 	return JS_EvalFunction(ctx, JS_MKPTR(JS_TAG_MODULE, mt->def));
 }
 
+static JSValue js_module_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!mt) return JS_EXCEPTION;
+	int res = JS_ResolveModule(ctx, JS_MKPTR(JS_TAG_MODULE, mt->def));
+	if (res != 0) {
+		return JS_EXCEPTION;
+	}
+
+	return JS_UNDEFINED;
+}
+
 static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
     tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
     if(!mt) return JS_EXCEPTION;
@@ -260,6 +271,7 @@ static const JSCFunctionListEntry js_module_proto_funcs[] = {
     JS_CFUNC_DEF("dump", 0, js_module_dump),
     JS_CGETSET_DEF("meta", js_module_get_meta, NULL),
 	JS_CFUNC_DEF("eval", 0, js_module_eval),
+	JS_CFUNC_DEF("resolve", 0, js_module_resolve),
 	JS_CFUNC_DEF("export", 0, js_module_export),
 	JS_CFUNC_DEF("unref", 0, js_module_unref),
 };
@@ -282,28 +294,27 @@ static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, J
     return JS_UNDEFINED;
 }
 
-static JSValue tjs_compile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_eval(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     size_t len = 0;
-    const uint8_t *tmp = JS_GetUint8Array(ctx, &len, argv[0]);
-    if (!tmp) {
-        return JS_EXCEPTION;
-    }
-    // We need to copy the buffer in order to null-terminate it, which JS_Eval needs.
-    uint8_t *buf = js_malloc(ctx, len + 1);
+    const char *buf = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!buf) {
         return JS_EXCEPTION;
     }
-    memcpy(buf, tmp, len);
-    buf[len] = '\0';
+
+	// use custom eval flag
+	int eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_BACKTRACE_BARRIER;
+	if (argc >= 3 && JS_IsNumber(argv[2]))
+		JS_ToInt32(ctx, &eval_flags, argv[2]);
+
     const char *module_name = JS_ToCString(ctx, argv[1]);
     if (!module_name) {
-        js_free(ctx, buf);
+		JS_FreeCString(ctx, buf);
         return JS_EXCEPTION;
     }
-    int eval_flags = JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_TYPE_MODULE;
-    JSValue obj = JS_Eval(ctx, (const char *) buf, len, module_name, eval_flags);
+    
+    JSValue obj = JS_Eval(ctx, buf, len, module_name, eval_flags);
     JS_FreeCString(ctx, module_name);
-    js_free(ctx, buf);
+    JS_FreeCString(ctx, buf);
     return obj;
 }
 
@@ -346,24 +357,6 @@ static JSValue tjs_deserialize(JSContext *ctx, JSValue this_val, int argc, JSVal
 		default:
 			return ret;
 	}
-}
-
-static JSValue tjs_evalBytecode(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSValue obj = argv[0];
-
-    if (JS_IsException(obj)) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
-        if (JS_ResolveModule(ctx, obj) < 0) {
-            return JS_EXCEPTION;
-        }
-
-        js_module_set_import_meta(ctx, obj, false, false);
-    }
-
-    return JS_EvalFunction(ctx, obj);
 }
 
 #define IFOPT(optname, optcheckfunc, then) \
@@ -518,10 +511,9 @@ static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int arg
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
-    TJS_CFUNC_DEF("compile", 2, tjs_compile),
-    TJS_CFUNC_DEF("serialize", 1, tjs_serialize),
+    TJS_CFUNC_DEF("eval", 3, tjs_eval),
+    TJS_CFUNC_DEF("serialize", 2, tjs_serialize),
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
-    TJS_CFUNC_DEF("evalBytecode", 1, tjs_evalBytecode),
 	TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
 	TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
@@ -536,6 +528,11 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CONST2("DUMP_DEEP", JS_WRITE_OBJ_REFERENCE),
 	TJS_CONST2("DUMP_LOCAL", JS_WRITE_OBJ_SAB),
 	TJS_CONST2("DUMP_DEFAULT", JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE),
+
+	TJS_CONST2("EVAL_MODULE", JS_EVAL_TYPE_MODULE),
+	TJS_CONST2("EVAL_ASYNC", JS_EVAL_FLAG_ASYNC),
+	TJS_CONST2("EVAL_STRICT", JS_EVAL_FLAG_STRICT),
+	TJS_CONST2("EVAL_NEW_BACKTRACE", JS_EVAL_FLAG_BACKTRACE_BARRIER),
 };
 
 /* clang-format off */

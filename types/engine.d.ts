@@ -33,6 +33,26 @@ declare namespace CModuleEngine {
      */
     export const DUMP_DEFAULT: number;
 
+    /**
+     * compile code with async eval support
+     */
+    export const EVAL_ASYNC: number
+
+    /**
+     * force strict
+     */
+    export const EVAL_STRICT: number
+
+    /**
+     * do not record previous backtrace when eval
+     */
+    export const EVAL_NEW_BACKTRACE: number;
+
+    /**
+     * eval code as module
+     */
+    export const EVAL_MODULE: number;
+
     export enum PromiseState {
         CONSTRUCT,
         BEFORE_THEN,
@@ -111,12 +131,13 @@ declare namespace CModuleEngine {
     export function setMaxStackSize(size: number): void;
 
     /**
-     * 编译 JavaScript 代码为字节码
-     * @param code 要编译的代码（Uint8Array 形式）
+     * 执行指定的 JavaScript 代码，默认作为模块执行
+     * @param code 要编译的代码
      * @param moduleName 模块名称（用于错误提示）
+     * @param flags 编译选项，默认为 `EVAL_MODULE`
      * @returns 编译后的字节码
      */
-    export function compile(code: Uint8Array, moduleName: string): Uint8Array;
+    export function eval<T = any>(code: string, moduleName: string, flags?: number): T;
 
     /**
      * 序列化 JavaScript 对象为字节码
@@ -131,14 +152,7 @@ declare namespace CModuleEngine {
      * @param bytecode 序列化后的字节码
      * @returns 反序列化后的对象
      */
-    export function deserialize(bytecode: Uint8Array): any;
-
-    /**
-     * 执行预编译的字节码
-     * @param bytecode 要执行的字节码
-     * @returns 执行结果
-     */
-    export function evalBytecode(bytecode: Uint8Array): any;
+    export function deserialize<T = any>(bytecode: Uint8Array): T;
 
     /**
      * 垃圾回收控制模块
@@ -215,6 +229,11 @@ declare namespace CModuleEngine {
          * 作为模块执行
          */
         eval(): Promise;
+
+        /**
+         * 开始解析依赖。错误会抛出
+         */
+        resolve(): void;
 
         /**
          * (适用于`from`创建的模块) 增加导出成员
