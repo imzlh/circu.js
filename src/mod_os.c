@@ -25,10 +25,6 @@
 #include "private.h"
 #include "utils.h"
 
-#ifdef CJS__HAS_WASM
-#include "wasm.h"
-#endif
-
 #include <curl/curl.h>
 #include <string.h>
 #include <unistd.h>

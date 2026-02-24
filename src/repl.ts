@@ -109,7 +109,7 @@ class TerminalController {
     }
 }
 
-function getenv (env: string) {
+function getenv(env: string) {
     try {
         return os.getenv(env);
     } catch {
@@ -291,7 +291,7 @@ class JSColorizer {
         if (this.#start > 0 && this.#str[this.#start - 1] === '.' && this.#braceLevel === 0) {
             this.#canBeRegex = true;
             while (this.#index < this.#length && this.#isWordChar(this.#str[this.#index]!)) this.#index ++;
-            
+
             const word = this.#str.substring(this.#start, this.#index);
             if (JSColorizer.#DIRECTIVES.has(word)) {
                 this.#currentStyle = 'directive';
@@ -601,10 +601,12 @@ class CJSRepl {
     }
 
     async #executeCommand(cmd: KeyCommand, input: string): Promise<void> {
+        this.#lastCommand = input;
         const result = await cmd.call(this, input);
 
         switch (result?.type) {
             case 'submit':
+                this.#historyIndex = this.#history.length;
                 if (this.#readlineResolver) {
                     const resolver = this.#readlineResolver;
                     this.#readlineResolver = null;
@@ -704,17 +706,17 @@ class CJSRepl {
     // ==================== Command Implementation ====================
 
     #moveCursor(delta: number): void {
-    const newPos = Math.max(0, Math.min(this.#cmd.length, this.#cursorPos + delta));
-    if (newPos !== this.#cursorPos) {
-        if (delta > 0 && newPos < this.#cmd.length && this.#isTrailingSurrogate(this.#cmd[newPos])) {
-            this.#cursorPos = newPos + 1;
-        } else if (delta < 0 && newPos > 0 && this.#isTrailingSurrogate(this.#cmd[newPos])) {
-            this.#cursorPos = newPos - 1;
-        } else {
-            this.#cursorPos = newPos;
+        const newPos = Math.max(0, Math.min(this.#cmd.length, this.#cursorPos + delta));
+        if (newPos !== this.#cursorPos) {
+            if (delta > 0 && newPos < this.#cmd.length && this.#isTrailingSurrogate(this.#cmd[newPos])) {
+                this.#cursorPos = newPos + 1;
+            } else if (delta < 0 && newPos > 0 && this.#isTrailingSurrogate(this.#cmd[newPos])) {
+                this.#cursorPos = newPos - 1;
+            } else {
+                this.#cursorPos = newPos;
+            }
         }
     }
-}
 
     #insert(str: string): void {
         this.#cmd = this.#cmd.slice(0, this.#cursorPos) + str + this.#cmd.slice(this.#cursorPos);
@@ -770,36 +772,31 @@ class CJSRepl {
             return;
         }
 
-        // Find common prefix
-        const prefix = completions[0]!.slice(0, position);
-        let common = prefix;
+        // const word = this.#cmd.substring(this.#cursorPos - position, this.#cursorPos);
+        let common = completions[0]!;
+
         for (let i = 1; i < completions.length; i++) {
-            while (!completions[i]!.startsWith(common)) {
-                common = common.slice(0, -1);
+            let j = position;
+            while (j < common.length && j < completions[i]!.length && common[j] === completions[i]![j]) {
+                j++;
             }
+            common = common.substring(0, j);
         }
 
-        // Insert common part
-        for (let i = position; i < common.length; i++) {
-            this.#insert(common[i]!);
-        }
-
-        // If single completion, add () for functions
-        if (completions.length === 1 && this.#lastCommand === '\t') {
-            const ctx = this.#completer.getCompletions(this.#cmd, this.#cursorPos).context;
-            const val = (ctx as Record<string, unknown>)?.[completions[0]!];
-            if (typeof val === 'function') {
-                this.#insert('()');
-                this.#moveCursor(-1);
-            } else if (typeof val === 'object' && val !== null) {
-                this.#insert('.');
+        if (common.length > position) {
+            for (let i = position; i < common.length; i++) {
+                this.#insert(common[i]!);
             }
+            this.#lastCommand = '';
+            return;
         }
 
-        // Show all if double tab
-        if (this.#lastCommand === '\t' && completions.length > 1) {
+        if (this.#lastCommand === '\t') {
             await this.#showCompletions(completions);
+            return;
         }
+
+        this.#alert();
     }
 
     async #showCompletions(list: string[]): Promise<void> {
@@ -969,7 +966,7 @@ class CJSRepl {
     async #evaluate(expr: string): Promise<void> {
         try {
             this.#evalStartTime = performance.now();
-            const result = await engine.eval<Promise<any>>(expr, '<eval>', engine.EVAL_ASYNC | engine.EVAL_NEW_BACKTRACE);
+            const result = (await engine.eval<any>(expr, '<eval>', engine.EVAL_ASYNC | engine.EVAL_NEW_BACKTRACE)).value;
 
             const time = performance.now() - this.#evalStartTime;
             if (this.#config.showTime) {

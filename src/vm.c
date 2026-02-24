@@ -401,7 +401,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* WASM */
 #ifdef CJS__HAS_WASM
-    qrt->wasm_ctx.env = m3_NewEnvironment();
+    qrt->wasm_ctx.initialized = false;
 #endif
 
     /* Timers */
@@ -449,8 +449,7 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 
     /* Destroy WASM runtime. */
 #ifdef CJS__HAS_WASM
-    m3_FreeEnvironment(qrt->wasm_ctx.env);
-    qrt->wasm_ctx.env = NULL;
+    tjs__mod_wasm_cleanup(qrt);
 #endif
 
     /* Cleanup loop. All handles should be closed. */

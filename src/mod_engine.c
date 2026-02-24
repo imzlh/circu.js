@@ -42,6 +42,10 @@
 #include <mimalloc.h>
 #endif
 
+#ifdef CJS__HAS_WASM
+#include <wasm_export.h>
+#endif
+
 #include <llhttp.h>
 #define LLHTTP_VERSION STRINGIFY(LLHTTP_VERSION_MAJOR) "." STRINGIFY(LLHTTP_VERSION_MINOR) "." STRINGIFY(LLHTTP_VERSION_PATCH)
 
@@ -564,7 +568,9 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 
 	JS_DefinePropertyValueStr(ctx, versions, "llhttp", JS_NewString(ctx, LLHTTP_VERSION), JS_PROP_C_W_E);
 #ifdef CJS__HAS_WASM
-    JS_DefinePropertyValueStr(ctx, versions, "wasm3", JS_NewString(ctx, M3_VERSION), JS_PROP_C_W_E);
+	char wasm_version[128] = {0};
+	wasm_runtime_get_file_package_version((uint8_t*)wasm_version, sizeof(wasm_version));
+    JS_DefinePropertyValueStr(ctx, versions, "wasm3", JS_NewString(ctx, wasm_version), JS_PROP_C_W_E);
 #endif
 #ifdef CJS__HAS_MIMALLOC
     JS_DefinePropertyValueStr(ctx, versions, "mimalloc", JS_NewInt32(ctx, mi_version()), JS_PROP_C_W_E);

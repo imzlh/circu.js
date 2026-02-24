@@ -31,10 +31,6 @@
 #include "utils.h"
 #include "sourcemap.h"
 
-#ifdef CJS__HAS_WASM
-#include "wasm.h"
-#endif
-
 #include <curl/curl.h>
 #include <sqlite3.h>
 #include <stdbool.h>
@@ -67,8 +63,8 @@ struct TJSRuntime {
     bool freeing;
 #ifdef CJS__HAS_WASM
     struct {
-        IM3Environment env;
-    } wasm_ctx;
+		bool initialized;
+	} wasm_ctx;
 #endif
     struct {
         TJSTimer *timers;
@@ -107,7 +103,6 @@ void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
 void tjs__mod_sys_init(JSContext *ctx, JSValue ns);
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
-void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
 void tjs__mod_http_init(JSContext *ctx, JSValue ns);
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
@@ -129,6 +124,11 @@ void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
 
 #ifdef CJS__HAS_ICONV
 void tjs__mod_text_init(JSContext *ctx, JSValue ns);
+#endif
+
+#ifdef CJS__HAS_WASM
+void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
+void tjs__mod_wasm_cleanup(TJSRuntime *qrt);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);

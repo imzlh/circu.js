@@ -33,10 +33,36 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#include <errno.h>
+typedef int pid_t;
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
   ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
 typedef VOID* HPCON;
+#endif
+#ifndef WNOHANG
+#define WNOHANG 1
+#endif
+#ifndef WEXITSTATUS
+#define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
+#endif
+#ifndef WIFEXITED
+#define WIFEXITED(s) (1)
+#endif
+#ifndef WIFSIGNALED
+#define WIFSIGNALED(s) (0)
+#endif
+#ifndef WEXITED
+#define WEXITED 0x04
+#endif
+#ifndef WSTOPPED
+#define WSTOPPED 0x02
+#endif
+#ifndef WCONTINUED
+#define WCONTINUED 0x08
+#endif
+#ifndef WNOWAIT
+#define WNOWAIT 0x1000000
 #endif
 #else
 #include <sys/ioctl.h>
@@ -449,10 +475,112 @@ static JSValue tjs_pty_get_slave_name(JSContext *ctx, JSValueConst this_val, int
 #endif
 }
 
+#ifdef _WIN32
+
+pid_t waitpid_cross(pid_t pid, int *status, int options) {
+    /* Simple implementation: only support waiting for specific PID */
+    if (pid <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Open handle to target process */
+    HANDLE hProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
+    if (hProcess == NULL) {
+        errno = ECHILD;  /* No such process */
+        return -1;
+    }
+
+    /* Determine timeout based on WNOHANG option */
+    DWORD timeout = (options & WNOHANG) ? 0 : INFINITE;
+    DWORD waitResult = WaitForSingleObject(hProcess, timeout);
+
+    if (waitResult == WAIT_TIMEOUT) {
+        /* Non-blocking call: process still alive */
+        CloseHandle(hProcess);
+        return 0;
+    }
+
+    if (waitResult != WAIT_OBJECT_0) {
+        /* Wait failed */
+        CloseHandle(hProcess);
+        errno = ECHILD;
+        return -1;
+    }
+
+    /* Process terminated, retrieve exit code */
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(hProcess, &exitCode)) {
+        CloseHandle(hProcess);
+        errno = ECHILD;
+        return -1;
+    }
+
+    CloseHandle(hProcess);
+
+    /* Encode exit code in POSIX format (shifted left by 8) 
+     * This allows WEXITSTATUS(status) to work correctly on both platforms
+     */
+    if (status) {
+        *status = (int)((exitCode & 0xFF) << 8);
+    }
+
+    return pid;
+}
+
+#else
+
+pid_t waitpid_cross(pid_t pid, int *status, int options) {
+    /* Direct passthrough to native implementation */
+    return waitpid(pid, status, options);
+}
+
+#endif
+
+static JSValue tjs_pty_waitpid(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || argc > 2) {
+        return JS_ThrowTypeError(ctx, "waitpid requires 1 or 2 arguments: pid, options");
+    }
+
+	int32_t pid;
+    if (JS_ToInt32(ctx, &pid, argv[0])) {
+        return JS_EXCEPTION;
+    }
+    
+    int options = 0;
+    if (argc > 1) {
+		if (JS_ToInt32(ctx, &options, argv[1])) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    int status = 0;
+    pid_t result = waitpid_cross(pid, &status, options);
+    if (result == -1) {
+        return JS_ThrowInternalError(ctx, "waitpid failed: %s", strerror(errno));
+    }
+    
+    if (result == 0) {
+        /* Non-blocking call: process still alive */
+        return JS_NewInt32(ctx, 0);
+    }
+    
+    /* Process terminated, retrieve exit code */
+    int exit_code = WEXITSTATUS(status);
+    return JS_NewInt32(ctx, exit_code);
+}
+
 static const JSCFunctionListEntry tjs_pty_funcs[] = {
     TJS_CFUNC_DEF("openpty", 1, tjs_pty_openpty),
     TJS_CFUNC_DEF("resize", 3, tjs_pty_resize),
     TJS_CFUNC_DEF("ptsname", 1, tjs_pty_get_slave_name),
+	TJS_CFUNC_DEF("waitpid", 1, tjs_pty_waitpid),
+
+	TJS_CONST(WNOHANG),
+	TJS_CONST(WEXITED),
+	TJS_CONST(WSTOPPED),
+	TJS_CONST(WCONTINUED),
+	TJS_CONST(WNOWAIT),
 };
 
 void tjs__mod_pty_init(JSContext *ctx, JSValue ns) {

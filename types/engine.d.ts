@@ -137,7 +137,7 @@ declare namespace CModuleEngine {
      * @param flags 编译选项，默认为 `EVAL_MODULE`
      * @returns 编译后的字节码
      */
-    export function eval<T = any>(code: string, moduleName: string, flags?: number): T;
+    export function eval<T = any>(code: string, moduleName: string, flags?: number): { value: T } | globalThis.Promise<{ value: T }>;
 
     /**
      * 序列化 JavaScript 对象为字节码

@@ -55,11 +55,6 @@ add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
 option(libuv_buildtests "" OFF)
 
-if(BUILD_WITH_WASM)
-    set(BUILD_WASI "simple" CACHE STRING "WASI implementation")
-    add_subdirectory(deps/wasm3 EXCLUDE_FROM_ALL)
-endif()
-
 if(BUILD_WITH_MIMALLOC)
     option(MI_OVERRIDE "" OFF)
     option(MI_BUILD_SHARED "" OFF)
@@ -86,6 +81,9 @@ find_package(llhttp) # optional
 if (BUILD_WITH_CURL)
     find_package(CURL REQUIRED)
 endif()
+if (BUILD_WITH_WASM)
+    find_package(iwasm REQUIRED)
+endif()
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
@@ -100,7 +98,6 @@ add_library(cjs
     src/utils.c
     src/version.c
     src/vm.c
-    src/wasm.c
     src/worker.c
     src/console.c
     src/sourcemap.c
@@ -160,6 +157,12 @@ if (BUILD_WITH_CURL AND CURL_FOUND)
     add_compile_definitions(CJS__HAS_CURL)
     target_sources(cjs PUBLIC src/mod_curl.c)
     target_link_libraries(cjs CURL::libcurl)
+endif()
+
+if (BUILD_WITH_WASM)
+    add_compile_definitions(CJS__HAS_WASM)
+    target_sources(cjs PUBLIC src/mod_wasm.c)
+    target_link_libraries(cjs iwasm)
 endif()
 
 # add_library(ffi-test SHARED
@@ -227,11 +230,6 @@ target_link_libraries(cjs qjs uv sqlite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
     target_link_libraries(cjs mimalloc-static)
-endif()
-
-if (BUILD_WITH_WASM)
-    target_compile_definitions(cjs PRIVATE CJS__HAS_WASM)
-    target_link_libraries(cjs m3)
 endif()
 
 add_executable(cjs-cli
