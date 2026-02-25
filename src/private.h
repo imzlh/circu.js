@@ -62,9 +62,9 @@ struct TJSRuntime {
     bool is_worker;
     bool freeing;
 #ifdef CJS__HAS_WASM
-    struct {
-		bool initialized;
-	} wasm_ctx;
+    // struct {
+	// 	bool initialized;
+	// } wasm_ctx;
 #endif
     struct {
         TJSTimer *timers;
@@ -86,6 +86,14 @@ struct TJSRuntime {
 		MappingContext* mapctx;
 	} module;
 };
+
+typedef enum {
+	EV_PROMISE = 0,
+	EV_UNHANDLED_REJECTION,
+	EV_JOB_EXCEPTION,
+	EV_EXIT,
+	EV_LOAD
+} TJSEvents;
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
@@ -128,7 +136,6 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 
 #ifdef CJS__HAS_WASM
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
-void tjs__mod_wasm_cleanup(TJSRuntime *qrt);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);
@@ -170,5 +177,6 @@ JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
 JSValue tjs__new_module(JSContext* ctx, JSModuleDef* def);
 SSL_CTX* tjs__sslctx_get(JSContext *ctx, JSValueConst obj);
 
-JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data);
+JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents evname, JSValue data);
+void tjs__dispatch_event2(JSContext *ctx, TJSEvents evname, JSValue data);
 #endif

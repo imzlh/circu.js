@@ -20,173 +20,239 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-
-#include "private.h"
-#include "tjs.h"
 #include <iconv.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 
-/* Macro for iconv error handling */
-#define ICONV_ERROR_CHECK(ctx, cd, operation) do { \
-    if ((cd) == (iconv_t)-1) { \
-        return JS_ThrowTypeError(ctx, "iconv error: %s - %s", \
-                                operation, strerror(errno)); \
-    } \
-} while(0)
+#include "private.h"
+#include "tjs.h"
 
-/* Macro for buffer growth strategy */
-#define BUFFER_GROW_SIZE 4096
+/* Encoding conversion constants */
 #define INITIAL_BUFFER_SIZE 1024
+#define BUFFER_GROWTH_RATE  1.5
+#define MAX_PENDING_BUFFER  16  // Max bytes for incomplete sequences (UTF-32 max)
 
-/* Macro for safe buffer reallocation */
-#define SAFE_REALLOC(ctx, ptr, old_size, new_size) ({ \
-    void *_new_ptr = js_realloc(ctx, ptr, new_size); \
-    if (!_new_ptr && (new_size) > 0) { \
-        js_free(ctx, ptr); \
-        JS_ThrowOutOfMemory(ctx); \
-    } \
-    _new_ptr; \
-})
-
-/* TextDecoder state */
+/*
+ * TextDecoder instance state
+ * 
+ * Web API: https://encoding.spec.whatwg.org/#textdecoder
+ */
 typedef struct {
     JSContext *ctx;
-    iconv_t cd;
-    char *encoding;
-    bool fatal;
-    bool ignore_bom;
-} TJSTextDecoder;
-
-/* TextEncoder state */
-typedef struct {
-    JSContext *ctx;
-    iconv_t cd;
-    char *encoding;
-} TJSTextEncoder;
-
-/* Helper: Detect and skip BOM */
-static size_t skip_bom(const uint8_t *data, size_t len, const char *encoding) {
-    if (!data || len < 2) return 0;
+    iconv_t cd;                    // iconv conversion descriptor
+    char *encoding;                // Normalized encoding name
+    bool fatal;                    // Throw on encoding errors
+    bool ignore_bom;               // Skip BOM detection
     
-    /* UTF-8 BOM: EF BB BF */
+    // Streaming support: buffer for incomplete multi-byte sequences
+    uint8_t pending[MAX_PENDING_BUFFER];
+    size_t pending_len;
+} decoder_t;
+
+/*
+ * TextEncoder instance state
+ * 
+ * Web API: https://encoding.spec.whatwg.org/#textencoder
+ * 
+ * Note: Web standard requires UTF-8 only, but we keep internal
+ * encoding support via iconv for potential extended usage.
+ */
+typedef struct {
+    JSContext *ctx;
+    iconv_t cd;                    // Always UTF-8 in standard mode
+    char *encoding;
+} encoder_t;
+
+/* Class IDs for QuickJS finalizers */
+static JSClassID tjs_text_decoder_class_id;
+static JSClassID tjs_text_encoder_class_id;
+
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================ */
+
+/*
+ * Detect and return BOM length for common Unicode encodings.
+ * Returns number of bytes to skip (0 if no BOM or ignored).
+ */
+static size_t detect_bom_skip(const uint8_t *data, size_t len, const char *encoding, bool ignore_bom) {
+    if (!data || len == 0 || ignore_bom) return 0;
+    
+    // UTF-8: EF BB BF
     if (strcasecmp(encoding, "UTF-8") == 0 && len >= 3) {
-        if (data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        if (data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF)
             return 3;
-        }
     }
-    /* UTF-16 BE BOM: FE FF */
+    // UTF-16 BE: FE FF
     else if (strcasecmp(encoding, "UTF-16BE") == 0 && len >= 2) {
-        if (data[0] == 0xFE && data[1] == 0xFF) {
+        if (data[0] == 0xFE && data[1] == 0xFF)
             return 2;
-        }
     }
-    /* UTF-16 LE BOM: FF FE */
+    // UTF-16 LE: FF FE
     else if (strcasecmp(encoding, "UTF-16LE") == 0 && len >= 2) {
-        if (data[0] == 0xFF && data[1] == 0xFE) {
+        if (data[0] == 0xFF && data[1] == 0xFE)
             return 2;
-        }
     }
-    /* UTF-32 BE BOM: 00 00 FE FF */
+    // UTF-32 BE: 00 00 FE FF
     else if (strcasecmp(encoding, "UTF-32BE") == 0 && len >= 4) {
-        if (data[0] == 0x00 && data[1] == 0x00 && 
-            data[2] == 0xFE && data[3] == 0xFF) {
+        if (data[0] == 0x00 && data[1] == 0x00 && data[2] == 0xFE && data[3] == 0xFF)
             return 4;
-        }
     }
-    /* UTF-32 LE BOM: FF FE 00 00 */
+    // UTF-32 LE: FF FE 00 00
     else if (strcasecmp(encoding, "UTF-32LE") == 0 && len >= 4) {
-        if (data[0] == 0xFF && data[1] == 0xFE && 
-            data[2] == 0x00 && data[3] == 0x00) {
+        if (data[0] == 0xFF && data[1] == 0xFE && data[2] == 0x00 && data[3] == 0x00)
             return 4;
-        }
     }
     
     return 0;
 }
 
-/* Helper: Perform iconv conversion with dynamic buffer */
-static JSValue iconv_convert(JSContext *ctx, iconv_t cd, 
-                             const char *inbuf, size_t inlen,
-                             bool fatal, bool is_to_utf8) {
-    size_t outsize = INITIAL_BUFFER_SIZE;
-    char *outbuf = js_malloc(ctx, outsize);
-    if (!outbuf) return JS_EXCEPTION;
+/*
+ * Convert encoding name to canonical form for comparison.
+ * Handles common aliases and normalizes case.
+ */
+static const char* normalize_encoding_name(const char *enc) {
+    if (!enc) return "utf-8";
+    
+    // Common aliases mapping
+    if (strcasecmp(enc, "utf8") == 0) return "UTF-8";
+    if (strcasecmp(enc, "utf-16") == 0) return "UTF-16LE"; // Platform default usually LE
+    if (strcasecmp(enc, "utf-32") == 0) return "UTF-32LE";
+    
+    return enc;
+}
+
+/* ============================================================================
+ * Core Conversion Logic
+ * ============================================================================ */
+
+/*
+ * Perform iconv conversion with dynamic buffer growth.
+ * 
+ * Parameters:
+ *   ctx         - QuickJS context
+ *   cd          - iconv descriptor (must be valid)
+ *   inbuf       - Input buffer
+ *   inlen       - Input length
+ *   fatal       - If true, throw on invalid sequences; else use replacement
+ *   is_to_utf8  - If true, output is string (UTF-8); else Uint8Array
+ *   out_result  - Output JSValue (string or Uint8Array)
+ * 
+ * Returns:
+ *   0 on success, -1 on error (exception thrown)
+ * 
+ * Note: Handles E2BIG (buffer growth), EILSEQ/EINVAL (replacement or error)
+ */
+static int perform_iconv_conversion(JSContext *ctx, iconv_t cd,
+                                    const char *inbuf, size_t inlen,
+                                    bool fatal, bool is_to_utf8,
+                                    JSValue *out_result) {
+    size_t outbuf_size = INITIAL_BUFFER_SIZE;
+    char *outbuf = js_malloc(ctx, outbuf_size);
+    if (!outbuf) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
     
     char *inptr = (char *)inbuf;
     char *outptr = outbuf;
     size_t inleft = inlen;
-    size_t outleft = outsize;
-    size_t total_written = 0;
+    size_t outleft = outbuf_size;
     
     while (inleft > 0) {
         size_t ret = iconv(cd, &inptr, &inleft, &outptr, &outleft);
         
         if (ret == (size_t)-1) {
-            if (errno == E2BIG) {
-                /* Need more output space */
-                size_t written = outptr - outbuf;
-                total_written += written;
-                outsize += BUFFER_GROW_SIZE;
-                outbuf = SAFE_REALLOC(ctx, outbuf, outsize - BUFFER_GROW_SIZE, outsize);
-                if (!outbuf) return JS_EXCEPTION;
-                outptr = outbuf + total_written;
-                outleft = outsize - total_written;
-            } else if (errno == EILSEQ || errno == EINVAL) {
-                if (fatal) {
-                    js_free(ctx, outbuf);
-                    return JS_ThrowTypeError(ctx, "Invalid byte sequence in conversion");
-                }
-                /* Skip invalid byte and insert replacement character */
-                if (inleft > 0) {
-                    inptr++;
-                    inleft--;
-                    /* Insert UTF-8 replacement character U+FFFD if converting to UTF-8 */
-                    if (is_to_utf8 && outleft >= 3) {
-                        *outptr++ = 0xEF;
-                        *outptr++ = 0xBF;
-                        *outptr++ = 0xBD;
-                        outleft -= 3;
-                    } else if (outleft >= 1) {
-                        *outptr++ = '?';
-                        outleft--;
+            switch (errno) {
+                case E2BIG: {
+                    // Output buffer full - grow it
+                    size_t used = outptr - outbuf;
+                    size_t new_size = (size_t)(outbuf_size * BUFFER_GROWTH_RATE);
+                    if (new_size == outbuf_size) new_size += INITIAL_BUFFER_SIZE;
+                    
+                    char *new_buf = js_realloc(ctx, outbuf, new_size);
+                    if (!new_buf) {
+                        js_free(ctx, outbuf);
+                        JS_ThrowOutOfMemory(ctx);
+                        return -1;
                     }
+                    
+                    outbuf = new_buf;
+                    outptr = outbuf + used;
+                    outleft = new_size - used;
+                    outbuf_size = new_size;
+                    break;
                 }
-            } else {
-                js_free(ctx, outbuf);
-                return JS_ThrowTypeError(ctx, "iconv conversion error: %s", strerror(errno));
+                    
+                case EILSEQ:  // Invalid byte sequence in input
+                case EINVAL: { // Incomplete byte sequence at end of input
+                    if (fatal) {
+                        js_free(ctx, outbuf);
+                        JS_ThrowTypeError(ctx, "The encoded data was not valid for encoding %s", 
+                                         is_to_utf8 ? "UTF-8" : "target");
+                        return -1;
+                    }
+                    
+                    // Skip invalid byte
+                    if (inleft > 0) {
+                        inptr++;
+                        inleft--;
+                        
+                        // Insert replacement character only if converting to UTF-8
+                        // For non-UTF-8 targets, we skip without replacement (best effort)
+                        if (is_to_utf8 && outleft >= 3) {
+                            // U+FFFD in UTF-8: EF BF BD
+                            *outptr++ = (char)0xEF;
+                            *outptr++ = (char)0xBF;
+                            *outptr++ = (char)0xBD;
+                            outleft -= 3;
+                        } else if (!is_to_utf8 && outleft >= 1) {
+                            // For byte output, use '?' as replacement
+                            *outptr++ = '?';
+                            outleft--;
+                        }
+                    }
+                    break;
+                }
+                    
+                default:
+                    js_free(ctx, outbuf);
+                    JS_ThrowTypeError(ctx, "Encoding conversion error: %s", strerror(errno));
+                    return -1;
             }
         }
     }
     
-    total_written += (outptr - outbuf);
+    // Calculate actual output size
+    size_t total_out = outptr - outbuf;
     
+    // Create result based on output type
     if (is_to_utf8) {
-        JSValue result = JS_NewStringLen(ctx, outbuf, total_written);
-        js_free(ctx, outbuf);
-        return result;
+        *out_result = JS_NewStringLen(ctx, outbuf, total_out);
     } else {
-        JSValue result = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)outbuf, total_written);
-        js_free(ctx, outbuf);
-        return result;
+        *out_result = JS_NewUint8ArrayCopy(ctx, (uint8_t *)outbuf, total_out);
     }
+    
+    js_free(ctx, outbuf);
+    return JS_IsException(*out_result) ? -1 : 0;
 }
 
-#pragma region TextDecoder
-
-static JSClassID tjs_text_decoder_class_id;
+/* ============================================================================
+ * TextDecoder Implementation
+ * ============================================================================ */
 
 static void tjs_text_decoder_finalizer(JSRuntime *rt, JSValue val) {
-    TJSTextDecoder *decoder = JS_GetOpaque(val, tjs_text_decoder_class_id);
-    if (decoder) {
-        if (decoder->cd != (iconv_t)-1) {
-            iconv_close(decoder->cd);
-        }
-        if (decoder->encoding) {
-            js_free_rt(rt, decoder->encoding);
-        }
-        js_free_rt(rt, decoder);
+    decoder_t *dec = JS_GetOpaque(val, tjs_text_decoder_class_id);
+    if (!dec) return;
+    
+    if (dec->cd != (iconv_t)-1) {
+        iconv_close(dec->cd);
     }
+    if (dec->encoding) {
+        js_free_rt(rt, dec->encoding);
+    }
+    js_free_rt(rt, dec);
 }
 
 static JSClassDef tjs_text_decoder_class = {
@@ -194,81 +260,119 @@ static JSClassDef tjs_text_decoder_class = {
     .finalizer = tjs_text_decoder_finalizer,
 };
 
-/* new TextDecoder(encoding, options) */
+/*
+ * TextDecoder constructor(utfLabel, options)
+ * 
+ * Web API: new TextDecoder([utfLabel [, options]])
+ */
 static JSValue tjs_text_decoder_constructor(JSContext *ctx, JSValueConst new_target,
-                                             int argc, JSValueConst *argv) {
+                                            int argc, JSValueConst *argv) {
     JSValue obj = JS_NewObjectClass(ctx, tjs_text_decoder_class_id);
     if (JS_IsException(obj)) return obj;
     
-    TJSTextDecoder *decoder = js_mallocz(ctx, sizeof(*decoder));
-    if (!decoder) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
+    decoder_t *dec = js_mallocz(ctx, sizeof(*dec));
+    if (!dec) goto fail_obj;
     
-    decoder->ctx = ctx;
-    decoder->cd = (iconv_t)-1;
-    decoder->fatal = false;
-    decoder->ignore_bom = false;
+    dec->ctx = ctx;
+    dec->cd = (iconv_t)-1;
+    dec->pending_len = 0;
     
-    /* Parse encoding */
-    const char *encoding = argc > 0 ? JS_ToCString(ctx, argv[0]) : "utf-8";
-    if (!encoding) {
-        js_free(ctx, decoder);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
+    // Parse encoding label (defaults to "utf-8")
+    const char *label = argc > 0 ? JS_ToCString(ctx, argv[0]) : "utf-8";
+    if (!label) goto fail_dec;
     
-    decoder->encoding = js_strdup(ctx, encoding);
-    if (argc > 0) JS_FreeCString(ctx, encoding);
+    dec->encoding = js_strdup(ctx, normalize_encoding_name(label));
+    if (argc > 0) JS_FreeCString(ctx, label);
+    if (!dec->encoding) goto fail_dec;
     
-    /* Parse options */
+    // Parse options: {fatal: bool, ignoreBOM: bool}
     if (argc > 1 && JS_IsObject(argv[1])) {
         JSValue fatal_val = JS_GetPropertyStr(ctx, argv[1], "fatal");
         JSValue ignore_bom_val = JS_GetPropertyStr(ctx, argv[1], "ignoreBOM");
         
-        decoder->fatal = JS_ToBool(ctx, fatal_val);
-        decoder->ignore_bom = JS_ToBool(ctx, ignore_bom_val);
+        dec->fatal = JS_ToBool(ctx, fatal_val);
+        dec->ignore_bom = JS_ToBool(ctx, ignore_bom_val);
         
         JS_FreeValue(ctx, fatal_val);
         JS_FreeValue(ctx, ignore_bom_val);
     }
     
-    /* Create iconv descriptor */
-    decoder->cd = iconv_open("UTF-8", decoder->encoding);
-    ICONV_ERROR_CHECK(ctx, decoder->cd, "iconv_open");
+    // Initialize iconv for decoding (from encoding to UTF-8)
+    dec->cd = iconv_open("UTF-8", dec->encoding);
+    if (dec->cd == (iconv_t)-1) {
+        JS_ThrowTypeError(ctx, "Unsupported encoding: %s", dec->encoding);
+        goto fail_encoding;
+    }
     
-    JS_SetOpaque(obj, decoder);
+    JS_SetOpaque(obj, dec);
     return obj;
+    
+fail_encoding:
+    js_free(ctx, dec->encoding);
+fail_dec:
+    js_free(ctx, dec);
+fail_obj:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
 }
 
-/* decoder.decode(buffer, options) */
+/*
+ * Decode input buffer with streaming support.
+ * 
+ * Algorithm:
+ * 1. If pending bytes exist from previous stream, prepend to input
+ * 2. Process BOM if present and not ignored
+ * 3. Convert via iconv
+ * 4. If stream=true and incomplete sequence at end, save to pending
+ * 5. If stream=false and incomplete sequence remains, handle per fatal flag
+ */
 static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv) {
-    TJSTextDecoder *decoder = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
-    if (!decoder) return JS_EXCEPTION;
+                                       int argc, JSValueConst *argv) {
+    decoder_t *dec = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
+    if (!dec) return JS_EXCEPTION;
     
-    /* Get input buffer */
-    size_t size;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        /* Try to get typed array */
-        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
-        if (JS_IsException(buffer)) {
-            return JS_ThrowTypeError(ctx, "Argument must be ArrayBuffer or TypedArray");
+    // Extract input buffer (ArrayBuffer or TypedArray)
+    size_t inlen;
+    uint8_t *inbuf = NULL;
+    JSValue buffer_val = JS_UNDEFINED;
+    
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        inbuf = JS_GetArrayBuffer(ctx, &inlen, argv[0]);
+        if (!inbuf) {
+            // Try TypedArray
+            buffer_val = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
+            if (JS_IsException(buffer_val)) {
+                return JS_ThrowTypeError(ctx, "Argument must be an ArrayBuffer or ArrayBufferView");
+            }
+            inbuf = JS_GetArrayBuffer(ctx, &inlen, buffer_val);
         }
-        buf = JS_GetArrayBuffer(ctx, &size, buffer);
-        JS_FreeValue(ctx, buffer);
-        if (!buf) return JS_EXCEPTION;
     }
     
-    /* Handle BOM */
-    size_t offset = 0;
-    if (!decoder->ignore_bom) {
-        offset = skip_bom(buf, size, decoder->encoding);
+    // If no input, process any pending bytes or return empty string
+    if (!inbuf || inlen == 0) {
+        JS_FreeValue(ctx, buffer_val);
+        
+        // Check for stream option
+        bool stream = false;
+        if (argc > 1 && JS_IsObject(argv[1])) {
+            JSValue stream_val = JS_GetPropertyStr(ctx, argv[1], "stream");
+            stream = JS_ToBool(ctx, stream_val);
+            JS_FreeValue(ctx, stream_val);
+        }
+        
+        if (!stream && dec->pending_len > 0) {
+            // Flush pending buffer: either error or ignore based on fatal
+            if (dec->fatal) {
+                dec->pending_len = 0; // Clear state
+                return JS_ThrowTypeError(ctx, "Incomplete character sequence at end of stream");
+            }
+            dec->pending_len = 0;
+        }
+        
+        return JS_NewString(ctx, "");
     }
     
-    /* Parse stream option */
+    // Parse options
     bool stream = false;
     if (argc > 1 && JS_IsObject(argv[1])) {
         JSValue stream_val = JS_GetPropertyStr(ctx, argv[1], "stream");
@@ -276,36 +380,165 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, stream_val);
     }
     
-    /* Reset decoder if not streaming */
-    if (!stream) {
-        iconv(decoder->cd, NULL, NULL, NULL, NULL);
+    // Handle BOM detection (only on first call or if not streaming)
+    size_t bom_skip = 0;
+    if (dec->pending_len == 0) { // First chunk or non-streaming
+        bom_skip = detect_bom_skip(inbuf, inlen, dec->encoding, dec->ignore_bom);
     }
     
-    /* Convert */
-    return iconv_convert(ctx, decoder->cd, 
-                        (const char *)(buf + offset), size - offset,
-                        decoder->fatal, true);
+    // Calculate total input size including pending bytes
+    size_t total_inlen = dec->pending_len + (inlen - bom_skip);
+    char *total_input = NULL;
+    bool need_free_input = false;
+    
+    if (dec->pending_len > 0) {
+        // Merge pending + new data
+        total_input = js_malloc(ctx, total_inlen);
+        if (!total_input) {
+            JS_FreeValue(ctx, buffer_val);
+            return JS_EXCEPTION;
+        }
+        memcpy(total_input, dec->pending, dec->pending_len);
+        memcpy(total_input + dec->pending_len, inbuf + bom_skip, inlen - bom_skip);
+        need_free_input = true;
+    } else {
+        // Use input directly (skip BOM)
+        total_input = (char *)(inbuf + bom_skip);
+    }
+    
+    // Reset iconv state if not streaming (Web API requirement)
+    if (!stream) {
+        iconv(dec->cd, NULL, NULL, NULL, NULL);
+    }
+    
+    // Perform conversion
+    JSValue result;
+    char *inptr = total_input;
+    size_t inleft = total_inlen;
+    size_t outbuf_size = INITIAL_BUFFER_SIZE;
+    char *outbuf = js_malloc(ctx, outbuf_size);
+    
+    if (!outbuf) {
+        if (need_free_input) js_free(ctx, total_input);
+        JS_FreeValue(ctx, buffer_val);
+        return JS_EXCEPTION;
+    }
+    
+    char *outptr = outbuf;
+    size_t outleft = outbuf_size;
+    int conversion_status = 0; // 0=success, 1=incomplete, 2=error
+    
+    while (inleft > 0) {
+        size_t ret = iconv(dec->cd, &inptr, &inleft, &outptr, &outleft);
+        
+        if (ret == (size_t)-1) {
+            if (errno == E2BIG) {
+                // Grow output buffer
+                size_t used = outptr - outbuf;
+                size_t new_size = (size_t)(outbuf_size * BUFFER_GROWTH_RATE);
+                if (new_size == outbuf_size) new_size += INITIAL_BUFFER_SIZE;
+                
+                char *new_buf = js_realloc(ctx, outbuf, new_size);
+                if (!new_buf) {
+                    js_free(ctx, outbuf);
+                    if (need_free_input) js_free(ctx, total_input);
+                    JS_FreeValue(ctx, buffer_val);
+                    return JS_EXCEPTION;
+                }
+                outbuf = new_buf;
+                outptr = outbuf + used;
+                outleft = new_size - used;
+                outbuf_size = new_size;
+            } else if (errno == EINVAL) {
+                // Incomplete sequence at end
+                if (stream && inleft <= MAX_PENDING_BUFFER) {
+                    // Save to pending for next call
+                    memcpy(dec->pending, inptr, inleft);
+                    dec->pending_len = inleft;
+                    inleft = 0; // Mark as consumed
+                    conversion_status = 1;
+                } else {
+                    // Non-streaming or too big for pending
+                    if (dec->fatal) {
+                        conversion_status = 2;
+                        break;
+                    }
+                    // Skip byte and continue with replacement
+                    inptr++;
+                    inleft--;
+                    if (outleft >= 3) {
+                        *outptr++ = (char)0xEF;
+                        *outptr++ = (char)0xBF;
+                        *outptr++ = (char)0xBD;
+                        outleft -= 3;
+                    }
+                }
+            } else if (errno == EILSEQ) {
+                // Invalid sequence
+                if (dec->fatal) {
+                    conversion_status = 2;
+                    break;
+                }
+                inptr++;
+                inleft--;
+                if (outleft >= 3) {
+                    *outptr++ = (char)0xEF;
+                    *outptr++ = (char)0xBF;
+                    *outptr++ = (char)0xBD;
+                    outleft -= 3;
+                }
+            } else {
+                conversion_status = 2;
+                break;
+            }
+        }
+    }
+    
+    // Cleanup input buffer if we allocated it
+    if (need_free_input) js_free(ctx, total_input);
+    JS_FreeValue(ctx, buffer_val);
+    
+    // Handle conversion status
+    if (conversion_status == 2) {
+        js_free(ctx, outbuf);
+        if (errno == EINVAL || errno == EILSEQ) {
+            return JS_ThrowTypeError(ctx, "Invalid encoded data");
+        }
+        return JS_ThrowTypeError(ctx, "Decoding error: %s", strerror(errno));
+    }
+    
+    // If non-streaming, clear any pending state (shouldn't happen, but safety)
+    if (!stream) {
+        dec->pending_len = 0;
+    }
+    
+    // Create result string
+    size_t outlen = outptr - outbuf;
+    result = JS_NewStringLen(ctx, outbuf, outlen);
+    js_free(ctx, outbuf);
+    
+    return result;
 }
 
 /* Getter: decoder.encoding */
 static JSValue tjs_text_decoder_get_encoding(JSContext *ctx, JSValueConst this_val) {
-    TJSTextDecoder *decoder = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
-    if (!decoder) return JS_EXCEPTION;
-    return JS_NewString(ctx, decoder->encoding);
+    decoder_t *dec = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
+    if (!dec) return JS_EXCEPTION;
+    return JS_NewString(ctx, dec->encoding);
 }
 
 /* Getter: decoder.fatal */
 static JSValue tjs_text_decoder_get_fatal(JSContext *ctx, JSValueConst this_val) {
-    TJSTextDecoder *decoder = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
-    if (!decoder) return JS_EXCEPTION;
-    return JS_NewBool(ctx, decoder->fatal);
+    decoder_t *dec = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
+    if (!dec) return JS_EXCEPTION;
+    return JS_NewBool(ctx, dec->fatal);
 }
 
 /* Getter: decoder.ignoreBOM */
 static JSValue tjs_text_decoder_get_ignore_bom(JSContext *ctx, JSValueConst this_val) {
-    TJSTextDecoder *decoder = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
-    if (!decoder) return JS_EXCEPTION;
-    return JS_NewBool(ctx, decoder->ignore_bom);
+    decoder_t *dec = JS_GetOpaque2(ctx, this_val, tjs_text_decoder_class_id);
+    if (!dec) return JS_EXCEPTION;
+    return JS_NewBool(ctx, dec->ignore_bom);
 }
 
 static const JSCFunctionListEntry tjs_text_decoder_proto_funcs[] = {
@@ -315,21 +548,21 @@ static const JSCFunctionListEntry tjs_text_decoder_proto_funcs[] = {
     JS_CGETSET_DEF("ignoreBOM", tjs_text_decoder_get_ignore_bom, NULL),
 };
 
-#pragma region TextEncoder
-
-static JSClassID tjs_text_encoder_class_id;
+/* ============================================================================
+ * TextEncoder Implementation
+ * ============================================================================ */
 
 static void tjs_text_encoder_finalizer(JSRuntime *rt, JSValue val) {
-    TJSTextEncoder *encoder = JS_GetOpaque(val, tjs_text_encoder_class_id);
-    if (encoder) {
-        if (encoder->cd != (iconv_t)-1) {
-            iconv_close(encoder->cd);
-        }
-        if (encoder->encoding) {
-            js_free_rt(rt, encoder->encoding);
-        }
-        js_free_rt(rt, encoder);
+    encoder_t *enc = JS_GetOpaque(val, tjs_text_encoder_class_id);
+    if (!enc) return;
+    
+    if (enc->cd != (iconv_t)-1) {
+        iconv_close(enc->cd);
     }
+    if (enc->encoding) {
+        js_free_rt(rt, enc->encoding);
+    }
+    js_free_rt(rt, enc);
 }
 
 static JSClassDef tjs_text_encoder_class = {
@@ -337,112 +570,157 @@ static JSClassDef tjs_text_encoder_class = {
     .finalizer = tjs_text_encoder_finalizer,
 };
 
-/* new TextEncoder(encoding) */
+/*
+ * TextEncoder constructor()
+ * 
+ * Web API: new TextEncoder()
+ * Note: Web standard only supports UTF-8. We accept an optional encoding
+ * parameter for extended usage, but default to UTF-8.
+ */
 static JSValue tjs_text_encoder_constructor(JSContext *ctx, JSValueConst new_target,
-                                             int argc, JSValueConst *argv) {
+                                            int argc, JSValueConst *argv) {
     JSValue obj = JS_NewObjectClass(ctx, tjs_text_encoder_class_id);
     if (JS_IsException(obj)) return obj;
     
-    TJSTextEncoder *encoder = js_mallocz(ctx, sizeof(*encoder));
-    if (!encoder) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+    encoder_t *enc = js_mallocz(ctx, sizeof(*enc));
+    if (!enc) goto fail_obj;
+    
+    enc->ctx = ctx;
+    enc->cd = (iconv_t)-1;
+    
+    // Parse encoding (defaults to utf-8, standard Web API behavior)
+    const char *label = argc > 0 ? JS_ToCString(ctx, argv[0]) : "utf-8";
+    if (!label) goto fail_enc;
+    
+    enc->encoding = js_strdup(ctx, normalize_encoding_name(label));
+    if (argc > 0) JS_FreeCString(ctx, label);
+    if (!enc->encoding) goto fail_enc;
+    
+    // Initialize iconv (UTF-8 to target encoding)
+    enc->cd = iconv_open(enc->encoding, "UTF-8");
+    if (enc->cd == (iconv_t)-1) {
+        JS_ThrowTypeError(ctx, "Unsupported encoding for TextEncoder: %s", enc->encoding);
+        goto fail_encoding;
     }
     
-    encoder->ctx = ctx;
-    encoder->cd = (iconv_t)-1;
-    
-    /* Parse encoding */
-    const char *encoding = argc > 0 ? JS_ToCString(ctx, argv[0]) : "utf-8";
-    if (!encoding) {
-        js_free(ctx, encoder);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    
-    encoder->encoding = js_strdup(ctx, encoding);
-    if(argc > 0) JS_FreeCString(ctx, encoding);
-    
-    /* Create iconv descriptor */
-    encoder->cd = iconv_open(encoder->encoding, "UTF-8");
-    ICONV_ERROR_CHECK(ctx, encoder->cd, "iconv_open");
-    
-    JS_SetOpaque(obj, encoder);
+    JS_SetOpaque(obj, enc);
     return obj;
+    
+fail_encoding:
+    js_free(ctx, enc->encoding);
+fail_enc:
+    js_free(ctx, enc);
+fail_obj:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
 }
 
-/* encoder.encode(string) */
+/*
+ * encoder.encode(string)
+ * Returns: Uint8Array
+ */
 static JSValue tjs_text_encoder_encode(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv) {
-    TJSTextEncoder *encoder = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
-    if (!encoder) return JS_EXCEPTION;
-    
-    size_t len;
-    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!str) return JS_EXCEPTION;
-    
-    /* Reset encoder state */
-    iconv(encoder->cd, NULL, NULL, NULL, NULL);
-    
-    /* Convert */
-    JSValue result = iconv_convert(ctx, encoder->cd, str, len, true, false);
-    JS_FreeCString(ctx, str);
-    
-    return result;
-}
-
-/* encoder.encodeInto(string, buffer) */
-static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_val,
-                                              int argc, JSValueConst *argv) {
-    TJSTextEncoder *encoder = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
-    if (!encoder) return JS_EXCEPTION;
+                                       int argc, JSValueConst *argv) {
+    encoder_t *enc = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
+    if (!enc) return JS_EXCEPTION;
     
     size_t str_len;
     const char *str = JS_ToCStringLen(ctx, &str_len, argv[0]);
     if (!str) return JS_EXCEPTION;
     
-    /* Get output buffer */
-    size_t buf_size;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    // Reset iconv state
+    iconv(enc->cd, NULL, NULL, NULL, NULL);
+    
+    JSValue result;
+    int ret = perform_iconv_conversion(ctx, enc->cd, str, str_len, 
+                                       true, false, &result);
+    JS_FreeCString(ctx, str);
+    
+    return ret == 0 ? result : JS_EXCEPTION;
+}
+
+/*
+ * encoder.encodeInto(string, uint8Array)
+ * Returns: {read: number, written: number}
+ * 
+ * Web API encodes as much as possible into the provided buffer without
+ * overflow. Returns counts of source chars read and bytes written.
+ */
+static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv) {
+    encoder_t *enc = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
+    if (!enc) return JS_EXCEPTION;
+    
+    // Get source string
+    size_t str_len;
+    const char *str = JS_ToCStringLen(ctx, &str_len, argv[0]);
+    if (!str) return JS_EXCEPTION;
+    
+    // Get destination buffer (TypedArray or ArrayBuffer)
+    size_t buf_len;
+    uint8_t *buf = JS_GetArrayBuffer(ctx, &buf_len, argv[1]);
+    JSValue buf_holder = JS_UNDEFINED;
+    
     if (!buf) {
-        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[1], NULL, NULL, NULL);
-        if (JS_IsException(buffer)) {
+        buf_holder = JS_GetTypedArrayBuffer(ctx, argv[1], NULL, NULL, NULL);
+        if (JS_IsException(buf_holder)) {
             JS_FreeCString(ctx, str);
-            return JS_ThrowTypeError(ctx, "Second argument must be ArrayBuffer or TypedArray");
+            return JS_ThrowTypeError(ctx, "Second argument must be an ArrayBufferView");
         }
-        buf = JS_GetArrayBuffer(ctx, &buf_size, buffer);
-        JS_FreeValue(ctx, buffer);
-        if (!buf) {
-            JS_FreeCString(ctx, str);
-            return JS_EXCEPTION;
-        }
+        buf = JS_GetArrayBuffer(ctx, &buf_len, buf_holder);
     }
     
-    /* Reset encoder state */
-    iconv(encoder->cd, NULL, NULL, NULL, NULL);
+    if (!buf) {
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, buf_holder);
+        return JS_EXCEPTION;
+    }
     
-    /* Convert into buffer */
+    // Reset iconv state
+    iconv(enc->cd, NULL, NULL, NULL, NULL);
+    
+    // Perform conversion directly into user buffer
     char *inptr = (char *)str;
     char *outptr = (char *)buf;
     size_t inleft = str_len;
-    size_t outleft = buf_size;
+    size_t outleft = buf_len;
+    size_t read = 0;
+    size_t written = 0;
+    bool error = false;
     
-    size_t ret = iconv(encoder->cd, &inptr, &inleft, &outptr, &outleft);
-    size_t read = str_len - inleft;
-    size_t written = buf_size - outleft;
+    while (inleft > 0 && outleft > 0) {
+        size_t ret = iconv(enc->cd, &inptr, &inleft, &outptr, &outleft);
+        
+        if (ret == (size_t)-1) {
+            if (errno == E2BIG) {
+                // Output buffer full - this is expected, stop here
+                break;
+            } else if (errno == EILSEQ || errno == EINVAL) {
+                // Invalid input sequence - skip and continue
+                inptr++;
+                inleft--;
+                if (outleft > 0) {
+                    *outptr++ = '?';
+                    outleft--;
+                }
+            } else {
+                error = true;
+                break;
+            }
+        }
+    }
+    
+    read = str_len - inleft;
+    written = buf_len - outleft;
     
     JS_FreeCString(ctx, str);
-
-	if (ret == -1){
-		if (errno == EILSEQ || errno == EINVAL) {
-			/* Invalid input byte sequence */
-			return JS_ThrowTypeError(ctx, "Invalid input byte sequence");
-		} else {
-			return JS_ThrowTypeError(ctx, "iconv conversion error(errno=%d): %s", errno, strerror(errno));
-		}
-	}
+    JS_FreeValue(ctx, buf_holder);
     
-    /* Return result object */
+    if (error) {
+        return JS_ThrowTypeError(ctx, "Encoding conversion failed: %s", strerror(errno));
+    }
+    
+    // Return result object {read, written}
     JSValue result = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, result, "read", JS_NewInt64(ctx, read));
     JS_SetPropertyStr(ctx, result, "written", JS_NewInt64(ctx, written));
@@ -450,11 +728,12 @@ static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_va
     return result;
 }
 
-/* Getter: encoder.encoding */
+/* Getter: encoder.encoding (Web API requires "utf-8") */
 static JSValue tjs_text_encoder_get_encoding(JSContext *ctx, JSValueConst this_val) {
-    TJSTextEncoder *encoder = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
-    if (!encoder) return JS_EXCEPTION;
-    return JS_NewString(ctx, encoder->encoding);
+    encoder_t *enc = JS_GetOpaque2(ctx, this_val, tjs_text_encoder_class_id);
+    if (!enc) return JS_EXCEPTION;
+    // Per Web API spec, TextEncoder always reports "utf-8"
+    return JS_NewString(ctx, "utf-8");
 }
 
 static const JSCFunctionListEntry tjs_text_encoder_proto_funcs[] = {
@@ -463,11 +742,21 @@ static const JSCFunctionListEntry tjs_text_encoder_proto_funcs[] = {
     JS_CGETSET_DEF("encoding", tjs_text_encoder_get_encoding, NULL),
 };
 
-#pragma region Utility Functions
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================ */
 
-/* convert(from, to, data) */
+/*
+ * Convert data between arbitrary encodings.
+ * Usage: convert(fromEncoding, toEncoding, uint8Array)
+ * Returns: string if toEncoding is UTF-8, else Uint8Array
+ */
 static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv) {
+                                int argc, JSValueConst *argv) {
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "convert requires 3 arguments: from, to, data");
+    }
+    
     const char *from = JS_ToCString(ctx, argv[0]);
     const char *to = JS_ToCString(ctx, argv[1]);
     if (!from || !to) {
@@ -477,52 +766,80 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     }
     
     iconv_t cd = iconv_open(to, from);
-    JS_FreeCString(ctx, from);
-    JS_FreeCString(ctx, to);
-    ICONV_ERROR_CHECK(ctx, cd, "iconv_open");
+    if (cd == (iconv_t)-1) {
+        JS_FreeCString(ctx, from);
+        JS_FreeCString(ctx, to);
+        return JS_ThrowTypeError(ctx, "Conversion from %s to %s not supported", from, to);
+    }
     
-    /* Get input data */
-    size_t size;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[2]);
-    if (!buf) {
-        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[2], NULL, NULL, NULL);
-        if (JS_IsException(buffer)) {
+    // Extract input data
+    size_t inlen;
+    uint8_t *inbuf = NULL;
+    JSValue buf_holder = JS_UNDEFINED;
+    
+    inbuf = JS_GetArrayBuffer(ctx, &inlen, argv[2]);
+    if (!inbuf) {
+        buf_holder = JS_GetTypedArrayBuffer(ctx, argv[2], NULL, NULL, NULL);
+        if (JS_IsException(buf_holder)) {
             iconv_close(cd);
-            return JS_ThrowTypeError(ctx, "Third argument must be ArrayBuffer or TypedArray");
+            JS_FreeCString(ctx, from);
+            JS_FreeCString(ctx, to);
+            return JS_ThrowTypeError(ctx, "Third argument must be an ArrayBufferView");
         }
-        buf = JS_GetArrayBuffer(ctx, &size, buffer);
-        JS_FreeValue(ctx, buffer);
-        if (!buf) {
-            iconv_close(cd);
-            return JS_EXCEPTION;
-        }
+        inbuf = JS_GetArrayBuffer(ctx, &inlen, buf_holder);
+    }
+    
+    if (!inbuf) {
+        iconv_close(cd);
+        JS_FreeCString(ctx, from);
+        JS_FreeCString(ctx, to);
+        JS_FreeValue(ctx, buf_holder);
+        return JS_EXCEPTION;
     }
     
     bool is_to_utf8 = (strcasecmp(to, "UTF-8") == 0);
-    JSValue result = iconv_convert(ctx, cd, (const char *)buf, size, false, is_to_utf8);
+    JSValue result;
+    int ret = perform_iconv_conversion(ctx, cd, (char *)inbuf, inlen, 
+                                       false, is_to_utf8, &result);
     
     iconv_close(cd);
-    return result;
+    JS_FreeCString(ctx, from);
+    JS_FreeCString(ctx, to);
+    JS_FreeValue(ctx, buf_holder);
+    
+    return ret == 0 ? result : JS_EXCEPTION;
 }
 
-/* listEncodings() */
+/*
+ * Return list of commonly supported encodings.
+ * Note: Actual availability depends on system iconv implementation.
+ */
 static JSValue tjs_text_list_encodings(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv) {
-    /* Common encodings supported by most iconv implementations */
-    const char *encodings[] = {
-        "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE", "UTF-32", "UTF-32BE", "UTF-32LE",
-        "ASCII", "ISO-8859-1", "ISO-8859-2", "ISO-8859-3", "ISO-8859-4", "ISO-8859-5",
-        "ISO-8859-6", "ISO-8859-7", "ISO-8859-8", "ISO-8859-9", "ISO-8859-10",
-        "ISO-8859-13", "ISO-8859-14", "ISO-8859-15", "ISO-8859-16",
-        "Windows-1250", "Windows-1251", "Windows-1252", "Windows-1253", "Windows-1254",
-        "Windows-1255", "Windows-1256", "Windows-1257", "Windows-1258",
-        "GB2312", "GBK", "GB18030", "BIG5", "EUC-JP", "SHIFT_JIS", "ISO-2022-JP",
-        "EUC-KR", "KOI8-R", "KOI8-U", "TIS-620"
+                                       int argc, JSValueConst *argv) {
+    static const char *encodings[] = {
+        "UTF-8",
+        "UTF-16LE", "UTF-16BE",
+        "UTF-32LE", "UTF-32BE",
+        "ASCII", "ISO-8859-1", "ISO-8859-15",
+        "Windows-1252", "Windows-1251",
+        "GBK", "GB18030", "Big5",
+        "EUC-JP", "Shift_JIS", "ISO-2022-JP",
+        "EUC-KR",
+        "KOI8-R", "KOI8-U",
+        "macintosh",
+        "IBM866"
     };
     
     JSValue arr = JS_NewArray(ctx);
+    if (JS_IsException(arr)) return arr;
+    
     for (size_t i = 0; i < sizeof(encodings) / sizeof(encodings[0]); i++) {
-        JS_SetPropertyUint32(ctx, arr, i, JS_NewString(ctx, encodings[i]));
+        JSValue str = JS_NewString(ctx, encodings[i]);
+        if (JS_IsException(str)) {
+            JS_FreeValue(ctx, arr);
+            return JS_EXCEPTION;
+        }
+        JS_SetPropertyUint32(ctx, arr, i, str);
     }
     
     return arr;
@@ -533,38 +850,44 @@ static const JSCFunctionListEntry tjs_text_funcs[] = {
     JS_CFUNC_DEF("listEncodings", 0, tjs_text_list_encodings),
 };
 
+/* ============================================================================
+ * Module Initialization
+ * ============================================================================ */
 
 void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    
     /* Register TextDecoder */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_text_decoder_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_text_decoder_class_id, &tjs_text_decoder_class);
+    JS_NewClassID(rt, &tjs_text_decoder_class_id);
+    JS_NewClass(rt, tjs_text_decoder_class_id, &tjs_text_decoder_class);
     
     JSValue decoder_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, decoder_proto, tjs_text_decoder_proto_funcs,
-                              countof(tjs_text_decoder_proto_funcs));
+                               sizeof(tjs_text_decoder_proto_funcs) / sizeof(JSCFunctionListEntry));
     JS_SetClassProto(ctx, tjs_text_decoder_class_id, decoder_proto);
     
     JSValue decoder_ctor = JS_NewCFunction2(ctx, tjs_text_decoder_constructor,
-                                           "TextDecoder", 2,
-                                           JS_CFUNC_constructor, 0);
-	JS_SetConstructor(ctx, decoder_ctor, decoder_proto);
+                                            "TextDecoder", 2,
+                                            JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, decoder_ctor, decoder_proto);
     JS_SetPropertyStr(ctx, ns, "Decoder", decoder_ctor);
     
     /* Register TextEncoder */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_text_encoder_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_text_encoder_class_id, &tjs_text_encoder_class);
+    JS_NewClassID(rt, &tjs_text_encoder_class_id);
+    JS_NewClass(rt, tjs_text_encoder_class_id, &tjs_text_encoder_class);
     
     JSValue encoder_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, encoder_proto, tjs_text_encoder_proto_funcs,
-                              countof(tjs_text_encoder_proto_funcs));
+                               sizeof(tjs_text_encoder_proto_funcs) / sizeof(JSCFunctionListEntry));
     JS_SetClassProto(ctx, tjs_text_encoder_class_id, encoder_proto);
     
     JSValue encoder_ctor = JS_NewCFunction2(ctx, tjs_text_encoder_constructor,
-                                           "TextEncoder", 1,
-                                           JS_CFUNC_constructor, 0);
-	JS_SetConstructor(ctx, encoder_ctor, encoder_proto);
+                                            "TextEncoder", 1,
+                                            JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, encoder_ctor, encoder_proto);
     JS_SetPropertyStr(ctx, ns, "Encoder", encoder_ctor);
     
     /* Register utility functions */
-    JS_SetPropertyFunctionList(ctx, ns, tjs_text_funcs, countof(tjs_text_funcs));
+    JS_SetPropertyFunctionList(ctx, ns, tjs_text_funcs,
+                               sizeof(tjs_text_funcs) / sizeof(JSCFunctionListEntry));
 }

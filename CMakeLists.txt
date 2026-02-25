@@ -215,6 +215,11 @@ endif()
     endif()
 # endif()
 
+if (BUILD_WITH_MIMALLOC)
+    target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
+    target_link_libraries(cjs mimalloc-static)
+endif()
+
 set_target_properties(cjs PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
@@ -226,11 +231,6 @@ target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(cjs PUBLIC src)
 # libutil is required for openpty
 target_link_libraries(cjs qjs uv sqlite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT util)
-
-if (BUILD_WITH_MIMALLOC)
-    target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
-    target_link_libraries(cjs mimalloc-static)
-endif()
 
 add_executable(cjs-cli
     src/cli.c

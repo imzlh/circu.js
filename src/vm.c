@@ -33,7 +33,13 @@
 #include <string.h>
 #include <assert.h>
 
+#ifdef CJS__HAS_WASM
+#include "wasm_export.h"
+#endif
+
 #define TJS__DEFAULT_STACK_SIZE 1024 * 1024  // 1 MB
+
+int8_t vm_exit_code;
 
 /* JS malloc functions */
 
@@ -207,7 +213,7 @@ JSValue tjs__get_args(JSContext *ctx) {
     return args;
 }
 
-JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data) {
+JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents ev, JSValue data) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
@@ -215,13 +221,15 @@ JSValue tjs__dispatch_event(JSContext *ctx, const char* evname, JSValue data) {
         return JS_UNDEFINED;
     }
 
-	JSValue evname_obj = JS_NewString(ctx, evname);
     JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
-		evname_obj, data
+		JS_NewInt32(ctx, ev), data
 	});
-	JS_FreeValue(ctx, evname_obj);
-
     return ret;
+}
+
+void tjs__dispatch_event2(JSContext *ctx, TJSEvents ev, JSValue data) {
+    JSValue ret = tjs__dispatch_event(ctx, ev, data);
+	JS_FreeValue(ctx, ret);
 }
 
 static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col){
@@ -245,7 +253,7 @@ static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
 		JS_DupValue(ctx, promise),
 		JS_DupValue(ctx, parent_promise)
 	});
-	tjs__dispatch_event(ctx, "promise", args);
+	tjs__dispatch_event2(ctx, EV_PROMISE, args);
 	JS_FreeValue(ctx, args);
 }
 
@@ -266,7 +274,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
 			JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
 		});
 
-        JSValue ret = tjs__dispatch_event(ctx, "unhandledrejection", args);
+        JSValue ret = tjs__dispatch_event(ctx, EV_UNHANDLED_REJECTION, args);
 		JS_FreeValue(ctx, args);
 
         if (JS_IsException(ret)) {
@@ -345,7 +353,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
 	/* Debug */
 #ifdef DEBUG
-	JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_ATOM_LEAKS);
+	// JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_ATOM_LEAKS);
 #endif
 
     /* Worker support */
@@ -401,7 +409,33 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* WASM */
 #ifdef CJS__HAS_WASM
-    qrt->wasm_ctx.initialized = false;
+
+// 	RunningMode pref_mode;
+// #define MCHECK(mode) if (wasm_runtime_is_running_mode_supported (mode)) pref_mode = mode; else
+// 	MCHECK(Mode_Multi_Tier_JIT) MCHECK(Mode_Fast_JIT) MCHECK(Mode_Interp) abort();
+// #undef MCHECK
+
+// 	RuntimeInitArgs init_args = {
+// 		.mem_alloc_type = Alloc_With_Allocator,
+// 		.mem_alloc_option = {
+// 			.allocator = {
+// 				.malloc_func = tjs__malloc,
+// 				.realloc_func = tjs__realloc,
+// 				.free_func = tjs__free,
+// 				.user_data = NULL
+// 			}
+// 		},
+// 		.max_thread_num = 0,
+// 		.running_mode = pref_mode,
+// 		0				// NULL padding
+// 	};
+
+// 	CHECK_EQ(wasm_runtime_full_init(&init_args), true);
+    wasm_runtime_init();
+
+#ifdef DEBUG
+	wasm_runtime_set_log_level(WASM_LOG_LEVEL_VERBOSE);
+#endif
 #endif
 
     /* Timers */
@@ -449,7 +483,7 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 
     /* Destroy WASM runtime. */
 #ifdef CJS__HAS_WASM
-    tjs__mod_wasm_cleanup(qrt);
+    wasm_runtime_destroy();
 #endif
 
     /* Cleanup loop. All handles should be closed. */
@@ -527,7 +561,7 @@ void tjs__execute_jobs(JSContext *ctx) {
         if (err <= 0) {
             if (err < 0) {
 				JSValue err = JS_GetException(ctx1);
-				JSValue retv = tjs__dispatch_event(ctx, "jobexception", err);
+				JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
 				JS_FreeValue(ctx, err);
 				if (JS_IsEqual(ctx, retv, JS_FALSE)) {
 					TJS_Stop(trt);
@@ -627,8 +661,6 @@ void tjs__run_main(TJSRuntime* qrt) {
 
 /* main loop which calls the user JS callbacks */
 int TJS_Run(TJSRuntime *qrt) {
-    int ret = 0;
-
     CHECK_EQ(uv_prepare_start(&qrt->jobs.prepare, uv__prepare_cb), 0);
     uv_unref((uv_handle_t *) &qrt->jobs.prepare);
     CHECK_EQ(uv_check_start(&qrt->jobs.check, uv__check_cb), 0);
@@ -641,9 +673,9 @@ int TJS_Run(TJSRuntime *qrt) {
 		tjs__run_main(qrt);
     }
 
-    if (ret != 0) {
-        return ret;
-    }
+	if (vm_exit_code != 0) {
+		return vm_exit_code;
+	}
 
     int r;
     do {
@@ -651,11 +683,13 @@ int TJS_Run(TJSRuntime *qrt) {
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
     } while (r == 0 && JS_IsJobPending(qrt->rt));
 
-    return ret;
+	return vm_exit_code;
 }
 
 void TJS_Stop(TJSRuntime *qrt) {
     CHECK_NOT_NULL(qrt);
+	if (vm_exit_code == 0) vm_exit_code = 1;
+	tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, vm_exit_code));
     uv_async_send(&qrt->stop);
 }
 
@@ -713,7 +747,7 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
 
     /* Emit window 'load' event. */
     if (!JS_IsException(ret) && is_main) {
-		JSValue ret = tjs__dispatch_event(ctx, "load", JS_UNDEFINED);
+		JSValue ret = tjs__dispatch_event(ctx, EV_LOAD, JS_UNDEFINED);
 		if (JS_IsException(ret)){
 			tjs_dump_error(ctx);
 		}

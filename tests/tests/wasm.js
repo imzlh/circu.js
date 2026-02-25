@@ -1,4 +1,3 @@
-// @ts-check
 const wasm = import.meta.use('wasm');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -19,12 +18,14 @@ test('wasm', () => {
     instance.exports.trigger();
 });
 
-// test('wasm:memory', () => {
-//     const mem = new wasm.Memory({
-//         initial: 1,
-//         maximum: 1,
-//         shared: false
-//     });
-//     mem.grow(1);
-//     assert(mem.buffer.byteLength == 2);
-// })
+test('wasm:memory', () => {
+    const mem = new wasm.Memory({
+        initial: 1,
+        maximum: 2,
+        shared: false
+    });
+    assert(mem.buffer.byteLength == 65536);
+    mem.grow(1);
+    console.log(mem.buffer.byteLength);
+    assert(mem.buffer.byteLength == 2 * 65536);
+})

@@ -476,7 +476,11 @@ static int build_mem_wasm(uint8_t *out, size_t cap,
                            uint32_t init, uint32_t max, bool has_max) {
     if (cap < 32) return -1;
     uint8_t *p = out;
-    memcpy(p, "\x00asm\x01\x00\x00\x00", 8); p += 8;
+	static uint8_t wasm_header[8] = {
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 
+	};
+
+    memcpy(p, wasm_header, 8); p += 8;
 
     uint8_t limits[12]; int ll = 0;
     if (has_max) {
@@ -488,7 +492,7 @@ static int build_mem_wasm(uint8_t *out, size_t cap,
         ll += leb_u32(limits + ll, init);
     }
     *p++ = 5;                               /* section id: memory */
-    p   += leb_u32(p, 1 + (uint32_t)ll);   /* section size       */
+    p   += leb_u32(p, 1 + (uint32_t)ll);    /* section size       */
     *p++ = 1;                               /* count              */
     memcpy(p, limits, (size_t)ll); p += ll;
     return (int)(p - out);
@@ -520,15 +524,22 @@ static JSValue mem_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
     if (!m) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
     JS_SetOpaque(obj, m);
 
-    uint8_t buf[64];
-    int     sz  = build_mem_wasm(buf, sizeof(buf), init, max, has_max);
-    if (sz < 0) { JS_FreeValue(ctx, obj); return wasm_err(ctx, "RangeError", "Bad descriptor"); }
-
+    /* buf must stay alive until unload; use heap + wasm_binary_freeable so
+     * WAMR copies what it needs internally, then we can free immediately */
+    uint8_t *buf = js_malloc(ctx, 64);
+    if (!buf) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
+    int sz = build_mem_wasm(buf, 64, init, max, has_max);
+    if (sz < 0) {
+        js_free(ctx, buf); JS_FreeValue(ctx, obj);
+        return wasm_err(ctx, "RangeError", "Bad descriptor");
+    }
     char          err[WASM_ERR_SZ];
-    wasm_module_t mod = wasm_runtime_load(buf, (uint32_t)sz, err, sizeof(err));
+    LoadArgs      la  = { .wasm_binary_freeable = true };
+    wasm_module_t mod = wasm_runtime_load_ex(buf, (uint32_t)sz, &la, err, sizeof(err));
+    js_free(ctx, buf);
     if (!mod) { JS_FreeValue(ctx, obj); return wasm_err(ctx, "CompileError", err); }
     m->inst = wasm_runtime_instantiate(mod, WASM_STACK_SIZE, WASM_HEAP_SIZE, err, sizeof(err));
-    wasm_runtime_unload(mod);   /* module no longer needed once instantiated */
+    wasm_runtime_unload(mod);
     if (!m->inst) { JS_FreeValue(ctx, obj); return wasm_err(ctx, "LinkError", err); }
 
     m->owned = true;
@@ -571,6 +582,7 @@ static JSValue mem_grow(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
 /* ------------------------------------------------------------------ */
 /* WasmTable  (pure JS, no WAMR)                                       */
 /* ------------------------------------------------------------------ */
+
 
 static JSValue fn_call(JSContext *ctx, JSValue tv, int argc, JSValue *argv,
                         int magic, JSValue *data) {
@@ -860,7 +872,6 @@ static void fn_finalizer(JSRuntime *rt, JSValue val) {
 }
 static JSClassDef js_fn_classdef = { "Func", .finalizer = fn_finalizer };
 
-
 /* ------------------------------------------------------------------ */
 /* WasmInstance                                                         */
 /* ------------------------------------------------------------------ */
@@ -1124,12 +1135,6 @@ static const JSCFunctionListEntry js_glb_proto[] = {
 
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns) {
     JSRuntime  *rt  = JS_GetRuntime(ctx);
-    TJSRuntime *qrt = TJS_GetRuntime(ctx);
-
-    if (!qrt->wasm_ctx.initialized) {
-        wasm_runtime_init();
-        qrt->wasm_ctx.initialized = true;
-    }
 
     REGCLS_BARE("Module",   js_mod_cls,  js_mod_classdef,  mod_ctor,  1);
     REGCLS("Instance", js_inst_cls, js_inst_classdef, js_inst_proto, inst_ctor, 1);
@@ -1153,11 +1158,4 @@ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns) {
     DEF_FN("instantiate", wasm_instantiate, 1);
     DEF_FN("validate",    wasm_validate,    1);
     #undef DEF_FN
-}
-
-void tjs__mod_wasm_cleanup(TJSRuntime *qrt) {
-    if (qrt->wasm_ctx.initialized) {
-        wasm_runtime_destroy();
-        qrt->wasm_ctx.initialized = false;
-    }
 }

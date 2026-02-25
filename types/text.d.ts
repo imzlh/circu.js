@@ -267,6 +267,8 @@ declare namespace CModuleText {
         fatal?: boolean;
         /** If true, ignore byte order mark (BOM) */
         ignoreBOM?: boolean;
+        /** If true, maintain state for streaming decode */
+        stream?: boolean;
     }
 
     /**

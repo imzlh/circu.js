@@ -60,11 +60,20 @@ declare namespace CModuleEngine {
         FULFILLED
     }
 
+    export enum EventType {
+        PROMISE = 0,
+        UNHANDLED_REJECTION,
+        JOB_EXCEPTION,
+        EXIT,
+        LOAD
+    }
+
     interface GlobalEvents {
-        unhandledrejection: [this: Promise, error: Error | any],
-        exit: [exitCode: number],
-        promise: [this: Promise, state: PromiseState, parent: Promise],
-        jobexception: [error: Error | any],
+        [EventType.PROMISE]: [this: Promise, error: Error | any],
+        [EventType.EXIT]: [exitCode: number],
+        [EventType.UNHANDLED_REJECTION]: [this: Promise, state: PromiseState, parent: Promise],
+        [EventType.JOB_EXCEPTION]: [error: Error | any],
+        [EventType.LOAD]: []
     }
 
     /**
@@ -283,7 +292,7 @@ declare namespace CModuleEngine {
      * 事件接收器函数，返回true表示事件已处理，否则可能被底层处理，如退出
      */
     export function onEvent(cb:
-        <T extends keyof GlobalEvents>(eventName: T, eventData: GlobalEvents[T]) => boolean
+        <T extends EventType>(eventName: T, eventData: GlobalEvents[T]) => boolean
     ): void;
 
     /**
