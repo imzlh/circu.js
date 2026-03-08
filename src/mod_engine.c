@@ -597,7 +597,6 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, versions, "sqlite3", JS_NewString(ctx, sqlite3_libversion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "zlib", JS_NewString(ctx, zlibVersion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "openssl", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)), JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, versions, "expat", JS_NewString(ctx, XML_ExpatVersion()), JS_PROP_C_W_E);
 
 	JS_DefinePropertyValueStr(ctx, versions, "llhttp", JS_NewString(ctx, LLHTTP_VERSION), JS_PROP_C_W_E);
 #ifdef CJS__HAS_WASM
@@ -608,6 +607,16 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 #ifdef CJS__HAS_MIMALLOC
     JS_DefinePropertyValueStr(ctx, versions, "mimalloc", JS_NewInt32(ctx, mi_version()), JS_PROP_C_W_E);
 #endif
+
+	
+    /* Export version info */
+	JS_SetPropertyStr(ctx, ns, "EXPAT_VERSION", JS_NewString(ctx,
+#ifdef HAVE_XML_EXPAT_VERSION
+    XML_ExpatVersion()
+#else
+	STRINGIFY(XML_MAJOR_VERSION) "." STRINGIFY(XML_MINOR_VERSION) "." STRINGIFY(XML_MICRO_VERSION)
+#endif
+	));
 
     JSValue gc = JS_NewObjectProto(ctx, JS_NULL);
     JS_SetPropertyFunctionList(ctx, gc, tjs_gc_funcs, countof(tjs_gc_funcs));

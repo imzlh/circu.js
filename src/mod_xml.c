@@ -389,14 +389,4 @@ void tjs__mod_xml_init(JSContext *ctx, JSValue ns) {
     JS_SetConstructor(ctx, constructor, proto);
     JS_SetPropertyStr(ctx, ns, "XMLParser", constructor);
     JS_SetPropertyFunctionList(ctx, ns, tjs_xml_funcs, countof(tjs_xml_funcs));
-    
-    /* Export version info */
-	JS_SetPropertyStr(ctx, ns, "EXPAT_VERSION",
-                     JS_NewString(ctx,
-#ifdef HAVE_XML_EXPAT_VERSION
-    XML_ExpatVersion()
-#else
-	STRINGIFY(XML_MAJOR_VERSION) "." STRINGIFY(XML_MINOR_VERSION) "." STRINGIFY(XML_MICRO_VERSION)
-#endif
-					 ));
 }

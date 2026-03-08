@@ -102,6 +102,7 @@ if(EXPAT_FOUND)
     
     if(NOT HAVE_XML_EXPAT_VERSION)
         message(STATUS "Old expat detected - using version macros instead of XML_ExpatVersion()")
+        add_compile_definitions(HAVE_XML_EXPAT_VERSION)
     endif()
 endif()
 
