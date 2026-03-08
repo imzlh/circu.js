@@ -613,7 +613,7 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &_empty, &_empty, &_empty);
 
     put_color(buf, opts, ANSI_MAGENTA);
-    dbuf_printf(buf, "%s(%zu) [ ", name, len);
+    dbuf_printf(buf, "%s(%" PRId64 ") [ ", name, len);
     put_reset(buf, opts);
 
 	JS_GetLength(ctx, val, &len);
@@ -626,7 +626,7 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     }
     if (len > show) {
         put_color(buf, opts, ANSI_GRAY);
-        dbuf_printf(buf, ", ... %zu more items", len - show);
+        dbuf_printf(buf, ", ... %" PRId64 " more items", len - show);
         put_reset(buf, opts);
     }
 

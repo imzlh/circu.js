@@ -50,6 +50,7 @@ cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
 cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
+cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
@@ -70,6 +71,11 @@ check_include_file(threads.h HAVE_THREADS_H)
 if(NOT HAVE_THREADS_H)
     add_compile_definitions(L_NO_THREADS_H)
     add_compile_definitions(thread_local=_Thread_local)
+endif()
+
+# use symbol instead of import.meta.use
+if (CJS_USE_SYMBOL_INTERNAL)
+    add_compile_definitions(CJS__DISABLE_MODULE_USE)
 endif()
 
 find_package(SQLite3 REQUIRED)

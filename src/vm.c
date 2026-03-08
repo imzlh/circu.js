@@ -403,6 +403,20 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 	qrt->builtins.concount = JS_NewObjectProto(ctx, JS_NULL);
 	qrt->builtins.contime = JS_NewObjectProto(ctx, JS_NULL);
 
+	/* runtime-shared module namespace cache */
+	qrt->module.imod_ns = JS_NewObjectProto(ctx, JS_NULL);
+
+	/* if import.meta.use not enabled, inject to global */
+#ifdef CJS__DISABLE_MODULE_USE
+	// define use()
+	JSValue use_sym = JS_NewSymbol(ctx, "cjs.internal.use", true);
+	JSAtom use_atom = JS_ValueToAtom(ctx, use_sym);
+	JSValue use_func = JS_NewCFunctionData(ctx, tjs__module_use, 1, 0, 1, (JSValueConst[]) { qrt->module.imod_ns });
+	JS_DefinePropertyValue(ctx, global_obj, use_atom, use_func, JS_PROP_C_W_E);
+	JS_FreeAtom(ctx, use_atom);
+	JS_FreeValue(ctx, use_sym);
+#endif
+
     /* end bootstrap */
     JS_FreeValue(ctx, global_obj);
 
@@ -584,6 +598,7 @@ static void uv__check_cb(uv_check_t *handle) {
 
 static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len, bool check_promise) {
     JSValue obj = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
 
     if (JS_IsException(obj)) {
         goto error;
@@ -599,12 +614,12 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 		JSModuleDef* m = JS_VALUE_GET_PTR(obj);
 		JSValue meta = JS_GetImportMeta(ctx, m);
 
+#ifndef CJS__DISABLE_MODULE_USE
 		// define use()
-		JSValue cache_obj = JS_NewObjectProto(ctx, JS_NULL);
-		JSValue use_func = JS_NewCFunctionData(ctx, tjs__module_use, 1, 0, 1, (JSValueConst[]) { cache_obj });
-		JS_FreeValue(ctx, cache_obj);
+		JSValue use_func = JS_NewCFunctionData(ctx, tjs__module_use, 1, 0, 1, (JSValueConst[]) { trt->module.imod_ns });
 		JS_DefinePropertyValueStr(ctx, meta, "use", use_func, JS_PROP_C_W_E);
 		JS_DefinePropertyValueStr(ctx, meta, "module", tjs__mod_list_init(ctx), JS_PROP_C_W_E);
+#endif
 
 		// end
 		JS_FreeValue(ctx, meta);

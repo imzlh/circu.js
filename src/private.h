@@ -83,6 +83,7 @@ struct TJSRuntime {
 		JSValue metaloader;
 		JSValue attrchecker;
 
+		JSValue imod_ns;
 		MappingContext* mapctx;
 	} module;
 };
