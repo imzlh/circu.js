@@ -194,7 +194,7 @@ static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, 
 	return module_obj;
 }
 
-static JSValue tjs__mod_list_init(JSContext* ctx){
+static __maybe_unused JSValue tjs__mod_list_init(JSContext* ctx){
 	JSValue obj = JS_NewArray(ctx);
 	for (int i = 0; i < countof(tjs_modules); i ++){
 		const struct TJSModule *m = &tjs_modules[i];
@@ -599,6 +599,7 @@ static void uv__check_cb(uv_check_t *handle) {
 static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len, bool check_promise) {
     JSValue obj = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	(void)trt;
 
     if (JS_IsException(obj)) {
         goto error;

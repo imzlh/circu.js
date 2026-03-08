@@ -84,6 +84,27 @@ find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv)  # optional
 find_package(llhttp) # optional
+
+# Check expat version for XML_ExpatVersion function availability
+if(EXPAT_FOUND)
+    include(CheckCSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${EXPAT_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${EXPAT_LIBRARIES})
+    
+    check_c_source_compiles("
+        #include <expat.h>
+        int main() {
+            const char* v = XML_ExpatVersion();
+            (void)v;
+            return 0;
+        }
+    " HAVE_XML_EXPAT_VERSION)
+    
+    if(NOT HAVE_XML_EXPAT_VERSION)
+        message(STATUS "Old expat detected - using version macros instead of XML_ExpatVersion()")
+    endif()
+endif()
+
 if (BUILD_WITH_CURL)
     find_package(CURL REQUIRED)
 endif()
