@@ -136,7 +136,6 @@ static const struct TJSModule tjs_modules[] = {
 	{ "fs", tjs__mod_fs_init },
 	{ "fswatch", tjs__mod_fswatch_init },
 	{ "http", tjs__mod_http_init },
-	{ "jsonc", tjs__mod_jsonc_init },
 	{ "os", tjs__mod_os_init },
 	{ "process", tjs__mod_process_init },
 	{ "pty", tjs__mod_pty_init },
@@ -353,7 +352,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
 	/* Debug */
 #ifdef DEBUG
-	// JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_ATOM_LEAKS);
+	JS_SetDumpFlags(rt, JS_DUMP_LEAKS);
 #endif
 
     /* Worker support */

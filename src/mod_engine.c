@@ -107,7 +107,7 @@ static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, 
 
 static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
     if(argc < 2 || !JS_IsString(argv[0])){
-		return JS_ThrowTypeError(ctx, "loadModule() requires 2 argument");
+		return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
     }
 
     size_t len;
@@ -156,16 +156,33 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
     const char *export_name = JS_ToCString(ctx, argv[0]);
     if(!export_name) return JS_EXCEPTION;
 	JSAtom name = JS_NewAtom(ctx, export_name);
-    void* def = JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
     JS_FreeCString(ctx, export_name);
-    if(!def) return JS_EXCEPTION;
+
+	// find whether export exists
+	struct list_head* pos;
+	list_for_each(pos, &mt->local_def){
+		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
+		if(name == me->atom){
+			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
+			JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
+			JS_FreeAtom(ctx, name);
+			goto end;
+		}
+	}
 
 	// add to list
+    void* def = JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
+    if(!def){
+		JS_FreeAtom(ctx, name);
+		return JS_EXCEPTION;
+	}
+
 	tjs_module_export_t* me = js_malloc(ctx, sizeof(tjs_module_export_t));
 	me->atom = name;
 	me->var = def;
 	list_add_tail(&me->list, &mt->local_def);
 
+end:
     return JS_UNDEFINED;
 }
 
@@ -205,6 +222,13 @@ static JSValue js_module_get_ptr(JSContext *ctx, JSValueConst this_val){
     JS_NewInt32
 #endif
     (ctx, (uintptr_t)mt->def);
+}
+
+static JSValue js_module_get_namespace(JSContext *ctx, JSValueConst this_val){
+	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+	if(!mt) return JS_EXCEPTION;
+
+	return JS_GetModuleNamespace(ctx, mt->def);
 }
 
 static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
@@ -250,7 +274,7 @@ static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
 	struct list_head *pos, *tmp;
 	list_for_each_safe(pos, tmp, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
-		JS_FreeModuleExport(rt, me->var);
+		// JS_FreeModuleExport(rt, me->var);
 		JS_FreeAtomRT(rt, me->atom);
 		js_free_rt(rt, me);
 	}
@@ -274,6 +298,7 @@ static const JSCFunctionListEntry js_module_proto_funcs[] = {
     JS_CGETSET_DEF("ptr", js_module_get_ptr, NULL),
     JS_CFUNC_DEF("dump", 0, js_module_dump),
     JS_CGETSET_DEF("meta", js_module_get_meta, NULL),
+	JS_CGETSET_DEF("namespace", js_module_get_namespace, NULL),
 	JS_CFUNC_DEF("eval", 0, js_module_eval),
 	JS_CFUNC_DEF("resolve", 0, js_module_resolve),
 	JS_CFUNC_DEF("export", 0, js_module_export),
@@ -554,6 +579,14 @@ static const JSCFunctionListEntry tjs_promise_enum[] = {
 	TJS_CONST2("AFTER_THEN", JS_PROMISE_HOOK_AFTER)
 };
 
+static const JSCFunctionListEntry tjs_event_enum[] = {
+	TJS_CONST2("LOAD", EV_LOAD),
+	TJS_CONST2("EXIT", EV_EXIT),
+	TJS_CONST2("UNHANDLED_REJECTION", EV_UNHANDLED_REJECTION),
+	TJS_CONST2("JOB_EXCEPTION", EV_JOB_EXCEPTION),
+	TJS_CONST2("PROMISE", EV_PROMISE),
+};
+
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, tjs_engine_funcs, countof(tjs_engine_funcs));
 
@@ -587,6 +620,11 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 	JS_SetPropertyFunctionList(ctx, promise_enum, tjs_promise_enum, countof(tjs_promise_enum));
 	JS_DefinePropertyValueStr(ctx, ns, "PromiseState", promise_enum, JS_PROP_C_W_E);
 	
+	// enum EventType
+	JSValue event_enum = JS_NewObject(ctx);
+	JS_SetPropertyFunctionList(ctx, event_enum, tjs_event_enum, countof(tjs_event_enum));
+	JS_DefinePropertyValueStr(ctx, ns, "EventType", event_enum, JS_PROP_C_W_E);
+
 	// class Module
 	JS_NewClassID(JS_GetRuntime(ctx), &js_module_class_id);
 	JS_NewClass(JS_GetRuntime(ctx), js_module_class_id, &js_module_class);

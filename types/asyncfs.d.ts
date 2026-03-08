@@ -1,4 +1,7 @@
 declare namespace CModuleAsyncFS {
+    // all of them are not shared
+    type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
     /**
      * 文件打开模式标志（对应C字符串标志）
      * @example 'r' (只读), 'w' (只写创建), 'r+' (读写), 'a' (追加)

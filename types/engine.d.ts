@@ -229,6 +229,11 @@ declare namespace CModuleEngine {
         get meta(): ImportMeta;
 
         /**
+         * 获取模块的导出对象。相当于`await import(mod.name)`
+         */
+        get namespace(): Record<string, any>;
+
+        /**
          * 导出模块为字节码
          * @param flag 序列化选项，默认为 `DUMP_DEFAULT`
          */

@@ -118,10 +118,8 @@ add_library(cjs
     src/mod_zlib.c
     src/mod_ssl.c
     src/mod_xml.c
-    src/mod_jsonc.c
     src/mod_crypto.c
     src/mod_http.c
-    deps/quickjs/cutils.c
 )
 
 if(UNIX)

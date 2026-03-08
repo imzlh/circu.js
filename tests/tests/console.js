@@ -5,7 +5,6 @@ Reflect.set(globalThis, 'setTimeout', setTimeout);
 Reflect.set(globalThis, 'clearTimeout', clearTimeout);
 Reflect.set(globalThis, 'clearInterval', clearInterval);
 Reflect.set(globalThis, 'setInterval', setInterval);
-
 test("console.log 基础类型", () => {
     console.log("=== 基础类型测试 ===");
     console.log("字符串:", "hello world");
