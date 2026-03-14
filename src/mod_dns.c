@@ -96,10 +96,16 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	JSValue opts = argv[1];
 	JSValue js_family = JS_GetPropertyStr(ctx, opts, "family");
 	int family;
-	if(-1 == JS_ToInt32(ctx, &family, js_family))
+	if(-1 == JS_ToInt32(ctx, &family, js_family)) {
+		JS_FreeValue(ctx, js_family);
+		JS_FreeCString(ctx, node);
 		return JS_ThrowTypeError(ctx, "Invalid family option. expected integer.");
-	if(family != AF_INET && family != AF_INET6 && family!= AF_UNSPEC)
+	}
+	if(family != AF_INET && family != AF_INET6 && family!= AF_UNSPEC) {
+		JS_FreeValue(ctx, js_family);
+		JS_FreeCString(ctx, node);
 		return JS_ThrowTypeError(ctx, "Invalid family option. expected AF_INET, AF_INET6 or AF_UNSPEC.");
+	}
 	JS_FreeValue(ctx, js_family);
 
 	JSValue js_nameserver = JS_GetPropertyStr(ctx, opts, "server");
@@ -147,10 +153,16 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 	JSValue opts = argv[1];
 	JSValue js_family = JS_GetPropertyStr(ctx, opts, "family");
 	int family;
-	if(-1 == JS_ToInt32(ctx, &family, js_family))
+	if(-1 == JS_ToInt32(ctx, &family, js_family)) {
+		JS_FreeValue(ctx, js_family);
+		JS_FreeCString(ctx, node);
 		return JS_ThrowTypeError(ctx, "Invalid family option. expected integer.");
-	if(family != AF_INET && family != AF_INET6 && family!= AF_UNSPEC)
+	}
+	if(family != AF_INET && family != AF_INET6 && family!= AF_UNSPEC) {
+		JS_FreeValue(ctx, js_family);
+		JS_FreeCString(ctx, node);
 		return JS_ThrowTypeError(ctx, "Invalid family option. expected AF_INET, AF_INET6 or AF_UNSPEC.");
+	}
 	JS_FreeValue(ctx, js_family);
 
 	JSValue js_nameserver = JS_GetPropertyStr(ctx, opts, "server");

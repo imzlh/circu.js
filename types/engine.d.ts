@@ -70,10 +70,10 @@ declare namespace CModuleEngine {
 
     interface GlobalEvents {
         [EventType.PROMISE]: [this: Promise, error: Error | any],
-        [EventType.EXIT]: [exitCode: number],
+        [EventType.EXIT]: number,
         [EventType.UNHANDLED_REJECTION]: [this: Promise, state: PromiseState, parent: Promise],
         [EventType.JOB_EXCEPTION]: [error: Error | any],
-        [EventType.LOAD]: []
+        [EventType.LOAD]: undefined
     }
 
     /**

@@ -156,23 +156,26 @@ static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
 /* Generate ECC key pair */
 /* Generate ECC key pair */
 static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
-    const EC_GROUP* group = get_ec_group_from_magic(magic);
+    EC_GROUP* group = (EC_GROUP*)get_ec_group_from_magic(magic);
     if (!group) {
         return JS_ThrowInternalError(ctx, "Invalid ECC curve");
     }
     
     EC_KEY* eckey = EC_KEY_new();
     if (!eckey) {
+        EC_GROUP_free(group);
         return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(eckey, group) != 1) {
         EC_KEY_free(eckey);
+        EC_GROUP_free(group);
         return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
     }
     
     if (EC_KEY_generate_key(eckey) != 1) {
         EC_KEY_free(eckey);
+        EC_GROUP_free(group);
         return JS_ThrowInternalError(ctx, "ECC key generation failed");
     }
     
@@ -181,6 +184,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     
     if (!priv_bn || !pub_point) {
         EC_KEY_free(eckey);
+        EC_GROUP_free(group);
         return JS_ThrowInternalError(ctx, "Failed to get key components");
     }
     
@@ -189,6 +193,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     
     if (pub_len == 0) {
         EC_KEY_free(eckey);
+        EC_GROUP_free(group);
         return JS_ThrowInternalError(ctx, "Failed to get public key length");
     }
     
@@ -199,6 +204,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
         js_free(ctx, priv_buf);
         js_free(ctx, pub_buf);
         EC_KEY_free(eckey);
+        EC_GROUP_free(group);
         return JS_EXCEPTION;
     }
     
@@ -210,6 +216,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     JS_SetPropertyStr(ctx, result, "privateKey", js_fastab(ctx, priv_buf, priv_len));
     
     EC_KEY_free(eckey);
+    EC_GROUP_free(group);
     
     return result;
 }

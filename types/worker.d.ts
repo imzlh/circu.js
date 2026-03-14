@@ -1,81 +1,71 @@
 declare namespace CModuleWorker {
-  /**
-   * Worker 模块
-   */
-
-  /**
-   * MessagePipe 对象
-   */
-  interface MessagePipe {
     /**
-     * 发送消息
-     * @param data 要发送的数据
-     * @returns 返回一个 Promise，解析为 undefined。
+     * MessagePipe 对象
      */
-    postMessage(data: any): Promise<void>;
+    export interface MessagePipe {
+        /**
+         * 发送消息
+         * @param data 要发送的数据
+         * @returns 返回一个 Promise，解析为 undefined。
+         */
+        postMessage(data: any): Promise<void>;
 
-    /**
-     * 消息事件处理函数
-     */
-    onmessage: ((data: any) => void) | undefined;
+        /**
+         * 消息事件处理函数
+         */
+        onmessage: ((data: any) => void) | undefined;
 
-    /**
-     * 消息错误事件处理函数
-     */
-    onmessageerror: ((error: Error) => void) | undefined;
+        /**
+         * 消息错误事件处理函数
+         */
+        onmessageerror: ((error: Error) => void) | undefined;
 
-    /**
-     * MessagePipe 对象的类型标签
-     */
-    readonly [Symbol.toStringTag]: 'MessagePipe';
-  }
-
-  /**
-   * Worker 对象
-   */
-  interface Worker {
-    /**
-     * 终止 Worker
-     * @returns 返回一个 Promise，解析为 undefined。
-     */
-    terminate(): Promise<void>;
+        /**
+         * MessagePipe 对象的类型标签
+         */
+        readonly [Symbol.toStringTag]: 'MessagePipe';
+    }
 
     /**
-     * 获取 MessagePipe 对象
-     * @returns 返回 MessagePipe 对象。
+     * Worker 对象
      */
-    readonly messagePipe: MessagePipe;
+    export class Worker {
+        /**
+         * 创建一个 Worker
+         * @param user_data 任意object，包括函数也被允许（但危险！）
+         */
+        constructor(user_data: any);
+
+        /**
+         * 终止 Worker
+         * @returns 返回一个 Promise，解析为 undefined。
+         */
+        terminate(): Promise<void>;
+
+        /**
+         * 获取 MessagePipe 对象
+         * @returns 返回 MessagePipe 对象。
+         */
+        readonly messagePipe: MessagePipe;
+
+        /**
+         * Worker 对象的类型标签
+         */
+        readonly [Symbol.toStringTag]: 'Worker';
+    }
 
     /**
-     * Worker 对象的类型标签
+     * Worker 是否在 Worker 线程中
      */
-    readonly [Symbol.toStringTag]: 'Worker';
-  }
+    export const isWorker: boolean;
 
-  /**
-   * 创建 Worker 对象
-   * @param specifier 模块路径
-   * @param source 模块源码（可选）
-   * @returns 返回一个 Promise，解析为 Worker 对象。
-   */
-  function create(specifier: string, source?: string): Promise<Worker>;
+    /**
+     * 获取当前 Worker 的 MessagePipe 对象
+     */
+    export const pipe: MessagePipe | undefined;
 
-  /**
-   * Worker 是否在 Worker 线程中
-   */
-  const isWorker: boolean;
-
-  /**
-   * 获取当前 Worker 的 MessagePipe 对象
-   */
-  const messagePipe: MessagePipe | undefined;
-
-  // 导出所有内容
-  export {
-    Worker,
-    MessagePipe,
-    create,
-    isWorker,
-    messagePipe
-  };
+    /**
+     * 获取当前 Worker 的用户数据(constructor中传入)
+     */
+    export const workerData: any;
 }

@@ -119,50 +119,53 @@ static char **tjs__argv = NULL;
 struct TJSModule {
 	const char *name;
 	void (*init)(JSContext *ctx, JSValue ns);
+	bool worker;
 };
 
 static const struct TJSModule tjs_modules[] = {
-	{ "algorithm", tjs__mod_algorithm_init },
-	{ "asyncfs", tjs__mod_asyncfs_init },
+	// name init_fn allow_in_worker
+	{ "algorithm", tjs__mod_algorithm_init, true },
+	{ "asyncfs", tjs__mod_asyncfs_init, true },
 #ifdef CJS__HAS_CURL
-	{ "curl", tjs__mod_curl_init },
+	{ "curl", tjs__mod_curl_init, false }, // not thread-safe currently
 #endif
-	{ "crypto", tjs__mod_crypto_init },
-	{ "console", tjs__mod_console_init },
-	{ "dns", tjs__mod_dns_init },
-	{ "engine", tjs__mod_engine_init },
-	{ "error", tjs__mod_error_init },
-	{ "ffi", tjs__mod_ffi_init },
-	{ "fs", tjs__mod_fs_init },
-	{ "fswatch", tjs__mod_fswatch_init },
-	{ "http", tjs__mod_http_init },
-	{ "os", tjs__mod_os_init },
-	{ "process", tjs__mod_process_init },
-	{ "pty", tjs__mod_pty_init },
-	{ "signals", tjs__mod_signals_init },
-	{ "sourcemap", tjs__mod_sourcemap_init },
-	{ "sqlite3", tjs__mod_sqlite3_init },
-	{ "ssl", tjs__mod_ssl_init },
-	{ "streams", tjs__mod_streams_init },
-	{ "sys", tjs__mod_sys_init },
+	{ "crypto", tjs__mod_crypto_init, true },
+	{ "console", tjs__mod_console_init, true },
+	{ "dns", tjs__mod_dns_init, true },
+	{ "engine", tjs__mod_engine_init, true },
+	{ "error", tjs__mod_error_init, true },
+	{ "ffi", tjs__mod_ffi_init, true },
+	{ "fs", tjs__mod_fs_init, true },
+	{ "fswatch", tjs__mod_fswatch_init, true },
+	{ "http", tjs__mod_http_init, true },
+	{ "os", tjs__mod_os_init, true },
+	{ "process", tjs__mod_process_init, true },
+	{ "pty", tjs__mod_pty_init, true },
+	{ "signals", tjs__mod_signals_init, false }, // worker is not allowed to control process behavior
+	{ "sourcemap", tjs__mod_sourcemap_init, true },
+	{ "sqlite3", tjs__mod_sqlite3_init, true },
+	{ "ssl", tjs__mod_ssl_init, true },
+	{ "streams", tjs__mod_streams_init, true },
+	{ "sys", tjs__mod_sys_init, true },
 #ifdef CJS__HAS_ICONV
-	{ "text", tjs__mod_text_init },
+	{ "text", tjs__mod_text_init, true },
 #endif
-	{ "timers", tjs__mod_timers_init },
-	{ "udp", tjs__mod_udp_init },
+	{ "timers", tjs__mod_timers_init, true },
+	{ "udp", tjs__mod_udp_init, true },
 #ifdef CJS__HAS_WASM
-	{ "wasm", tjs__mod_wasm_init },
+	{ "wasm", tjs__mod_wasm_init, false },
 #endif
-	{ "worker", tjs__mod_worker_init },
-	{ "xml", tjs__mod_xml_init },
-	{ "zlib", tjs__mod_zlib_init },
+	{ "worker", tjs__mod_worker_init, true },
+	{ "xml", tjs__mod_xml_init, true },
+	{ "zlib", tjs__mod_zlib_init, true },
 #ifndef _WIN32
-	{ "posix_socket", tjs__mod_posix_socket_init }
+	{ "posix_socket", tjs__mod_posix_socket_init, true }
 #endif
 };
 
 static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
 	JSValue ns = value[0];
+	TJSRuntime* qrt = TJS_GetRuntime(ctx);
 
 	// find name
 	if(argc == 0){
@@ -180,7 +183,10 @@ static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, 
 			break;
 		}
 	}
-	if(!mod) return JS_NULL;
+	if(!mod || (!mod->worker && qrt->is_worker)) {
+		JS_FreeCString(ctx, name);
+		return JS_NULL;
+	}
 
 	JSValue module_obj = JS_GetPropertyStr(ctx, ns, mod->name);
 	if(!JS_IsUndefined(module_obj)){
@@ -191,6 +197,7 @@ static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, 
 	module_obj = JS_NewObjectProto(ctx, JS_NULL);
 	mod->init(ctx, module_obj);
 	JS_SetPropertyStr(ctx, ns, mod->name, JS_DupValue(ctx, module_obj));
+	JS_FreeCString(ctx, name);
 	return module_obj;
 }
 
@@ -358,6 +365,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     /* Worker support */
     qrt->is_worker = is_worker;
     JS_SetCanBlock(rt, is_worker);
+	init_list_head(&qrt->workers);
 
     CHECK_EQ(uv_loop_init(&qrt->loop), 0);
 
@@ -399,9 +407,8 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     // qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
     // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
 	qrt->builtins.dispatch_event_func =
+	qrt->builtins.worker_udata =
 	qrt->builtins.message_pipe = JS_UNDEFINED;
-	qrt->builtins.concount = JS_NewObjectProto(ctx, JS_NULL);
-	qrt->builtins.contime = JS_NewObjectProto(ctx, JS_NULL);
 
 	/* runtime-shared module namespace cache */
 	qrt->module.imod_ns = JS_NewObjectProto(ctx, JS_NULL);
@@ -461,6 +468,14 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 void TJS_FreeRuntime(TJSRuntime *qrt) {
     qrt->freeing = true;
 
+	/* Stop all workers */
+	struct list_head *p, *tmp;
+	list_for_each_safe(p, tmp, &qrt->workers) {
+		TJSWorker *worker = list_entry(p, TJSWorker, link);
+		if (!worker->terminated) TJS_Stop(worker->wrt);
+		js_free(qrt->ctx, worker);
+	}
+
     /* Close all core loop handles. */
     uv_close((uv_handle_t *) &qrt->jobs.prepare, NULL);
     uv_close((uv_handle_t *) &qrt->jobs.idle, NULL);
@@ -476,9 +491,16 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	qrt->module.resolver = qrt->module.loader = 
 	qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
 
-	/* remove console.count cache */
-	JS_FreeValue(qrt->ctx, qrt->builtins.concount);
-	JS_FreeValue(qrt->ctx, qrt->builtins.contime);
+	/* remove built-in data */
+	JS_FreeValue(qrt->ctx, qrt->builtins.worker_udata);
+	qrt->builtins.worker_udata = JS_UNDEFINED;
+    JS_FreeValue(qrt->ctx, qrt->builtins.dispatch_event_func);
+    qrt->builtins.dispatch_event_func = JS_UNDEFINED;
+	JS_FreeValue(qrt->ctx, qrt->builtins.message_pipe);
+	qrt->builtins.message_pipe = JS_UNDEFINED;
+
+	/* Destroy shared module namespace */
+	JS_FreeValue(qrt->ctx, qrt->module.imod_ns);
 
 	/* remove debug sourcemap */
 	js_destroy_mapping_context(qrt->module.mapctx);
@@ -487,10 +509,6 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     tjs__destroy_timers(qrt);
 
     /* Destroy the JS engine. */
-    JS_FreeValue(qrt->ctx, qrt->builtins.dispatch_event_func);
-    qrt->builtins.dispatch_event_func = JS_UNDEFINED;
-	JS_FreeValue(qrt->ctx, qrt->builtins.message_pipe);
-	qrt->builtins.message_pipe = JS_UNDEFINED;
     JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
 
@@ -703,7 +721,7 @@ int TJS_Run(TJSRuntime *qrt) {
 
 void TJS_Stop(TJSRuntime *qrt) {
     CHECK_NOT_NULL(qrt);
-	if (vm_exit_code == 0) vm_exit_code = 1;
+	if (!qrt->is_worker && vm_exit_code == 0) vm_exit_code = 1;
 	tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, vm_exit_code));
     uv_async_send(&qrt->stop);
 }

@@ -1148,7 +1148,7 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
         char error_msg[256];
         snprintf(error_msg, sizeof(error_msg), 
                  "Failed to read symbolic link: %s", strerror(errno));
-        free(link_path);
+        js_free(ctx, link_path);
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, error_msg);
     }

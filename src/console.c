@@ -21,10 +21,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-/**
- * QuickJS Console - Production Ready
- * Compatible with QuickJS-NG
- */
 
 #include "mem.h"
 #include "private.h"
@@ -58,6 +54,12 @@
 static void* console_realloc(void* opaque, void* ptr, size_t size) {
     return js_realloc_rt((JSRuntime*)opaque, ptr, size);
 }
+
+/* STDOUT lock */
+uv_mutex_t stdout_mutex;
+#define __mutex(op) uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex);
+#define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
+#define fprintf2(...) __mutex(fprintf(__VA_ARGS__))
 
 /* Indentation - Fixed: properly initialized */
 static const char* get_indent(int depth) {
@@ -779,7 +781,7 @@ static JSValue js_console_inspect(JSContext* ctx, JSValueConst this_val, int arg
 static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
                                 FILE* stream, int default_depth, bool show_hidden) {
     if (argc == 0) {
-        fprintf(stream, "\n");
+        fwrite2("\n", 1, 1, stream);
         return;
     }
 
@@ -803,7 +805,7 @@ static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
     }
 
     dbuf_putc(&buf, '\n');
-    fwrite(buf.buf, 1, buf.size, stream);
+    fwrite2(buf.buf, 1, buf.size, stream);
     fflush(stream);
     dbuf_free(&buf);
 }
@@ -814,22 +816,27 @@ static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, J
 }
 
 static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+	fprintf2(stderr, ANSI_RED "error " ANSI_RESET);
     console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    console_log_internal(ctx, argc, argv, stdout, 2, false);
+    fprintf2(stderr, ANSI_YELLOW "warn " ANSI_RESET);
+	console_log_internal(ctx, argc, argv, stdout, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_info(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    return js_console_log(ctx, this_val, argc, argv);
+    fprintf2(stdout, ANSI_CYAN "info " ANSI_RESET);
+	console_log_internal(ctx, argc, argv, stdout, 2, false);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (!getenv("DEBUG")) return JS_UNDEFINED;
-    return js_console_log(ctx, this_val, argc, argv);
+    console_log_internal(ctx, argc, argv, stdout, 2, false);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -847,7 +854,7 @@ static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, J
 
     format_value(ctx, argv[0], 0, &stack, &buf, false, &opts);
     dbuf_putc(&buf, '\n');
-    fwrite(buf.buf, 1, buf.size, stdout);
+    fwrite2(buf.buf, 1, buf.size, stdout);
     fflush(stdout);
     dbuf_free(&buf);
     return JS_UNDEFINED;
@@ -861,6 +868,8 @@ static JSValue js_console_clear(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     js_console_log(ctx, this_val, argc, argv);
+
+	fprintf2(stderr, ANSI_MAGENTA "trace " ANSI_RESET);
     
     JSValue err = JS_NewError(ctx);
     JSValue stack = JS_GetPropertyStr(ctx, err, "stack");
@@ -878,9 +887,9 @@ static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (argc == 0 || !JS_ToBool(ctx, argv[0])) {
-        fprintf(stderr, "Assertion failed");
+        fprintf2(stderr, ANSI_RED "Assertion failed " ANSI_RESET);
         if (argc > 1) {
-            fprintf(stderr, ": ");
+            fprintf2(stderr, ": ");
             InspectOptions opts = {0};
             opts.depth = 2;
             opts.colors = isatty(STDERR_FILENO);
@@ -891,10 +900,10 @@ static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc
                 if (i > 1) dbuf_putc(&buf, ' ');
                 format_value(ctx, argv[i], 0, &stack, &buf, false, &opts);
             }
-            fwrite(buf.buf, 1, buf.size, stderr);
+            fwrite2(buf.buf, 1, buf.size, stderr);
             dbuf_free(&buf);
         }
-        fprintf(stderr, "\n");
+        fwrite2("\n", 1, 1, stderr);
         fflush(stderr);
     }
     return JS_UNDEFINED;

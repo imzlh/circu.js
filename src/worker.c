@@ -189,7 +189,7 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 
     /* We have a complete buffer now. */
     JSSABTab sab_tab;
-    int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE;
+    int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE;
     JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) p->reading.data, total_size, flags, &sab_tab);
     if (JS_IsException(obj)) {
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, JS_GetException(ctx));
@@ -198,10 +198,11 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     }
     JS_FreeValue(ctx, obj);
 
-    /* Decrement the SAB reference counts. */
+    /* Decrement the SAB reference counts and free the SAB table. */
     for (int i = 0; i < sab_tab.len; i++) {
         tjs__sab_free(NULL, sab_tab.tab[i]);
     }
+    js_free(ctx, sab_tab.tab);
 
     js_free(ctx, p->reading.data);
     memset(&p->reading, 0, sizeof(p->reading));
@@ -320,59 +321,30 @@ static const JSCFunctionListEntry tjs_msgpipe_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("onmessageerror", tjs_msgpipe_event_get, tjs_msgpipe_event_set, MSGPIPE_EVENT_MESSAGE_ERROR),
 };
 
+static void reg_msgpipe(JSContext* ctx) {
+	JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_NewClassID(rt, &tjs_msgpipe_class_id);
+    JS_NewClass(rt, tjs_msgpipe_class_id, &tjs_msgpipe_class);
+    JSValue proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, proto, tjs_msgpipe_proto_funcs, countof(tjs_msgpipe_proto_funcs));
+    JS_SetClassProto(ctx, tjs_msgpipe_class_id, proto);
+}
+
 static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd);
 
 static JSClassID tjs_worker_class_id;
 
+/* Worker thread data passed to worker_entry */
 typedef struct {
-    const char *specifier;
-    const char *source;
     uv_os_sock_t channel_fd;
     uv_sem_t *sem;
     TJSRuntime *wrt;
+    int init_error;
+
+	// something pass to worker
+	uint8_t* udata;
+	size_t udata_size;
 } worker_data_t;
-
-typedef struct {
-    JSContext *ctx;
-    uv_thread_t tid;
-    JSValue message_pipe;
-    TJSRuntime *wrt;
-} TJSWorker;
-
-static JSValue worker_eval(JSContext *ctx, int argc, JSValue *argv) {
-    const char *specifier;
-    JSValue ret;
-
-    specifier = JS_ToCString(ctx, argv[0]);
-    if (!specifier) {
-        goto error;
-    }
-
-    if (!JS_IsUndefined(argv[1])) {
-        size_t len;
-        const char *source = JS_ToCStringLen(ctx, &len, argv[1]);
-        ret = TJS_EvalModuleContent(ctx, specifier, false, false, source, len);
-        JS_FreeCString(ctx, source);
-    } else {
-        ret = TJS_EvalModule(ctx, specifier, false);
-    }
-    JS_FreeCString(ctx, specifier);
-
-    if (JS_IsException(ret)) {
-        JS_FreeValue(ctx, ret);
-        goto error;
-    }
-
-    JS_FreeValue(ctx, ret);
-    return JS_UNDEFINED;
-
-error:;
-    TJSRuntime *qrt = TJS_GetRuntime(ctx);
-    CHECK_NOT_NULL(qrt);
-    TJS_Stop(qrt);
-
-    return JS_UNDEFINED;
-}
 
 /* This is what the worker runs */
 static void worker_entry(void *arg) {
@@ -383,21 +355,19 @@ static void worker_entry(void *arg) {
     JSContext *ctx = TJS_GetJSContext(wrt);
 
     /* Bootstrap the worker scope. */
+	reg_msgpipe(ctx);	// we should register class MessagePipe before creating
     JSValue message_pipe = tjs_new_msgpipe(ctx, wd->channel_fd);
     wrt->builtins.message_pipe = message_pipe;
+	if (wd->udata){
+		wrt->builtins.worker_udata = JS_ReadObject(ctx, wd->udata, wd->udata_size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE);
+		tjs__free(wd->udata);
+		wd->udata = NULL; 	// fail safe
+	} else {
+		wrt->builtins.worker_udata = JS_UNDEFINED;
+	}
 
 	/* run core bootstrap code */
 	tjs__run_main(wrt);
-
-    /* Load and eval the specifier when the loop runs. */
-    JSValue specifier = JS_NewString(ctx, wd->specifier);
-    JSValue source = wd->source ? JS_NewString(ctx, wd->source) : JS_UNDEFINED;
-    JSValue args[2] = { specifier, source };
-
-    CHECK_EQ(JS_EnqueueJob(ctx, worker_eval, 2, (JSValue *) &args), 0);
-
-    JS_FreeValue(ctx, source);
-    JS_FreeValue(ctx, specifier);
 
     /* Notify the caller we are setup.  */
     wd->wrt = wrt;
@@ -413,6 +383,7 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     TJSWorker *w = JS_GetOpaque(val, tjs_worker_class_id);
     if (w) {
         JS_FreeValueRT(rt, w->message_pipe);
+		w->message_pipe = JS_UNDEFINED;
     }
 }
 
@@ -446,6 +417,7 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
     }
 
     w->ctx = ctx;
+    w->terminated = false;
     w->message_pipe = tjs_new_msgpipe(ctx, channel_fd);
 
     if (JS_IsException(w->message_pipe)) {
@@ -459,15 +431,26 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
 }
 
 static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
-    const char *specifier = JS_ToCString(ctx, argv[0]);
-    if (!specifier) {
-        return JS_EXCEPTION;
-    }
+	TJSRuntime *qrt = TJS_GetRuntime(ctx);
+	if (qrt->is_worker) {
+		return JS_ThrowTypeError(ctx, "Nested workers are not supported.");
+	}
+
+	/* serialize user_data */
+    JSValue user_data = argc >= 1 ? argv[0] : JS_UNDEFINED;
+	size_t udata_size = 0;
+	uint8_t* udata = NULL;
+	if (!JS_IsUndefined(user_data) && !JS_IsNull(user_data)){
+		udata = JS_WriteObject(ctx, &udata_size, user_data, JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE);
+		if (!udata) {
+			return JS_EXCEPTION;
+		}
+	}
 
     uv_os_sock_t fds[2];
     int r = uv_socketpair(SOCK_STREAM, 0, fds, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE);
     if (r != 0) {
-        JS_FreeCString(ctx, specifier);
+		js_free(ctx, udata);
         return tjs_throw_errno(ctx, r);
     }
 
@@ -475,7 +458,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     if (JS_IsException(obj)) {
         close(fds[0]);
         close(fds[1]);
-        JS_FreeCString(ctx, specifier);
+		js_free(ctx, udata);
         return JS_EXCEPTION;
     }
 
@@ -485,22 +468,20 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     uv_sem_t sem;
     CHECK_EQ(uv_sem_init(&sem, 0), 0);
 
-    const char *source = JS_IsUndefined(argv[1]) ? NULL : JS_ToCString(ctx, argv[1]);
-
-    worker_data_t worker_data = { .channel_fd = fds[1],
-                                  .specifier = specifier,
-                                  .source = source,
-                                  .sem = &sem,
-                                  .wrt = NULL };
+    worker_data_t worker_data = {
+		.channel_fd = fds[1],
+		.sem = &sem,
+		.wrt = NULL,
+		.udata = udata,
+		.udata_size = udata_size
+	};
 
     CHECK_EQ(uv_thread_create(&w->tid, worker_entry, (void *) &worker_data), 0);
+	list_add(&w->link, &qrt->workers);
 
     /* Wait for the worker to initialize. */
     uv_sem_wait(&sem);
     uv_sem_destroy(&sem);
-
-    JS_FreeCString(ctx, specifier);
-    JS_FreeCString(ctx, source);
 
     uv_update_time(tjs_get_loop(ctx));
 
@@ -516,7 +497,8 @@ static JSValue tjs_worker_terminate(JSContext *ctx, JSValue this_val, int argc, 
     if (!w) {
         return JS_EXCEPTION;
     }
-    if (w->wrt) {
+    if (w->wrt != NULL && !w->terminated) {
+        w->terminated = true;
         TJS_Stop(w->wrt);
         CHECK_EQ(uv_thread_join(&w->tid), 0);
         uv_update_time(tjs_get_loop(ctx));
@@ -556,16 +538,14 @@ void tjs__mod_worker_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, ns, "Worker", obj, JS_PROP_C_W_E);
 
     /* MessagePipe class */
-    JS_NewClassID(rt, &tjs_msgpipe_class_id);
-    JS_NewClass(rt, tjs_msgpipe_class_id, &tjs_msgpipe_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_msgpipe_proto_funcs, countof(tjs_msgpipe_proto_funcs));
-    JS_SetClassProto(ctx, tjs_msgpipe_class_id, proto);
+	if (!trt->is_worker) reg_msgpipe(ctx);
 
 	/* If we are in a worker, we need to initialize the pipe. */
-	JS_SetPropertyStr(ctx, ns, "worker", JS_NewBool(ctx, trt->is_worker));
+	JS_SetPropertyStr(ctx, ns, "isWorker", JS_NewBool(ctx, trt->is_worker));
 	if (trt->is_worker){
-		JS_SetPropertyStr(ctx, ns, "messagePipe", trt->builtins.message_pipe);
+		JS_SetPropertyStr(ctx, ns, "pipe", trt->builtins.message_pipe);
 		trt->builtins.message_pipe = JS_UNDEFINED;	// avoid double free
+		JS_SetPropertyStr(ctx, ns, "workerData", trt->builtins.worker_udata);
+		trt->builtins.worker_udata = JS_UNDEFINED;
 	}
 }

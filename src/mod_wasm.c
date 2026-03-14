@@ -1,16 +1,25 @@
 /*
  * mod_wasm.c  –  WebAssembly via WAMR (wasm-micro-runtime >= 2.4)
  *
- * Key design decisions:
- *  - One wasm_runtime_load per Module; Instance just calls wasm_runtime_instantiate
- *  - Instance borrows module->mod (holds a dup'd JSValue ref to prevent GC)
- *  - Raw-native trampolines use wasm_runtime_register_natives_raw so WAMR
- *    calls them as  void f(wasm_exec_env_t, uint64_t *args)
- *  - Module loads with no_resolve=true; resolve + instantiate happen in
- *    Instance ctor after natives are registered
- *  - Table / Global are pure C structs (no WAMR involved)
- *  - Standalone Memory still needs a mini-wasm, but the module is unloaded
- *    immediately after instantiation
+ * Copyright (c) 2025-2026 iz
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
 
 #include "private.h"
@@ -123,6 +132,8 @@ typedef struct {
 /* Small helpers                                                        */
 /* ------------------------------------------------------------------ */
 
+#define get_buf(ctx, buf, len) JS_GetAnyBuffer(ctx, len, buf)
+
 static JSValue wasm_err(JSContext *ctx, const char *name, const char *msg) {
     JSValue e = JS_NewError(ctx);
     JS_DefinePropertyValueStr(ctx, e, "message",
@@ -132,20 +143,6 @@ static JSValue wasm_err(JSContext *ctx, const char *name, const char *msg) {
         JS_NewString(ctx, name),
         JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     return JS_Throw(ctx, e);
-}
-
-static uint8_t *get_buf(JSContext *ctx, JSValue v, size_t *sz) {
-    uint8_t *p = JS_GetArrayBuffer(ctx, sz, v);
-    if (p) return p;
-    JS_FreeValue(ctx, JS_GetException(ctx));
-    size_t off, len;
-    JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &off, &len, NULL);
-    if (JS_IsException(ab)) return NULL;
-    p = JS_GetArrayBuffer(ctx, sz, ab);
-    JS_FreeValue(ctx, ab);
-    if (!p) { JS_FreeValue(ctx, JS_GetException(ctx)); return NULL; }
-    *sz = len;
-    return p + off;
 }
 
 static JSValue val_to_js(JSContext *ctx, wasm_valkind_t k, const wasm_val_t *v) {
@@ -324,10 +321,8 @@ static const TrFn g_tramps[WASM_MAX_IMP] = { TRAMP_LIST };
 /* Fill NativeSymbol array; signature=NULL required for register_natives_raw */
 static void build_syms(ImportTable *t) {
     for (uint32_t i = 0; i < t->count; i++) {
-        /* Safe cast: fn ptr → void* via union (avoids -Wpedantic warning) */
-        union { TrFn fn; void *p; } u = { .fn = g_tramps[i] };
         t->syms[i].symbol     = t->entries[i].name;
-        t->syms[i].func_ptr   = u.p;
+        t->syms[i].func_ptr   = (void*)g_tramps[i];
         t->syms[i].signature  = NULL;
         t->syms[i].attachment = NULL;
     }
@@ -378,7 +373,7 @@ static void mod_finalizer(JSRuntime *rt, JSValue val) {
 static JSClassDef js_mod_classdef = { "Module", .finalizer = mod_finalizer };
 
 static JSValue mod_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing buffer");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing buffer");
     size_t   size;
     uint8_t *src = get_buf(ctx, argv[0], &size);
     if (!src || size < 8 || src[0] != 0x00 || src[1] != 0x61 ||
@@ -415,9 +410,9 @@ static JSValue mod_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
 
 static JSValue mod_exports(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     (void)tv;
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing module");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing module");
     JSWasmModule *m = JS_GetOpaque2(ctx, argv[0], js_mod_cls);
-    if (!m || !m->mod) return wasm_err(ctx, "TypeError", "Invalid Module");
+    if (!m || !m->mod) return JS_ThrowTypeError(ctx, "Invalid Module");
 
     uint32_t total = wasm_runtime_get_export_count(m->mod);
     JSValue  arr   = JS_NewArray(ctx);
@@ -439,9 +434,9 @@ static JSValue mod_exports(JSContext *ctx, JSValue tv, int argc, JSValue *argv) 
 
 static JSValue mod_imports(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     (void)tv;
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing module");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing module");
     JSWasmModule *m = JS_GetOpaque2(ctx, argv[0], js_mod_cls);
-    if (!m || !m->mod) return wasm_err(ctx, "TypeError", "Invalid Module");
+    if (!m || !m->mod) return JS_ThrowTypeError(ctx, "Invalid Module");
 
     ImportTable t;
     parse_imports(m->mod, &t);
@@ -500,7 +495,7 @@ static int build_mem_wasm(uint8_t *out, size_t cap,
 
 static JSValue mem_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
     if (argc < 1 || !JS_IsObject(argv[0]))
-        return wasm_err(ctx, "TypeError", "Descriptor must be an object");
+        return JS_ThrowTypeError(ctx, "Descriptor must be an object");
 
     JSValue iv = JS_GetPropertyStr(ctx, argv[0], "initial");
     uint32_t init;
@@ -548,14 +543,14 @@ static JSValue mem_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
 
 static JSValue mem_shared_get(JSContext *ctx, JSValue tv) {
     JSWasmMemory *m = JS_GetOpaque2(ctx, tv, js_mem_cls);
-    if (!m) return wasm_err(ctx, "TypeError", "Invalid Memory");
+    if (!m) return JS_ThrowTypeError(ctx, "Invalid Memory");
     wasm_memory_inst_t mi = wasm_runtime_get_default_memory(m->inst);
     return mi ? JS_NewBool(ctx, wasm_memory_get_shared(mi)) : JS_FALSE;
 }
 
 static JSValue mem_buffer_get(JSContext *ctx, JSValue tv) {
     JSWasmMemory *m = JS_GetOpaque2(ctx, tv, js_mem_cls);
-    if (!m) return wasm_err(ctx, "TypeError", "Invalid Memory");
+    if (!m) return JS_ThrowTypeError(ctx, "Invalid Memory");
     uint32_t pages = 0;
     uint8_t *base  = mem_base(m->inst, &pages);
     if (!base) return JS_NewArrayBuffer(ctx, NULL, 0, NULL, NULL, false);
@@ -564,8 +559,8 @@ static JSValue mem_buffer_get(JSContext *ctx, JSValue tv) {
 
 static JSValue mem_grow(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     JSWasmMemory *m = JS_GetOpaque2(ctx, tv, js_mem_cls);
-    if (!m) return wasm_err(ctx, "TypeError", "Invalid Memory");
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing delta");
+    if (!m) return JS_ThrowTypeError(ctx, "Invalid Memory");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing delta");
 
     uint32_t delta;
     if (JS_ToUint32(ctx, &delta, argv[0])) return JS_EXCEPTION;
@@ -595,7 +590,7 @@ static JSValue fn_call(JSContext *ctx, JSValue tv, int argc, JSValue *argv,
 
     uint32_t np = wasm_func_get_param_count(f->fn, f->inst);
     uint32_t nr = wasm_func_get_result_count(f->fn, f->inst);
-    if ((uint32_t)argc < np) return wasm_err(ctx, "TypeError", "Not enough arguments");
+    if ((uint32_t)argc < np) return JS_ThrowTypeError(ctx, "Not enough arguments");
     if (np > WASM_MAX_VALS || nr > WASM_MAX_VALS)
         return wasm_err(ctx, "RangeError", "Too many params/results");
 
@@ -606,7 +601,7 @@ static JSValue fn_call(JSContext *ctx, JSValue tv, int argc, JSValue *argv,
     wasm_val_t params[WASM_MAX_VALS], results[WASM_MAX_VALS];
     for (uint32_t i = 0; i < np; i++)
         if (js_to_val(ctx, argv[i], ptypes[i], &params[i]))
-            return wasm_err(ctx, "TypeError", "Invalid argument");
+            return JS_ThrowTypeError(ctx, "Invalid argument");
 
     if (!wasm_runtime_call_wasm_a(inst->exec_env, f->fn, nr, results, np, params)) {
         const char *ex = wasm_runtime_get_exception(inst->inst);
@@ -664,14 +659,14 @@ static JSClassDef js_tbl_classdef = {
 
 static JSValue tbl_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
     if (argc < 1 || !JS_IsObject(argv[0]))
-        return wasm_err(ctx, "TypeError", "Descriptor must be an object");
+        return JS_ThrowTypeError(ctx, "Descriptor must be an object");
 
     JSValue etv = JS_GetPropertyStr(ctx, argv[0], "element");
     const char *ets = JS_ToCString(ctx, etv);
     JS_FreeValue(ctx, etv);
     if (!ets || strcmp(ets, "anyfunc")) {
         JS_FreeCString(ctx, ets);
-        return wasm_err(ctx, "TypeError", "element must be \"anyfunc\"");
+        return JS_ThrowTypeError(ctx, "element must be \"anyfunc\"");
     }
     JS_FreeCString(ctx, ets);
 
@@ -710,12 +705,12 @@ static JSValue tbl_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
 
 static JSValue tbl_length_get(JSContext *ctx, JSValue tv) {
     JSWasmTable *t = JS_GetOpaque2(ctx, tv, js_tbl_cls);
-    return t ? JS_NewUint32(ctx, t->size) : wasm_err(ctx, "TypeError", "Invalid Table");
+    return t ? JS_NewUint32(ctx, t->size) : JS_ThrowTypeError(ctx, "Invalid Table");
 }
 
 static JSValue tbl_get(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     JSWasmTable *t = JS_GetOpaque2(ctx, tv, js_tbl_cls);
-    if (!t) return wasm_err(ctx, "TypeError", "Invalid Table");
+    if (!t) return JS_ThrowTypeError(ctx, "Invalid Table");
     uint32_t idx;
     if (JS_ToUint32(ctx, &idx, argv[0]) || idx >= t->size)
         return wasm_err(ctx, "RangeError", "Index out of bounds");
@@ -733,9 +728,9 @@ static JSValue tbl_get(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
 
 static JSValue tbl_set(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     JSWasmTable *t = JS_GetOpaque2(ctx, tv, js_tbl_cls);
-    if (!t) return wasm_err(ctx, "TypeError", "Invalid Table");
+    if (!t) return JS_ThrowTypeError(ctx, "Invalid Table");
     if (t->from_wasm)
-        return wasm_err(ctx, "TypeError", "Cannot set on wasm-exported Table");
+        return JS_ThrowTypeError(ctx, "Cannot set on wasm-exported Table");
     uint32_t idx;
     if (JS_ToUint32(ctx, &idx, argv[0]) || idx >= t->size)
         return wasm_err(ctx, "RangeError", "Index out of bounds");
@@ -746,10 +741,10 @@ static JSValue tbl_set(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
 
 static JSValue tbl_grow(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     JSWasmTable *t = JS_GetOpaque2(ctx, tv, js_tbl_cls);
-    if (!t) return wasm_err(ctx, "TypeError", "Invalid Table");
+    if (!t) return JS_ThrowTypeError(ctx, "Invalid Table");
     if (t->from_wasm)
-        return wasm_err(ctx, "TypeError", "Cannot grow wasm-exported Table");
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing delta");
+        return JS_ThrowTypeError(ctx, "Cannot grow wasm-exported Table");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing delta");
     uint32_t delta;
     if (JS_ToUint32(ctx, &delta, argv[0])) return JS_EXCEPTION;
 
@@ -803,14 +798,14 @@ static wasm_valkind_t parse_valtype(const char *s) {
 
 static JSValue glb_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
     if (argc < 1 || !JS_IsObject(argv[0]))
-        return wasm_err(ctx, "TypeError", "Descriptor must be an object");
+        return JS_ThrowTypeError(ctx, "Descriptor must be an object");
 
     JSValue     tv  = JS_GetPropertyStr(ctx, argv[0], "value");
     const char *ts  = JS_ToCString(ctx, tv);
     JS_FreeValue(ctx, tv);
     wasm_valkind_t type = parse_valtype(ts);
     JS_FreeCString(ctx, ts);
-    if (type == 255) return wasm_err(ctx, "TypeError", "Invalid value type");
+    if (type == 255) return JS_ThrowTypeError(ctx, "Invalid value type");
 
     JSValue muv = JS_GetPropertyStr(ctx, argv[0], "mutable");
     bool mutable_ = JS_ToBool(ctx, muv);
@@ -832,7 +827,7 @@ static JSValue glb_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
         wasm_val_t v = {0};
         if (js_to_val(ctx, argv[1], type, &v)) {
             JS_FreeValue(ctx, obj);
-            return wasm_err(ctx, "TypeError", "Invalid initial value");
+            return JS_ThrowTypeError(ctx, "Invalid initial value");
         }
         memcpy(g->data_ptr, &v.of, 8);
     }
@@ -841,7 +836,7 @@ static JSValue glb_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
 
 static JSValue glb_value_get(JSContext *ctx, JSValue tv) {
     JSWasmGlobal *g = JS_GetOpaque2(ctx, tv, js_glb_cls);
-    if (!g) return wasm_err(ctx, "TypeError", "Invalid Global");
+    if (!g) return JS_ThrowTypeError(ctx, "Invalid Global");
     wasm_val_t v = { .kind = g->type };
     memcpy(&v.of, g->data_ptr, 8);   /* live read from data_ptr */
     return val_to_js(ctx, g->type, &v);
@@ -849,8 +844,8 @@ static JSValue glb_value_get(JSContext *ctx, JSValue tv) {
 
 static JSValue glb_value_set(JSContext *ctx, JSValue tv, JSValue val) {
     JSWasmGlobal *g = JS_GetOpaque2(ctx, tv, js_glb_cls);
-    if (!g) return wasm_err(ctx, "TypeError", "Invalid Global");
-    if (!g->mutable_) return wasm_err(ctx, "TypeError", "Immutable global");
+    if (!g) return JS_ThrowTypeError(ctx, "Invalid Global");
+    if (!g->mutable_) return JS_ThrowTypeError(ctx, "Immutable global");
     wasm_val_t v = {0};
     if (js_to_val(ctx, val, g->type, &v)) return JS_EXCEPTION;
     memcpy(g->data_ptr, &v.of, 8);   /* live write to data_ptr */
@@ -970,9 +965,9 @@ static JSValue build_exports(JSContext *ctx, JSWasmInstance *inst, JSValue iobj)
 }
 
 static JSValue inst_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing module");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing module");
     JSWasmModule *m = JS_GetOpaque2(ctx, argv[0], js_mod_cls);
-    if (!m || !m->mod) return wasm_err(ctx, "TypeError", "Invalid Module");
+    if (!m || !m->mod) return JS_ThrowTypeError(ctx, "Invalid Module");
 
     JSValue obj = JS_NewObjectClass(ctx, js_inst_cls);
     if (JS_IsException(obj)) return obj;
@@ -1030,7 +1025,7 @@ static JSValue inst_ctor(JSContext *ctx, JSValue nt, int argc, JSValue *argv) {
 
 static JSValue inst_exports_get(JSContext *ctx, JSValue tv) {
     JSWasmInstance *inst = JS_GetOpaque2(ctx, tv, js_inst_cls);
-    if (!inst) return wasm_err(ctx, "TypeError", "Invalid Instance");
+    if (!inst) return JS_ThrowTypeError(ctx, "Invalid Instance");
     return build_exports(ctx, inst, tv);
 }
 
@@ -1045,7 +1040,7 @@ static JSValue wasm_compile(JSContext *ctx, JSValue tv, int argc, JSValue *argv)
 
 static JSValue wasm_instantiate(JSContext *ctx, JSValue tv, int argc, JSValue *argv) {
     (void)tv;
-    if (argc < 1) return wasm_err(ctx, "TypeError", "Missing argument");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Missing argument");
 
     bool from_buf  = !JS_GetOpaque(argv[0], js_mod_cls);
     JSValue module = from_buf ? mod_ctor(ctx, JS_UNDEFINED, 1, argv)

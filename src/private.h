@@ -27,6 +27,7 @@
 
 #include "../deps/quickjs/cutils.h"
 #include "../deps/quickjs/quickjs.h"
+#include "../deps/quickjs/list.h"
 #include "tjs.h"
 #include "utils.h"
 #include "sourcemap.h"
@@ -59,8 +60,11 @@ struct TJSRuntime {
 		bool paused;
     } jobs;
     uv_async_t stop;
+
     bool is_worker;
-    bool freeing;
+    struct list_head workers;
+
+	bool freeing;
 #ifdef CJS__HAS_WASM
     // struct {
 	// 	bool initialized;
@@ -73,9 +77,7 @@ struct TJSRuntime {
     struct {
         JSValue dispatch_event_func;
 		JSValue message_pipe;	// for worker messaging
-
-		JSValue concount;
-		JSValue contime;
+		JSValue worker_udata;	// user-data passed from parent
     } builtins;
 	struct {
 		JSValue resolver;
@@ -87,6 +89,15 @@ struct TJSRuntime {
 		MappingContext* mapctx;
 	} module;
 };
+
+typedef struct {
+    JSContext *ctx;
+    uv_thread_t tid;
+    JSValue message_pipe;
+    TJSRuntime *wrt;
+    bool terminated;
+	struct list_head link;
+} TJSWorker;
 
 typedef enum {
 	EV_PROMISE = 0,

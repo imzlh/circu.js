@@ -4,10 +4,11 @@
 
 const { use } = import.meta;
 const console = use('console');
-const { onEvent, onModule } = use('engine');
+const { onEvent, onModule, EventType } = use('engine');
 const { args, version, platform, exePath, loadModule } = use('sys');
 const { exit } = use('os');
 const { realpath } = use('fs');
+const worker = use('worker');
 globalThis.console = console;
 /**
  * @type {ImportMeta['use']}
@@ -17,7 +18,7 @@ globalThis.use = (name) => use(name);
 // override promise reject event handler
 const currentExceptions = [];
 onEvent((name, data) => {
-    if (name == 'unhandledrejection') {
+    if (name == EventType.UNHANDLED_REJECTION) {
         if (currentExceptions.some(e => e[0] === data[0])) {
             return true;    // prevent duplicate error messages
         }
@@ -82,7 +83,11 @@ if (!script || !script.endsWith(".js")) {
     throw new Error("Script must be a .js file");
 }
 
-console.log("Test suite, tjs", version, "on", platform);
-console.log("Loading script:", realpath(script));
+if (!worker.isWorker) {
+    console.log("Test suite, tjs", version, "on", platform);
+    console.log("Loading script:", realpath(script));
+}
 await loadModule(script);
-console.log("🎉 " + script.split('/').at(-1).split('.').at(0) + ": All tests passed!")
+if (!worker.isWorker){
+    console.log("🎉 " + script.split('/').at(-1).split('.').at(0) + ": All tests passed!")
+}

@@ -206,6 +206,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 
 	meta_obj = JS_GetImportMeta(ctx, m);
     if (JS_IsException(meta_obj)) {
+        JS_FreeCString(ctx, module_name);
         return -1;
     }
 
