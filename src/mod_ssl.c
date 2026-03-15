@@ -10,10 +10,11 @@
 #include <openssl/x509v3.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <stdatomic.h>
 #include <string.h>
 
-/* Module initialization flag */
-static bool ssl_initialized = false;
+/* Module initialization flag — accessed from multiple worker threads */
+static _Atomic(bool) ssl_initialized = false;
 
 /* Error handling macros */
 #define SSL_ERROR_CHECK(ctx, result, operation) do { \
@@ -157,11 +158,12 @@ static int alpn_cb(SSL* ssl, const unsigned char** out, unsigned char* outlen,
 /* new SSLContext(options) */
 static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_target,
                                             int argc, JSValueConst *argv) {
-    if (!ssl_initialized) {
+    /* One-time initialization — safe from multiple worker threads */
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&ssl_initialized, &expected, true)) {
         SSL_library_init();
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
-        ssl_initialized = true;
     }
     
     JSValue obj = JS_NewObjectClass(ctx, tjs_ssl_context_class_id);
@@ -235,6 +237,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
             JS_FreeValue(ctx, cert_val);
             JS_FreeValue(ctx, key_val);
             if (key) JS_FreeCString(ctx, key);
+            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);  /* fix: leaked */
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
@@ -242,13 +245,15 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         }
     }
     JS_FreeValue(ctx, cert_val);
-    
+
     if (key) {
         ssl_ctx->key_file = js_strdup(ctx, key);
         int ret = SSL_CTX_use_PrivateKey_file(ssl_ctx->ssl_ctx, key, SSL_FILETYPE_PEM);
         JS_FreeCString(ctx, key);
         if (ret != 1) {
             JS_FreeValue(ctx, key_val);
+            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);  /* fix: leaked */
+            if (ssl_ctx->key_file) js_free(ctx, ssl_ctx->key_file);    /* fix: leaked */
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
@@ -266,6 +271,10 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         JS_FreeCString(ctx, ca);
         if (ret != 1) {
             JS_FreeValue(ctx, ca_val);
+            /* fix: all previously strdup'd fields leaked before */
+            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
+            if (ssl_ctx->key_file)  js_free(ctx, ssl_ctx->key_file);
+            if (ssl_ctx->ca_file)   js_free(ctx, ssl_ctx->ca_file);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
@@ -361,25 +370,25 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     /* DH parameters */
     JSValue dhparam_val = JS_GetPropertyStr(ctx, options, "dhparam");
     const char *dhparam = cstr(ctx, dhparam_val);
-if (dhparam) {
-    BIO *bio = BIO_new_file(dhparam, "r");
-    if (bio) {
+    if (dhparam) {
+        BIO *bio = BIO_new_file(dhparam, "r");
+        if (bio) {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-        EVP_PKEY *dh = PEM_read_bio_Parameters(bio, NULL);
-        if (dh) {
-            SSL_CTX_set0_tmp_dh_pkey(ssl_ctx->ssl_ctx, dh);
-        }
+            EVP_PKEY *dh = PEM_read_bio_Parameters(bio, NULL);
+            if (dh) {
+                SSL_CTX_set0_tmp_dh_pkey(ssl_ctx->ssl_ctx, dh);
+            }
 #else
-        DH *dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
-        if (dh) {
-            SSL_CTX_set_tmp_dh(ssl_ctx->ssl_ctx, dh);
-            DH_free(dh);
-        }
+            DH *dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
+            if (dh) {
+                SSL_CTX_set_tmp_dh(ssl_ctx->ssl_ctx, dh);
+                DH_free(dh);
+            }
 #endif
-        BIO_free(bio);
+            BIO_free(bio);
+        }
+        JS_FreeCString(ctx, dhparam);
     }
-    JS_FreeCString(ctx, dhparam);
-}
     JS_FreeValue(ctx, dhparam_val);
     
     /* ECDH curve */

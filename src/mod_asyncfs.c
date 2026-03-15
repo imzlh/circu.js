@@ -479,9 +479,12 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return tjs_throw_errno(ctx, r);
     }
 
-    tjs_fsreq_init(ctx, fr, this_val);
+    /* tjs_fsreq_init returns a dup'd promise reference for the caller to own.
+     * Do NOT discard it and return fr->result.p directly — that would leak
+     * one reference and break ref-counting on promise settlement. */
+    JSValue promise = tjs_fsreq_init(ctx, fr, this_val);
     fr->rw.tarray = JS_DupValue(ctx, argv[0]);
-    return fr->result.p;
+    return promise;
 }
 
 static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

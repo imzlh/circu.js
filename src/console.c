@@ -164,7 +164,9 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
         const char* str = JS_ToCString(ctx, tag);
         JS_FreeValue(ctx, tag);
         if (str && str[0]) {
-            return js_strdup(ctx, str);  // Return duplicated string
+            char* dup = js_strdup(ctx, str);
+            JS_FreeCString(ctx, str);  /* fix: str leaked before return */
+            return dup;
         }
         if (str) JS_FreeCString(ctx, str);
     }
@@ -189,7 +191,9 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
     JS_FreeValue(ctx, name);
     
     if (str && str[0] && strcmp(str, "Object") != 0) {
-        return js_strdup(ctx, str);
+        char* dup = js_strdup(ctx, str);
+        JS_FreeCString(ctx, str);  /* fix: str leaked before return */
+        return dup;
     }
     if (str) JS_FreeCString(ctx, str);
     return NULL;

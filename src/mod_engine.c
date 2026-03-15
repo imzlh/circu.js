@@ -195,6 +195,7 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 	const char* name = JS_ToCString(ctx, argv[0]);
     if(!name) return JS_EXCEPTION;
 	JSAtom name_atom = JS_NewAtom(ctx, name);
+	JS_FreeCString(ctx, name);  /* fix: free immediately after atom creation */
 
 	// find in exports
 	struct list_head* pos;
@@ -205,11 +206,14 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 			JS_FreeAtom(ctx, me->atom);
 			list_del(&me->list);
 			js_free(ctx, me);
+			JS_FreeAtom(ctx, name_atom);  /* fix: free our lookup atom */
 			return JS_UNDEFINED;
 		}
 	}
 
-    return JS_ThrowTypeError(ctx, "export not found: %s", name);
+	JSValue err = JS_ThrowTypeError(ctx, "export not found");
+	JS_FreeAtom(ctx, name_atom);  /* fix: free on error path */
+    return err;
 }
 
 static JSValue js_module_get_ptr(JSContext *ctx, JSValueConst this_val){
@@ -432,6 +436,7 @@ static JSValue tjs__set_event_receiver(JSContext *ctx, JSValue this_val, int arg
 	}
 
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	JS_FreeValue(ctx, trt->builtins.dispatch_event_func);  /* fix: free old value */
 	trt->builtins.dispatch_event_func = JS_DupValue(ctx, argv[0]);
 	return JS_UNDEFINED;
 }
@@ -489,7 +494,7 @@ static JSValue tjs_encodeU16String(JSContext* ctx, JSValue this_val, int argc, J
 		JS_FreeValue(ctx, buffer);
 		return JS_ThrowTypeError(ctx, "Uint16Array constructor not found");
 	}
-	JSValue u16arr = JS_Call(ctx, u16arrctor, u16arrctor, 1, (JSValueConst[]) { buffer });
+	JSValue u16arr = JS_CallConstructor(ctx, u16arrctor, 1, (JSValueConst[]) { buffer });
 	JS_FreeValue(ctx, buffer);
 	JS_FreeValue(ctx, u16arrctor);
 	JS_FreeValue(ctx, global);

@@ -164,13 +164,40 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
         size_t len_size = sizeof(p->reading.total_size.u8);
 
         /* This is a bogus read, likely a zero-read. Just return the buffer. */
-        if (nread != len_size) {
+        if (nread != (ssize_t)len_size) {
             return;
         }
 
         uint64_t total_size = p->reading.total_size.u64;
         CHECK_GE(total_size, 0);
+
+        /* fix: a zero-byte payload is technically valid (though unusual).
+         * Handle it immediately rather than calling js_malloc(0) which may
+         * return NULL and then stall the reader forever waiting for more data
+         * that will never arrive. */
+        if (total_size == 0) {
+            JSSABTab sab_tab = { .tab = NULL, .len = 0 };
+            JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) "", 0,
+                JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE, &sab_tab);
+            if (JS_IsException(obj)) {
+                emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, JS_GetException(ctx));
+            } else {
+                emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE, obj);
+            }
+            JS_FreeValue(ctx, obj);
+            js_free(ctx, sab_tab.tab);
+            memset(&p->reading, 0, sizeof(p->reading));
+            return;
+        }
+
         p->reading.data = js_malloc(ctx, total_size);
+        /* fix: malloc failure — reset state and report error instead of stalling */
+        if (!p->reading.data) {
+            memset(&p->reading, 0, sizeof(p->reading));
+            JSValue err = tjs_new_error(ctx, UV_ENOMEM);
+            emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, err);
+            JS_FreeValue(ctx, err);
+        }
 
         return;
     }
@@ -192,7 +219,10 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE;
     JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) p->reading.data, total_size, flags, &sab_tab);
     if (JS_IsException(obj)) {
-        emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, JS_GetException(ctx));
+        /* fix: JS_GetException transfers ownership; must free after emitting */
+        JSValue exc = JS_GetException(ctx);
+        emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, exc);
+        JS_FreeValue(ctx, exc);
     } else {
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE, obj);
     }

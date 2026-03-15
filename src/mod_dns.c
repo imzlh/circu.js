@@ -676,7 +676,8 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
         }
         
         // value (remaining)
-        size_t value_len = ans->rdlength - 2 - tag_len;
+        /* fix: guard against underflow if rdlength < 2 + tag_len */
+        size_t value_len = (ans->rdlength >= 2 + tag_len) ? ans->rdlength - 2 - tag_len : 0;
         if (value_len > 0) {
             const char *value = (const char *)(ptr + 2 + tag_len);
             JS_SetPropertyStr(ctx, obj, "value", 
@@ -689,8 +690,11 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 			uint8_t* data = js_malloc(ctx, ans->rdlength);
 			if (data) {
 				memcpy(data, ans->rdata, ans->rdlength);
+				/* fix: use TJS_NewUint8Array so the buffer is freed via js_free_rt
+				 * when GC'd. The old JS_NewArrayBuffer(..., NULL, NULL, 1) (external,
+				 * no freer) would silently leak the js_malloc'd block. */
 				JS_SetPropertyStr(ctx, obj, "data",
-					JS_NewArrayBuffer(ctx, data, ans->rdlength, NULL, NULL, 1));
+					TJS_NewUint8Array(ctx, data, ans->rdlength));
 			}
 		}
 	}
@@ -784,6 +788,9 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 		JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
 		JS_FreeValue(ctx->ctx, error);
 
+		/* fix: stop recv before closing; otherwise udp_recv_callback may fire
+		 * after resolve/reject funcs are freed, causing UAF. */
+		uv_udp_recv_stop(&ctx->udp);
 		uv_timer_stop(&ctx->timeout_timer);
 		uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);
 		uv_close((uv_handle_t*) &ctx->udp, cleanup_callback);
@@ -821,6 +828,7 @@ static void udp_recv_sync_callback(uv_udp_t* handle, ssize_t nread,
 	if (nread < 0) {
 		sync_ctx->status = nread;
 		sync_ctx->done = true;
+		if (buf->base) free(buf->base);  /* fix: was leaked on error early return */
 		return;
 	}
 
@@ -1002,8 +1010,10 @@ static JSValue tjs_dns_query_sync(JSContext* ctx, JSValueConst this_val,
 		return JS_ThrowOutOfMemory(ctx);
 	}
 	memset(req_ctx, 0, sizeof(dns_sync_ctx_t));
-
-	dns_udp_ctx_t* udp_ctx = &req_ctx->ctx;
+	/* fix: resolve_func is abused to hold the result array in sync mode; init
+	 * it to JS_UNDEFINED (not 0) so it's safe to JS_FreeValue on error paths */
+	udp_ctx = &req_ctx->ctx;
+	udp_ctx->resolve_func = JS_UNDEFINED;
 	udp_ctx->ctx = ctx;
 	udp_ctx->hostname = strdup(hostname);
 	udp_ctx->query_id = (uint16_t) (rand() & 0xFFFF);

@@ -1589,7 +1589,7 @@ static JSValue tjs_gcm_update(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowInternalError(ctx, "update failed");
     }
     
-    return JS_NewArrayBuffer(ctx, out_data, out_len, NULL, NULL, 1);
+    return js_fastab(ctx, out_data, out_len);
 }
 
 // Method: final(tag)
@@ -1630,7 +1630,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
             uint8_t *data_copy = js_malloc(ctx, out_len);
             memcpy(data_copy, out_data, out_len);
             JS_SetPropertyStr(ctx, result, "data", 
-                JS_NewArrayBuffer(ctx, data_copy, out_len, NULL, NULL, 1));
+                js_fastab(ctx, data_copy, out_len));
         } else {
             JS_SetPropertyStr(ctx, result, "data", 
                 JS_NewArrayBufferCopy(ctx, NULL, 0));
@@ -1639,7 +1639,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         uint8_t *tag_copy = js_malloc(ctx, 16);
         memcpy(tag_copy, tag, 16);
         JS_SetPropertyStr(ctx, result, "tag", 
-            JS_NewArrayBuffer(ctx, tag_copy, 16, NULL, NULL, 1));
+            js_fastab(ctx, tag_copy, 16));
         
     } else {
         // Decryption: verify tag
@@ -1670,7 +1670,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
             uint8_t *data_copy = js_malloc(ctx, out_len);
             memcpy(data_copy, out_data, out_len);
             JS_SetPropertyStr(ctx, result, "data", 
-                JS_NewArrayBuffer(ctx, data_copy, out_len, NULL, NULL, 1));
+                js_fastab(ctx, data_copy, out_len));
         } else {
             JS_SetPropertyStr(ctx, result, "data", 
                 JS_NewArrayBufferCopy(ctx, NULL, 0));
@@ -1777,9 +1777,9 @@ static JSValue tjs_gcm_encrypt(JSContext *ctx, JSValueConst this_val,
     // Return result
     JSValue result = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, result, "ciphertext", 
-        JS_NewArrayBuffer(ctx, ciphertext, ciphertext_len, NULL, NULL, 1));
+        js_fastab(ctx, ciphertext, ciphertext_len));
     JS_SetPropertyStr(ctx, result, "tag", 
-        JS_NewArrayBuffer(ctx, tag, tag_len, NULL, NULL, 1));
+        js_fastab(ctx, tag, tag_len));
     
     return result;
 }
@@ -1866,7 +1866,7 @@ static JSValue tjs_gcm_decrypt(JSContext *ctx, JSValueConst this_val,
     // Return result
     JSValue result = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, result, "plaintext", 
-        JS_NewArrayBuffer(ctx, plaintext, plaintext_len, NULL, NULL, 1));
+        js_fastab(ctx, plaintext, plaintext_len));
     JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, verified == 1));
     
     return result;
@@ -2287,21 +2287,22 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     }
     
     int decoded = EVP_DecodeBlock(out, (const uint8_t*)str, str_len);
+
+    /* fix: check padding BEFORE freeing str — was UAF */
+    int padding = 0;
+    if (str_len >= 2 && str[str_len - 1] == '=') {
+        padding++;
+        if (str[str_len - 2] == '=') padding++;
+    }
     JS_FreeCString(ctx, str);
-    
+
     if (decoded < 0) {
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "Base64 decode failed");
     }
-    
-    // Remove padding
-    if (str_len >= 2 && str[str_len - 1] == '=') {
-        decoded--;
-        if (str[str_len - 2] == '=') {
-            decoded--;
-        }
-    }
-    
+
+    decoded -= padding;
+
     JSValue result = js_fastab(ctx, out, decoded);
     return result;
 }

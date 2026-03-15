@@ -230,6 +230,58 @@ static JSValue tjs_process_stdio_get(JSContext *ctx, JSValue this_val, int magic
     return JS_DupValue(ctx, p->stdio[magic]);
 }
 
+/* Parse a JS string-or-array into a NULL-terminated C argv.
+ * Caller must free each element and the array itself with js_free(). */
+static char **tjs__parse_args(JSContext *ctx, JSValue arg0) {
+    char **args = NULL;
+
+    if (JS_IsString(arg0)) {
+        args = js_mallocz(ctx, sizeof(*args) * 2);
+        if (!args) return NULL;
+        const char *s = JS_ToCString(ctx, arg0);
+        if (!s) { js_free(ctx, args); return NULL; }
+        args[0] = js_strdup(ctx, s);
+        JS_FreeCString(ctx, s);
+        if (!args[0]) { js_free(ctx, args); return NULL; }
+    } else if (JS_IsArray(arg0)) {
+        JSValue js_len = JS_GetPropertyStr(ctx, arg0, "length");
+        uint64_t len;
+        if (JS_ToIndex(ctx, &len, js_len)) {
+            JS_FreeValue(ctx, js_len);
+            return NULL;
+        }
+        JS_FreeValue(ctx, js_len);
+        args = js_mallocz(ctx, sizeof(*args) * (len + 1));
+        if (!args) return NULL;
+        for (uint64_t i = 0; i < len; i++) {
+            JSValue v = JS_GetPropertyUint32(ctx, arg0, (uint32_t)i);
+            if (JS_IsException(v)) goto fail;
+            const char *s = JS_ToCString(ctx, v);
+            JS_FreeValue(ctx, v);  /* free v immediately after ToCString */
+            if (!s) goto fail;
+            args[i] = js_strdup(ctx, s);
+            JS_FreeCString(ctx, s);
+            if (!args[i]) goto fail;
+        }
+    } else {
+        JS_ThrowTypeError(ctx, "only string and array are allowed");
+    }
+    return args;
+
+fail:
+    if (args) {
+        for (int i = 0; args[i]; i++) js_free(ctx, args[i]);
+        js_free(ctx, args);
+    }
+    return NULL;
+}
+
+static void tjs__free_args(JSContext *ctx, char **args) {
+    if (!args) return;
+    for (int i = 0; args[i]; i++) js_free(ctx, args[i]);
+    js_free(ctx, args);
+}
+
 static void uv__exit_cb(uv_process_t *handle, int64_t exit_status, int term_signal) {
     TJSProcess *p = handle->data;
     CHECK_NOT_NULL(p);
@@ -295,55 +347,10 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     options.stdio = stdio;
 
     /* args */
-    JSValue arg0 = argv[0];
-
-    if (JS_IsString(arg0)) {
-        options.args = js_mallocz(ctx, sizeof(*options.args) * 2);
-        if (!options.args) {
-            goto fail;
-        }
-        const char *arg0_str = JS_ToCString(ctx, arg0);
-        if (!arg0_str) {
-            goto fail;
-        }
-        options.args[0] = js_strdup(ctx, arg0_str);
-        JS_FreeCString(ctx, arg0_str);
-        if (!options.args[0]) {
-            goto fail;
-        }
-    } else if (JS_IsArray(arg0)) {
-        JSValue js_length = JS_GetPropertyStr(ctx, arg0, "length");
-        uint64_t len;
-        if (JS_ToIndex(ctx, &len, js_length)) {
-            JS_FreeValue(ctx, js_length);
-            goto fail;
-        }
-        JS_FreeValue(ctx, js_length);
-        options.args = js_mallocz(ctx, sizeof(*options.args) * (len + 1));
-        if (!options.args) {
-            goto fail;
-        }
-        for (int i = 0; i < len; i++) {
-            JSValue v = JS_GetPropertyUint32(ctx, arg0, i);
-            if (JS_IsException(v)) {
-                goto fail;
-            }
-            const char *arg_str = JS_ToCString(ctx, v);
-            JS_FreeValue(ctx, v);
-            if (!arg_str) {
-                goto fail;
-            }
-            options.args[i] = js_strdup(ctx, arg_str);
-            JS_FreeCString(ctx, arg_str);
-            if (!options.args[i]) {
-                goto fail;
-            }
-        }
-    } else {
-        JS_ThrowTypeError(ctx, "only string and array are allowed");
+    options.args = tjs__parse_args(ctx, argv[0]);
+    if (!options.args) {
         goto fail;
     }
-
     options.file = options.args[0];
 
     JSValue arg1 = argv[1];
@@ -544,12 +551,7 @@ fail:
     JS_FreeValue(ctx, obj);
     ret = JS_EXCEPTION;
 cleanup:
-    if (options.args) {
-        for (int i = 0; options.args[i] != NULL; i++) {
-            js_free(ctx, options.args[i]);
-        }
-        js_free(ctx, options.args);
-    }
+    tjs__free_args(ctx, options.args);
     if (options.env) {
         for (int i = 0; options.env[i] != NULL; i++) {
             js_free(ctx, options.env[i]);

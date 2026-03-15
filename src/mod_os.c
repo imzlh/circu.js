@@ -188,6 +188,7 @@ static JSValue tjs_setenv(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 
     const char *value = JS_ToCString(ctx, argv[1]);
     if (!value) {
+        JS_FreeCString(ctx, name);  /* fix: name leaked when value fails */
         return JS_EXCEPTION;
     }
 
@@ -336,7 +337,8 @@ static JSValue tjs_memory(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 	uint64_t available = uv_get_available_memory(),
 		total = uv_get_total_memory(),
 		constrained = uv_get_constrained_memory(),
-		rss = uv_get_constrained_memory();
+		rss = 0;
+	uv_resident_set_memory(&rss);  /* fix: was incorrectly using uv_get_constrained_memory() */
 
 	JSMemoryUsage memory;
 	JS_ComputeMemoryUsage(JS_GetRuntime(ctx), &memory);

@@ -215,8 +215,13 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 		JSValueConst args[] = { JS_NewString(ctx, module_name), meta_obj };
 		JSValue ret = JS_Call(ctx, trt->module.metaloader, JS_UNDEFINED, 2, args);
 		JS_FreeValue(ctx, args[0]);
-		JS_FreeValue(ctx, ret);
 		JS_FreeValue(ctx, meta_obj);
+		JS_FreeCString(ctx, module_name);  /* fix: was leaked on this path */
+		if (JS_IsException(ret)) {         /* fix: propagate exception instead of swallowing */
+			JS_FreeValue(ctx, ret);
+			return -1;
+		}
+		JS_FreeValue(ctx, ret);
 		return 0;
 	}
 

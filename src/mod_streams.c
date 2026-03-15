@@ -288,6 +288,13 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
     // Run the event loop until the read completes using our abstract function
 	UV_RUN(sync_req);
 
+	/* fix: if the loop was stopped externally (e.g. TJS_Stop) before the
+	 * callback fired, uv__sync_read_cb never called uv_read_stop, leaving
+	 * the handle active and blocking loop cleanup. */
+	if (!sync_req.done) {
+		uv_read_stop(&s->h.stream);
+	}
+
 	s->read.b.data = NULL;
 	s->read.b.len = 0;
 	s->read.b.tarray = JS_UNDEFINED;
@@ -412,7 +419,14 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
     
     /* Run the event loop until the write completes using our abstract function */
     UV_RUN(sync_req);
-    
+
+    /* fix: if the loop was stopped externally before the write callback fired,
+     * sync_req (stack variable) would be freed while the uv_write req still
+     * holds a pointer to it — UAF.  Drain until the callback fires. */
+    while (!sync_req.done) {
+        uv_run(tjs_get_loop(ctx), UV_RUN_ONCE);
+    }
+
     if (sync_req.status < 0) {
         return tjs_throw_errno(ctx, sync_req.status);
     }
@@ -790,7 +804,11 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     
     // Run the event loop until the connection completes using our abstract function
     UV_RUN(sync_req);
-    
+    /* fix: drain if externally stopped to avoid UAF on stack req */
+    while (!sync_req.done) {
+        uv_run(tjs_get_loop(ctx), UV_RUN_ONCE);
+    }
+
     if (sync_req.status != 0) {
         return tjs_throw_errno(ctx, sync_req.status);
     }
@@ -1111,7 +1129,11 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
     
     // Run the event loop until the connection completes using our abstract function
     UV_RUN(sync_req);
-    
+    /* fix: drain if externally stopped to avoid UAF on stack req */
+    while (!sync_req.done) {
+        uv_run(tjs_get_loop(ctx), UV_RUN_ONCE);
+    }
+
     if (sync_req.status != 0) {
         return tjs_throw_errno(ctx, sync_req.status);
     }

@@ -190,6 +190,7 @@ static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, 
 
 	JSValue module_obj = JS_GetPropertyStr(ctx, ns, mod->name);
 	if(!JS_IsUndefined(module_obj)){
+		JS_FreeCString(ctx, name);  /* fix: name was leaked on cache hit */
 		return module_obj;
 	}
 
@@ -305,6 +306,11 @@ static void uv__stop(uv_async_t *handle) {
     TJSRuntime *qrt = handle->data;
     CHECK_NOT_NULL(qrt);
 
+    /* Dispatch EV_EXIT here (inside the event loop) to ensure JS calls are
+     * always made from the correct thread. TJS_Stop may be called from a
+     * different thread (e.g. main thread stopping a worker), so JS dispatch
+     * must NOT happen in TJS_Stop itself. */
+    tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, vm_exit_code));
     uv_stop(&qrt->loop);
 }
 
@@ -468,11 +474,16 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 void TJS_FreeRuntime(TJSRuntime *qrt) {
     qrt->freeing = true;
 
-	/* Stop all workers */
+	/* Stop all workers and wait for their threads to finish before freeing
+     * any shared state.  TJS_Stop is async (uv_async_send), so we must
+     * join to ensure the thread has exited. */
 	struct list_head *p, *tmp;
 	list_for_each_safe(p, tmp, &qrt->workers) {
 		TJSWorker *worker = list_entry(p, TJSWorker, link);
-		if (!worker->terminated) TJS_Stop(worker->wrt);
+		if (!worker->terminated) {
+			TJS_Stop(worker->wrt);
+			uv_thread_join(&worker->tid);  /* wait; prevents UAF of worker->wrt */
+		}
 		js_free(qrt->ctx, worker);
 	}
 
@@ -632,6 +643,10 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 		// define module meta
 		JSModuleDef* m = JS_VALUE_GET_PTR(obj);
 		JSValue meta = JS_GetImportMeta(ctx, m);
+		if (JS_IsException(meta)) {  /* fix: unchecked exception could crash */
+			JS_FreeValue(ctx, obj);
+			goto error;
+		}
 
 #ifndef CJS__DISABLE_MODULE_USE
 		// define use()
@@ -722,7 +737,8 @@ int TJS_Run(TJSRuntime *qrt) {
 void TJS_Stop(TJSRuntime *qrt) {
     CHECK_NOT_NULL(qrt);
 	if (!qrt->is_worker && vm_exit_code == 0) vm_exit_code = 1;
-	tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, vm_exit_code));
+    /* Only uv_async_send is thread-safe; JS dispatch is deferred to uv__stop
+     * which runs inside the target runtime's own event loop thread. */
     uv_async_send(&qrt->stop);
 }
 

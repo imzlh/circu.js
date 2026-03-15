@@ -111,7 +111,7 @@ static JSValue tjs_fswatch_path_get(JSContext *ctx, JSValue this_val) {
         if (!dbuf) {
             return JS_EXCEPTION;
         }
-        uv_fs_event_getpath(&fw->handle, dbuf, &size);
+        r = uv_fs_event_getpath(&fw->handle, dbuf, &size);  /* fix: must re-check new r */
         if (r != 0) {
             js_free(ctx, dbuf);
             return tjs_throw_errno(ctx, r);
@@ -151,7 +151,8 @@ static void uv__fs_event_cb(uv_fs_event_t *handle, const char *filename, int eve
     }
 
     JSValue args[2] = {
-        JS_NewString(ctx, filename),
+        /* fix: filename can be NULL on Linux inotify for directory moves */
+        filename ? JS_NewString(ctx, filename) : JS_UNDEFINED,
         event,
     };
 

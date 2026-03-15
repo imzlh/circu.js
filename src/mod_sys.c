@@ -39,11 +39,8 @@ static JSValue tjs_loadModule(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
     ret = TJS_EvalModule(ctx, filename, true);
-    // JS_FreeCString(ctx, filename);
-	// assert(JS_IsModule(ret));
-	// JSModuleDef *m = JS_VALUE_GET_PTR(ret);
-	// return tjs__new_module(ctx, m);
-	return ret;
+    JS_FreeCString(ctx, filename);  /* fix: was commented out, causing CString leak */
+    return ret;
 }
 
 static JSValue tjs_loadScript(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
