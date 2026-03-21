@@ -168,12 +168,16 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
 		// alias to jobexception
 		JSValue err = JS_GetException(ctx);
 		JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
-		JS_FreeValue(ctx, err);
 		if (JS_IsEqual(ctx, retv, JS_FALSE)) {
 			TJSRuntime* trt = TJS_GetRuntime(ctx);
 			CHECK_NOT_NULL(trt);
+#ifdef DEBUG
+			fprintf(stderr, "[CORE] CALLED: ");
+			tjs_dump_error1(ctx, err);
+#endif
 			TJS_Stop(trt);
 		}
+		JS_FreeValue(ctx, err);
 		JS_FreeValue(ctx, retv);
     }
     JS_FreeValue(ctx, ret);

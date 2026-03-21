@@ -294,6 +294,10 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
                 TJSRuntime *qrt = TJS_GetRuntime(ctx);
                 CHECK_NOT_NULL(qrt);
                 JS_Throw(qrt->ctx, JS_DupValue(qrt->ctx, reason));
+#ifdef DEBUG
+				fprintf(stderr, "[CORE] UNHANDLED: ");
+				tjs_dump_error1(ctx, reason);
+#endif
                 TJS_Stop(qrt);
             }
         }
@@ -606,6 +610,10 @@ void tjs__execute_jobs(JSContext *ctx) {
 				JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
 				JS_FreeValue(ctx, err);
 				if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+#ifdef DEBUG
+					fprintf(stderr, "[CORE] JOB: ");
+					tjs_dump_error1(ctx, err);
+#endif
 					TJS_Stop(trt);
 				}
 				JS_FreeValue(ctx, retv);

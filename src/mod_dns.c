@@ -1012,7 +1012,7 @@ static JSValue tjs_dns_query_sync(JSContext* ctx, JSValueConst this_val,
 	memset(req_ctx, 0, sizeof(dns_sync_ctx_t));
 	/* fix: resolve_func is abused to hold the result array in sync mode; init
 	 * it to JS_UNDEFINED (not 0) so it's safe to JS_FreeValue on error paths */
-	udp_ctx = &req_ctx->ctx;
+	dns_udp_ctx_t* udp_ctx = &req_ctx->ctx;
 	udp_ctx->resolve_func = JS_UNDEFINED;
 	udp_ctx->ctx = ctx;
 	udp_ctx->hostname = strdup(hostname);
