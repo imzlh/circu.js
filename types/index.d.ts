@@ -38,13 +38,13 @@ interface TJSOptionalModules {
     'curl': typeof CModuleCURL
 }
 
-interface ImportMeta {
+interface UseFN {
     /**
      * Load a built-in module by name
      * @param name The name of the module to load (e.g. "fs", "dns")
      * @returns The corresponding module object
      */
-    use<K extends keyof TjsModules>(name: K): TjsModules[K];
+    <K extends keyof TjsModules>(name: K): TjsModules[K];
 
     /**
      * Load a built-in module by name
@@ -52,12 +52,20 @@ interface ImportMeta {
      * @param name The name of the module to load (e.g. "posix-ffi")
      * @returns The corresponding module object or null if module not found
      */
-    use<K extends keyof TJSOptionalModules>(name: K): TJSOptionalModules[K] | null;
+    <K extends keyof TJSOptionalModules>(name: K): TJSOptionalModules[K] | null;
 
     /**
      * Module not found, upgrade your circu.js type definitions?
      */
-    use(name: string): null;
+    (name: string): null;
+}
+
+interface ImportMeta {
+    /**
+     * Load a built-in module by name
+     * **NOTE** unusable if you enabled `CJS_USE_SYMBOL_INTERNAL`
+     */
+    use: UseFN; 
 
     /**
      * The names of all built-in modules available to this program

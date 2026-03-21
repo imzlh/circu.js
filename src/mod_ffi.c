@@ -1075,8 +1075,8 @@ static const JSCFunctionListEntry funcs[] = {
     JS_SetPropertyStr(ctx, obj, #name, name##_jsval)
 #define ADD_ALIAS_TYPE(ctx, obj, alias, oldname) JS_SetPropertyStr(ctx, obj, #alias, JS_DupValue(ctx, oldname##_jsval))
 
-static JSValue tjs__mod_ffi_init_js(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSValue ffiobj = JS_NewObject(ctx);
+
+void tjs__mod_ffi_init(JSContext *ctx, JSValue ffiobj) {
     JS_SetPropertyFunctionList(ctx, ffiobj, funcs, countof(funcs));
 
     REGISTER_CLASS(ctx, js_ffi_type);
@@ -1139,10 +1139,4 @@ static JSValue tjs__mod_ffi_init_js(JSContext *ctx, JSValue this_val, int argc, 
 #endif
 
     // ffi also supports some complex types, currently not implemented
-    return ffiobj;
-}
-
-void tjs__mod_ffi_init(JSContext *ctx, JSValue ns) {
-    JSValue func = JS_NewCFunction(ctx, tjs__mod_ffi_init_js, "ffi_load_native", 0);
-    JS_SetPropertyStr(ctx, ns, "ffi_load_native", func);
 }
