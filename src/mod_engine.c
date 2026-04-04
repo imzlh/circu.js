@@ -132,7 +132,10 @@ fail:
 static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
 	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
 	if(!mt) return JS_EXCEPTION;
-	return JS_EvalFunction(ctx, JS_MKPTR(JS_TAG_MODULE, mt->def));
+	JSValue mod_val = JS_MKPTR(JS_TAG_MODULE, mt->def);
+	/* JS_EvalFunction expects the module value to have ref_count >= 2,
+	 * as it will JS_FreeValue it internally */
+	return JS_EvalFunction(ctx, JS_DupValue(ctx, mod_val));
 }
 
 static JSValue js_module_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -163,7 +166,9 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
 	list_for_each(pos, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
 		if(name == me->atom){
-			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
+			/* Don't free the var_ref here! JS_DefineModuleExport will reuse
+			 * the same var_ref and just update its value. The var_ref is owned
+			 * by the module and will be freed when the module is destroyed. */
 			JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
 			JS_FreeAtom(ctx, name);
 			goto end;
@@ -195,24 +200,26 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 	const char* name = JS_ToCString(ctx, argv[0]);
     if(!name) return JS_EXCEPTION;
 	JSAtom name_atom = JS_NewAtom(ctx, name);
-	JS_FreeCString(ctx, name);  /* fix: free immediately after atom creation */
+	JS_FreeCString(ctx, name);
 
 	// find in exports
 	struct list_head* pos;
 	list_for_each(pos, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
 		if(name_atom == me->atom){
-			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
+			/* Note: do NOT free me->var here! The var_ref is owned by the module's
+			 * JSExportEntry and will be freed when the module is destroyed.
+			 * We just remove our tracking entry. */
 			JS_FreeAtom(ctx, me->atom);
 			list_del(&me->list);
 			js_free(ctx, me);
-			JS_FreeAtom(ctx, name_atom);  /* fix: free our lookup atom */
+			JS_FreeAtom(ctx, name_atom);
 			return JS_UNDEFINED;
 		}
 	}
 
 	JSValue err = JS_ThrowTypeError(ctx, "export not found");
-	JS_FreeAtom(ctx, name_atom);  /* fix: free on error path */
+	JS_FreeAtom(ctx, name_atom);
     return err;
 }
 

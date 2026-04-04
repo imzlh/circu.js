@@ -644,7 +644,6 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
         if (JS_ResolveModule(ctx, obj) < 0) {
-            JS_FreeValue(ctx, obj);
             goto error;
         }
 
@@ -652,7 +651,6 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 		JSModuleDef* m = JS_VALUE_GET_PTR(obj);
 		JSValue meta = JS_GetImportMeta(ctx, m);
 		if (JS_IsException(meta)) {  /* fix: unchecked exception could crash */
-			JS_FreeValue(ctx, obj);
 			goto error;
 		}
 
