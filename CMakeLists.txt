@@ -50,7 +50,8 @@ cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
 cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
-cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" ON)
+# we recommend to enable to make attached binary smaller
+cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 

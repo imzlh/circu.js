@@ -21,7 +21,7 @@ await test('Module#create + export() should be importable immediately', async ()
 });
 
 
-/* --------- test case 3 --------- */
+/* --------- test case 2 --------- */
 await test('over-writing export with same name', async () => {
   const m = engine.Module.create('mod3');
   m.export('val', 1);
@@ -32,3 +32,11 @@ await test('over-writing export with same name', async () => {
 
   if (mod.val !== 2)                 throw new Error('val not overwritten');
 });
+
+await test('free not-imported module', async () => {
+  const m = engine.Module.create('mod4');
+  m.export('val', 1);
+
+  // the var_ref should be automately GCed
+  engine.gc.run()
+})

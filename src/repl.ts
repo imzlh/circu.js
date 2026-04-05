@@ -27,6 +27,8 @@ const streams = import.meta.use('streams');
 const signal = import.meta.use('signals');
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
+const fs = import.meta.use('asyncfs');
+const sfs = import.meta.use('fs');
 
 // preset some envs
 globalThis.console = console;
@@ -1044,6 +1046,14 @@ class CJSRepl {
             });
         }
     }
+
+    exportHistory(){
+        return this.#history;
+    }
+
+    importHistory(history: string[]){
+        this.#history = history;
+    }
 }
 
 // prevent default unhandled rejections
@@ -1051,7 +1061,18 @@ engine.onEvent(e => false);
 
 // Start REPL
 const repl = new CJSRepl();
-repl.start();
+repl.start().then(() => {
+    const history = repl.exportHistory();
+    sfs.writeFile(home + '/.cjs_history', engine.encodeString(history.join('\n')), 0o600);
+});
+
+// Load History
+const home = os.getenv('HOME') || os.getenv('USERPROFILE');
+if (home) try{
+    const file = await fs.readFile(home + '/.cjs_history');
+    const lines = engine.decodeString(file).split('\n');
+    repl.importHistory(lines);
+} catch {}
 
 // bind exit handler
 signal.signal(signal.signals.SIGINT, () => {

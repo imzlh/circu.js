@@ -214,6 +214,14 @@ declare namespace CModuleEngine {
         static create(name: string): Module;
 
         /**
+         * (推荐，这是QJS-ng官方的最佳实践)
+         * 创建一个模块，将object的元素添加到模块导出
+         * @param name 模块名称
+         * @param object 需要添加的模块内容
+         */
+        static from(name: string, object: Record<string, any>): Module;
+
+        /**
          * 将传入的模块内容编译
          */
         constructor(content: string, filename: string);

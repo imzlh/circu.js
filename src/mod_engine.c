@@ -105,6 +105,62 @@ static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, 
     return module_new(ctx, m);
 }
 
+// callback to export all private value
+static int js_module_init_fn(JSContext *ctx, JSModuleDef *m) {
+	JSPropertyEnum* ep;
+	JSValueConst raw_object = JS_GetModulePrivateValue(ctx, m);
+	int len = JS_GetOwnPropertyNames(ctx, &ep, NULL, raw_object, JS_GPN_STRING_MASK);
+	if (len == -1) {
+		JS_FreeValue(ctx, raw_object);
+		return -1;
+	}
+	for (int i = 0; i < len; i++) {
+		const char* name = JS_AtomToCString(ctx, ep[i].atom);
+		JSValueConst val = JS_GetProperty(ctx, raw_object, ep[i].atom);
+		if (JS_IsException(val)){
+			JS_FreeCString(ctx, name);
+			continue;
+		}
+		JS_SetModuleExport(ctx, m, name, val);
+		JS_FreeCString(ctx, name);
+	}
+	JS_FreePropertyEnum(ctx, ep, len);
+	JS_FreeValue(ctx, raw_object);
+	return 0;
+}
+
+static JSValue js_module_static_from(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv){
+	if (argc < 2){
+		return JS_ThrowTypeError(ctx, "Module.from() requires 2 arguements");
+    }
+
+	if (!JS_IsString(argv[0]) || !JS_IsObject(argv[1])) {
+		return JS_ThrowTypeError(ctx, "invalid arguments to Module.from()");
+	}
+
+	const char* name = JS_ToCString(ctx, argv[0]);
+	JSValue raw_object = JS_DupValue(ctx, argv[1]);
+	JSModuleDef* m = JS_NewCModule(ctx, name, js_module_init_fn);
+	JS_FreeCString(ctx, name);
+
+	// export all keys
+	JSPropertyEnum* ep;
+	int len = JS_GetOwnPropertyNames(ctx, &ep, NULL, raw_object, JS_GPN_STRING_MASK);
+	if (len == -1) {
+		JS_FreeValue(ctx, raw_object);
+		return JS_EXCEPTION;
+	}
+	for (int i = 0; i < len; i++) {
+		const char* name = JS_AtomToCString(ctx, ep[i].atom);
+		JS_AddModuleExport(ctx, m, name);
+		JS_FreeCString(ctx, name);
+	}
+	JS_FreePropertyEnum(ctx, ep, len);
+
+	JS_SetModulePrivateValue(ctx, m, raw_object);
+	return module_new(ctx, m);
+}
+
 static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
     if(argc < 2 || !JS_IsString(argv[0])){
 		return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
@@ -659,4 +715,8 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 	// Module.create
 	JSValue mcreate = JS_NewCFunction(ctx, js_module_static_create, "create", 1);
 	JS_DefinePropertyValueStr(ctx, ctor, "create", mcreate, JS_PROP_C_W_E);
+
+	// Module.from
+	JSValue mfrom = JS_NewCFunction(ctx, js_module_static_from, "from", 1);
+	JS_DefinePropertyValueStr(ctx, ctor, "from", mfrom, JS_PROP_C_W_E);
 }
