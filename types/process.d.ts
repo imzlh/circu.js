@@ -71,7 +71,7 @@ declare namespace CModuleProcess {
     }
 
     /**
-     * 子进程对象（对应 C 代码中的 Process 类）
+     * 子进程对象
      */
     export interface ChildProcess {
         /** 进程ID */
@@ -82,8 +82,6 @@ declare namespace CModuleProcess {
         readonly stdout?: Pipe;
         /** 标准错误流（如果配置为 pipe） */
         readonly stderr?: Pipe;
-        /** 类型标签 */
-        readonly [Symbol.toStringTag]: 'Process';
 
         /**
          * 等待进程退出
@@ -99,62 +97,29 @@ declare namespace CModuleProcess {
 
         /**
          * 向进程发送信号
-         * @param signal 要发送的信号，默认 SIGTERM
+         * @param signal 要发送的信号，默认 SIGTERM（可以是字符串或数字）
          */
-        kill(signal?: Signal): void;
-    }
-
-    /**
-     * 当前进程接口（对应全局 process 对象）
-     */
-    export interface CurrentProcess {
-        /** 当前进程ID */
-        readonly pid: number;
-        /** 父进程ID */
-        readonly ppid: number;
-        /** 平台名称 */
-        readonly platform: string;
-        /** 当前工作目录 */
-        readonly cwd: string;
-        /** 环境变量 */
-        readonly env: Record<string, string>;
-        /** 进程标题 */
-        title: string;
-
-        /**
-         * 退出当前进程
-         * @param code 退出码
-         */
-        exit(code?: number): never;
-
-        /**
-         * 添加信号监听器
-         */
-        on(signal: Signal , listener: () => void): void;
-
-        /**
-         * 移除信号监听器
-         */
-        off(signal: Signal , listener: () => void): void;
+        kill(signal?: Signal | number): void;
     }
 
     /**
      * 创建子进程
+     * @param args 命令字符串或参数数组（第一个元素是要执行的命令）
+     * @param options 可选配置
      */
-    export function spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcess;
+    export function spawn(args: string | string[], options?: SpawnOptions): ChildProcess;
 
     /**
-     * 执行命令并返回输出
+     * 执行命令（spawn + wait 的简写）
+     * @param args 命令字符串或参数数组
+     * @param options 可选配置
      */
-    export function exec(command: string, args?: string[], options?: SpawnOptions): Promise<string>;
+    export function exec(args: string | string[], options?: SpawnOptions): ChildProcess;
 
     /**
-     * 向指定进程发送信号（全局函数）
+     * 向指定进程发送信号
+     * @param pid 进程ID
+     * @param signal 信号（字符串或数字），默认 SIGTERM
      */
-    export function kill(pid: number, signal?: Signal ): void;
-
-    /**
-     * 当前进程实例
-     */
-    export const process: CurrentProcess;
+    export function kill(pid: number, signal?: Signal | number): void;
 }

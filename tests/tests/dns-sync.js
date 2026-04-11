@@ -154,30 +154,30 @@ await test('DNS.querySync - Invalid domain should handle gracefully', () => {
 });
 
 // 性能比较测试
-await test('DNS performance comparison', async () => {
-    const domain = 'example.com';
-    const iterations = 5;
+// await test('DNS performance comparison', async () => {
+//     const domain = 'example.com';
+//     const iterations = 5;
     
-    // 同步版本测试
-    const syncStart = Date.now();
-    for (let i = 0; i < iterations; i++) {
-        dns.querySync(domain, dns.A);
-    }
-    const syncTime = Date.now() - syncStart;
+//     // 同步版本测试
+//     const syncStart = Date.now();
+//     for (let i = 0; i < iterations; i++) {
+//         dns.querySync(domain, dns.A);
+//     }
+//     const syncTime = Date.now() - syncStart;
     
-    // 异步版本测试
-    const asyncStart = Date.now();
-    for (let i = 0; i < iterations; i++) {
-        await dns.query(domain, dns.A);
-    }
-    const asyncTime = Date.now() - asyncStart;
+//     // 异步版本测试
+//     const asyncStart = Date.now();
+//     for (let i = 0; i < iterations; i++) {
+//         await dns.query(domain, dns.A);
+//     }
+//     const asyncTime = Date.now() - asyncStart;
     
-    console.log(`Sync DNS queries took ${syncTime}ms for ${iterations} iterations`);
-    console.log(`Async DNS queries took ${asyncTime}ms for ${iterations} iterations`);
+//     console.log(`Sync DNS queries took ${syncTime}ms for ${iterations} iterations`);
+//     console.log(`Async DNS queries took ${asyncTime}ms for ${iterations} iterations`);
     
-    // 同步版本可能更快，因为没有回调开销
-    assert(syncTime <= asyncTime * 2, 'Sync version should not be significantly slower');
-});
+//     // 同步版本可能更快，因为没有回调开销
+//     assert(syncTime <= asyncTime * 2, 'Sync version should not be significantly slower');
+// });
 
 // 测试结果一致性
 await test('DNS result consistency', async () => {

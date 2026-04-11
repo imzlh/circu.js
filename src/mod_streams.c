@@ -147,7 +147,7 @@ static void uv__stream_close_cb(uv_handle_t *handle) {
 }
 
 static void maybe_close(TJSStream *s) {
-    if (!uv_is_closing(&s->h.handle)) {
+    if (!uv_is_closing(&s->h.handle) && !s->closed) {
         uv_close(&s->h.handle, uv__stream_close_cb);
     }
 }
@@ -221,9 +221,7 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
-    }
+    if (!buf) return JS_EXCEPTION;
     s->read.b.tarray = JS_DupValue(ctx, argv[0]);
     s->read.b.data = buf;
     s->read.b.len = size;
@@ -257,9 +255,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
 
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
-    }
+    if (!buf) return JS_EXCEPTION;
 
 	// queueing?
 	if (TJS_IsPromisePending(ctx, &s->read.result)) {
@@ -340,9 +336,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
 
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
-    }
+    if (!buf) return JS_EXCEPTION;
 
     /* First try to do the write inline */
     int r;
@@ -389,9 +383,7 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
 
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_ThrowTypeError(ctx, "data must be a Uint8Array");
-    }
+    if (!buf) return JS_EXCEPTION;
 
     /* First try to do the write inline */
     int r;

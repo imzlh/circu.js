@@ -308,8 +308,47 @@ static void uv__exit_cb(uv_process_t *handle, int64_t exit_status, int term_sign
     maybe_close(p);
 }
 
+#define SETUP_STDIO(name, idx, pipe_flag, def_fd) do { \
+    JSValue js_##name = JS_GetPropertyStr(ctx, arg1, #name); \
+    if (!JS_IsException(js_##name) && !JS_IsUndefined(js_##name)) { \
+        const char *val = JS_ToCString(ctx, js_##name); \
+        if (!val) { \
+            JS_FreeValue(ctx, js_##name); \
+            goto fail; \
+        } \
+        if (strcmp(val, "pipe") == 0) { \
+            JSValue obj = tjs_new_pipe(ctx); \
+            if (JS_IsException(obj)) { \
+                JS_FreeCString(ctx, val); \
+                JS_FreeValue(ctx, js_##name); \
+                goto fail; \
+            } \
+            p->stdio[idx] = obj; \
+            stdio[idx].flags = UV_CREATE_PIPE | (pipe_flag); \
+            stdio[idx].data.stream = tjs_pipe_get_stream(ctx, obj); \
+            if (!stdio[idx].data.stream) { \
+                JS_FreeCString(ctx, val); \
+                JS_FreeValue(ctx, js_##name); \
+                JS_ThrowTypeError(ctx, "Failed to create pipe stream. Did `streams` module initialized?"); \
+                goto fail; \
+            } \
+        } else if (strcmp(val, "ignore") == 0) { \
+            stdio[idx].flags = UV_IGNORE; \
+        } else { \
+            stdio[idx].flags = UV_INHERIT_FD; \
+            stdio[idx].data.fd = (def_fd); \
+        } \
+        JS_FreeCString(ctx, val); \
+    } \
+    JS_FreeValue(ctx, js_##name); \
+} while(0)
+
 static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JSValue ret;
+
+	if (argc == 0) {
+		return JS_ThrowTypeError(ctx, "Expect at least 1 arguement");
+	}
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_process_class_id);
     if (JS_IsException(obj)) {
@@ -353,9 +392,8 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     }
     options.file = options.args[0];
 
-    JSValue arg1 = argv[1];
-
-    if (!JS_IsUndefined(arg1)) {
+    if (argc >= 2 && JS_IsObject(argv[1])) {
+    	JSValue arg1 = argv[1];
         /* env */
         JSValue js_env = JS_GetPropertyStr(ctx, arg1, "env");
         if (JS_IsObject(js_env)) {
@@ -451,83 +489,23 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         JS_FreeValue(ctx, js_gid);
 
         /* stdio */
-        JSValue js_stdin = JS_GetPropertyStr(ctx, arg1, "stdin");
-        if (!JS_IsException(js_stdin) && !JS_IsUndefined(js_stdin)) {
-            const char *in = JS_ToCString(ctx, js_stdin);
-            if (!in) {
-                JS_FreeValue(ctx, js_stdin);
-                goto fail;
-            }
-            if (strcmp(in, "inherit") == 0) {
-                stdio[0].flags = UV_INHERIT_FD;
-                stdio[0].data.fd = STDIN_FILENO;
-            } else if (strcmp(in, "pipe") == 0) {
-                JSValue obj = tjs_new_pipe(ctx);
-                if (JS_IsException(obj)) {
-                    JS_FreeValue(ctx, js_stdin);
-                    goto fail;
-                }
-                p->stdio[0] = obj;
-                stdio[0].flags = UV_CREATE_PIPE | UV_READABLE_PIPE;
-                stdio[0].data.stream = tjs_pipe_get_stream(ctx, obj);
-            } else if (strcmp(in, "ignore") == 0) {
-                stdio[0].flags = UV_IGNORE;
-            }
-            JS_FreeCString(ctx, in);
-        }
-        JS_FreeValue(ctx, js_stdin);
+		SETUP_STDIO(stdin,  0, UV_READABLE_PIPE,  STDIN_FILENO);
+		SETUP_STDIO(stdout, 1, UV_WRITABLE_PIPE, STDOUT_FILENO);
+		SETUP_STDIO(stderr, 2, UV_WRITABLE_PIPE, STDERR_FILENO);
 
-        JSValue js_stdout = JS_GetPropertyStr(ctx, arg1, "stdout");
-        if (!JS_IsException(js_stdout) && !JS_IsUndefined(js_stdout)) {
-            const char *out = JS_ToCString(ctx, js_stdout);
-            if (!out) {
-                JS_FreeValue(ctx, js_stdout);
-                goto fail;
-            }
-            if (strcmp(out, "inherit") == 0) {
-                stdio[1].flags = UV_INHERIT_FD;
-                stdio[1].data.fd = STDOUT_FILENO;
-            } else if (strcmp(out, "pipe") == 0) {
-                JSValue obj = tjs_new_pipe(ctx);
-                if (JS_IsException(obj)) {
-                    JS_FreeValue(ctx, js_stdout);
-                    goto fail;
-                }
-                p->stdio[1] = obj;
-                stdio[1].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
-                stdio[1].data.stream = tjs_pipe_get_stream(ctx, obj);
-            } else if (strcmp(out, "ignore") == 0) {
-                stdio[1].flags = UV_IGNORE;
-            }
-            JS_FreeCString(ctx, out);
-        }
-        JS_FreeValue(ctx, js_stdout);
+		/* detached */
+		JSValue js_detached = JS_GetPropertyStr(ctx, arg1, "detached");
+		if (JS_IsEqual(ctx, js_detached, JS_TRUE)) {
+			options.flags |= UV_PROCESS_DETACHED;
+		}
+		JS_FreeValue(ctx, js_detached);
 
-        JSValue js_stderr = JS_GetPropertyStr(ctx, arg1, "stderr");
-        if (!JS_IsException(js_stderr) && !JS_IsUndefined(js_stderr)) {
-            const char *err = JS_ToCString(ctx, js_stderr);
-            if (!err) {
-                JS_FreeValue(ctx, js_stderr);
-                goto fail;
-            }
-            if (strcmp(err, "inherit") == 0) {
-                stdio[2].flags = UV_INHERIT_FD;
-                stdio[2].data.fd = STDERR_FILENO;
-            } else if (strcmp(err, "pipe") == 0) {
-                JSValue obj = tjs_new_pipe(ctx);
-                if (JS_IsException(obj)) {
-                    JS_FreeValue(ctx, js_stderr);
-                    goto fail;
-                }
-                p->stdio[2] = obj;
-                stdio[2].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
-                stdio[2].data.stream = tjs_pipe_get_stream(ctx, obj);
-            } else if (strcmp(err, "ignore") == 0) {
-                stdio[2].flags = UV_IGNORE;
-            }
-            JS_FreeCString(ctx, err);
-        }
-        JS_FreeValue(ctx, js_stderr);
+		/* background */
+		JSValue js_background = JS_GetPropertyStr(ctx, arg1, "background");
+		if (JS_IsEqual(ctx, js_background, JS_TRUE)) {
+			options.flags |= UV_PROCESS_WINDOWS_HIDE;
+		}
+		JS_FreeValue(ctx, js_background);
     }
 
     options.exit_cb = uv__exit_cb;

@@ -545,15 +545,7 @@ static JSValue tjs_ssl_pipe_feed(JSContext *ctx, JSValueConst this_val,
     
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
-        if (JS_IsException(buffer)) {
-            return JS_ThrowTypeError(ctx, "Argument must be ArrayBuffer or TypedArray");
-        }
-        buf = JS_GetAnyBuffer(ctx, &size, buffer);
-        JS_FreeValue(ctx, buffer);
-        if (!buf) return JS_EXCEPTION;
-    }
+    if (!buf) return JS_EXCEPTION;
     
     int ret = BIO_write(pipe->rbio, buf, size);
     return JS_NewInt32(ctx, ret);
@@ -594,15 +586,7 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
     
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
-        if (JS_IsException(buffer)) {
-            return JS_ThrowTypeError(ctx, "Argument must be ArrayBuffer or TypedArray");
-        }
-        buf = JS_GetAnyBuffer(ctx, &size, buffer);
-        JS_FreeValue(ctx, buffer);
-        if (!buf) return JS_EXCEPTION;
-    }
+    if (!buf) return JS_EXCEPTION;
     
     int ret = SSL_write(pipe->ssl, buf, size);
     

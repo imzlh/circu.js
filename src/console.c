@@ -614,19 +614,16 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     default: break;
     }
 
-    int64_t len = 0;
-	size_t _empty = 0;
-    JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &_empty, &_empty, &_empty);
+	size_t offset, len, per;
+    JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &offset, &len, &per);
 
     put_color(buf, opts, ANSI_MAGENTA);
     dbuf_printf(buf, "%s(%" PRId64 ") [ ", name, len);
     put_reset(buf, opts);
-
-	JS_GetLength(ctx, val, &len);
     size_t show = MIN(len, opts->max_array_length);
     for (size_t i = 0; i < show; i++) {
         if (i > 0) dbuf_putstr(buf, ", ");
-        JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+        JSValue elem = JS_GetPropertyUint32(ctx, val, i + offset);
         format_number(ctx, elem, buf, opts);
         JS_FreeValue(ctx, elem);
     }

@@ -153,8 +153,9 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 
 	size_t poffset, plen, pbytes_per_element;
 	JSValue arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
-	if (JS_IsException(arrbuf))
+	if (JS_IsException(arrbuf)){
 		return NULL;
+	}
 	*psize = plen * pbytes_per_element;
 	size_t __psize;
 	void* ret = JS_GetArrayBuffer(ctx, &__psize, arrbuf);

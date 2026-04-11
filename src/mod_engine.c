@@ -263,9 +263,7 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 	list_for_each(pos, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
 		if(name_atom == me->atom){
-			/* Note: do NOT free me->var here! The var_ref is owned by the module's
-			 * JSExportEntry and will be freed when the module is destroyed.
-			 * We just remove our tracking entry. */
+			JS_FreeModuleExport(JS_GetRuntime(ctx), mt->def);
 			JS_FreeAtom(ctx, me->atom);
 			list_del(&me->list);
 			js_free(ctx, me);
@@ -338,12 +336,15 @@ static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
 	if(!mt) return;
 	
 	// here we should free var
-	struct list_head *pos, *tmp;
-	list_for_each_safe(pos, tmp, &mt->local_def){
-		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
-		// JS_FreeModuleExport(rt, me->var);
-		JS_FreeAtomRT(rt, me->atom);
-		js_free_rt(rt, me);
+	// FIXME: link maybe incomplete, we should fix it
+	if(mt->local_def.next) {
+		struct list_head *pos, *tmp;
+		list_for_each_safe(pos, tmp, &mt->local_def){
+			tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
+			// JS_FreeModuleExport(rt, me->var);
+			JS_FreeAtomRT(rt, me->atom);
+			js_free_rt(rt, me);
+		}
 	}
 
 	js_free_rt(rt, mt);

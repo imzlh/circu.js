@@ -230,9 +230,21 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
         return JS_ThrowTypeError(ctx, "ecdsaSign() requires 2 arguments: privateKey and data");
     }
     
-    const EVP_MD* md = get_md_from_magic(magic);
-    if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+    // Determine curve and hash algorithm based on magic value
+    int nid;
+    const EVP_MD* md;
+    
+    if (magic == HASH_SHA256) {
+        nid = NID_X9_62_prime256v1;  // P-256
+        md = EVP_sha256();
+    } else if (magic == HASH_SHA384) {
+        nid = NID_secp384r1;  // P-384
+        md = EVP_sha384();
+    } else if (magic == HASH_SHA512) {
+        nid = NID_secp521r1;  // P-521
+        md = EVP_sha512();
+    } else {
+        return JS_ThrowInternalError(ctx, "Invalid ECDSA sign algorithm");
     }
     
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -243,16 +255,6 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
     data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
     if (!data) {
         return JS_EXCEPTION;
-    }
-    
-    // Determine curve NID
-    int nid;
-    if (magic == ECC_CURVE_P256) {
-        nid = NID_X9_62_prime256v1;
-    } else if (magic == ECC_CURVE_P384) {
-        nid = NID_secp384r1;
-    } else {
-        nid = NID_secp521r1;
     }
     
     // Import private key
@@ -328,9 +330,21 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
         return JS_ThrowTypeError(ctx, "ecdsaVerify() requires 3 arguments: publicKey, data, signature");
     }
     
-    const EVP_MD* md = get_md_from_magic(magic);
-    if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+    // Determine curve and hash algorithm based on magic value
+    int nid;
+    const EVP_MD* md;
+    
+    if (magic == ECC_CURVE_P256) {
+        nid = NID_X9_62_prime256v1;  // P-256
+        md = EVP_sha256();
+    } else if (magic == ECC_CURVE_P384) {
+        nid = NID_secp384r1;  // P-384
+        md = EVP_sha384();
+    } else if (magic == ECC_CURVE_P521) {
+        nid = NID_secp521r1;  // P-521
+        md = EVP_sha512();
+    } else {
+        return JS_ThrowInternalError(ctx, "Invalid ECDSA verify algorithm");
     }
     
     pub_data = JS_GetAnyBuffer(ctx, &pub_len, argv[0]);
@@ -339,16 +353,6 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
     
     if (!pub_data || !data || !sig_data) {
         return JS_EXCEPTION;
-    }
-    
-    // Determine curve NID
-    int nid;
-    if (magic == ECC_CURVE_P256) {
-        nid = NID_X9_62_prime256v1;
-    } else if (magic == ECC_CURVE_P384) {
-        nid = NID_secp384r1;
-    } else {
-        nid = NID_secp521r1;
     }
     
     // Parse public key

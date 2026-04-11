@@ -170,32 +170,28 @@ await test('Stream - Result consistency', async () => {
     const asyncClient = new stream.TCP();
     
     try {
-        const ip = dns.resolveSync('example.com', { family: os.AF_UNSPEC })[0].ip;
+        const ip = dns.resolveSync('www.gstatic.com', { family: os.AF_UNSPEC })[0].ip;
         // 连接到公共服务器
         syncClient.connectSync({ ip, port: 80 });
         
-        await new Promise(resolve => {
-            asyncClient.connect({ ip, port: 80 }, () => resolve());
-        });
+        await asyncClient.connect({ ip, port: 80 });
         
         // 准备测试数据
-        const requestData = engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\n\r\n');
-        
-        // 同步写入
-        stream.writeSync(syncClient, requestData);
+        const requestData = engine.encodeString('GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\n\r\n');
         
         // 异步写入
-        await new Promise(resolve => {
-            asyncClient.write(requestData, () => resolve());
-        });
+        await asyncClient.write(requestData);
+
+        // 同步写入
+        syncClient.writeSync(requestData);
         
         // 同步读取
-        const syncData = stream.readSync(syncClient, 1024);
+        const syncData = new Uint8Array(1024);
+        syncClient.readSync(syncData);
         
         // 异步读取
-        const asyncData = await new Promise(resolve => {
-            asyncClient.read(1024, (data) => resolve(data));
-        });
+        const asyncData = new Uint8Array(1024);
+        await asyncClient.read(asyncData);
         
         // 验证结果一致性
         if (syncData !== null && asyncData !== null) {
@@ -209,6 +205,10 @@ await test('Stream - Result consistency', async () => {
                     console.log(`Byte ${i} differs: sync=${syncData[i]}, async=${asyncData[i]}`);
                     failed = true;
                 }
+            }
+            if (failed) {
+                console.log('Data differs');
+                console.log(engine.decodeString(syncData), '\n', engine.decodeString(asyncData));
             }
             assert(!failed, 'Data should be consistent');
             console.log('Data is consistent');

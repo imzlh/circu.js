@@ -87,12 +87,6 @@ static inline void tjs_llhttp_init_ref(JSValue* slot) {
 	*slot = JS_UNDEFINED;
 }
 
-static inline bool tjs_is_u8_view(JSContext* ctx, JSValueConst v) {
-	/* Accept ArrayBuffer or TypedArray. We’ll try to extract bytes anyway. */
-	(void) ctx;
-	return JS_IsArrayBuffer(v) || JS_GetTypedArrayType(v) != -1;
-}
-
 static inline const char* tjs_llhttp_event_name(TJSLlhttpEvent ev) {
 	switch (ev){
 		case EV_MESSAGE_BEGIN: return "messageBegin";
@@ -358,18 +352,15 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
 
-	if (argc < 1 || !tjs_is_u8_view(ctx, argv[0])) {
-		return JS_ThrowTypeError(ctx, "execute expects ArrayBuffer/TypedArray/DataView");
-	}
+	size_t len = 0;
+	uint8_t* data = argc == 0 ? NULL : JS_GetAnyBuffer(ctx, &len, argv[0]);
+	if (!data) return JS_EXCEPTION;
 
 	/* clear pending exception before running */
 	if (!JS_IsUndefined(p->pending_exc)) {
 		JS_FreeValue(ctx, p->pending_exc);
 		p->pending_exc = JS_UNDEFINED;
 	}
-
-	size_t len = 0;
-	uint8_t* data = JS_GetAnyBuffer(ctx, &len, argv[0]);
 
 	tjs_llhttp_set_ref(ctx, &p->current_buf, JS_DupValue(ctx, argv[0]));
 

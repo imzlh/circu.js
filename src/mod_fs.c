@@ -218,7 +218,7 @@ static int crt2uv(int crt_err) {
 #define THROW2(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
 #else
 #define THROW(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-#define THROW2(msg) abort();	// windows only, should never happen
+#define THROW2(msg) do { fprintf(stderr, "THROW2 called on non-Windows platform\n"); abort(); } while(0)	// windows only, should never happen
 #endif
 
 
@@ -253,10 +253,10 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
     JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
     JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
     JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
-    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512));
-    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, st.st_atime * 1000));
-    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, st.st_mtime * 1000));
-    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, st.st_ctime * 1000));
+    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512 < 0 ? 0 : (st.st_size + 511) / 512));
+    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, (int64_t)st.st_atime * 1000));
+    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, (int64_t)st.st_mtime * 1000));
+    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, (int64_t)st.st_ctime * 1000));
     
     /* Helper methods */
     JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
@@ -301,10 +301,10 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
     JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
     JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
     JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
-    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512));
-    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, st.st_atime * 1000));
-    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, st.st_mtime * 1000));
-    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, st.st_ctime * 1000));
+    JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512 < 0 ? 0 : (st.st_size + 511) / 512));
+    JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, (int64_t)st.st_atime * 1000));
+    JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, (int64_t)st.st_mtime * 1000));
+    JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, (int64_t)st.st_ctime * 1000));
     
     JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
     JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
@@ -627,9 +627,47 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     JS_FreeCString(ctx, path);
     
     size_t size = st.st_size;
-	if (size == 0) {
-		return JS_NewArrayBufferCopy(ctx, NULL, 0);
-	}
+    
+    // For pseudo-files (like /proc/*, /sys/*), st_size may be 0 but content exists
+    // Use dynamic buffer for such cases
+    if (size == 0) {
+        size_t capacity = 4096;
+        size_t total_read = 0;
+        uint8_t* buf = js_malloc(ctx, capacity);
+        if (!buf) {
+            close(fd);
+            return JS_EXCEPTION;
+        }
+        
+        ssize_t n;
+        while ((n = read(fd, buf + total_read, capacity - total_read)) != 0) {
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                js_free(ctx, buf);
+                close(fd);
+                THROW("read");
+            }
+            total_read += n;
+            if (total_read >= capacity) {
+                // Grow buffer
+                size_t new_capacity = capacity * 2;
+                uint8_t* new_buf = js_realloc(ctx, buf, new_capacity);
+                if (!new_buf) {
+                    js_free(ctx, buf);
+                    close(fd);
+                    return JS_EXCEPTION;
+                }
+                buf = new_buf;
+                capacity = new_capacity;
+            }
+        }
+        
+        close(fd);
+        
+        JSValue result = JS_NewArrayBufferCopy(ctx, buf, total_read);
+        js_free(ctx, buf);
+        return result;
+    }
 
     uint8_t* buf = js_malloc(ctx, size);
     if (!buf) {
@@ -638,16 +676,16 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     }
     
     ssize_t n, total_read = 0;
-	while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
-		if (n < 0) {
-			if (errno == EINTR) continue;
+    while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
             js_free(ctx, buf);
             close(fd);
             THROW("read");
-       	}
-		total_read += n;
-		if (total_read == size) break;
-	}
+        }
+        total_read += n;
+        if (total_read == size) break;
+    }
     
     close(fd);
     
@@ -795,7 +833,6 @@ static JSValue tjs_syncfs_link(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
     const char *existing_path, *new_path;
-    int result;
     
     if (argc < 2) {
         return JS_ThrowSyntaxError(ctx, "Missing string arguments: requires existingPath and newPath");
@@ -819,26 +856,33 @@ static JSValue tjs_syncfs_link(JSContext *ctx, JSValueConst this_val,
     // Platform-specific link creation
 #ifdef _WIN32
     // Windows implementation using CreateHardLink
-    result = CreateHardLinkA(new_path, existing_path, NULL);
+    BOOL result = CreateHardLinkA(new_path, existing_path, NULL);
+    (void)result;  // Silence unused variable warning in case of macro weirdness
     if (!result) {
         DWORD error_code = GetLastError();
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Failed to create hard link on Windows. Error code: %lu", error_code);
+        LPSTR messageBuffer = NULL;
+        JSValue error;
+        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+        if (messageBuffer) {
+            error = JS_ThrowTypeError(ctx, "Failed to create hard link: %s", messageBuffer);
+            LocalFree(messageBuffer);
+        } else {
+            error = JS_ThrowTypeError(ctx, "Failed to create hard link. Error code: %lu", error_code);
+        }
         JS_FreeCString(ctx, existing_path);
         JS_FreeCString(ctx, new_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return error;
     }
 #else
     // Unix-like implementation using link()
-    result = link(existing_path, new_path);
+    int result = link(existing_path, new_path);
+    (void)result;  // Silence unused variable warning in case of macro weirdness
     if (result != 0) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Failed to create hard link. System error: %s", strerror(errno));
+        int saved_errno = errno;
         JS_FreeCString(ctx, existing_path);
         JS_FreeCString(ctx, new_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
     }
 #endif
 
@@ -979,21 +1023,30 @@ static JSValue tjs_syncfs_symlink(JSContext *ctx, JSValueConst this_val,
     
     if (!success) {
         DWORD error_code = GetLastError();
+        LPSTR messageBuffer = NULL;
+        JSValue error;
+        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+        if (messageBuffer) {
+            error = JS_ThrowTypeError(ctx, "Failed to create symbolic link: %s", messageBuffer);
+            LocalFree(messageBuffer);
+        } else {
+            error = JS_ThrowTypeError(ctx, "Failed to create symbolic link. Error code: %lu", error_code);
+        }
         JS_FreeCString(ctx, target);
         JS_FreeCString(ctx, path);
-        return JS_ThrowTypeError(ctx, "Failed to create symbolic link. %s", strerror(error_code));
+        return error;
     }
 #else
     // Unix-like implementation using symlink
-    int symlink_result;
-    
     // For Unix, we can ignore the type parameter as symlink works for both files and directories
-    symlink_result = symlink(target, path);
+    int symlink_result = symlink(target, path);
     
     if (symlink_result != 0) {
+        int saved_errno = errno;
         JS_FreeCString(ctx, target);
         JS_FreeCString(ctx, path);
-        return JS_ThrowPlainError(ctx, "Failed to create symlink. System error: %s", strerror(errno));
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
     }
 #endif
 
@@ -1047,11 +1100,18 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     
     if (hFile == INVALID_HANDLE_VALUE) {
         DWORD error_code = GetLastError();
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Cannot open symbolic link. Error code: %lu", error_code);
+        LPSTR messageBuffer = NULL;
+        JSValue error;
+        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+        if (messageBuffer) {
+            error = JS_ThrowTypeError(ctx, "Cannot open symbolic link: %s", messageBuffer);
+            LocalFree(messageBuffer);
+        } else {
+            error = JS_ThrowTypeError(ctx, "Cannot open symbolic link. Error code: %lu", error_code);
+        }
         JS_FreeCString(ctx, path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return error;
     }
     
     // Allocate buffer for reparse point data
@@ -1109,12 +1169,19 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     
     if (!success || !link_path) {
         DWORD error_code = GetLastError();
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Failed to read symbolic link. Error code: %lu", error_code);
+        LPSTR messageBuffer = NULL;
+        JSValue error;
+        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+        if (messageBuffer) {
+            error = JS_ThrowTypeError(ctx, "Failed to read symbolic link: %s", messageBuffer);
+            LocalFree(messageBuffer);
+        } else {
+            error = JS_ThrowTypeError(ctx, "Failed to read symbolic link. Error code: %lu", error_code);
+        }
         JS_FreeCString(ctx, path);
         if (link_path) js_free(ctx, link_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return error;
     }
 #else
     // Unix-like implementation using readlink
@@ -1129,11 +1196,11 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
     }
     
     // Read the symbolic link
-    link_size = readlink(path, link_path, buffer_size - 1);
+    link_size = readlink(path, link_path, buffer_size);
     
     // Handle buffer too small case
-    if (link_size == buffer_size - 1) {
-        // Buffer might be too small, try with larger buffer
+    if (link_size == (ssize_t)buffer_size) {
+        // Buffer might be too small (content was truncated), try with larger buffer
         js_free(ctx, link_path);
         buffer_size = 65536; // 64KB should be sufficient for most paths
         link_path = (char*)js_malloc(ctx, buffer_size);
@@ -1141,16 +1208,14 @@ static JSValue tjs_syncfs_readlink(JSContext *ctx, JSValueConst this_val,
             JS_FreeCString(ctx, path);
             return JS_ThrowTypeError(ctx, "Memory allocation failed");
         }
-        link_size = readlink(path, link_path, buffer_size - 1);
+        link_size = readlink(path, link_path, buffer_size);
     }
     
     if (link_size == -1) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Failed to read symbolic link: %s", strerror(errno));
+        int saved_errno = errno;
         js_free(ctx, link_path);
         JS_FreeCString(ctx, path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
     }
     
     // Null-terminate the string
@@ -1198,17 +1263,34 @@ static JSValue tjs_syncfs_copy(JSContext *ctx, JSValueConst this_val,
     }
     
 #ifdef _WIN32
+    // Check if source is a regular file (not a directory)
+    DWORD src_attribs = GetFileAttributesA(src_path);
+    if (src_attribs == INVALID_FILE_ATTRIBUTES) {
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        THROW2("copy: cannot access source file");
+    }
+    if (src_attribs & FILE_ATTRIBUTE_DIRECTORY) {
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, "Source is a directory, not a file");
+    }
+    
     // Windows high-performance copy using CopyFileEx with progress callback (NULL for simple copy)
-    result = CopyFileExA(src_path, dest_path, NULL, NULL, NULL, COPY_FILE_FAIL_IF_EXISTS);
+    // Note: We use 0 flags (not COPY_FILE_FAIL_IF_EXISTS) to match Unix behavior (overwrite)
+    BOOL result = CopyFileExA(src_path, dest_path, NULL, NULL, NULL, 0);
     if (!result) {
         DWORD error_code = GetLastError();
         char error_msg[256];
         
-        if (error_code == ERROR_FILE_EXISTS) {
-            snprintf(error_msg, sizeof(error_msg), "Destination file already exists: %s", dest_path);
+        LPSTR messageBuffer = NULL;
+        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+        if (messageBuffer) {
+            snprintf(error_msg, sizeof(error_msg), "Failed to copy file: %s", messageBuffer);
+            LocalFree(messageBuffer);
         } else {
-            snprintf(error_msg, sizeof(error_msg), 
-                     "Failed to copy file on Windows. Error code: %lu", error_code);
+            snprintf(error_msg, sizeof(error_msg), "Failed to copy file. Error code: %lu", error_code);
         }
         
         JS_FreeCString(ctx, src_path);
@@ -1225,77 +1307,110 @@ static JSValue tjs_syncfs_copy(JSContext *ctx, JSValueConst this_val,
     // Open source file (read-only)
     src_fd = open(src_path, O_RDONLY);
     if (src_fd == -1) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Cannot open source file: %s", strerror(errno));
+        int saved_errno = errno;
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
     }
     
-    // Get source file info
+    // Check if source is a regular file (don't copy directories or special files)
     if (fstat(src_fd, &src_stat) == -1) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Cannot get source file info: %s", strerror(errno));
+        int saved_errno = errno;
         close(src_fd);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+    }
+    if (!S_ISREG(src_stat.st_mode)) {
+        close(src_fd);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, "Source is not a regular file");
     }
     
     // Open destination file (create, write-only, with same permissions as source)
     dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
     if (dest_fd == -1) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Cannot create destination file: %s", strerror(errno));
+        int saved_errno = errno;
         close(src_fd);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
     }
     
     // Use sendfile for efficient zero-copy file transfer (where available)
     #ifdef __linux__
-        bytes_copied = sendfile(dest_fd, src_fd, &offset, src_stat.st_size);
+        // Loop to handle partial writes and EINTR
+        bytes_copied = 0;
+        while (offset < src_stat.st_size) {
+            size_t to_send = (size_t)(src_stat.st_size - offset);
+            // Limit chunk size to avoid issues with large files on 32-bit systems
+            if (to_send > 0x7ffff000) to_send = 0x7ffff000;
+            ssize_t ret = sendfile(dest_fd, src_fd, &offset, to_send);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                bytes_copied = -1;
+                break;
+            }
+            if (ret == 0) {
+                // EOF reached before expected (file truncated during copy)
+                break;
+            }
+            bytes_copied += ret;
+        }
     #else
         // Fallback to read/write for systems without sendfile
         char buffer[65536]; // 64KB buffer
         ssize_t bytes_read;
         bytes_copied = 0;
         
-        while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
-            ssize_t bytes_written = write(dest_fd, buffer, bytes_read);
-            if (bytes_written != bytes_read) {
-                // Write error
+        while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) != 0) {
+            if (bytes_read < 0) {
+                if (errno == EINTR) continue;
                 bytes_copied = -1;
                 break;
             }
-            bytes_copied += bytes_written;
-        }
-        
-        if (bytes_read == -1) {
-            bytes_copied = -1;
+            ssize_t total_written = 0;
+            while (total_written < bytes_read) {
+                ssize_t bytes_written = write(dest_fd, buffer + total_written, bytes_read - total_written);
+                if (bytes_written < 0) {
+                    if (errno == EINTR) continue;
+                    bytes_copied = -1;
+                    break;
+                }
+                total_written += bytes_written;
+            }
+            if (bytes_copied == -1) break;
+            bytes_copied += bytes_read;
         }
     #endif
     
     // Close file descriptors
-    close(src_fd);
-    close(dest_fd);
+    int close_ret1 = close(src_fd);
+    int close_ret2 = close(dest_fd);
+    int saved_errno = 0;
+    if (bytes_copied < 0) {
+        saved_errno = errno;
+    } else if (close_ret1 < 0 || close_ret2 < 0) {
+        saved_errno = errno;
+        bytes_copied = -1;
+    }
     
-    // Check if copy was successful
-    if (bytes_copied == -1 || bytes_copied != src_stat.st_size) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), 
-                 "Failed to copy file data: %s", strerror(errno));
-        
+    // Check if copy was successful (bytes_copied should match file size)
+    if (bytes_copied < 0 || bytes_copied != src_stat.st_size) {
         // Clean up partial destination file on error
+        int saved_errno2 = errno;
         unlink(dest_path);
         
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        if (saved_errno != 0) {
+            return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        }
+        if (saved_errno2 != 0 && saved_errno2 != ENOENT) {
+            return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno2));
+        }
+        return JS_ThrowTypeError(ctx, "Failed to copy file data (file may have been modified during copy)");
     }
 #endif
 
@@ -1420,7 +1535,7 @@ static JSValue tjs_syncfs_realpath(JSContext *ctx,
                                NULL);
     JS_FreeCString(ctx, path);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2(ctx, "realpath");
+        THROW2("realpath");
     }
 
     /* 2. get final path (resolved symlinks, ., and ..) */
@@ -1430,7 +1545,7 @@ static JSValue tjs_syncfs_realpath(JSContext *ctx,
     CloseHandle(hFile);
     if (len == 0 || len >= sizeof(buf)) {
         SetLastError(len == 0 ? ERROR_GEN_FAILURE : ERROR_INSUFFICIENT_BUFFER);
-        THROW2(ctx, "realpath");
+        THROW2("realpath");
     }
 
     const char *out = buf;

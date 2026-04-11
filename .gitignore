@@ -3,6 +3,7 @@
 .DS_Store
 
 build/
+build_test/
 src/bundles/js/
 src/js/core.js
 src/js/std.js

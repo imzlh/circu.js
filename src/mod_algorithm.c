@@ -26,8 +26,9 @@
 #include "private.h"
 #include "utils.h"
 
-#include <openssl/sha.h>
 #include <string.h>
+#include <time.h>
+#include <stdint.h>
 
 static inline bool JS_IsUint8Array(JSValueConst val){
 	return JS_GetTypedArrayType(val) == JS_TYPED_ARRAY_UINT8;
@@ -45,8 +46,8 @@ static JSValue tjs_ws_unpack(JSContext* ctx, JSValue this_arg, int argc, JSValue
 	size_t inbuflen, keybuflen;
 	uint8_t* inbuf = JS_GetUint8Array(ctx, &inbuflen, argv[0]);
 	uint8_t* keybuf = JS_GetUint8Array(ctx, &keybuflen, argv[1]);
-	if(keybuflen != 8){
-		return JS_ThrowTypeError(ctx, "Invalid ws mask key. expected: 32 bits");
+	if(keybuflen != 4){
+		return JS_ThrowTypeError(ctx, "Invalid ws mask key. expected: 4 bytes");
 	}
 
 	uint8_t* outbuf = js_malloc(ctx, inbuflen);
@@ -59,7 +60,7 @@ static JSValue tjs_ws_unpack(JSContext* ctx, JSValue this_arg, int argc, JSValue
 		outbuf[i] = inbuf[i] ^ keybuf[i % 4];
 	}
 
-	return JS_NewArrayBuffer(ctx, outbuf, inbuflen, tjs__free_ab, NULL, false);
+	return JS_NewUint8Array(ctx, outbuf, inbuflen, tjs__free_ab, NULL, false);
 }
 
 typedef struct {
@@ -416,8 +417,200 @@ static JSValue xoshiro_init(JSContext *ctx) {
 	return constructor;
 }
 
+/* Simple non-cryptographic hash functions */
+
+// FNV-1a 32-bit hash
+static uint32_t fnv1a_32(const uint8_t *data, size_t len) {
+    uint32_t hash = 2166136261U;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+// FNV-1a 64-bit hash
+static uint64_t fnv1a_64(const uint8_t *data, size_t len) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+// MurmurHash3 32-bit
+static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
+    const uint32_t c1 = 0xcc9e2d51;
+    const uint32_t c2 = 0x1b873593;
+    const uint32_t r1 = 15;
+    const uint32_t r2 = 13;
+    const uint32_t m = 5;
+    const uint32_t n = 0xe6546b64;
+
+    uint32_t hash = seed;
+
+    const int nblocks = len / 4;
+    const uint32_t *blocks = (const uint32_t *)key;
+
+    for (int i = -nblocks; i; i++) {
+        uint32_t k = blocks[i];
+        k *= c1;
+        k = (k << r1) | (k >> (32 - r1));
+        k *= c2;
+
+        hash ^= k;
+        hash = ((hash << r2) | (hash >> (32 - r2))) * m + n;
+    }
+
+    const uint8_t *tail = (const uint8_t *)(key + nblocks * 4);
+    uint32_t k1 = 0;
+
+    switch (len & 3) {
+        case 3: k1 ^= tail[2] << 16;
+        case 2: k1 ^= tail[1] << 8;
+        case 1: k1 ^= tail[0];
+                k1 *= c1;
+                k1 = (k1 << r1) | (k1 >> (32 - r1));
+                k1 *= c2;
+                hash ^= k1;
+    }
+
+    hash ^= len;
+    hash ^= (hash >> 16);
+    hash *= 0x85ebca6b;
+    hash ^= (hash >> 13);
+    hash *= 0xc2b2ae35;
+    hash ^= (hash >> 16);
+
+    return hash;
+}
+
+static JSValue tjs_hash_fnv1a32(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsUint8Array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    uint32_t result = fnv1a_32(data, len);
+    return JS_NewUint32(ctx, result);
+}
+
+static JSValue tjs_hash_fnv1a64(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsUint8Array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    uint64_t result = fnv1a_64(data, len);
+    return JS_NewBigUint64(ctx, result);
+}
+
+static JSValue tjs_hash_murmur3(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsUint8Array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint32_t seed = 0;
+    if (argc >= 2 && JS_IsNumber(argv[1])) {
+        if (JS_ToUint32(ctx, &seed, argv[1])) {
+            return JS_EXCEPTION;
+        }
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    uint32_t result = murmur3_32(data, len, seed);
+    return JS_NewUint32(ctx, result);
+}
+
+/* xxHash - simple implementation */
+
+static const uint32_t XXH_PRIME32_1 = 2654435761U;
+static const uint32_t XXH_PRIME32_2 = 2246822519U;
+static const uint32_t XXH_PRIME32_3 = 3266489917U;
+static const uint32_t XXH_PRIME32_4 = 668265263U;
+static const uint32_t XXH_PRIME32_5 = 374761393U;
+
+static uint32_t xxh32_rotl(uint32_t x, int r) {
+    return (x << r) | (x >> (32 - r));
+}
+
+static uint32_t xxhash32(const uint8_t *input, size_t len, uint32_t seed) {
+    uint32_t h32;
+    const uint8_t *p = input;
+    const uint8_t *const bEnd = input + len;
+
+    if (len >= 16) {
+        const uint8_t *const limit = bEnd - 16;
+        uint32_t v1 = seed + XXH_PRIME32_1 + XXH_PRIME32_2;
+        uint32_t v2 = seed + XXH_PRIME32_2;
+        uint32_t v3 = seed + 0;
+        uint32_t v4 = seed - XXH_PRIME32_1;
+
+        do {
+            v1 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v1 = xxh32_rotl(v1, 13) * XXH_PRIME32_1;
+            p += 4;
+            v2 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v2 = xxh32_rotl(v2, 13) * XXH_PRIME32_1;
+            p += 4;
+            v3 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v3 = xxh32_rotl(v3, 13) * XXH_PRIME32_1;
+            p += 4;
+            v4 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v4 = xxh32_rotl(v4, 13) * XXH_PRIME32_1;
+            p += 4;
+        } while (p <= limit);
+
+        h32 = xxh32_rotl(v1, 1) + xxh32_rotl(v2, 7) + xxh32_rotl(v3, 12) + xxh32_rotl(v4, 18);
+    } else {
+        h32 = seed + XXH_PRIME32_5;
+    }
+
+    h32 += (uint32_t)len;
+
+    while (p + 4 <= bEnd) {
+        h32 += *(const uint32_t *)p * XXH_PRIME32_3;
+        h32 = xxh32_rotl(h32, 17) * XXH_PRIME32_4;
+        p += 4;
+    }
+
+    while (p < bEnd) {
+        h32 += (*p) * XXH_PRIME32_5;
+        h32 = xxh32_rotl(h32, 11) * XXH_PRIME32_1;
+        p++;
+    }
+
+    h32 ^= h32 >> 15;
+    h32 *= XXH_PRIME32_2;
+    h32 ^= h32 >> 13;
+    h32 *= XXH_PRIME32_3;
+    h32 ^= h32 >> 16;
+
+    return h32;
+}
+
+static JSValue tjs_hash_xxhash32(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsUint8Array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint32_t seed = 0;
+    if (argc >= 2 && JS_IsNumber(argv[1])) {
+        if (JS_ToUint32(ctx, &seed, argv[1])) {
+            return JS_EXCEPTION;
+        }
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    uint32_t result = xxhash32(data, len, seed);
+    return JS_NewUint32(ctx, result);
+}
+
 static const JSCFunctionListEntry tjs_algorithm_funcs[] = {
 	TJS_CFUNC_DEF("ws_unpack", 2, tjs_ws_unpack),
+    TJS_CFUNC_DEF("fnv1a32", 1, tjs_hash_fnv1a32),
+    TJS_CFUNC_DEF("fnv1a64", 1, tjs_hash_fnv1a64),
+    TJS_CFUNC_DEF("murmur3", 2, tjs_hash_murmur3),
+    TJS_CFUNC_DEF("xxhash32", 2, tjs_hash_xxhash32),
 };
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns){

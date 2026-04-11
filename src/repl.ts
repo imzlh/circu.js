@@ -107,6 +107,10 @@ class TerminalController {
     }
 
     [Symbol.dispose]() {
+        // Disable bracketed paste mode before exiting
+        if (this.#tty) {
+            this.#tty.write(engine.encodeString('\x1b[?2004l'));
+        }
         this.#tty?.setMode(streams.TTY_MODE_NORMAL);
     }
 }
@@ -438,8 +442,10 @@ class CJSRepl {
 
     // Input handling
     #readlineResolver: ((value: string | null) => void) | null = null;
-    #escState: 'normal' | 'esc' | 'csi' | 'osc' = 'normal';
+    #escState: 'normal' | 'esc' | 'csi' | 'osc' | 'paste' = 'normal';
     #escBuffer = '';
+    #pasteBuffer = '';
+    #inPasteMode = false;
 
     // Performance tracking
     #evalStartTime = 0;
@@ -466,6 +472,10 @@ class CJSRepl {
 
     async start(): Promise<void> {
         await this.#print('Circu.js REPL. enter ".help" for help.\n');
+        // Enable bracketed paste mode
+        if (this.#term.isTTY) {
+            await this.#print('\x1b[?2004h');
+        }
         this.#readInput();
         await this.#readLineLoop();
     }
@@ -543,6 +553,24 @@ class CJSRepl {
     #handleChar(code: number): void {
         const char = String.fromCodePoint(code);
 
+        // Handle paste mode - accumulate everything until we see the end sequence
+        if (this.#escState === 'paste') {
+            this.#pasteBuffer += char;
+            // Check for paste end sequence \x1b[201~
+            if (this.#pasteBuffer.endsWith('\x1b[201~')) {
+                // Remove the end sequence and insert the content
+                const content = this.#pasteBuffer.slice(0, -7); // -7 for \x1b[201~
+                this.#escState = 'normal';
+                this.#inPasteMode = false;
+                // Insert the pasted content (with newlines as regular chars)
+                for (const c of content) {
+                    this.#insert(c);
+                }
+                this.#update();
+            }
+            return;
+        }
+
         switch (this.#escState) {
             case 'normal':
                 if (char === '\x1b') {
@@ -555,9 +583,11 @@ class CJSRepl {
 
             case 'esc':
                 this.#escBuffer += char;
-                if (char === '[') this.#escState = 'csi';
-                else if (char === 'O') this.#escState = 'osc';
-                else {
+                if (char === '[') {
+                    this.#escState = 'csi';
+                } else if (char === 'O') {
+                    this.#escState = 'osc';
+                } else {
                     this.#processEscSequence(this.#escBuffer);
                     this.#escState = 'normal';
                 }
@@ -566,6 +596,13 @@ class CJSRepl {
             case 'csi':
             case 'osc':
                 this.#escBuffer += char;
+                // Check for paste start sequence \x1b[200~
+                if (this.#escBuffer === '\x1b[200~') {
+                    this.#escState = 'paste';
+                    this.#inPasteMode = true;
+                    this.#pasteBuffer = '';
+                    return;
+                }
                 if ((char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || char === '~') {
                     this.#processEscSequence(this.#escBuffer);
                     this.#escState = 'normal';
@@ -657,6 +694,10 @@ class CJSRepl {
         ['\x7f', () => this.#deleteChar(-1)],
         ['\t', () => this.#complete()],                               // Tab
         ['\n', async () => {                                          // ^J
+            if (this.#inPasteMode) {
+                this.#insert('\n');
+                return;
+            }
             await this.#print('\n');
             this.#history.push(this.#cmd);
             return { type: 'submit', value: this.#cmd } as const;
@@ -666,6 +707,10 @@ class CJSRepl {
             this.#cmd = this.#cmd.slice(0, this.#cursorPos);
         }],
         ['\x0d', async () => {                                        // ^M
+            if (this.#inPasteMode) {
+                this.#insert('\n');
+                return;
+            }
             await this.#print('\n');
             this.#history.push(this.#cmd);
             return { type: 'submit', value: this.#cmd } as const;
