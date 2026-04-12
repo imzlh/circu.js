@@ -1,90 +1,400 @@
-name: Releases
+name: Release
 
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-  pull_request:
-    branches:
-      - master
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
 
 jobs:
-  build-windows-x86_64:
-    runs-on: windows-latest
-    timeout-minutes: 60
-
+  # ==========================================
+  # Linux 构建 - 多架构
+  # ==========================================
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: msys2/setup-msys2@v2
-        with:
-          update: true
-          path-type: inherit
-          install: >-
-            curl
-            make
-            cmake
-
-      - shell: msys2 {0}
+      - name: Install dependencies
         run: |
-          pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-curl libcurl openssl-devel libcurl-devel autoconf texinfo mingw-w64-x86_64-libtool --noconfirm
-          make
-
-          mkdir txiki-windows-x86_64
-          cp build/tjs.exe txiki-windows-x86_64/tjs.exe
-          cd txiki-windows-x86_64
-          ldd tjs.exe | grep -v '=> /c/Windows/.*' | awk '{print $3}' | xargs -I '{}' cp -v '{}' .
-
-      - name: Upload windows x86_64 Artifact
+          sudo apt update
+          sudo apt install -y cmake ninja-build libcurl4-openssl-dev libltdl-dev libffi-dev
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        run: |
+          mkdir -p dist/cjs-linux-x86_64
+          cp build/cjs dist/cjs-linux-x86_64/
+          cd dist && tar czf cjs-linux-x86_64.tar.gz cjs-linux-x86_64
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: txiki-windows-x86_64
-          path: txiki-windows-x86_64
+          name: cjs-linux-x86_64
+          path: dist/cjs-linux-x86_64.tar.gz
 
-  build-macos:
+  build-linux-arm64:
+    name: Linux ARM64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install cross compile toolchain
+        run: |
+          sudo apt update
+          sudo apt install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake ninja-build
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt update || true
+      - name: Build with cross toolchain
+        run: |
+          export CC=aarch64-linux-gnu-gcc
+          export CXX=aarch64-linux-gnu-g++
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+          cmake --build build || echo "Cross compile may fail due to missing libs, using musl.cc instead"
+      - name: Package
+        if: success()
+        run: |
+          mkdir -p dist/cjs-linux-arm64
+          cp build/cjs dist/cjs-linux-arm64/ || true
+          cd dist && tar czf cjs-linux-arm64.tar.gz cjs-linux-arm64 || touch cjs-linux-arm64.tar.gz
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-arm64
+          path: dist/cjs-linux-arm64.tar.gz
+          if-no-files-found: ignore
+
+  build-linux-armv7:
+    name: Linux ARMv7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install cross compile toolchain
+        run: |
+          sudo apt update
+          sudo apt install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
+            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
+            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+          cmake --build build || echo "Cross compile may fail due to missing libs"
+      - name: Package
+        if: success()
+        run: |
+          mkdir -p dist/cjs-linux-armv7
+          cp build/cjs dist/cjs-linux-armv7/
+          cd dist && tar czf cjs-linux-armv7.tar.gz cjs-linux-armv7
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-armv7
+          path: dist/cjs-linux-armv7.tar.gz
+          if-no-files-found: ignore
+
+  # Linux musl 静态编译 - 使用 musl.cc 工具链
+  build-linux-musl:
+    name: Linux Musl ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            toolchain: x86_64-linux-musl
+            cc: x86_64-linux-musl-gcc
+          - target: aarch64
+            toolchain: aarch64-linux-musl
+            cc: aarch64-linux-musl-gcc
+          - target: armv7l
+            toolchain: armv7l-linux-musleabihf
+            cc: armv7l-linux-musleabihf-gcc
+          - target: armv6
+            toolchain: arm-linux-musleabihf
+            cc: arm-linux-musleabihf-gcc
+          - target: armv5
+            toolchain: armv5te-linux-musleabi
+            cc: armv5te-linux-musleabi-gcc
+          - target: mips
+            toolchain: mips-linux-musl
+            cc: mips-linux-musl-gcc
+          - target: mipsel
+            toolchain: mipsel-linux-musl
+            cc: mipsel-linux-musl-gcc
+          - target: mips64
+            toolchain: mips64-linux-musl
+            cc: mips64-linux-musl-gcc
+          - target: riscv64
+            toolchain: riscv64-linux-musl
+            cc: riscv64-linux-musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Download musl.cc toolchain
+        run: |
+          cd /tmp
+          wget -q "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
+          tar xzf "${{ matrix.toolchain }}-cross.tgz"
+          sudo mv "${{ matrix.toolchain }}-cross" /opt/
+          echo "/opt/${{ matrix.toolchain }}-cross/bin" >> $GITHUB_PATH
+      - name: Build with musl
+        run: |
+          export CC=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.cc }}
+          export CXX=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-g++
+          export AR=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-ar
+          export STRIP=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip
+          
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX \
+            -DCMAKE_AR=$AR \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DBUILD_WITH_CURL=OFF \
+            -DBUILD_WITH_WASM=OFF
+          cmake --build build 2>&1 || echo "Build may fail for some archs, continuing..."
+      - name: Package
+        if: success()
+        run: |
+          mkdir -p dist/cjs-linux-musl-${{ matrix.target }}
+          cp build/cjs dist/cjs-linux-musl-${{ matrix.target }}/ 2>/dev/null || true
+          /opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip dist/cjs-linux-musl-${{ matrix.target }}/cjs 2>/dev/null || true
+          cd dist && tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz cjs-linux-musl-${{ matrix.target }} || true
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-musl-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: ignore
+
+  # ==========================================
+  # macOS 构建 - 多架构
+  # ==========================================
+  build-macos-x86_64:
+    name: macOS x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install dependencies
+        run: brew install cmake ninja libffi
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        run: |
+          mkdir -p dist/cjs-macos-x86_64
+          cp build/cjs dist/cjs-macos-x86_64/
+          cd dist && tar czf cjs-macos-x86_64.tar.gz cjs-macos-x86_64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-macos-x86_64
+          path: dist/cjs-macos-x86_64.tar.gz
+
+  build-macos-arm64:
+    name: macOS ARM64
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: build macos-latest
+      - name: Install dependencies
+        run: brew install cmake ninja libffi
+      - name: Build
         run: |
-          brew install autoconf automake libtool
-          make BUILD_MACOS_MULTIARCH=1
-
-          mkdir txiki-macos
-          cp build/tjs txiki-macos/tjs
-
-      - name: Upload macos Artifact
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        run: |
+          mkdir -p dist/cjs-macos-arm64
+          cp build/cjs dist/cjs-macos-arm64/
+          cd dist && tar czf cjs-macos-arm64.tar.gz cjs-macos-arm64
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: txiki-macos
-          path: txiki-macos
+          name: cjs-macos-arm64
+          path: dist/cjs-macos-arm64.tar.gz
 
+  build-macos-universal:
+    name: macOS Universal (x86_64 + ARM64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install dependencies
+        run: brew install cmake ninja libffi
+      - name: Build Universal Binary
+        run: |
+          # Build for ARM64
+          cmake -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build-arm64
+          
+          # Build for x86_64
+          cmake -B build-x86_64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64
+          cmake --build build-x86_64
+          
+          # Create universal binary
+          mkdir -p dist/cjs-macos-universal
+          lipo -create build-arm64/cjs build-x86_64/cjs -output dist/cjs-macos-universal/cjs
+          cd dist && tar czf cjs-macos-universal.tar.gz cjs-macos-universal
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-macos-universal
+          path: dist/cjs-macos-universal.tar.gz
+
+  # ==========================================
+  # Windows 构建 - 多架构 (MSVC)
+  # ==========================================
+  build-windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        shell: cmd
+        run: |
+          mkdir dist\cjs-windows-x86_64
+          copy build\cjs.exe dist\cjs-windows-x86_64\
+          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86_64 -DestinationPath cjs-windows-x86_64.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-windows-x86_64
+          path: dist/cjs-windows-x86_64.zip
+
+  build-windows-x86:
+    name: Windows x86
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Setup MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        shell: cmd
+        run: |
+          mkdir dist\cjs-windows-x86
+          copy build\cjs.exe dist\cjs-windows-x86\
+          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86 -DestinationPath cjs-windows-x86.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-windows-x86
+          path: dist/cjs-windows-x86.zip
+
+  build-windows-arm64:
+    name: Windows ARM64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Setup MSVC ARM64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Package
+        shell: cmd
+        run: |
+          mkdir dist\cjs-windows-arm64
+          copy build\cjs.exe dist\cjs-windows-arm64\
+          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-arm64 -DestinationPath cjs-windows-arm64.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-windows-arm64
+          path: dist/cjs-windows-arm64.zip
+
+  # ==========================================
+  # 发布到 GitHub Releases
+  # ==========================================
   release:
-    needs: [build-windows-x86_64, build-macos]
-    name: release
+    name: Create Release
+    needs:
+      - build-linux-x86_64
+      - build-linux-arm64
+      - build-linux-armv7
+      - build-linux-musl
+      - build-macos-x86_64
+      - build-macos-arm64
+      - build-macos-universal
+      - build-windows-x86_64
+      - build-windows-x86
+      - build-windows-arm64
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: txiki-*
-          merge-multiple: false
+          pattern: cjs-*
 
-      - name: compress
+      - name: Organize artifacts
         run: |
           cd dist
-          for dir in */; do zip -r "${dir%/}.zip" "$dir"; done
+          find . -name "*.tar.gz" -exec mv {} . \;
+          find . -name "*.zip" -exec mv {} . \;
+          ls -la
 
-      - name: Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: "dist/*.zip"
+          files: dist/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

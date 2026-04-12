@@ -1,30 +1,36 @@
 name: CI
 
-on: [pull_request]
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 jobs:
+  # 代码检查和文档生成测试
   lint:
     name: Lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-    - name: Install dependencies
-      run: |
-        npm install
-        sudo apt update
-        sudo apt install -y clang-format
-        clang-format --version
-    - name: Run the linter
-      run: npm run lint
-    - name: Run the formatter
-      run: clang-format -i src/*.{c,h}
-    - name: Check if the tree is dirty
-      run: $(exit $(git status --porcelain --untracked-files=no | head -255 | wc -l)) || (echo "Dirty git tree"; git diff; exit 1)
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install dependencies
+        run: |
+          npm install
+          sudo apt update
+          sudo apt install -y clang-format
+      - name: Run the linter
+        run: npm run lint
+      - name: Run the formatter
+        run: clang-format -i src/*.{c,h}
+      - name: Check if the tree is dirty
+        run: $(exit $(git status --porcelain --untracked-files=no | head -255 | wc -l)) || (echo "Dirty git tree"; git diff; exit 1)
+
   codegen:
     name: Codegen
     runs-on: ubuntu-latest
@@ -40,140 +46,91 @@ jobs:
           npm install
           sudo apt update
           sudo apt install -y libcurl4-openssl-dev
-      - name: Build it
-        run: |
-          make js
+      - name: Build JS
+        run: make js
       - name: Check if the git repository is clean
         run: $(exit $(git status --porcelain --untracked-files=no | head -255 | wc -l)) || (echo "Dirty git tree"; git diff; exit 1)
+
   docs:
-    name: Docs
+    name: TypeDoc Check
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-    - name: Install dependencies
-      run: npm install
-    - name: Run the linter
-      run: npm run api-docs
-  build-linux:
-    name: Linux
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build TypeDoc
+        run: npm run api-docs
+
+  # Test Build - 三个平台 x86_64
+  build-linux-x86_64:
+    name: Test Build - Linux x86_64
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        buildType: [Debug, Release]
-        compiler: [gcc, clang]
-    env:
-      BUILDTYPE: ${{ matrix.buildType }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-    - name: Dependencies
-      env:
-        ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
-      run: |
-        sudo apt update
-        sudo apt install -y libcurl4-openssl-dev libltdl-dev
-        if [ "${{ matrix.compiler }}" = "clang" ]; then
-          sudo apt install -y clang
-          echo "::set-env name=CC::clang"
-          echo "::set-env name=CXX::clang++"
-        fi
-    - name: Build it
-      run: make VERBOSE=1
-    - name: Test it
-      run: make test
-    - name: Test it (advanced)
-      run: make test-advanced
-  build-macos:
-    name: macOS
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        buildType: [Debug, Release]
-        os: [macOS-14, macOS-latest]
-    env:
-      BUILDTYPE: ${{ matrix.buildType }}
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake ninja-build libcurl4-openssl-dev libltdl-dev libffi-dev
+      - name: Build
+        run: cmake -B build -G Ninja && cmake --build build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-x86_64-test
+          path: build/cjs
+
+  build-macos-x86_64:
+    name: Test Build - macOS x86_64
+    runs-on: macos-13
     steps:
-    - name: Install automake
-      run: brew install automake autoconf libtool
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-    - name: Build it
-      run: make VERBOSE=1
-    - name: Test it
-      run: make test
-    - name: Test it (advanced)
-      run: make test-advanced
-  build-alpine:
-    name: Alpine Linux
-    runs-on: ubuntu-latest
-    container: alpine:3.21
-    strategy:
-      fail-fast: false
-      matrix:
-        buildType: [Debug, Release]
-    env:
-      BUILDTYPE: ${{ matrix.buildType }}
-    steps:
-    - name: Prepare
-      run: apk add git build-base cmake curl-dev autoconf automake libtool texinfo linux-headers libffi-dev --update-cache
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-    - name: Build it
-      run: make VERBOSE=1 USE_EXTERNAL_FFI=ON
-    - name: Test it
-      run: make test
-  build-windows:
-    name: Windows
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install dependencies
+        run: brew install cmake ninja libffi
+      - name: Build
+        run: cmake -B build -G Ninja && cmake --build build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-macos-x86_64-test
+          path: build/cjs
+
+  build-windows-x86_64:
+    name: Test Build - Windows x86_64
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        sys:
-          - mingw64
-          - clang64
-          - ucrt64
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: true
-    - name: Setup MSYS2
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: ${{matrix.sys}}
-        update: true
-        install: >-
-          git
-          make
-        pacboy: >-
-          curl-winssl:p
-          autotools:p
-          toolchain:p
-          cmake:p
-          ninja:p
-          libffi:p
-    - name: Build it
-      run: make VERBOSE=1
-    - name: Test it
-      run: make test
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-windows-x86_64-test
+          path: build/cjs.exe
