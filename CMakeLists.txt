@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 project(cjs LANGUAGES C)
 
 include(ExternalProject)
+include(FetchContent)
 include(GNUInstallDirs)
 
 if (NOT CMAKE_BUILD_TYPE)
@@ -169,7 +170,7 @@ else()
     FetchContent_MakeAvailable(llhttp)
 
     # Link with the llhttp_static target
-    target_link_libraries(${EXAMPLE_PROJECT_NAME} ${PROJECT_LIBRARIES} llhttp_static ${PROJECT_NAME})
+    target_link_libraries(cjs llhttp_static)
 endif()
 
 if (Iconv_FOUND)
