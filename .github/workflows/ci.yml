@@ -18,11 +18,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
-          cache: 'npm'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
       - name: Install dependencies
-        run: npm ci
+        run: pnpm ci
       - name: Build TypeDoc
-        run: npm run api-docs
+        run: pnpm run api-docs
         
   build-linux-x86_64:
     name: Test Build - Linux x86_64
@@ -95,7 +97,7 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: 'a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6'
+          vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
       - name: Install dependencies via vcpkg
         run: |
           vcpkg install sqlite3:x64-windows openssl:x64-windows zlib:x64-windows expat:x64-windows curl:x64-windows libffi:x64-windows

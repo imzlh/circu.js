@@ -669,14 +669,13 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
         // tag (1bytes + string)
         uint8_t tag_len = ptr[1];
         char tag[256] = {0};
-        if (tag_len > 0 && tag_len < sizeof(tag) && 2 + tag_len <= ans->rdlength) {
+        if (tag_len > 0 && 2 + tag_len <= ans->rdlength) {
             memcpy(tag, ptr + 2, tag_len);
             tag[tag_len] = '\0';
             JS_SetPropertyStr(ctx, obj, "tag", JS_NewString(ctx, tag));
         }
         
         // value (remaining)
-        /* fix: guard against underflow if rdlength < 2 + tag_len */
         size_t value_len = (ans->rdlength >= 2 + tag_len) ? ans->rdlength - 2 - tag_len : 0;
         if (value_len > 0) {
             const char *value = (const char *)(ptr + 2 + tag_len);
@@ -1101,7 +1100,7 @@ static JSValue tjs_dns_query_sync(JSContext* ctx, JSValueConst this_val,
 				error_msg = uv_strerror(req_ctx->status);
 				break;
 		}
-		result = JS_ThrowInternalError(ctx, error_msg);
+		result = JS_ThrowInternalError(ctx, "%s", error_msg);
 	} else {
 		result = udp_ctx->resolve_func;
 	}

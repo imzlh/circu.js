@@ -169,8 +169,9 @@ else()
     set(LLHTTP_BUILD_STATIC_LIBS ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(llhttp)
 
-    # Link with the llhttp_static target
+    # Link with the llhttp_static target and add include directory
     target_link_libraries(cjs llhttp_static)
+    target_include_directories(cjs PRIVATE ${llhttp_SOURCE_DIR}/include)
 endif()
 
 if (Iconv_FOUND)
