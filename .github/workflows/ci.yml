@@ -19,9 +19,26 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y cmake ninja-build libcurl4-openssl-dev libltdl-dev libffi-dev
+          sudo apt install -y cmake ninja-build \
+            libcurl4-openssl-dev libltdl-dev libffi-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
+      - name: Build iwasm (WAMR)
+        run: |
+          git clone --depth 1 https://github.com/bytecodealliance/wasm-micro-runtime.git /tmp/wamr
+          cd /tmp/wamr/product-mini/platforms/linux
+          mkdir build && cd build
+          cmake .. -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 -DWAMR_BUILD_AOT=0 \
+            -DWAMR_BUILD_LIBC_BUILTIN=1 -DWAMR_BUILD_LIBC_WASI=0 -DWAMR_BUILD_LIB_PTHREAD=0
+          make -j$(nproc)
+          sudo make install
+          sudo cp /tmp/wamr/product-mini/platforms/linux/build/libvmlib.a /usr/local/lib/
+          sudo cp -r /tmp/wamr/core/iwasm/include/* /usr/local/include/
       - name: Build
-        run: cmake -B build -G Ninja && cmake --build build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/usr/local
+          cmake --build build
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -30,15 +47,21 @@ jobs:
 
   build-macos-x86_64:
     name: Test Build - macOS x86_64
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install dependencies
-        run: brew install cmake ninja libffi
+        run: |
+          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
       - name: Build
-        run: cmake -B build -G Ninja && cmake --build build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DBUILD_WITH_WASM=OFF
+          cmake --build build
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -56,10 +79,21 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6'
+      - name: Install dependencies via vcpkg
+        run: |
+          vcpkg install sqlite3:x64-windows openssl:x64-windows zlib:x64-windows expat:x64-windows curl:x64-windows libffi:x64-windows
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "NMake Makefiles" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DBUILD_WITH_WASM=OFF ^
+            -DBUILD_WITH_CURL=ON
           cmake --build build
       - name: Upload artifact
         uses: actions/upload-artifact@v4

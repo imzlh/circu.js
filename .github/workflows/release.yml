@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # Linux 构建 - 多架构
+  # Linux 构建 - 多架构（启用 WASM）
   # ==========================================
   build-linux-x86_64:
     name: Linux x86_64
@@ -22,15 +22,31 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y cmake ninja-build libcurl4-openssl-dev libltdl-dev libffi-dev
+          sudo apt install -y cmake ninja-build \
+            libcurl4-openssl-dev libltdl-dev libffi-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
+      - name: Build iwasm (WAMR)
+        run: |
+          git clone --depth 1 https://github.com/bytecodealliance/wasm-micro-runtime.git /tmp/wamr
+          cd /tmp/wamr/product-mini/platforms/linux
+          mkdir build && cd build
+          cmake .. -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 -DWAMR_BUILD_AOT=0 \
+            -DWAMR_BUILD_LIBC_BUILTIN=1 -DWAMR_BUILD_LIBC_WASI=0 -DWAMR_BUILD_LIB_PTHREAD=0
+          make -j$(nproc)
+          sudo make install
+          sudo cp /tmp/wamr/product-mini/platforms/linux/build/libvmlib.a /usr/local/lib/
+          sudo cp -r /tmp/wamr/core/iwasm/include/* /usr/local/include/
       - name: Build
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/usr/local
           cmake --build build
       - name: Package
         run: |
           mkdir -p dist/cjs-linux-x86_64
           cp build/cjs dist/cjs-linux-x86_64/
+          strip dist/cjs-linux-x86_64/cjs
           cd dist && tar czf cjs-linux-x86_64.tar.gz cjs-linux-x86_64
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -53,23 +69,25 @@ jobs:
           sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
           echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
           sudo apt update || true
+          sudo apt install -y libsqlite3-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 libexpat1-dev:arm64 libcurl4-openssl-dev:arm64 libffi-dev:arm64 || true
       - name: Build with cross toolchain
         run: |
-          export CC=aarch64-linux-gnu-gcc
-          export CXX=aarch64-linux-gnu-g++
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
-          cmake --build build || echo "Cross compile may fail due to missing libs, using musl.cc instead"
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DBUILD_WITH_WASM=OFF \
+            -DBUILD_WITH_CURL=OFF
+          cmake --build build || echo "Cross compile may fail due to missing libs"
       - name: Package
         if: success()
         run: |
           mkdir -p dist/cjs-linux-arm64
-          cp build/cjs dist/cjs-linux-arm64/ || true
-          cd dist && tar czf cjs-linux-arm64.tar.gz cjs-linux-arm64 || touch cjs-linux-arm64.tar.gz
+          cp build/cjs dist/cjs-linux-arm64/
+          aarch64-linux-gnu-strip dist/cjs-linux-arm64/cjs || true
+          cd dist && tar czf cjs-linux-arm64.tar.gz cjs-linux-arm64
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -96,13 +114,16 @@ jobs:
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=arm \
             -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
-            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
+            -DBUILD_WITH_WASM=OFF \
+            -DBUILD_WITH_CURL=OFF
           cmake --build build || echo "Cross compile may fail due to missing libs"
       - name: Package
         if: success()
         run: |
           mkdir -p dist/cjs-linux-armv7
           cp build/cjs dist/cjs-linux-armv7/
+          arm-linux-gnueabihf-strip dist/cjs-linux-armv7/cjs || true
           cd dist && tar czf cjs-linux-armv7.tar.gz cjs-linux-armv7
       - name: Upload artifact
         if: always()
@@ -172,8 +193,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=$CXX \
             -DCMAKE_AR=$AR \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_WITH_CURL=OFF \
-            -DBUILD_WITH_WASM=OFF
+            -DBUILD_WITH_WASM=OFF \
+            -DBUILD_WITH_CURL=OFF
           cmake --build build 2>&1 || echo "Build may fail for some archs, continuing..."
       - name: Package
         if: success()
@@ -191,25 +212,30 @@ jobs:
           if-no-files-found: ignore
 
   # ==========================================
-  # macOS 构建 - 多架构
+  # macOS 构建 - 多架构（禁用 WASM）
   # ==========================================
   build-macos-x86_64:
     name: macOS x86_64
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install dependencies
-        run: brew install cmake ninja libffi
+        run: |
+          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
       - name: Build
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DBUILD_WITH_WASM=OFF
           cmake --build build
       - name: Package
         run: |
           mkdir -p dist/cjs-macos-x86_64
           cp build/cjs dist/cjs-macos-x86_64/
+          strip dist/cjs-macos-x86_64/cjs
           cd dist && tar czf cjs-macos-x86_64.tar.gz cjs-macos-x86_64
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -225,15 +251,20 @@ jobs:
         with:
           submodules: true
       - name: Install dependencies
-        run: brew install cmake ninja libffi
+        run: |
+          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
       - name: Build
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_WITH_WASM=OFF
           cmake --build build
       - name: Package
         run: |
           mkdir -p dist/cjs-macos-arm64
           cp build/cjs dist/cjs-macos-arm64/
+          strip dist/cjs-macos-arm64/cjs
           cd dist && tar czf cjs-macos-arm64.tar.gz cjs-macos-arm64
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -249,20 +280,28 @@ jobs:
         with:
           submodules: true
       - name: Install dependencies
-        run: brew install cmake ninja libffi
+        run: |
+          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
       - name: Build Universal Binary
         run: |
           # Build for ARM64
-          cmake -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake -B build-arm64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_WITH_WASM=OFF
           cmake --build build-arm64
           
           # Build for x86_64
-          cmake -B build-x86_64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64
+          cmake -B build-x86_64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DBUILD_WITH_WASM=OFF
           cmake --build build-x86_64
           
           # Create universal binary
           mkdir -p dist/cjs-macos-universal
           lipo -create build-arm64/cjs build-x86_64/cjs -output dist/cjs-macos-universal/cjs
+          strip dist/cjs-macos-universal/cjs
           cd dist && tar czf cjs-macos-universal.tar.gz cjs-macos-universal
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -271,7 +310,7 @@ jobs:
           path: dist/cjs-macos-universal.tar.gz
 
   # ==========================================
-  # Windows 构建 - 多架构 (MSVC)
+  # Windows 构建 - 多架构（MSVC + vcpkg，禁用 WASM）
   # ==========================================
   build-windows-x86_64:
     name: Windows x86_64
@@ -284,10 +323,21 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6'
+      - name: Install dependencies via vcpkg
+        run: |
+          vcpkg install sqlite3:x64-windows openssl:x64-windows zlib:x64-windows expat:x64-windows curl:x64-windows libffi:x64-windows
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "NMake Makefiles" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DBUILD_WITH_WASM=OFF ^
+            -DBUILD_WITH_CURL=ON
           cmake --build build
       - name: Package
         shell: cmd
@@ -312,10 +362,21 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6'
+      - name: Install dependencies via vcpkg
+        run: |
+          vcpkg install sqlite3:x86-windows openssl:x86-windows zlib:x86-windows expat:x86-windows curl:x86-windows libffi:x86-windows
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "NMake Makefiles" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DBUILD_WITH_WASM=OFF ^
+            -DBUILD_WITH_CURL=ON
           cmake --build build
       - name: Package
         shell: cmd
@@ -340,10 +401,21 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6'
+      - name: Install dependencies via vcpkg
+        run: |
+          vcpkg install sqlite3:arm64-windows openssl:arm64-windows zlib:arm64-windows expat:arm64-windows curl:arm64-windows libffi:arm64-windows || true
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "NMake Makefiles" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DBUILD_WITH_WASM=OFF ^
+            -DBUILD_WITH_CURL=ON || echo "ARM64 may have missing packages"
           cmake --build build
       - name: Package
         shell: cmd
