@@ -4,12 +4,8 @@
 
 build/
 build_test/
-src/bundles/js/
-src/js/core.js
-src/js/std.js
 src/version.h
 node_modules/
-types/api/
 test_dir*/
 pnpm-lock.yaml
 *lock.json

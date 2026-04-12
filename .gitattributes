@@ -1,3 +1,0 @@
-# Ignore changes in bundle files when doing git diff
-
-src/bundles/** -diff
