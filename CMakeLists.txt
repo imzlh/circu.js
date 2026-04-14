@@ -49,7 +49,7 @@ endmacro()
 
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
-cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
+cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" OFF)
 cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
 # we recommend to enable to make attached binary smaller
 cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
@@ -111,9 +111,9 @@ endif()
 if (BUILD_WITH_CURL)
     find_package(CURL REQUIRED)
 endif()
-if (BUILD_WITH_WASM)
-    find_package(iwasm REQUIRED)
-endif()
+#if (BUILD_WITH_WASM)
+#    find_package(iwasm REQUIRED)
+#endif()
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
@@ -131,6 +131,7 @@ add_library(cjs
     src/worker.c
     src/console.c
     src/sourcemap.c
+    src/fs_utils.c
     src/mod_algorithm.c
     src/mod_dns.c
     src/mod_engine.c
@@ -165,8 +166,8 @@ else()
     FetchContent_Declare(llhttp
         URL "https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.3.0.tar.gz")
 
-    set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
-    set(LLHTTP_BUILD_STATIC_LIBS ON CACHE INTERNAL "")
+    set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+    set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(llhttp)
 
     # Link with the llhttp_static target and add include directory

@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "utils.h"
+#include "fs_utils.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -82,58 +83,6 @@ typedef off_t fs_off_t;
 #include <sys/file.h>
 #endif
 
-/* File mode flags using magic */
-enum {
-    OPEN_RDONLY = O_RDONLY,
-    OPEN_WRONLY = O_WRONLY,
-    OPEN_RDWR = O_RDWR,
-    OPEN_CREAT = O_CREAT,
-    OPEN_EXCL = O_EXCL,
-    OPEN_TRUNC = O_TRUNC,
-    OPEN_APPEND = O_APPEND,
-};
-
-/* Helper: build flags from JS object */
-static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
-    int flags = 0;
-    
-    if (JS_IsString(flags_obj)) {
-        const char* str = JS_ToCString(ctx, flags_obj);
-        if (!str) return -1;
-        
-        if (strcmp(str, "r") == 0) {
-            flags = O_RDONLY;
-        } else if (strcmp(str, "r+") == 0) {
-            flags = O_RDWR;
-        } else if (strcmp(str, "w") == 0) {
-            flags = O_WRONLY | O_CREAT | O_TRUNC;
-        } else if (strcmp(str, "w+") == 0) {
-            flags = O_RDWR | O_CREAT | O_TRUNC;
-        } else if (strcmp(str, "a") == 0) {
-            flags = O_WRONLY | O_CREAT | O_APPEND;
-        } else if (strcmp(str, "a+") == 0) {
-            flags = O_RDWR | O_CREAT | O_APPEND;
-        } else if (strcmp(str, "wx") == 0) {
-            flags = O_WRONLY | O_CREAT | O_EXCL;
-        } else if (strcmp(str, "wx+") == 0) {
-            flags = O_RDWR | O_CREAT | O_EXCL;
-        } else {
-            JS_FreeCString(ctx, str);
-            return -1;
-        }
-        JS_FreeCString(ctx, str);
-    } else {
-        if (JS_ToInt32(ctx, &flags, flags_obj) < 0) {
-            return -1;
-        }
-    }
-    
-#ifdef _WIN32
-    flags |= O_BINARY | O_NOINHERIT;  /* Always binary mode on Windows */
-#endif
-    
-    return flags;
-}
 
 #ifdef _WIN32
 static int crt2uv(int crt_err) {
@@ -596,14 +545,11 @@ static JSValue tjs_syncfs_set_blocking(JSContext* ctx, JSValueConst this_val, in
 
 /* readFile() - read entire file */
 static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    const char* path;
-    struct stat st;
-    
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "readFile() requires 1 argument: path");
     }
     
-    path = JS_ToCString(ctx, argv[0]);
+    const char* path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
     }
@@ -618,6 +564,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         THROW("open");
     }
     
+    struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
         JS_FreeCString(ctx, path);
@@ -627,13 +574,13 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     JS_FreeCString(ctx, path);
     
     size_t size = st.st_size;
+    uint8_t* buf = NULL;
+    size_t total_read = 0;
     
     // For pseudo-files (like /proc/*, /sys/*), st_size may be 0 but content exists
-    // Use dynamic buffer for such cases
     if (size == 0) {
         size_t capacity = 4096;
-        size_t total_read = 0;
-        uint8_t* buf = js_malloc(ctx, capacity);
+        buf = js_malloc(ctx, capacity);
         if (!buf) {
             close(fd);
             return JS_EXCEPTION;
@@ -661,30 +608,24 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
                 capacity = new_capacity;
             }
         }
-        
-        close(fd);
-        
-        JSValue result = JS_NewArrayBufferCopy(ctx, buf, total_read);
-        js_free(ctx, buf);
-        return result;
-    }
-
-    uint8_t* buf = js_malloc(ctx, size);
-    if (!buf) {
-        close(fd);
-        return JS_EXCEPTION;
-    }
-    
-    ssize_t n, total_read = 0;
-    while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            js_free(ctx, buf);
+    } else {
+        buf = js_malloc(ctx, size);
+        if (!buf) {
             close(fd);
-            THROW("read");
+            return JS_EXCEPTION;
         }
-        total_read += n;
-        if (total_read == size) break;
+        
+        ssize_t n;
+        while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                js_free(ctx, buf);
+                close(fd);
+                THROW("read");
+            }
+            total_read += n;
+            if (total_read == size) break;
+        }
     }
     
     close(fd);

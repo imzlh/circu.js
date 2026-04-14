@@ -255,9 +255,13 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
     p->events[0] = JS_UNDEFINED;
     p->events[1] = JS_UNDEFINED;
 
-    CHECK_EQ(uv_tcp_init(tjs_get_loop(ctx), &p->h.tcp), 0);
-    CHECK_EQ(uv_tcp_open(&p->h.tcp, fd), 0);
-    CHECK_EQ(uv_read_start(&p->h.stream, uv__alloc_cb, uv__read_cb), 0);
+    if (uv_tcp_init(tjs_get_loop(ctx), &p->h.tcp) != 0 ||
+        uv_tcp_open(&p->h.tcp, fd) != 0 ||
+        uv_read_start(&p->h.stream, uv__alloc_cb, uv__read_cb) != 0) {
+        js_free(ctx, p);
+        JS_FreeValue(ctx, obj);
+        return JS_ThrowTypeError(ctx, "Failed to initialize message pipe");
+    }
 
     JS_SetOpaque(obj, p);
     return obj;
@@ -312,14 +316,20 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     if (r != 0) {
         js_free(ctx, buf);
         js_free(ctx, wr);
-        js_free(ctx, sab_tab.tab);
-
+        if (sab_tab.tab) {
+            js_free(ctx, sab_tab.tab);
+        }
         return tjs_throw_errno(ctx, r);
     }
 
     /* Increment the SAB reference counts. */
     for (int i = 0; i < sab_tab.len; i++) {
         tjs__sab_dup(NULL, sab_tab.tab[i]);
+    }
+
+    /* Free the SAB tab since we've already duplicated the references */
+    if (sab_tab.tab) {
+        js_free(ctx, sab_tab.tab);
     }
 
     return JS_UNDEFINED;
@@ -381,7 +391,15 @@ static void worker_entry(void *arg) {
     worker_data_t *wd = arg;
 
     TJSRuntime *wrt = TJS_NewRuntimeWorker();
-    CHECK_NOT_NULL(wrt);
+    if (!wrt) {
+        if (wd->udata) {
+            js_free(NULL, wd->udata);
+            wd->udata = NULL;
+        }
+        wd->wrt = NULL;
+        uv_sem_post(wd->sem);
+        return;
+    }
     JSContext *ctx = TJS_GetJSContext(wrt);
 
     /* Bootstrap the worker scope. */
@@ -390,8 +408,8 @@ static void worker_entry(void *arg) {
     wrt->builtins.message_pipe = message_pipe;
 	if (wd->udata){
 		wrt->builtins.worker_udata = JS_ReadObject(ctx, wd->udata, wd->udata_size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE);
-		tjs__free(wd->udata);
-		wd->udata = NULL; 	// fail safe
+		js_free(ctx, wd->udata);
+		wd->udata = NULL;  	// fail safe
 	} else {
 		wrt->builtins.worker_udata = JS_UNDEFINED;
 	}
@@ -496,7 +514,14 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     /* We will wait for the worker to complete the creation of the VM. */
     uv_sem_t sem;
-    CHECK_EQ(uv_sem_init(&sem, 0), 0);
+    if (uv_sem_init(&sem, 0) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        js_free(ctx, udata);
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, w);
+        return JS_ThrowTypeError(ctx, "Failed to initialize semaphore");
+    }
 
     worker_data_t worker_data = {
 		.channel_fd = fds[1],
@@ -506,7 +531,15 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 		.udata_size = udata_size
 	};
 
-    CHECK_EQ(uv_thread_create(&w->tid, worker_entry, (void *) &worker_data), 0);
+    if (uv_thread_create(&w->tid, worker_entry, (void *) &worker_data) != 0) {
+        uv_sem_destroy(&sem);
+        close(fds[0]);
+        close(fds[1]);
+        js_free(ctx, udata);
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, w);
+        return JS_ThrowTypeError(ctx, "Failed to create worker thread");
+    }
 	list_add(&w->link, &qrt->workers);
 
     /* Wait for the worker to initialize. */
@@ -517,7 +550,12 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     worker_data.sem = NULL;
     w->wrt = worker_data.wrt;
-    CHECK_NOT_NULL(w->wrt);
+    if (!w->wrt) {
+        close(fds[0]);
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, w);
+        return JS_ThrowTypeError(ctx, "Failed to create worker runtime");
+    }
 
     return obj;
 }

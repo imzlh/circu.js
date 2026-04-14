@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "utils.h"
+#include "fs_utils.h"
 
 #include <string.h>
 #include <uv.h>
@@ -329,8 +330,6 @@ static void uv__fs_req_cb(uv_fs_t *req) {
 
     JSContext *ctx = fr->ctx;
     JSValue arg;
-    TJSFile *f;
-    TJSDir *d;
     bool is_reject = false;
 
     if (req->result < 0) {
@@ -339,21 +338,27 @@ static void uv__fs_req_cb(uv_fs_t *req) {
         goto skip;
     }
 
+    // Handle different filesystem operations
     switch (req->fs_type) {
         case UV_FS_OPEN:
             arg = tjs_new_file(ctx, fr->req.result, fr->req.path);
             break;
-        case UV_FS_CLOSE:
+        
+        case UV_FS_CLOSE: {
             arg = JS_UNDEFINED;
-            f = tjs_file_get(ctx, fr->obj);
-            CHECK_NOT_NULL(f);
-            f->fd = -1;
-            JS_FreeValue(ctx, f->path);
-            f->path = JS_UNDEFINED;
+            TJSFile *f = tjs_file_get(ctx, fr->obj);
+            if (f) {
+                f->fd = -1;
+                JS_FreeValue(ctx, f->path);
+                f->path = JS_UNDEFINED;
+            }
             break;
+        }
+        
         case UV_FS_READ:
             arg = fr->req.result == 0 ? JS_NULL : JS_NewInt32(ctx, fr->req.result);
             break;
+        
         case UV_FS_WRITE:
             arg = JS_NewInt32(ctx, fr->req.result);
             break;
@@ -373,6 +378,7 @@ static void uv__fs_req_cb(uv_fs_t *req) {
             arg = JS_NewString(ctx, fr->req.ptr);
             break;
 
+        // Operations that return undefined
         case UV_FS_COPYFILE:
         case UV_FS_FDATASYNC:
         case UV_FS_FSYNC:
@@ -406,25 +412,32 @@ static void uv__fs_req_cb(uv_fs_t *req) {
             arg = tjs_new_dir(ctx, fr->req.ptr, fr->req.path);
             break;
 
-        case UV_FS_CLOSEDIR:
+        case UV_FS_CLOSEDIR: {
             arg = JS_UNDEFINED;
-            d = tjs_dir_get(ctx, fr->obj);
-            CHECK_NOT_NULL(d);
-            d->dir = NULL;
-            JS_FreeValue(ctx, d->path);
-            d->path = JS_UNDEFINED;
-            break;
-
-        case UV_FS_READDIR:
-            d = tjs_dir_get(ctx, fr->obj);
-            d->done = fr->req.result == 0;
-            arg = JS_NewObjectProto(ctx, JS_NULL);
-            JS_DefinePropertyValueStr(ctx, arg, "done", JS_NewBool(ctx, d->done), JS_PROP_C_W_E);
-            if (fr->req.result != 0) {
-                JSValue item = tjs_new_dirent(ctx, &d->dirent);
-                JS_DefinePropertyValueStr(ctx, arg, "value", item, JS_PROP_C_W_E);
+            TJSDir *d = tjs_dir_get(ctx, fr->obj);
+            if (d) {
+                d->dir = NULL;
+                JS_FreeValue(ctx, d->path);
+                d->path = JS_UNDEFINED;
             }
             break;
+        }
+
+        case UV_FS_READDIR: {
+            TJSDir *d = tjs_dir_get(ctx, fr->obj);
+            if (d) {
+                d->done = fr->req.result == 0;
+                arg = JS_NewObjectProto(ctx, JS_NULL);
+                JS_DefinePropertyValueStr(ctx, arg, "done", JS_NewBool(ctx, d->done), JS_PROP_C_W_E);
+                if (fr->req.result != 0) {
+                    JSValue item = tjs_new_dirent(ctx, &d->dirent);
+                    JS_DefinePropertyValueStr(ctx, arg, "value", item, JS_PROP_C_W_E);
+                }
+            } else {
+                arg = JS_UNDEFINED;
+            }
+            break;
+        }
 
         default:
             abort();
@@ -900,43 +913,10 @@ static JSValue tjs_stat_issymlink(JSContext *ctx, JSValue this_val) {
 
 /* Module functions */
 
-static int js__uv_open_flags(const char *strflags, size_t len) {
-    int flags = 0, read = 0, write = 0;
 
-    for (int i = 0; i < len; i++) {
-        switch (strflags[i]) {
-            case 'r':
-                read = 1;
-                break;
-            case 'w':
-                write = 1;
-                flags |= O_TRUNC | O_CREAT;
-                break;
-            case 'a':
-                write = 1;
-                flags |= O_APPEND | O_CREAT;
-                break;
-            case '+':
-                read = 1;
-                write = 1;
-                break;
-            case 'x':
-                flags |= O_EXCL;
-                break;
-            default:
-                break;
-        }
-    }
-
-    flags |= read ? (write ? O_RDWR : O_RDONLY) : (write ? O_WRONLY : 0);
-
-    return flags;
-}
 
 static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     const char *path;
-    const char *strflags;
-    size_t len;
     int flags;
     int32_t mode;
 
@@ -945,13 +925,11 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
-    strflags = JS_ToCStringLen(ctx, &len, argv[1]);
-    if (!strflags) {
+    flags = parse_open_flags(ctx, argv[1]);
+    if (flags < 0) {
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
-    flags = js__uv_open_flags(strflags, len);
-    JS_FreeCString(ctx, strflags);
 
     mode = 0666;
     if (!JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &mode, argv[2])) {
@@ -1342,13 +1320,18 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     tjs_dbuf_init(ctx, &fr->dbuf);
     fr->r = -1;
     fr->filename = js_strdup(ctx, path);
+    if (!fr->filename) {
+        js_free(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     fr->req.data = fr;
     JS_FreeCString(ctx, path);
 
     int r = uv_queue_work(tjs_get_loop(ctx), &fr->req, tjs__readfile_work_cb, tjs__readfile_after_work_cb);
     if (r != 0) {
         js_free(ctx, fr->filename);
-		dbuf_free(&fr->dbuf);
+        dbuf_free(&fr->dbuf);
         js_free(ctx, fr);
         return tjs_throw_errno(ctx, r);
     }
