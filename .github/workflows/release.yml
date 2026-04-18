@@ -18,29 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y cmake ninja-build \
             libcurl4-openssl-dev libltdl-dev libffi-dev \
             libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
-      - name: Build iwasm (WAMR)
-        run: |
-          git clone --depth 1 https://github.com/bytecodealliance/wasm-micro-runtime.git /tmp/wamr
-          cd /tmp/wamr/product-mini/platforms/linux
-          mkdir build && cd build
-          cmake .. -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 -DWAMR_BUILD_AOT=0 \
-            -DWAMR_BUILD_LIBC_BUILTIN=1 -DWAMR_BUILD_LIBC_WASI=0 -DWAMR_BUILD_LIB_PTHREAD=0
-          make -j$(nproc)
-          sudo make install
-          sudo cp /tmp/wamr/product-mini/platforms/linux/build/libvmlib.a /usr/local/lib/
-          sudo cp -r /tmp/wamr/core/iwasm/include/* /usr/local/include/
       - name: Build
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH=/usr/local
+            -DCMAKE_BUILD_TYPE=Release
           cmake --build build
       - name: Package
         run: |
@@ -60,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install cross compile toolchain
         run: |
           sudo apt update
@@ -78,7 +66,6 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DBUILD_WITH_WASM=OFF \
             -DBUILD_WITH_CURL=OFF
           cmake --build build || echo "Cross compile may fail due to missing libs"
       - name: Package
@@ -102,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install cross compile toolchain
         run: |
           sudo apt update
@@ -115,7 +102,6 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=arm \
             -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
             -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
-            -DBUILD_WITH_WASM=OFF \
             -DBUILD_WITH_CURL=OFF
           cmake --build build || echo "Cross compile may fail due to missing libs"
       - name: Package
@@ -171,7 +157,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Download musl.cc toolchain
         run: |
           cd /tmp
@@ -193,7 +179,6 @@ jobs:
             -DCMAKE_CXX_COMPILER=$CXX \
             -DCMAKE_AR=$AR \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_WITH_WASM=OFF \
             -DBUILD_WITH_CURL=OFF
           cmake --build build 2>&1 || echo "Build may fail for some archs, continuing..."
       - name: Package
@@ -212,7 +197,7 @@ jobs:
           if-no-files-found: ignore
 
   # ==========================================
-  # macOS 构建 - 多架构（禁用 WASM）
+  # macOS 构建 - 多架构
   # ==========================================
   build-macos-x86_64:
     name: macOS x86_64
@@ -220,7 +205,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install dependencies
         run: |
           brew install cmake ninja libffi sqlite3 openssl zlib expat curl
@@ -228,8 +213,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DBUILD_WITH_WASM=OFF
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
           cmake --build build
       - name: Package
         run: |
@@ -249,7 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install dependencies
         run: |
           brew install cmake ninja libffi sqlite3 openssl zlib expat curl
@@ -257,8 +241,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DBUILD_WITH_WASM=OFF
+            -DCMAKE_OSX_ARCHITECTURES=arm64
           cmake --build build
       - name: Package
         run: |
@@ -278,7 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Install dependencies
         run: |
           brew install cmake ninja libffi sqlite3 openssl zlib expat curl
@@ -287,17 +270,15 @@ jobs:
           # Build for ARM64
           cmake -B build-arm64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DBUILD_WITH_WASM=OFF
+            -DCMAKE_OSX_ARCHITECTURES=arm64
           cmake --build build-arm64
-          
+
           # Build for x86_64
           cmake -B build-x86_64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DBUILD_WITH_WASM=OFF
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
           cmake --build build-x86_64
-          
+
           # Create universal binary
           mkdir -p dist/cjs-macos-universal
           lipo -create build-arm64/cjs build-x86_64/cjs -output dist/cjs-macos-universal/cjs
@@ -310,7 +291,7 @@ jobs:
           path: dist/cjs-macos-universal.tar.gz
 
   # ==========================================
-  # Windows 构建 - 多架构（MSVC + vcpkg，禁用 WASM）
+  # Windows 构建 - 多架构（MSVC + vcpkg）
   # ==========================================
   build-windows-x86_64:
     name: Windows x86_64
@@ -318,7 +299,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Setup MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -336,7 +317,6 @@ jobs:
           cmake -B build -G "NMake Makefiles" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_WASM=OFF ^
             -DBUILD_WITH_CURL=ON
           cmake --build build
       - name: Package
@@ -357,7 +337,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Setup MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -375,7 +355,6 @@ jobs:
           cmake -B build -G "NMake Makefiles" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_WASM=OFF ^
             -DBUILD_WITH_CURL=ON
           cmake --build build
       - name: Package
@@ -396,7 +375,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
       - name: Setup MSVC ARM64
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -414,7 +393,6 @@ jobs:
           cmake -B build -G "NMake Makefiles" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_WASM=OFF ^
             -DBUILD_WITH_CURL=ON || echo "ARM64 may have missing packages"
           cmake --build build
       - name: Package
