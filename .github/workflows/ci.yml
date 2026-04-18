@@ -7,6 +7,11 @@ on:
     tags-ignore:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 jobs:
   docs:
     name: TypeDoc Check
@@ -25,6 +30,37 @@ jobs:
         run: pnpm install
       - name: Build TypeDoc
         run: pnpm run api-docs
+
+  deploy-docs:
+    name: Deploy API Docs
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: docs
+    concurrency:
+      group: "pages"
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build TypeDoc
+        run: pnpm run api-docs
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './api'
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
         
   build-linux-x86_64:
     name: Test Build - Linux x86_64

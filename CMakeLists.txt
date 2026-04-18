@@ -21,11 +21,21 @@ set(CMAKE_C_STANDARD 11)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# disable #pragma region warning for GCC
-list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror)
-if (CMAKE_BUILD_TYPE MATCHES "Debug")
-    list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
-    add_compile_definitions(DEBUG)
+# Set compiler flags based on compiler type
+if(MSVC)
+    # MSVC compiler flags
+    list(APPEND cjs_cflags /W4 /Zi)
+    if (CMAKE_BUILD_TYPE MATCHES "Debug")
+        list(APPEND cjs_cflags /Od)
+        add_compile_definitions(DEBUG)
+    endif()
+else()
+    # GCC/Clang compiler flags
+    list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror)
+    if (CMAKE_BUILD_TYPE MATCHES "Debug")
+        list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
+        add_compile_definitions(DEBUG)
+    endif()
 endif()
 
 set(CJS__VERSION_MAJOR 25)

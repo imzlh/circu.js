@@ -77,7 +77,9 @@ typedef off_t fs_off_t;
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#ifndef __APPLE__
 #include <sys/sendfile.h>
+#endif
 #include <sys/stat.h>
 #include <sys/file.h>
 #endif
