@@ -94,6 +94,23 @@ endif()
 
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# Check if SQLite3 supports extension loading
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${SQLite3_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_LIBRARIES ${SQLite3_LIBRARIES})
+check_c_source_compiles("
+    #include <sqlite3.h>
+    int main() {
+        sqlite3 *db;
+        sqlite3_load_extension(db, \"test\", 0, 0);
+        return 0;
+    }
+" SQLITE_HAS_LOAD_EXTENSION)
+
+if(NOT SQLITE_HAS_LOAD_EXTENSION)
+    message(WARNING "SQLite3 does not support extension loading. Some features may be disabled.")
+endif()
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv)  # optional

@@ -161,11 +161,13 @@ static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
 
     // Enable sqlite extensions (but only via C calls)
+#ifdef SQLITE_HAS_LOAD_EXTENSION
     r = sqlite3_db_config(handle, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
     if (r != SQLITE_OK) {
         sqlite3_close(handle);
         return tjs_throw_sqlite3_errno(ctx, r);
     }
+#endif
 
     JSValue obj = tjs_new_sqlite3(ctx, handle);
     if (JS_IsException(obj)) {
@@ -193,6 +195,7 @@ static JSValue tjs_sqlite3_close(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef SQLITE_HAS_LOAD_EXTENSION
     TJSSqlite3Handle *h = tjs_sqlite3_get(ctx, this_val);
 
     if (!h) {
@@ -220,6 +223,9 @@ static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int 
     }
 
     return JS_UNDEFINED;
+#else
+    return JS_ThrowTypeError(ctx, "SQLite3 extension loading is not supported");
+#endif
 }
 
 static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
