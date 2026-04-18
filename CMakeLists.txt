@@ -169,7 +169,7 @@ else()
     FetchContent_MakeAvailable(llhttp)
 
     # Link with the llhttp_static target and add include directory
-    target_link_libraries(cjs llhttp_static)
+    target_link_libraries(cjs llhttp)
     target_include_directories(cjs PRIVATE ${llhttp_SOURCE_DIR}/include)
 endif()
 
@@ -206,14 +206,11 @@ if (BUILD_WITH_WASM)
     # Configure WAMR build options
     set(WAMR_BUILD_INTERP 1)
     set(WAMR_BUILD_FAST_INTERP 1)
-    # Fast JIT: lightweight JIT without LLVM dependency, much faster than interpreter
-    # Note: FAST_JIT is incompatible with MULTI_MODULE
-    set(WAMR_BUILD_FAST_JIT 1)
     set(WAMR_BUILD_AOT 0)
     set(WAMR_BUILD_JIT 0)
     set(WAMR_BUILD_LIBC_BUILTIN 1)
     set(WAMR_BUILD_LIBC_WASI 1)
-    set(WAMR_BUILD_MULTI_MODULE 0)
+    set(WAMR_BUILD_MULTI_MODULE 1)
     set(WAMR_BUILD_REF_TYPES 1)
     set(WAMR_BUILD_BULK_MEMORY 1)
     set(WAMR_BUILD_LIB_PTHREAD 0)
