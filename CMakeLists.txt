@@ -158,19 +158,21 @@ if(UNIX)
 endif()
 
 if(llhttp_FOUND)
-    target_link_libraries(cjs llhttp)
+    # System-installed llhttp may not provide CMake targets
+    # Use the traditional variables instead
+    target_link_libraries(cjs ${llhttp_LIBRARIES})
+    target_include_directories(cjs PRIVATE ${llhttp_INCLUDE_DIRS})
 else()
     message(NOTICE "build with llhttp github repo")
     FetchContent_Declare(llhttp
         URL "https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.3.0.tar.gz")
 
-    set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
-    set(LLHTTP_BUILD_STATIC_LIBS ON CACHE INTERNAL "")
+    set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+    set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(llhttp)
 
-    # Link with the llhttp_static target and add include directory
-    target_link_libraries(cjs llhttp)
-    target_include_directories(cjs PRIVATE ${llhttp_SOURCE_DIR}/include)
+    # Link with the llhttp::llhttp alias (points to llhttp_static when BUILD_STATIC_LIBS=ON)
+    target_link_libraries(cjs llhttp::llhttp)
 endif()
 
 if (Iconv_FOUND)
@@ -211,12 +213,17 @@ if (BUILD_WITH_WASM)
     set(WAMR_BUILD_LIBC_BUILTIN 1)
     set(WAMR_BUILD_LIBC_WASI 1)
     set(WAMR_BUILD_MULTI_MODULE 1)
+    set(WAMR_BUILD_SIMD 0)
     set(WAMR_BUILD_REF_TYPES 1)
     set(WAMR_BUILD_BULK_MEMORY 1)
     set(WAMR_BUILD_LIB_PTHREAD 0)
     set(WAMR_BUILD_MINI_LOADER 0)
     set(WAMR_DISABLE_HW_BOUND_CHECK 1)
     set(WAMR_DISABLE_STACK_HW_BOUND_CHECK 1)
+    # Use C version of invokeNative on macOS to avoid Apple Clang assembly issues
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(WAMR_BUILD_INVOKE_NATIVE_GENERAL 1)
+    endif()
 
     # Include WAMR build scripts
     include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)

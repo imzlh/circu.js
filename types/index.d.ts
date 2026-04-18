@@ -16,7 +16,6 @@ interface TjsModules {
     signals: typeof CModuleSignals,
     sqlite3: typeof CModuleSQLite3,
     streams: typeof CModuleStreams,
-    sys: typeof CModuleSys,
     timers: typeof CModuleTimers,
     udp: typeof CModuleUDP,
     worker: typeof CModuleWorker,

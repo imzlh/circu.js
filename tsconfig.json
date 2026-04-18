@@ -42,6 +42,16 @@
         "skipLibCheck": false,
         "allowJs": true
     },
+    "include": [
+        "types/**/*"
+    ],
+    "exclude": [
+        "node_modules",
+        "deps",
+        "build",
+        "dist",
+        "api"
+    ],
     "typedocOptions": {
         "name": "circu.js",
         "entryPoints": [
@@ -49,6 +59,12 @@
         ],
         "entryPointStrategy": "expand",
         "out": "./api/",
-        "disableSources": true
+        "disableSources": true,
+        "exclude": [
+            "node_modules/**",
+            "deps/**",
+            "build/**",
+            "dist/**"
+        ]
     },
 }
