@@ -170,8 +170,7 @@ endif()
 if(llhttp_FOUND)
     # System-installed llhttp may not provide CMake targets
     # Use the traditional variables instead
-    target_link_libraries(cjs ${llhttp_LIBRARIES})
-    target_include_directories(cjs PRIVATE ${llhttp_INCLUDE_DIRS})
+    target_link_libraries(cjs llhttp)
 else()
     message(NOTICE "build with llhttp github repo")
     FetchContent_Declare(llhttp
