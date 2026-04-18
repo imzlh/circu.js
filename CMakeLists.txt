@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 
+cmake_policy(SET CMP0091 NEW)
+
 project(cjs LANGUAGES C)
 
 include(ExternalProject)
@@ -111,9 +113,6 @@ endif()
 if (BUILD_WITH_CURL)
     find_package(CURL REQUIRED)
 endif()
-if (BUILD_WITH_WASM)
-    find_package(iwasm REQUIRED)
-endif()
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
@@ -191,7 +190,47 @@ endif()
 if (BUILD_WITH_WASM)
     add_compile_definitions(CJS__HAS_WASM)
     target_sources(cjs PUBLIC src/mod_wasm.c)
-    target_link_libraries(cjs iwasm)
+
+    # WAMR Configuration (interpreter only for maximum portability)
+    set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/wamr)
+
+    # Detect platform for WAMR
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(WAMR_BUILD_PLATFORM "darwin")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        set(WAMR_BUILD_PLATFORM "windows")
+    else()
+        set(WAMR_BUILD_PLATFORM "linux")
+    endif()
+
+    # Configure WAMR build options
+    set(WAMR_BUILD_INTERP 1)
+    set(WAMR_BUILD_FAST_INTERP 1)
+    # Fast JIT: lightweight JIT without LLVM dependency, much faster than interpreter
+    # Note: FAST_JIT is incompatible with MULTI_MODULE
+    set(WAMR_BUILD_FAST_JIT 1)
+    set(WAMR_BUILD_AOT 0)
+    set(WAMR_BUILD_JIT 0)
+    set(WAMR_BUILD_LIBC_BUILTIN 1)
+    set(WAMR_BUILD_LIBC_WASI 1)
+    set(WAMR_BUILD_MULTI_MODULE 0)
+    set(WAMR_BUILD_REF_TYPES 1)
+    set(WAMR_BUILD_BULK_MEMORY 1)
+    set(WAMR_BUILD_LIB_PTHREAD 0)
+    set(WAMR_BUILD_MINI_LOADER 0)
+    set(WAMR_DISABLE_HW_BOUND_CHECK 1)
+    set(WAMR_DISABLE_STACK_HW_BOUND_CHECK 1)
+
+    # Include WAMR build scripts
+    include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
+
+    add_library(vmlib STATIC ${WAMR_RUNTIME_LIB_SOURCE})
+    target_include_directories(vmlib PUBLIC ${WAMR_ROOT_DIR}/core/iwasm/include)
+    if(WIN32)
+        target_link_libraries(vmlib PUBLIC ntdll)
+    endif()
+    target_include_directories(cjs PRIVATE ${WAMR_ROOT_DIR}/core/iwasm/include)
+    target_link_libraries(cjs vmlib)
 endif()
 
 # add_library(ffi-test SHARED

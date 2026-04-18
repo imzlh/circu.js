@@ -7,3 +7,6 @@
 [submodule "deps/libuv"]
 	path = deps/libuv
 	url = https://github.com/libuv/libuv
+[submodule "deps/wamr"]
+	path = deps/wamr
+	url = https://github.com/bytecodealliance/wasm-micro-runtime
