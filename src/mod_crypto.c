@@ -2377,6 +2377,45 @@ static JSValue tjs_crypto_hex_decode(JSContext* ctx, JSValueConst this_val, int 
     return result;
 }
 
+static JSValue tjs_randomUUID(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    char v[37];
+    unsigned char u[16];
+
+    int r = uv_random(NULL, NULL, u, sizeof(u), 0, NULL);
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+
+    u[6] &= 15;
+    u[6] |= 64;  // '4x'
+
+    u[8] &= 63;
+    u[8] |= 128;  // 0b10xxxxxx
+
+    snprintf(v,
+             sizeof(v),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0],
+             u[1],
+             u[2],
+             u[3],
+             u[4],
+             u[5],
+             u[6],
+             u[7],
+             u[8],
+             u[9],
+             u[10],
+             u[11],
+             u[12],
+             u[13],
+             u[14],
+             u[15]);
+
+    return JS_NewString(ctx, v);
+}
+
 /* Module function list with magic values */
 static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     /* Hash functions */
@@ -2476,6 +2515,9 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
 	/* Streaming GCM */
     JS_CFUNC_DEF("gcmEncrypt", 5, tjs_gcm_encrypt),
     JS_CFUNC_DEF("gcmDecrypt", 5, tjs_gcm_decrypt),
+
+	/* Others */
+    JS_CFUNC_DEF("randomUUID", 0, tjs_randomUUID)
 };
 
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns) {

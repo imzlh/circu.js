@@ -926,3 +926,26 @@ static const JSCFunctionListEntry console_funcs[] = {
 void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }
+
+// # C apis
+static void tjs_dump_obj(JSContext *ctx, FILE *f, JSValue val) {
+	VisitStack st;
+	InspectOptions io = {0};
+	DynBuf buf;
+
+	dbuf_init(&buf);
+	format_value(ctx, val, 0, &st, &buf, false, &io);
+	fwrite(buf.buf, buf.size, 1, f);
+	dbuf_free(&buf);
+}
+
+void tjs_dump_error(JSContext *ctx) {
+    JSValue exception_val = JS_GetException(ctx);
+    tjs_dump_error1(ctx, exception_val);
+    JS_FreeValue(ctx, exception_val);
+}
+
+void tjs_dump_error1(JSContext *ctx, JSValue exception_val) {
+    tjs_dump_obj(ctx, stderr, exception_val);
+    fflush(stderr);
+}

@@ -128,35 +128,24 @@ void tjs_addr2obj(JSContext *ctx, JSValue obj, const struct sockaddr *sa, bool s
     }
 }
 
-static void tjs_dump_obj(JSContext *ctx, FILE *f, JSValue val) {
-    const char *str = JS_ToCString(ctx, val);
-    if (str) {
-        fprintf(f, "%s\n", str);
-        JS_FreeCString(ctx, str);
-    } else {
-        fprintf(f, "[exception]\n");
+JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents ev, JSValue data) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    CHECK_NOT_NULL(qrt);
+
+    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_func)) {
+        return JS_UNDEFINED;
     }
+
+    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
+		JS_NewInt32(ctx, ev), data
+	});
+    return ret;
 }
 
-void tjs_dump_error(JSContext *ctx) {
-    JSValue exception_val = JS_GetException(ctx);
-    tjs_dump_error1(ctx, exception_val);
-    JS_FreeValue(ctx, exception_val);
+void tjs__dispatch_event2(JSContext *ctx, TJSEvents ev, JSValue data) {
+    JSValue ret = tjs__dispatch_event(ctx, ev, data);
+	JS_FreeValue(ctx, ret);
 }
-
-void tjs_dump_error1(JSContext *ctx, JSValue exception_val) {
-    int is_error = JS_IsError(exception_val);
-    tjs_dump_obj(ctx, stderr, exception_val);
-    if (is_error) {
-        JSValue val = JS_GetPropertyStr(ctx, exception_val, "stack");
-        if (!JS_IsUndefined(val)) {
-            tjs_dump_obj(ctx, stderr, val);
-        }
-        JS_FreeValue(ctx, val);
-    }
-    fflush(stderr);
-}
-
 void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
     JSValue ret, func1;
     /* 'func' might be destroyed when calling itself (if it frees the
@@ -405,4 +394,115 @@ int tjs_getsignum(const char *sig_str) {
 
 void tjs_dbuf_init(JSContext *ctx, DynBuf *s) {
     dbuf_init2(s, JS_GetRuntime(ctx), (DynBufReallocFunc *) js_realloc_rt);
+}
+
+
+int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename) {
+    uv_fs_t req;
+    uv_file fd;
+    int r;
+
+    r = uv_fs_open(NULL, &req, filename, O_RDONLY, 0, NULL);
+    uv_fs_req_cleanup(&req);
+    if (r < 0) {
+        return r;
+    }
+
+    fd = r;
+    char buf[64 * 1024];
+    uv_buf_t b = uv_buf_init(buf, sizeof(buf));
+    size_t offset = 0;
+
+    do {
+        r = uv_fs_read(NULL, &req, fd, &b, 1, offset, NULL);
+        uv_fs_req_cleanup(&req);
+        if (r <= 0) {
+            break;
+        }
+        offset += r;
+        r = dbuf_put(dbuf, (const uint8_t *) b.base, r);
+        if (r != 0) {
+            break;
+        }
+    } while (1);
+
+    uv_fs_close(NULL, &req, fd, NULL);
+    uv_fs_req_cleanup(&req);
+
+    return r;
+}
+
+JSValue TJS_EvalModuleContent(JSContext *ctx,
+                              const char *specifier,
+                              bool is_main,
+                              bool use_real_path,
+                              const char *content,
+                              size_t len) {
+    /* Compile then run to be able to set import.meta */
+    JSValue ret = JS_Eval(ctx, content, len, specifier, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (!JS_IsException(ret)) {
+        js_module_set_import_meta(ctx, ret, use_real_path, is_main);
+        ret = JS_EvalFunction(ctx, ret);
+    }
+
+    /* Emit window 'load' event. */
+    if (!JS_IsException(ret) && is_main) {
+		JSValue ret = tjs__dispatch_event(ctx, EV_LOAD, JS_UNDEFINED);
+		if (JS_IsException(ret)){
+			tjs_dump_error(ctx);
+		}
+		JS_FreeValue(ctx, ret);
+    }
+
+    return ret;
+}
+
+JSValue TJS_EvalScript(JSContext *ctx, const char *filename) {
+    DynBuf dbuf;
+    size_t dbuf_size;
+    int r;
+    JSValue ret;
+
+    tjs_dbuf_init(ctx, &dbuf);
+    r = tjs__load_file(ctx, &dbuf, filename);
+    if (r != 0) {
+        dbuf_free(&dbuf);
+        JS_ThrowReferenceError(ctx, "could not load '%s' - %s: %s", filename, uv_err_name(r), uv_strerror(r));
+        return JS_EXCEPTION;
+    }
+
+    dbuf_size = dbuf.size;
+
+    /* Add null termination, required by JS_Eval. */
+    dbuf_putc(&dbuf, '\0');
+
+    ret = JS_Eval(ctx, (char *) dbuf.buf, dbuf_size - 1, filename, JS_EVAL_TYPE_GLOBAL);
+
+    dbuf_free(&dbuf);
+    return ret;
+}
+
+JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main) {
+    DynBuf dbuf;
+    size_t dbuf_size;
+    int r;
+    JSValue ret;
+
+    tjs_dbuf_init(ctx, &dbuf);
+    r = tjs__load_file(ctx, &dbuf, filename);
+    if (r != 0) {
+        dbuf_free(&dbuf);
+        JS_ThrowReferenceError(ctx, "could not load '%s' - %s: %s", filename, uv_err_name(r), uv_strerror(r));
+        return JS_EXCEPTION;
+    }
+
+    dbuf_size = dbuf.size;
+
+    /* Add null termination, required by JS_Eval. */
+    dbuf_putc(&dbuf, '\0');
+
+    ret = TJS_EvalModuleContent(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size - 1);
+
+    dbuf_free(&dbuf);
+    return ret;
 }

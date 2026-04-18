@@ -289,4 +289,15 @@ declare namespace CModuleOS {
      * 当前进程用户信息（getter属性）
      */
     const userInfo: UserInfo;
+
+    /**
+     * 获取当前可执行文件的路径
+     * @returns 返回当前可执行文件的路径。
+     */
+    const exePath: string;
+
+    /**
+     * 当前命令行参数数组
+     */
+    const args: string[];
 }

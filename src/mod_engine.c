@@ -606,6 +606,29 @@ static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int arg
 	}
 }
 
+
+static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    return JS_NewBool(ctx, argc >= 1 && JS_IsArrayBuffer(argv[0]));
+}
+
+static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	if(argc == 0 && !JS_IsArrayBuffer(argv[0]))
+		return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
+    JS_DetachArrayBuffer(ctx, argv[0]);
+
+    return JS_UNDEFINED;
+}
+
+
+static JSValue tjs_immutArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	if(argc == 0 && !JS_IsArrayBuffer(argv[0]))
+		return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
+	bool immut = argc >= 2 ? JS_ToBool(ctx, argv[1]) : true;
+    int ret = JS_SetImmutableArrayBuffer(argv[0], immut);
+
+    return ret == 0 ? JS_UNDEFINED : JS_EXCEPTION;
+}
+
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
@@ -619,6 +642,9 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
 	TJS_CFUNC_DEF("decodeU16String", 1, tjs_decodeU16String),
 	TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),
+    TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
+    TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
+	TJS_CFUNC_DEF("setImmutableArrayBuffer", 2, tjs_immutArrayBuffer),
 
 	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),
 	TJS_CONST2("DUMP_NODEBUG", JS_WRITE_OBJ_STRIP_DEBUG),
@@ -666,6 +692,7 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, versions, "sqlite3", JS_NewString(ctx, sqlite3_libversion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "zlib", JS_NewString(ctx, zlibVersion()), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, versions, "openssl", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, versions, "core", JS_NewString(ctx, tjs_version()), JS_PROP_C_W_E);
 
 	JS_DefinePropertyValueStr(ctx, versions, "llhttp", JS_NewString(ctx, LLHTTP_VERSION), JS_PROP_C_W_E);
 #ifdef CJS__HAS_WASM

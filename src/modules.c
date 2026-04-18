@@ -28,50 +28,104 @@
 
 #include <string.h>
 
+// # internal modules
+struct TJSModule {
+	const char *name;
+	void (*init)(JSContext *ctx, JSValue ns);
+	bool worker;
+};
 
-JSModuleDef *tjs__load_http(JSContext *ctx, const char *url) {
-//     JSModuleDef *m;
-//     DynBuf dbuf;
+static const struct TJSModule tjs_modules[] = {
+	// name init_fn allow_in_worker
+	{ "algorithm", tjs__mod_algorithm_init, true },
+	{ "asyncfs", tjs__mod_asyncfs_init, true },
+#ifdef CJS__HAS_CURL
+	{ "curl", tjs__mod_curl_init, false }, // not thread-safe currently
+#endif
+	{ "crypto", tjs__mod_crypto_init, true },
+	{ "console", tjs__mod_console_init, true },
+	{ "dns", tjs__mod_dns_init, true },
+	{ "engine", tjs__mod_engine_init, true },
+	{ "error", tjs__mod_error_init, true },
+	{ "ffi", tjs__mod_ffi_init, true },
+	{ "fs", tjs__mod_fs_init, true },
+	{ "fswatch", tjs__mod_fswatch_init, true },
+	{ "http", tjs__mod_http_init, true },
+	{ "os", tjs__mod_os_init, true },
+	{ "process", tjs__mod_process_init, true },
+	{ "pty", tjs__mod_pty_init, true },
+	{ "signals", tjs__mod_signals_init, false }, // worker is not allowed to control process behavior
+	{ "sourcemap", tjs__mod_sourcemap_init, true },
+	{ "sqlite3", tjs__mod_sqlite3_init, true },
+	{ "ssl", tjs__mod_ssl_init, true },
+	{ "streams", tjs__mod_streams_init, true },
+	{ "sys", tjs__mod_sys_init, true },
+#ifdef CJS__HAS_ICONV
+	{ "text", tjs__mod_text_init, true },
+#endif
+	{ "timers", tjs__mod_timers_init, true },
+	{ "udp", tjs__mod_udp_init, true },
+#ifdef CJS__HAS_WASM
+	{ "wasm", tjs__mod_wasm_init, false },
+#endif
+	{ "worker", tjs__mod_worker_init, true },
+	{ "xml", tjs__mod_xml_init, true },
+	{ "zlib", tjs__mod_zlib_init, true },
+#ifndef _WIN32
+	{ "posix_socket", tjs__mod_posix_socket_init, true }
+#endif
+};
 
-//     tjs_dbuf_init(ctx, &dbuf);
+JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
+	JSValue ns = value[0];
+	TJSRuntime* qrt = TJS_GetRuntime(ctx);
 
-//     int r = tjs_curl_load_http(&dbuf, url);
-//     if (r != 200) {
-//         m = NULL;
-//         if (r < 0) {
-//             /* curl error */
-//             JS_ThrowReferenceError(ctx, "could not load '%s': %s", url, curl_easy_strerror(-r));
-//         } else {
-//             /* http error */
-//             JS_ThrowReferenceError(ctx, "could not load '%s': %d", url, r);
-//         }
-//         goto end;
-//     }
+	// find name
+	if(argc == 0){
+		return JS_NULL;
+	}
 
-//     /* compile the module */
-//     JSValue func_val =
-//         JS_Eval(ctx, (char *) dbuf.buf, dbuf.size - 1, url, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-//     if (JS_IsException(func_val)) {
-//         JS_FreeValue(ctx, func_val);
-//         m = NULL;
-//         goto end;
-//     }
+	const char* name = JS_ToCString(ctx, argv[0]);
+	if(!name) return JS_NULL;
 
-//     /* XXX: could propagate the exception */
-//     js_module_set_import_meta(ctx, func_val, false, false);
-//     /* the module is already referenced, so we must free it */
-//     m = JS_VALUE_GET_PTR(func_val);
-//     JS_FreeValue(ctx, func_val);
+	const struct TJSModule *mod = NULL;
+	for (int i = 0; i < countof(tjs_modules); i ++){
+		const struct TJSModule *m = &tjs_modules[i];
+		if (strcmp(m->name, name) == 0){
+			mod = m;
+			break;
+		}
+	}
+	if(!mod || (!mod->worker && qrt->is_worker)) {
+		JS_FreeCString(ctx, name);
+		return JS_NULL;
+	}
 
-// end:
-//     /* free the memory we allocated */
-//     dbuf_free(&dbuf);
+	JSValue module_obj = JS_GetPropertyStr(ctx, ns, mod->name);
+	if(!JS_IsUndefined(module_obj)){
+		JS_FreeCString(ctx, name);  /* fix: name was leaked on cache hit */
+		return module_obj;
+	}
 
-//     return m;
-	JS_ThrowTypeError(ctx, "http module not implemented");
-	return NULL;
+	// init
+	module_obj = JS_NewObjectProto(ctx, JS_NULL);
+	mod->init(ctx, module_obj);
+	JS_SetPropertyStr(ctx, ns, mod->name, JS_DupValue(ctx, module_obj));
+	JS_FreeCString(ctx, name);
+	return module_obj;
 }
 
+JSValue tjs__mod_list_init(JSContext* ctx){
+	JSValue obj = JS_NewArray(ctx);
+	for (int i = 0; i < countof(tjs_modules); i ++){
+		const struct TJSModule *m = &tjs_modules[i];
+		JS_SetPropertyUint32(ctx, obj, i, JS_NewString(ctx, m->name));
+	}
+	JS_SetLength(ctx, obj, countof(tjs_modules));
+	return obj;
+}
+
+// # module loader
 int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes){
 	// by default, we will not check attributes for better capability
 	TJSRuntime *trt = TJS_GetRuntime(ctx);
@@ -88,8 +142,6 @@ int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes)
 }
 
 JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *opaque, JSValueConst attributes) {
-    static const char http[] = "http://";
-    static const char https[] = "https://";
     static const char json_tpl_start[] = "export default JSON.parse(`";
     static const char json_tpl_end[] = "`);";
 
@@ -127,10 +179,6 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
 			return NULL;
 		}
 	}
-
-    if (strncmp(http, module_name, strlen(http)) == 0 || strncmp(https, module_name, strlen(https)) == 0) {
-        return tjs__load_http(ctx, module_name);
-    }
 
     tjs_dbuf_init(ctx, &dbuf);
 

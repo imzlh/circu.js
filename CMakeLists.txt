@@ -120,15 +120,15 @@ add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_library(cjs
     src/binary.c
-    src/error.c
+    src/mod_error.c
     src/mem.c
     src/modules.c
-    src/signals.c
-    src/timers.c
+    src/mod_signals.c
+    src/mod_timers.c
     src/utils.c
     src/version.c
     src/vm.c
-    src/worker.c
+    src/mod_worker.c
     src/console.c
     src/sourcemap.c
     src/mod_algorithm.c

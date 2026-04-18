@@ -676,4 +676,9 @@ declare namespace CModuleCrypto {
         /** final */
         final(): { ciphertext: ArrayBuffer, tag: ArrayBuffer };
     }
+    
+    /**
+     * Generate random UUID string
+     */
+    function randomUUID(): Promise<string>;
 }

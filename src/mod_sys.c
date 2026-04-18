@@ -69,106 +69,17 @@ static JSValue tjs_loadAsyncScript(JSContext *ctx, JSValue this_val, int argc, J
     return ret;
 }
 
-static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    return JS_NewBool(ctx, JS_IsArrayBuffer(argv[0]));
-}
 
-static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-	if(!JS_IsArrayBuffer(argv[0])) return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
-    JS_DetachArrayBuffer(ctx, argv[0]);
-
-    return JS_UNDEFINED;
-}
-
-static JSValue tjs_exepath(JSContext *ctx, JSValue this_val) {
-    char buf[1024];
-    size_t size = sizeof(buf);
-    char *dbuf = buf;
-    int r;
-
-    r = uv_exepath(dbuf, &size);
-    if (r != 0) {
-        if (r != UV_ENOBUFS) {
-            return tjs_throw_errno(ctx, r);
-        }
-        dbuf = js_malloc(ctx, size);
-        if (!dbuf) {
-            return JS_EXCEPTION;
-        }
-        r = uv_exepath(dbuf, &size);
-        if (r != 0) {
-            js_free(ctx, dbuf);
-            return tjs_throw_errno(ctx, r);
-        }
-    }
-
-    JSValue ret = JS_NewStringLen(ctx, dbuf, size);
-
-    if (dbuf != buf) {
-        js_free(ctx, dbuf);
-    }
-
-    return ret;
-}
-
-static JSValue tjs_randomUUID(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    char v[37];
-    unsigned char u[16];
-
-    int r = uv_random(NULL, NULL, u, sizeof(u), 0, NULL);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
-    u[6] &= 15;
-    u[6] |= 64;  // '4x'
-
-    u[8] &= 63;
-    u[8] |= 128;  // 0b10xxxxxx
-
-    snprintf(v,
-             sizeof(v),
-             "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
-             "%02x%02x-%02x%02x%02x%02x%02x%02x",
-             u[0],
-             u[1],
-             u[2],
-             u[3],
-             u[4],
-             u[5],
-             u[6],
-             u[7],
-             u[8],
-             u[9],
-             u[10],
-             u[11],
-             u[12],
-             u[13],
-             u[14],
-             u[15]);
-
-    return JS_NewString(ctx, v);
-}
 
 /* clang-format off */
 static const JSCFunctionListEntry tjs_sys_funcs[] = {
     TJS_CFUNC_DEF("loadModule", 1, tjs_loadModule),
     TJS_CFUNC_DEF("loadAsyncScript", 1, tjs_loadAsyncScript),
     TJS_CFUNC_DEF("loadScript", 1, tjs_loadScript),
-    TJS_CFUNC_DEF("randomUUID", 0, tjs_randomUUID),
-    TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
-    TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
-    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
 };
 /* clang-format on */
 
-#ifndef TJS__PLATFORM
-#define TJS__PLATFORM "unknown"
-#endif
 
 void tjs__mod_sys_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, tjs_sys_funcs, countof(tjs_sys_funcs));
-    JS_DefinePropertyValueStr(ctx, ns, "args", tjs__get_args(ctx), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, ns, "version", JS_NewString(ctx, tjs_version()), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, ns, "platform", JS_NewString(ctx, TJS__PLATFORM), JS_PROP_C_W_E);
 }

@@ -40,9 +40,11 @@
 #define TJS__DEFAULT_STACK_SIZE 1024 * 1024  // 1 MB
 
 int8_t vm_exit_code;
+static int tjs__argc = 0;
+static char **tjs__argv = NULL;
+
 
 /* JS malloc functions */
-
 static void *tjs__mf_calloc(void *opaque, size_t count, size_t size) {
     (void) opaque;
     return tjs__calloc(count, size);
@@ -112,131 +114,12 @@ static const JSSharedArrayBufferFunctions tjs_sf = {
     .sab_opaque = NULL,
 };
 
-/* core */
-static int tjs__argc = 0;
-static char **tjs__argv = NULL;
-
-struct TJSModule {
-	const char *name;
-	void (*init)(JSContext *ctx, JSValue ns);
-	bool worker;
-};
-
-static const struct TJSModule tjs_modules[] = {
-	// name init_fn allow_in_worker
-	{ "algorithm", tjs__mod_algorithm_init, true },
-	{ "asyncfs", tjs__mod_asyncfs_init, true },
-#ifdef CJS__HAS_CURL
-	{ "curl", tjs__mod_curl_init, false }, // not thread-safe currently
-#endif
-	{ "crypto", tjs__mod_crypto_init, true },
-	{ "console", tjs__mod_console_init, true },
-	{ "dns", tjs__mod_dns_init, true },
-	{ "engine", tjs__mod_engine_init, true },
-	{ "error", tjs__mod_error_init, true },
-	{ "ffi", tjs__mod_ffi_init, true },
-	{ "fs", tjs__mod_fs_init, true },
-	{ "fswatch", tjs__mod_fswatch_init, true },
-	{ "http", tjs__mod_http_init, true },
-	{ "os", tjs__mod_os_init, true },
-	{ "process", tjs__mod_process_init, true },
-	{ "pty", tjs__mod_pty_init, true },
-	{ "signals", tjs__mod_signals_init, false }, // worker is not allowed to control process behavior
-	{ "sourcemap", tjs__mod_sourcemap_init, true },
-	{ "sqlite3", tjs__mod_sqlite3_init, true },
-	{ "ssl", tjs__mod_ssl_init, true },
-	{ "streams", tjs__mod_streams_init, true },
-	{ "sys", tjs__mod_sys_init, true },
-#ifdef CJS__HAS_ICONV
-	{ "text", tjs__mod_text_init, true },
-#endif
-	{ "timers", tjs__mod_timers_init, true },
-	{ "udp", tjs__mod_udp_init, true },
-#ifdef CJS__HAS_WASM
-	{ "wasm", tjs__mod_wasm_init, false },
-#endif
-	{ "worker", tjs__mod_worker_init, true },
-	{ "xml", tjs__mod_xml_init, true },
-	{ "zlib", tjs__mod_zlib_init, true },
-#ifndef _WIN32
-	{ "posix_socket", tjs__mod_posix_socket_init, true }
-#endif
-};
-
-static JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
-	JSValue ns = value[0];
-	TJSRuntime* qrt = TJS_GetRuntime(ctx);
-
-	// find name
-	if(argc == 0){
-		return JS_NULL;
-	}
-
-	const char* name = JS_ToCString(ctx, argv[0]);
-	if(!name) return JS_NULL;
-
-	const struct TJSModule *mod = NULL;
-	for (int i = 0; i < countof(tjs_modules); i ++){
-		const struct TJSModule *m = &tjs_modules[i];
-		if (strcmp(m->name, name) == 0){
-			mod = m;
-			break;
-		}
-	}
-	if(!mod || (!mod->worker && qrt->is_worker)) {
-		JS_FreeCString(ctx, name);
-		return JS_NULL;
-	}
-
-	JSValue module_obj = JS_GetPropertyStr(ctx, ns, mod->name);
-	if(!JS_IsUndefined(module_obj)){
-		JS_FreeCString(ctx, name);  /* fix: name was leaked on cache hit */
-		return module_obj;
-	}
-
-	// init
-	module_obj = JS_NewObjectProto(ctx, JS_NULL);
-	mod->init(ctx, module_obj);
-	JS_SetPropertyStr(ctx, ns, mod->name, JS_DupValue(ctx, module_obj));
-	JS_FreeCString(ctx, name);
-	return module_obj;
-}
-
-static __maybe_unused JSValue tjs__mod_list_init(JSContext* ctx){
-	JSValue obj = JS_NewArray(ctx);
-	for (int i = 0; i < countof(tjs_modules); i ++){
-		const struct TJSModule *m = &tjs_modules[i];
-		JS_SetPropertyUint32(ctx, obj, i, JS_NewString(ctx, m->name));
-	}
-	JS_SetLength(ctx, obj, countof(tjs_modules));
-	return obj;
-}
-
 JSValue tjs__get_args(JSContext *ctx) {
     JSValue args = JS_NewArray(ctx);
     for (int i = 0; i < tjs__argc; i++) {
         JS_SetPropertyUint32(ctx, args, i, JS_NewString(ctx, tjs__argv[i]));
     }
     return args;
-}
-
-JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents ev, JSValue data) {
-    TJSRuntime *qrt = TJS_GetRuntime(ctx);
-    CHECK_NOT_NULL(qrt);
-
-    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_func)) {
-        return JS_UNDEFINED;
-    }
-
-    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
-		JS_NewInt32(ctx, ev), data
-	});
-    return ret;
-}
-
-void tjs__dispatch_event2(JSContext *ctx, TJSEvents ev, JSValue data) {
-    JSValue ret = tjs__dispatch_event(ctx, ev, data);
-	JS_FreeValue(ctx, ret);
 }
 
 static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col){
@@ -750,114 +633,4 @@ void TJS_Stop(TJSRuntime *qrt) {
 
 uv_loop_t *TJS_GetLoop(TJSRuntime *qrt) {
     return &qrt->loop;
-}
-
-int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename) {
-    uv_fs_t req;
-    uv_file fd;
-    int r;
-
-    r = uv_fs_open(NULL, &req, filename, O_RDONLY, 0, NULL);
-    uv_fs_req_cleanup(&req);
-    if (r < 0) {
-        return r;
-    }
-
-    fd = r;
-    char buf[64 * 1024];
-    uv_buf_t b = uv_buf_init(buf, sizeof(buf));
-    size_t offset = 0;
-
-    do {
-        r = uv_fs_read(NULL, &req, fd, &b, 1, offset, NULL);
-        uv_fs_req_cleanup(&req);
-        if (r <= 0) {
-            break;
-        }
-        offset += r;
-        r = dbuf_put(dbuf, (const uint8_t *) b.base, r);
-        if (r != 0) {
-            break;
-        }
-    } while (1);
-
-    uv_fs_close(NULL, &req, fd, NULL);
-    uv_fs_req_cleanup(&req);
-
-    return r;
-}
-
-JSValue TJS_EvalModuleContent(JSContext *ctx,
-                              const char *specifier,
-                              bool is_main,
-                              bool use_real_path,
-                              const char *content,
-                              size_t len) {
-    /* Compile then run to be able to set import.meta */
-    JSValue ret = JS_Eval(ctx, content, len, specifier, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (!JS_IsException(ret)) {
-        js_module_set_import_meta(ctx, ret, use_real_path, is_main);
-        ret = JS_EvalFunction(ctx, ret);
-    }
-
-    /* Emit window 'load' event. */
-    if (!JS_IsException(ret) && is_main) {
-		JSValue ret = tjs__dispatch_event(ctx, EV_LOAD, JS_UNDEFINED);
-		if (JS_IsException(ret)){
-			tjs_dump_error(ctx);
-		}
-		JS_FreeValue(ctx, ret);
-    }
-
-    return ret;
-}
-
-JSValue TJS_EvalScript(JSContext *ctx, const char *filename) {
-    DynBuf dbuf;
-    size_t dbuf_size;
-    int r;
-    JSValue ret;
-
-    tjs_dbuf_init(ctx, &dbuf);
-    r = tjs__load_file(ctx, &dbuf, filename);
-    if (r != 0) {
-        dbuf_free(&dbuf);
-        JS_ThrowReferenceError(ctx, "could not load '%s' - %s: %s", filename, uv_err_name(r), uv_strerror(r));
-        return JS_EXCEPTION;
-    }
-
-    dbuf_size = dbuf.size;
-
-    /* Add null termination, required by JS_Eval. */
-    dbuf_putc(&dbuf, '\0');
-
-    ret = JS_Eval(ctx, (char *) dbuf.buf, dbuf_size - 1, filename, JS_EVAL_TYPE_GLOBAL);
-
-    dbuf_free(&dbuf);
-    return ret;
-}
-
-JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main) {
-    DynBuf dbuf;
-    size_t dbuf_size;
-    int r;
-    JSValue ret;
-
-    tjs_dbuf_init(ctx, &dbuf);
-    r = tjs__load_file(ctx, &dbuf, filename);
-    if (r != 0) {
-        dbuf_free(&dbuf);
-        JS_ThrowReferenceError(ctx, "could not load '%s' - %s: %s", filename, uv_err_name(r), uv_strerror(r));
-        return JS_EXCEPTION;
-    }
-
-    dbuf_size = dbuf.size;
-
-    /* Add null termination, required by JS_Eval. */
-    dbuf_putc(&dbuf, '\0');
-
-    ret = TJS_EvalModuleContent(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size - 1);
-
-    dbuf_free(&dbuf);
-    return ret;
 }

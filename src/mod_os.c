@@ -548,6 +548,39 @@ static JSValue tjs_availableParallelism(JSContext *ctx, JSValue this_val, int ar
     return JS_NewUint32(ctx, uv_available_parallelism());
 }
 
+
+
+static JSValue tjs_exepath(JSContext *ctx, JSValue this_val) {
+    char buf[1024];
+    size_t size = sizeof(buf);
+    char *dbuf = buf;
+    int r;
+
+    r = uv_exepath(dbuf, &size);
+    if (r != 0) {
+        if (r != UV_ENOBUFS) {
+            return tjs_throw_errno(ctx, r);
+        }
+        dbuf = js_malloc(ctx, size);
+        if (!dbuf) {
+            return JS_EXCEPTION;
+        }
+        r = uv_exepath(dbuf, &size);
+        if (r != 0) {
+            js_free(ctx, dbuf);
+            return tjs_throw_errno(ctx, r);
+        }
+    }
+
+    JSValue ret = JS_NewStringLen(ctx, dbuf, size);
+
+    if (dbuf != buf) {
+        js_free(ctx, dbuf);
+    }
+
+    return ret;
+}
+
 static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CONST(AF_INET),
     TJS_CONST(AF_INET6),
@@ -578,8 +611,15 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CGETSET_DEF("ppid", tjs_getppid, NULL),
     TJS_CGETSET_DEF("tmpDir", tjs_tmpdir, NULL),
     TJS_CGETSET_DEF("userInfo", tjs_userInfo, NULL),
+    TJS_CGETSET_DEF("exePath", tjs_exepath, NULL),
 };
 
+
+#ifndef TJS__PLATFORM
+#define TJS__PLATFORM "unknown"
+#endif
 void tjs__mod_os_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, tjs_os_funcs, countof(tjs_os_funcs));
+    JS_DefinePropertyValueStr(ctx, ns, "args", tjs__get_args(ctx), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, ns, "platform", JS_NewString(ctx, TJS__PLATFORM), JS_PROP_C_W_E);
 }

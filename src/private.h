@@ -158,6 +158,10 @@ uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);
 void tjs__execute_jobs(JSContext *ctx);
 JSModuleDef *tjs__load_builtin(JSContext *ctx, const char *name);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);
+
+JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value);
+JSValue tjs__mod_list_init(JSContext* ctx);
+
 JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *opaque, JSValueConst attributes);
 char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque);
 int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes);

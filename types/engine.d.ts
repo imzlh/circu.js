@@ -125,6 +125,9 @@ declare namespace CModuleEngine {
         wasm3?: string;
         /** 若编译时包含 mimalloc，则存在（值为 number） */
         mimalloc?: number;
+
+        /** 核心circu.js版本号 */
+        core: string;
     }
 
     /**
@@ -313,4 +316,19 @@ declare namespace CModuleEngine {
      * @param promise 获取的Promise
      */
     export function promiseResult<T>(promise: globalThis.Promise<T>): T | null;
+
+    
+    /**
+     * 检查值是否为 ArrayBuffer
+     * @param value 要检查的值
+     * @returns 返回布尔值，表示值是否为 ArrayBuffer。
+     */
+    export function isArrayBuffer(value: any): boolean;
+
+    /**
+     * 分离 ArrayBuffer
+     * @param buffer ArrayBuffer 对象
+     * @returns 返回一个 Promise，解析为 undefined。
+     */
+    export function detachArrayBuffer(buffer: ArrayBuffer): globalThis.Promise<void>;
 }
