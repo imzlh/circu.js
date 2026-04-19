@@ -1,19 +1,16 @@
 /**
  * circu.js test suite entry point.
  */
+// @ts-check
 
 const { use } = import.meta;
 const console = use('console');
-const { onEvent, onModule, EventType } = use('engine');
-const { args, version, platform, exePath, loadModule } = use('sys');
-const { exit } = use('os');
+const { onEvent, onModule, EventType, versions } = use('engine');
+const { exit, args, uname, exePath } = use('os');
 const { realpath } = use('fs');
 const worker = use('worker');
 globalThis.console = console;
-/**
- * @type {ImportMeta['use']}
- */
-globalThis.use = (name) => use(name);
+Reflect.set(globalThis, 'use', use);
 
 // override promise reject event handler
 const currentExceptions = [];
@@ -83,11 +80,12 @@ if (!script || !script.endsWith(".js")) {
     throw new Error("Script must be a .js file");
 }
 
+const un = uname();
 if (!worker.isWorker) {
-    console.log("Test suite, tjs", version, "on", platform);
+    console.log("Test suite, tjs", versions.core, "on", un.machine);
     console.log("Loading script:", realpath(script));
 }
-await loadModule(script);
+await import(realpath(script));
 if (!worker.isWorker){
     console.log("🎉 " + script.split('/').at(-1).split('.').at(0) + ": All tests passed!")
 }

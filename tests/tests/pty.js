@@ -1,5 +1,7 @@
 // tests/tests/pty.js - PTY module tests
 
+import { readOnce } from "../polyfill/stream.read.js";
+
 const pty = import.meta.use('pty');
 const sys = import.meta.use('sys');
 const streams = import.meta.use('streams');
@@ -75,7 +77,7 @@ await test('pty.openpty - execute command', async () => {
     
     while (Date.now() - startTime < timeout) {
         const data = new Uint8Array(1024);
-        const n = await pipe.read(data);
+        const n = await readOnce(pipe, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -112,7 +114,7 @@ await test('pty.openpty - interactive session', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await pipe.read(data);
+        const n = await readOnce(pipe, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             if (text.includes('TEST$') || text.includes('$') || text.includes('#')) {
@@ -149,7 +151,7 @@ await test('pty.openpty - environment variables', async () => {
     
     while (Date.now() - startTime < 3000) try{
         const data = new Uint8Array(1024);
-        const n = await pipe.read(data);
+        const n = await readOnce(pipe, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -185,7 +187,7 @@ await test('pty.openpty - working directory', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await pipe.read(data);
+        const n = await readOnce(pipe, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -258,7 +260,7 @@ await test('pty - integration with process module', async () => {
     let processOutput = '';
     const data = new Uint8Array(1024);
     while (true) {
-        const n = await childProcess.stdout.read(data);
+        const n = await readOnce(childProcess.stdout, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             processOutput += text;
@@ -292,7 +294,7 @@ await test('pty - input and output', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await pipe.read(data);
+        const n = await readOnce(pipe, data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;

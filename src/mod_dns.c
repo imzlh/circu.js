@@ -817,69 +817,6 @@ static void udp_timeout_callback(uv_timer_t* handle) {
 	if (ctx->hostname) free(ctx->hostname);
 }
 
-// Sync versions of the callbacks
-static void udp_recv_sync_callback(uv_udp_t* handle, ssize_t nread,
-	const uv_buf_t* buf, const struct sockaddr* addr,
-	unsigned flags) {
-	dns_sync_ctx_t* sync_ctx = (dns_sync_ctx_t*) handle->data;
-	dns_udp_ctx_t* ctx = &sync_ctx->ctx;
-
-	if (nread < 0) {
-		sync_ctx->status = nread;
-		sync_ctx->done = true;
-		if (buf->base) free(buf->base);  /* fix: was leaked on error early return */
-		return;
-	}
-
-	if (nread > 0) {
-		// Parse DNS response
-		dns_answer_t* answers = NULL;
-		int answer_count = 0;
-
-		if (parse_dns_response((uint8_t*) buf->base, nread,
-			&answers, &answer_count) == 0) {
-			// Store the answers in the context for later use
-			ctx->resolve_func = JS_NewArray(ctx->ctx);
-			for (int i = 0; i < answer_count; i++) {
-				JSValue ans_obj = dns_answer_to_js(ctx->ctx, &answers[i]);
-				JS_SetPropertyUint32(ctx->ctx, ctx->resolve_func, i, ans_obj);
-			}
-			free_dns_answers(answers, answer_count);
-			sync_ctx->status = 0;
-		} else {
-			sync_ctx->status = -1; // Parse error
-		}
-		sync_ctx->done = true;
-	}
-
-	if (buf->base) free(buf->base);
-}
-
-static void udp_send_sync_callback(uv_udp_send_t* req, int status) {
-	dns_sync_ctx_t* sync_ctx = (dns_sync_ctx_t*) req->data;
-
-	if (status < 0) {
-		sync_ctx->status = status;
-		sync_ctx->done = true;
-	}
-}
-
-static void uv__close_step_1(uv_handle_t* handle) {
-	dns_sync_ctx_t* ctx = (void*) handle->data;
-	ctx->close_status |= 0xf;
-}
-
-static void uv__close_step_2(uv_handle_t* handle) {
-	dns_sync_ctx_t* ctx = (void*) handle->data;
-	ctx->close_status |= 0xf0;
-}
-
-static void udp_timeout_sync_callback(uv_timer_t* handle) {
-	dns_sync_ctx_t* sync_ctx = (dns_sync_ctx_t*) handle->data;
-	sync_ctx->status = -2; // Timeout error
-	sync_ctx->done = true;
-}
-
 // DNS.query(hostname, type, server, [timeout])
 // Performs raw UDP DNS query
 static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
@@ -977,143 +914,8 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	return promise;
 }
 
-// DNS.querySync(hostname, type, server, [timeout])
-// Performs raw UDP DNS query synchronously
-static JSValue tjs_dns_query_sync(JSContext* ctx, JSValueConst this_val,
-	int argc, JSValueConst* argv) {
-	TJSRuntime* trt = TJS_GetRuntime(ctx);
-	const char* hostname = JS_ToCString(ctx, argv[0]);
-	if (!hostname) return JS_ThrowTypeError(ctx, "Invalid hostname");
-
-	int32_t qtype = 1;  // Default A record
-	if (argc >= 2 && -1 == JS_ToInt32(ctx, &qtype, argv[1]))
-		return JS_ThrowTypeError(ctx, "Invalid query type");
-
-	const char* server = qtype == DNS_AAAA ? "2001:4860:4860::8888" : "8.8.8.8";  // Default Google DNS
-	if (argc >= 3 && !JS_IsUndefined(argv[2])) {
-		server = JS_ToCString(ctx, argv[2]);
-		if (!server) {
-			JS_FreeCString(ctx, hostname);
-			return JS_ThrowTypeError(ctx, "Invalid server");
-		}
-	}
-
-	int32_t timeout_ms = 5000;  // Default 5s timeout
-	if (argc >= 4 && -1 == JS_ToInt32(ctx, &timeout_ms, argv[3]))
-		return JS_ThrowTypeError(ctx, "Invalid timeout");
-
-	dns_sync_ctx_t* req_ctx = malloc(sizeof(dns_sync_ctx_t));
-	if (!req_ctx) {
-		JS_FreeCString(ctx, hostname);
-		if (argc >= 3) JS_FreeCString(ctx, server);
-		return JS_ThrowOutOfMemory(ctx);
-	}
-	memset(req_ctx, 0, sizeof(dns_sync_ctx_t));
-	/* fix: resolve_func is abused to hold the result array in sync mode; init
-	 * it to JS_UNDEFINED (not 0) so it's safe to JS_FreeValue on error paths */
-	dns_udp_ctx_t* udp_ctx = &req_ctx->ctx;
-	udp_ctx->resolve_func = JS_UNDEFINED;
-	udp_ctx->ctx = ctx;
-	udp_ctx->hostname = strdup(hostname);
-	udp_ctx->query_id = (uint16_t) (rand() & 0xFFFF);
-	udp_ctx->udp.data = req_ctx;
-	udp_ctx->send_req.data = req_ctx;
-	udp_ctx->timeout_timer.data = req_ctx;
-	req_ctx->done = false;
-	req_ctx->status = 0;
-	req_ctx->close_status = 0;
-
-	// Build DNS query packet
-	uint8_t query_buf[512];
-	int query_len = build_dns_query(hostname, udp_ctx->query_id, qtype,
-		query_buf, sizeof(query_buf));
-
-	JS_FreeCString(ctx, hostname);
-
-	if (query_len < 0) {
-		if (argc >= 3) JS_FreeCString(ctx, server);
-		free(udp_ctx->hostname);
-		free(req_ctx);
-		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
-	}
-
-	// Setup server address
-	uv_ip4_addr(server, 53, &udp_ctx->server_addr);
-	if (argc >= 3) JS_FreeCString(ctx, server);
-
-	// Initialize UDP socket
-	// Note: TJS is not using libuv's default loop
-	uv_loop_t* loop = TJS_GetLoop(trt);
-	uv_udp_init(loop, &udp_ctx->udp);
-
-	// Start receiving
-	uv_udp_recv_start(&udp_ctx->udp, udp_alloc_callback, udp_recv_sync_callback);
-
-	// Send query
-	uv_buf_t buf = uv_buf_init((char*) query_buf, query_len);
-	int ret = uv_udp_send(&udp_ctx->send_req, &udp_ctx->udp, &buf, 1,
-		(const struct sockaddr*) &udp_ctx->server_addr,
-		udp_send_sync_callback);
-
-	if (ret < 0) {
-		uv_close((uv_handle_t*) &udp_ctx->udp, NULL);
-		free(udp_ctx->hostname);
-		free(req_ctx);
-		return JS_ThrowInternalError(ctx, "Failed to send DNS query");
-	}
-
-	// Setup timeout
-	uv_timer_init(loop, &udp_ctx->timeout_timer);
-	uv_timer_start(&udp_ctx->timeout_timer, udp_timeout_sync_callback,
-		timeout_ms, 0);
-
-	// Run the event loop until the operation is done
-	while (!req_ctx->done) {
-		uv_run(loop, UV_RUN_ONCE);
-	}
-
-	// Clean up
-	uv_timer_stop(&udp_ctx->timeout_timer);
-	uv_udp_recv_stop(&udp_ctx->udp);
-	
-	// Close handles
-	req_ctx->close_status = 0;
-	uv_close((uv_handle_t*) &udp_ctx->timeout_timer, uv__close_step_1);
-	uv_close((uv_handle_t*) &udp_ctx->udp, uv__close_step_2);
-	
-	// Wait for handles to be closed properly
-	while (req_ctx->close_status != 0xff) {
-		uv_run(loop, UV_RUN_ONCE);
-	}
-
-	JSValue result;
-	if (req_ctx->status != 0) {
-		const char* error_msg;
-		switch (req_ctx->status) {
-			case -1:
-				error_msg = "Failed to parse DNS response";
-				break;
-			case -2:
-				error_msg = "DNS query timeout";
-				break;
-			default:
-				error_msg = uv_strerror(req_ctx->status);
-				break;
-		}
-		result = JS_ThrowInternalError(ctx, "%s", error_msg);
-	} else {
-		result = udp_ctx->resolve_func;
-	}
-
-	free(udp_ctx->hostname);
-	free(req_ctx);
-
-	return result;
-}
-
 static const JSCFunctionListEntry tjs_dns_funcs[] = {
 	JS_CFUNC_DEF("query", 4, tjs_dns_query),
-	JS_CFUNC_DEF("querySync", 4, tjs_dns_query_sync),
 	// DNS record type constants
 	TJS_CONST2("A", DNS_A),
 	TJS_CONST2("AAAA", DNS_AAAA),
@@ -1128,7 +930,7 @@ static const JSCFunctionListEntry tjs_dns_funcs[] = {
 	TJS_CONST2("CAA", DNS_CAA),
 
 	TJS_CFUNC_DEF("resolve", 2, tjs_dns_getaddrinfo),
-	TJS_CFUNC_DEF("resolveSync", 2, tjs_dns_getaddrinfo_sync),
+	TJS_CFUNC_DEF("resolveSync", 2, tjs_dns_getaddrinfo_sync)
 };
 
 void tjs__mod_dns_init(JSContext* ctx, JSValue ns) {

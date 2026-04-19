@@ -331,4 +331,10 @@ declare namespace CModuleEngine {
      * @returns 返回一个 Promise，解析为 undefined。
      */
     export function detachArrayBuffer(buffer: ArrayBuffer): globalThis.Promise<void>;
+
+    /**
+     * **危险** 使用伪同步将promise同步化，即异步IO变成同步IO，但是可能有互斥行为。
+     * @param prom 带有任何IO行为的promise。几乎所有promise都满足这点
+     */
+    export function waitPromise<T>(prom: globalThis.Promise<T>): T;
 }

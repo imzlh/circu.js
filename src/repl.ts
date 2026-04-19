@@ -62,14 +62,6 @@ type CommandResult =
     | { type: 'cancel' }
     | { type: 'exit' };
 
-// note: performance is defined in QJS
-// here we declared it as global
-declare global {
-    const performance: {
-        now(): number;
-    }
-}
-
 // ==================== Utilities ====================
 
 const COLOR = {
@@ -506,16 +498,17 @@ class CJSRepl {
 
     async #readInput(): Promise<void> {
         const buf = new Uint8Array(256);
-
-        while (this.#running) {
-            const n = await this.#stdin.read(buf);
-            if (!n) continue;
-
-            for (let i = 0; i < n; i++) {
-                if (!this.#running) return;
-                this.#handleByte(buf[i]!);
+        this.#stdin.onread = (res: null | undefined | Uint8Array, err: undefined | CModuleError.Error) => {
+            if (!res) {
+                console.error('Failed to read from console:', err ?? 'EOF');
+                os.exit(1);
+                throw 0;    // fallback
             }
-        }
+            for (let i = 0 ; i < res.length && this.#running ; i ++)
+                this.#handleByte(buf[i]!);
+            if (!this.#running) this.#stdin.stopRead();
+        };
+        this.#stdin.startRead();
     }
 
     #handleByte(byte: number): void {
@@ -882,7 +875,7 @@ class CJSRepl {
     // ==================== Display ====================
 
     async #printPrompt(): Promise<void> {
-        const timeStr = this.#config.showTime ? `${(performance.now() / 1000).toFixed(6)} ` : '';
+        const timeStr = this.#config.showTime ? `${(Date.now() / 1000).toFixed(6)} ` : '';
         const prompt = this.#multilineExpr
             ? ' '.repeat(this.#config.ps1.length) + this.#config.ps2
             : timeStr + this.#config.ps1;
@@ -1012,10 +1005,10 @@ class CJSRepl {
 
     async #evaluate(expr: string): Promise<void> {
         try {
-            this.#evalStartTime = performance.now();
+            this.#evalStartTime = Date.now();
             const result = (await engine.eval<any>(expr, '<eval>', engine.EVAL_ASYNC | engine.EVAL_NEW_BACKTRACE)).value;
 
-            const time = performance.now() - this.#evalStartTime;
+            const time = Date.now() - this.#evalStartTime;
             if (this.#config.showTime) {
                 this.#config.showTime = false; // Show once
             }
@@ -1054,10 +1047,28 @@ class CJSRepl {
     }
 
     // ==================== Utilities ====================
+    #writePromise: PromiseWithResolvers<void> | undefined;
+    async #bindWriteEvent() {
+        this.#stdout.onwrite = (error?: CModuleError.Error) => {
+            if (!this.#writePromise) return;
+            if (error) {
+                this.#writePromise.reject(error);
+            } else {
+                this.#writePromise.resolve();
+            }
+            this.#writePromise = undefined;
+        }
+    }
+
+    async #write(buf:Uint8Array) {
+        if (!this.#stdout.write(buf)) throw new Error('write failed');
+        this.#writePromise = Promise.withResolvers();
+        return this.#writePromise.promise;
+    }
 
     async #print(str: string): Promise<void> {
         const buf = engine.encodeString(str);
-        await this.#stdout.write(buf);
+        this.#write(buf);
     }
 
     async #printError(err: unknown): Promise<void> {
@@ -1068,7 +1079,7 @@ class CJSRepl {
     }
 
     #alert(): void {
-        this.#stdout.write(new Uint8Array([0x07]));
+        this.#write(new Uint8Array([0x07]));
     }
 
     #isWordChar(c: string) { return /[a-zA-Z0-9_$]/.test(c); }

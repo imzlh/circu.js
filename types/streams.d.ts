@@ -6,17 +6,45 @@
 
 declare namespace CModuleStreams {
     /**
-     * 错误对象接口
-     */
-    export interface TJSError {
-        readonly message: string;
-        readonly errno: number;
-    }
-
-    /**
      * 基础Stream接口
      */
     export interface Stream {
+        /**
+         * 读取数据回调
+         */
+        onread:
+            ((result: null, error: undefined) => void) |
+            ((result: undefined, error: CModuleError.Error) => void) |
+            ((result: Uint8Array, error: undefined) => void);
+
+        /**
+         * 写入完成回调
+         */
+        onwrite:
+            ((error: undefined) => void) |
+            ((error: CModuleError.Error) => void);
+
+        /**
+         * 连接完成回调
+         */
+        onconnect:
+            ((error: undefined) => void) |
+            ((error: CModuleError.Error) => void);
+
+        /**
+         * 新连接到达回调（服务器模式）
+         */
+        onconnection:
+            ((error: undefined, client: Stream) => void) |
+            ((error: CModuleError.Error, client: undefined) => void);
+
+        /**
+         * 关闭完成回调
+         */
+        onshutdown:
+            ((error: undefined) => void) |
+            ((error: CModuleError.Error) => void);
+
         /**
          * 开始监听传入连接（仅服务器模式）
          * @param backlog 挂起连接队列的最大长度，默认511
@@ -51,38 +79,53 @@ declare namespace CModuleStreams {
         close(): void;
 
         /**
-         * 从流中读取数据
-         * @param buffer 用于存储数据的Uint8Array缓冲区
-         * @returns Promise解析为实际读取的字节数，或null(EOF)
+         * 开始读取数据
          */
-        read(buffer: Uint8Array): Promise<number | null>;
+        startRead(): void;
 
         /**
-         * 同步读取数据
-         * @param buffer 用于存储数据的Uint8Array缓冲区
-         * @returns 实际读取的字节数，或null(EOF)
+         * 停止读取数据
          */
-        readSync(buffer: Uint8Array): number | null;
-
-        /**
-         * 同步写入数据
-         * @param buffer 包含要写入数据的Uint8Array
-         * @returns 实际写入的字节数
-         */
-        writeSync(buffer: Uint8Array): number;
+        stopRead(): void;
 
         /**
          * 向流中写入数据
          * @param buffer 包含要写入数据的Uint8Array
-         * @returns Promise解析为实际写入的字节数
+         * @returns true=全部内联写入, false=部分或全部异步写入
          */
-        write(buffer: Uint8Array): Promise<number>;
+        write(buffer: Uint8Array): boolean;
+
+        /**
+         * 同步从流中读取数据，使用OS级别的阻塞read()/recv()
+         * @param buffer 用于存放读取数据的Uint8Array
+         * @returns 读取的字节数，null表示EOF
+         * @throws 同步抛出错误
+         */
+        readSync(buffer: Uint8Array): number | null;
+
+        /**
+         * 同步向流中写入数据，使用OS级别的阻塞write()/send()
+         * @param buffer 包含要写入数据的Uint8Array
+         * @returns 实际写入的字节数
+         * @throws 同步抛出错误
+         */
+        writeSync(buffer: Uint8Array): number;
 
         /**
          * 获取底层的文件描述符
          * @returns 文件描述符数值（同步返回）
          */
         fileno(): number;
+
+        /**
+         * 增加事件循环引用计数，防止句柄被回收
+         */
+        ref(): void;
+
+        /**
+         * 减少事件循环引用计数，允许句柄被回收
+         */
+        unref(): void;
 
         readonly [Symbol.toStringTag]: 'Stream';
     }
@@ -146,7 +189,7 @@ declare namespace CModuleStreams {
         }): Promise<void>;
 
         /**
-         * 同步连接到指定地址
+         * 同步连接到指定地址，使用OS级别的阻塞connect()
          * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
          * @throws 同步抛出错误
          */
@@ -205,7 +248,7 @@ declare namespace CModuleStreams {
      */
     export interface Pipe extends Stream {
         /**
-         * 同步连接到指定Pipe
+         * 同步连接到指定Pipe，使用OS级别的阻塞connect()
          * @param name Pipe路径或名称
          * @throws 同步抛出错误
          */

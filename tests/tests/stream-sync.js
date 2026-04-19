@@ -1,3 +1,5 @@
+import { readOnce } from "../polyfill/stream.read.js";
+
 // test-stream-sync.ts
 const engine = import.meta.use('engine');
 const stream = import.meta.use('streams');
@@ -22,6 +24,7 @@ await test('Stream.readSync - Basic functionality', () => {
         
         // 尝试连接到一个公共服务器
         client.connectSync({ ip, port: 80 });
+        client.setBlocking(true);
         console.log('Connect OK')
         
         // 尝试读取数据（可能会因为没有数据而返回null或空数组）
@@ -61,6 +64,7 @@ await test('Stream.writeSync - Basic functionality', () => {
         
         // 尝试连接到一个公共服务器
         client.connectSync({ ip, port: 80 });
+        client.setBlocking(true);
         
         // 创建一个简单的HTTP请求
         const requestData = engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\n\r\n');
@@ -94,6 +98,7 @@ await test('Stream - Large file sync operations', () => {
         
         // 尝试连接到一个公共服务器
         client.connectSync({ ip, port: 80 });
+        client.setBlocking(true);
         
         // 发送一个简单的HTTP请求
         const requestData = engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
@@ -173,6 +178,7 @@ await test('Stream - Result consistency', async () => {
         const ip = dns.resolveSync('www.gstatic.com', { family: os.AF_UNSPEC })[0].ip;
         // 连接到公共服务器
         syncClient.connectSync({ ip, port: 80 });
+        syncClient.setBlocking(true);
         
         await asyncClient.connect({ ip, port: 80 });
         
@@ -191,7 +197,7 @@ await test('Stream - Result consistency', async () => {
         
         // 异步读取
         const asyncData = new Uint8Array(1024);
-        await asyncClient.read(asyncData);
+        await readOnce(asyncClient, asyncData);
         
         // 验证结果一致性
         if (syncData !== null && asyncData !== null) {

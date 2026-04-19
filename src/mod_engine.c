@@ -629,6 +629,32 @@ static JSValue tjs_immutArrayBuffer(JSContext *ctx, JSValue this_val, int argc, 
     return ret == 0 ? JS_UNDEFINED : JS_EXCEPTION;
 }
 
+static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *argv) {
+	if (argc == 0 || !JS_IsPromise(argv[0])) 
+		return JS_ThrowTypeError(ctx, "not a Promise.");
+
+	JS_DupValue(ctx, argv[0]);
+	JSValue abort_check = argc >= 2 && JS_IsFunction(ctx, argv[1]) ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+	
+	// call uv_run to make promise sync
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	uv_loop_t* loop = TJS_GetLoop(trt);
+
+	trt->jobs.paused = true;
+	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
+		uv_run(loop, UV_RUN_ONCE);
+		if (!JS_IsUndefined(abort_check) && JS_IsEqual(ctx, 
+			JS_Call(ctx, abort_check, this_val, 0, NULL), JS_TRUE
+		)) break;
+	}
+	trt->jobs.paused = false;
+	tjs__execute_jobs(ctx);
+
+	JS_FreeValue(ctx, argv[0]);
+	JS_FreeValue(ctx, abort_check);
+	return JS_PromiseResult(ctx, argv[0]);
+}
+
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
@@ -645,6 +671,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
 	TJS_CFUNC_DEF("setImmutableArrayBuffer", 2, tjs_immutArrayBuffer),
+	TJS_CFUNC_DEF("waitPromise", 2, tjs_waitIO),
 
 	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),
 	TJS_CONST2("DUMP_NODEBUG", JS_WRITE_OBJ_STRIP_DEBUG),

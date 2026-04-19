@@ -8,6 +8,7 @@ const engine = import.meta.use('engine');
 await test('Module#create + export() should be importable immediately', async () => {
   /* create the C-module and export stuff */
   const m = engine.Module.create('mod1');
+  console.log(m)
   m.export('answer', 42);
   m.export('greet',  name => `Hello, ${name}!`);
 

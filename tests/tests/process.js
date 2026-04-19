@@ -1,5 +1,7 @@
 // tests/tests/process.js - Process management module tests
 
+import { readOnce } from "../polyfill/stream.read.js";
+
 const proc = import.meta.use('process');
 const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
@@ -16,7 +18,7 @@ await test('proc.spawn - basic spawn', async () => {
     // Read output
     if (child.stdout) {
         const buf = new Uint8Array(1024);
-        const r = await child.stdout.read(buf);
+        const r = await readOnce(child.stdout, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('hello world'), 'Should output correct text');
     }
@@ -35,7 +37,7 @@ await test('proc.spawn - spawn with string args', async () => {
     
     if (child.stdout) {
         const buf = new Uint8Array(1024);
-        const r = await child.stdout.read(buf);
+        const r = await readOnce(child.stdout, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('test'), 'Should output test');
     }
@@ -56,7 +58,7 @@ await test('proc.spawn - spawn with stdin', async () => {
         
         // Read from stdout
         const buf = new Uint8Array(1024);
-        const r = await child.stdout.read(buf);
+        const r = await readOnce(child.stdout, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('hello from stdin'), 'Should echo input');
     }
@@ -71,7 +73,7 @@ await test('proc.spawn - spawn with stderr', async () => {
     
     if (child.stderr) {
         const buf = new Uint8Array(1024);
-        const r = await child.stderr.read(buf);
+        const r = await readOnce(child.stderr, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('error'), 'Should capture stderr');
     }
@@ -87,7 +89,7 @@ await test('proc.spawn - spawn with cwd', async () => {
     
     if (child.stdout) {
         const buf = new Uint8Array(1024);
-        const r = await child.stdout.read(buf);
+        const r = await readOnce(child.stdout, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('/tmp'), 'Should be in /tmp directory');
     }
@@ -103,7 +105,7 @@ await test('proc.spawn - spawn with env', async () => {
     
     if (child.stdout) {
         const buf = new Uint8Array(1024);
-        const r = await child.stdout.read(buf);
+        const r = await readOnce(child.stdout, buf);
         const t = engine.decodeString(buf.slice(0, r));
         assert(t.includes('test_value'), 'Should have env variable');
     }
@@ -135,7 +137,7 @@ await test('proc.wait - wait multiple times returns same result', async () => {
     // Read output first
     if (child.stdout) {
         const buf = new Uint8Array(1024);
-        await child.stdout.read(buf);
+        await readOnce(child.stdout, buf);
     }
     
     const status1 = await child.wait();
