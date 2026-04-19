@@ -88,19 +88,18 @@ jobs:
 
   build-macos-x86_64:
     name: Test Build - macOS x86_64
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: Install dependencies
         run: |
-          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
+          brew install cmake ninja libffi sqlite3 openssl@3 zlib expat curl
       - name: Build
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64
+            -DCMAKE_BUILD_TYPE=Release
           cmake --build build
       - name: Upload artifact
         uses: actions/upload-artifact@v4
