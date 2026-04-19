@@ -160,7 +160,7 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 	size_t __psize;
 	void* ret = JS_GetArrayBuffer(ctx, &__psize, arrbuf);
 	JS_FreeValue(ctx, arrbuf);
-	return ret + poffset;
+	return (uint8_t*)ret + poffset;
 }
 
 #endif

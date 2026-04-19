@@ -1175,6 +1175,228 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
     return result;
 }
 
+/* GCM encrypt with AAD support - one-shot function
+ * Arguments: key, iv, plaintext, aad (optional), tagLength (optional, default 16)
+ * Returns: {ciphertext: ArrayBuffer, tag: ArrayBuffer}
+ */
+static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    size_t key_len, iv_len, plaintext_len, aad_len = 0;
+    const uint8_t *key, *iv, *plaintext, *aad = NULL;
+    
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "gcmEncrypt requires at least 3 arguments: key, iv, plaintext");
+    }
+    
+    key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
+    iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
+    plaintext = JS_GetAnyBuffer(ctx, &plaintext_len, argv[2]);
+    
+    if (!key || !iv || !plaintext) {
+        return JS_EXCEPTION;
+    }
+    
+    // Optional AAD (4th argument)
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[3]);
+        if (!aad && aad_len > 0) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    // Optional tag length (5th argument, default 16)
+    int tag_len = 16;
+    if (argc >= 5 && !JS_IsUndefined(argv[4])) {
+        int32_t tl;
+        if (JS_ToInt32(ctx, &tl, argv[4]) < 0) {
+            return JS_EXCEPTION;
+        }
+        if (tl < 4 || tl > 16) {
+            return JS_ThrowRangeError(ctx, "tagLength must be between 4 and 16");
+        }
+        tag_len = tl;
+    }
+    
+    // Determine cipher based on key length
+    const EVP_CIPHER* cipher = NULL;
+    switch (key_len) {
+        case 16: cipher = EVP_aes_128_gcm(); break;
+        case 24: cipher = EVP_aes_192_gcm(); break;
+        case 32: cipher = EVP_aes_256_gcm(); break;
+        default:
+            return JS_ThrowTypeError(ctx, "key must be 16, 24, or 32 bytes for AES-GCM");
+    }
+    
+    EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
+    if (!cctx) {
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    
+    // Initialize encryption
+    if (EVP_EncryptInit_ex(cctx, cipher, NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
+        EVP_EncryptInit_ex(cctx, NULL, NULL, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "Failed to initialize GCM encryption");
+    }
+    
+    // Set AAD if provided
+    int len;
+    if (aad && aad_len > 0) {
+        if (EVP_EncryptUpdate(cctx, NULL, &len, aad, aad_len) != 1) {
+            EVP_CIPHER_CTX_free(cctx);
+            return JS_ThrowInternalError(ctx, "Failed to set AAD");
+        }
+    }
+    
+    // Allocate output buffer
+    uint8_t* ciphertext = js_malloc(ctx, plaintext_len);
+    if (!ciphertext) {
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_EXCEPTION;
+    }
+    
+    // Encrypt plaintext
+    int ciphertext_len;
+    if (EVP_EncryptUpdate(cctx, ciphertext, &ciphertext_len, plaintext, plaintext_len) != 1) {
+        js_free(ctx, ciphertext);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "GCM encryption failed");
+    }
+    
+    // Finalize encryption
+    int final_len;
+    if (EVP_EncryptFinal_ex(cctx, ciphertext + ciphertext_len, &final_len) != 1) {
+        js_free(ctx, ciphertext);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "GCM encryption finalization failed");
+    }
+    ciphertext_len += final_len;
+    
+    // Get authentication tag
+    uint8_t* tag = js_malloc(ctx, tag_len);
+    if (!tag || EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_GET_TAG, tag_len, tag) != 1) {
+        js_free(ctx, ciphertext);
+        if (tag) js_free(ctx, tag);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "Failed to get authentication tag");
+    }
+    
+    EVP_CIPHER_CTX_free(cctx);
+    
+    // Return result object
+    JSValue result = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, result, "ciphertext", js_fastab(ctx, ciphertext, ciphertext_len));
+    JS_SetPropertyStr(ctx, result, "tag", js_fastab(ctx, tag, tag_len));
+    
+    return result;
+}
+
+/* GCM decrypt with AAD support - one-shot function
+ * Arguments: key, iv, ciphertext, tag, aad (optional)
+ * Returns: {plaintext: ArrayBuffer, verified: boolean}
+ */
+static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    size_t key_len, iv_len, ciphertext_len, tag_len, aad_len = 0;
+    const uint8_t *key, *iv, *ciphertext, *tag, *aad = NULL;
+    
+    if (argc < 4) {
+        return JS_ThrowTypeError(ctx, "gcmDecrypt requires at least 4 arguments: key, iv, ciphertext, tag");
+    }
+    
+    key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
+    iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
+    ciphertext = JS_GetAnyBuffer(ctx, &ciphertext_len, argv[2]);
+    tag = JS_GetAnyBuffer(ctx, &tag_len, argv[3]);
+    
+    if (!key || !iv || !ciphertext || !tag) {
+        return JS_EXCEPTION;
+    }
+    
+    // Optional AAD (5th argument)
+    if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
+        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[4]);
+        if (!aad && aad_len > 0) {
+            return JS_EXCEPTION;
+        }
+    }
+    
+    // Determine cipher based on key length
+    const EVP_CIPHER* cipher = NULL;
+    switch (key_len) {
+        case 16: cipher = EVP_aes_128_gcm(); break;
+        case 24: cipher = EVP_aes_192_gcm(); break;
+        case 32: cipher = EVP_aes_256_gcm(); break;
+        default:
+            return JS_ThrowTypeError(ctx, "key must be 16, 24, or 32 bytes for AES-GCM");
+    }
+    
+    EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
+    if (!cctx) {
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    
+    // Initialize decryption
+    if (EVP_DecryptInit_ex(cctx, cipher, NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
+        EVP_DecryptInit_ex(cctx, NULL, NULL, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "Failed to initialize GCM decryption");
+    }
+    
+    // Set AAD if provided
+    int len;
+    if (aad && aad_len > 0) {
+        if (EVP_DecryptUpdate(cctx, NULL, &len, aad, aad_len) != 1) {
+            EVP_CIPHER_CTX_free(cctx);
+            return JS_ThrowInternalError(ctx, "Failed to set AAD");
+        }
+    }
+    
+    // Allocate output buffer
+    uint8_t* plaintext = js_malloc(ctx, ciphertext_len);
+    if (!plaintext) {
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_EXCEPTION;
+    }
+    
+    // Decrypt ciphertext
+    int plaintext_len;
+    if (EVP_DecryptUpdate(cctx, plaintext, &plaintext_len, ciphertext, ciphertext_len) != 1) {
+        js_free(ctx, plaintext);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "GCM decryption failed");
+    }
+    
+    // Set expected tag for verification
+    if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_TAG, tag_len, (void*)tag) != 1) {
+        js_free(ctx, plaintext);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "Failed to set authentication tag");
+    }
+    
+    // Verify and finalize
+    int final_len;
+    int verified = EVP_DecryptFinal_ex(cctx, plaintext + plaintext_len, &final_len);
+    
+    EVP_CIPHER_CTX_free(cctx);
+    
+    // Return result object
+    JSValue result = JS_NewObject(ctx);
+    
+    if (verified == 1) {
+        plaintext_len += final_len;
+        JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, plaintext, plaintext_len));
+        JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 1));
+    } else {
+        // Verification failed - still return plaintext but mark as unverified
+        plaintext_len += final_len;
+        JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, plaintext, plaintext_len));
+        JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 0));
+    }
+    
+    return result;
+}
+
 /* PBKDF2 key derivation */
 static JSValue tjs_crypto_pbkdf2(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t password_len, salt_len;
@@ -1686,195 +1908,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
     return result;
 }
 
-// One-shot function: gcmEncrypt(key, iv, plaintext, aad, tagLength)
-// Returns: {ciphertext: ArrayBuffer, tag: ArrayBuffer}
-static JSValue tjs_gcm_encrypt(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv) {
-    if (argc < 3) {
-        return JS_ThrowTypeError(ctx, "gcmEncrypt requires at least 3 arguments");
-    }
-    
-    size_t key_len, iv_len, plaintext_len, aad_len = 0;
-    uint8_t *key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
-    uint8_t *iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
-    uint8_t *plaintext = JS_GetAnyBuffer(ctx, &plaintext_len, argv[2]);
-    uint8_t *aad = NULL;
-    
-    if (!key || !iv || !plaintext) {
-        return JS_ThrowTypeError(ctx, "key, iv, and plaintext must be ArrayBuffers");
-    }
-    
-    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
-        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[3]);
-    }
-    
-    int tag_len = 16;  // Default 16 bytes
-    if (argc >= 5) {
-        JS_ToInt32(ctx, &tag_len, argv[4]);
-        if (tag_len < 4 || tag_len > 16) {
-            return JS_ThrowRangeError(ctx, "tagLength must be between 4 and 16");
-        }
-    }
-    
-    // Initialize
-    EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
-    if (!evp_ctx) {
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    
-    const EVP_CIPHER *cipher = NULL;
-    switch (key_len) {
-        case 16: cipher = EVP_aes_128_gcm(); break;
-        case 24: cipher = EVP_aes_192_gcm(); break;
-        case 32: cipher = EVP_aes_256_gcm(); break;
-        default:
-            EVP_CIPHER_CTX_free(evp_ctx);
-            return JS_ThrowTypeError(ctx, "key must be 16, 24, or 32 bytes");
-    }
-    
-    if (EVP_EncryptInit_ex(evp_ctx, cipher, NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
-        EVP_EncryptInit_ex(evp_ctx, NULL, NULL, key, iv) != 1) {
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "failed to initialize encryption");
-    }
-    
-    // Set AAD if provided
-    int len;
-    if (aad && aad_len > 0) {
-        EVP_EncryptUpdate(evp_ctx, NULL, &len, aad, aad_len);
-    }
-    
-    // Encrypt
-    uint8_t *ciphertext = js_malloc(ctx, plaintext_len);
-    if (!ciphertext) {
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_EXCEPTION;
-    }
-    
-    int ciphertext_len;
-    if (EVP_EncryptUpdate(evp_ctx, ciphertext, &ciphertext_len, plaintext, plaintext_len) != 1) {
-        js_free(ctx, ciphertext);
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "encryption failed");
-    }
-    
-    int final_len;
-    if (EVP_EncryptFinal_ex(evp_ctx, ciphertext + ciphertext_len, &final_len) != 1) {
-        js_free(ctx, ciphertext);
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "encryption final failed");
-    }
-    ciphertext_len += final_len;
-    
-    // Get tag
-    uint8_t *tag = js_malloc(ctx, tag_len);
-    if (!tag || EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_GET_TAG, tag_len, tag) != 1) {
-        js_free(ctx, ciphertext);
-        if (tag) js_free(ctx, tag);
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "failed to get tag");
-    }
-    
-    EVP_CIPHER_CTX_free(evp_ctx);
-    
-    // Return result
-    JSValue result = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, result, "ciphertext", 
-        js_fastab(ctx, ciphertext, ciphertext_len));
-    JS_SetPropertyStr(ctx, result, "tag", 
-        js_fastab(ctx, tag, tag_len));
-    
-    return result;
-}
 
-// One-shot function: gcmDecrypt(key, iv, ciphertext, tag, aad)
-// Returns: {plaintext: ArrayBuffer, verified: boolean}
-static JSValue tjs_gcm_decrypt(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv) {
-    if (argc < 4) {
-        return JS_ThrowTypeError(ctx, "gcmDecrypt requires at least 4 arguments");
-    }
-    
-    size_t key_len, iv_len, ciphertext_len, tag_len, aad_len = 0;
-    uint8_t *key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
-    uint8_t *iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
-    uint8_t *ciphertext = JS_GetAnyBuffer(ctx, &ciphertext_len, argv[2]);
-    uint8_t *tag = JS_GetAnyBuffer(ctx, &tag_len, argv[3]);
-    uint8_t *aad = NULL;
-    
-    if (!key || !iv || !ciphertext || !tag) {
-        return JS_ThrowTypeError(ctx, "key, iv, ciphertext, and tag must be ArrayBuffers");
-    }
-    
-    if (argc >= 5 && !JS_IsUndefined(argv[4])) {
-        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[4]);
-    }
-    
-    // Initialize
-    EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
-    if (!evp_ctx) {
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    
-    const EVP_CIPHER *cipher = NULL;
-    switch (key_len) {
-        case 16: cipher = EVP_aes_128_gcm(); break;
-        case 24: cipher = EVP_aes_192_gcm(); break;
-        case 32: cipher = EVP_aes_256_gcm(); break;
-        default:
-            EVP_CIPHER_CTX_free(evp_ctx);
-            return JS_ThrowTypeError(ctx, "key must be 16, 24, or 32 bytes");
-    }
-    
-    if (EVP_DecryptInit_ex(evp_ctx, cipher, NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
-        EVP_DecryptInit_ex(evp_ctx, NULL, NULL, key, iv) != 1) {
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "failed to initialize decryption");
-    }
-    
-    // Set AAD if provided
-    int len;
-    if (aad && aad_len > 0) {
-        EVP_DecryptUpdate(evp_ctx, NULL, &len, aad, aad_len);
-    }
-    
-    // Decrypt
-    uint8_t *plaintext = js_malloc(ctx, ciphertext_len);
-    if (!plaintext) {
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_EXCEPTION;
-    }
-    
-    int plaintext_len;
-    if (EVP_DecryptUpdate(evp_ctx, plaintext, &plaintext_len, ciphertext, ciphertext_len) != 1) {
-        js_free(ctx, plaintext);
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "decryption failed");
-    }
-    
-    // Set and verify tag
-    if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_GCM_SET_TAG, tag_len, tag) != 1) {
-        js_free(ctx, plaintext);
-        EVP_CIPHER_CTX_free(evp_ctx);
-        return JS_ThrowInternalError(ctx, "failed to set tag");
-    }
-    
-    int final_len;
-    int verified = EVP_DecryptFinal_ex(evp_ctx, plaintext + plaintext_len, &final_len);
-    plaintext_len += final_len;
-    
-    EVP_CIPHER_CTX_free(evp_ctx);
-    
-    // Return result
-    JSValue result = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, result, "plaintext", 
-        js_fastab(ctx, plaintext, plaintext_len));
-    JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, verified == 1));
-    
-    return result;
-}
 
 // Module initialization
 static const JSCFunctionListEntry tjs_gcm_proto_funcs[] = {
@@ -2512,9 +2546,9 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("hkdfSha256", 2, tjs_crypto_hkdf, HASH_SHA256),
     JS_CFUNC_MAGIC_DEF("hkdfSha512", 2, tjs_crypto_hkdf, HASH_SHA512),
 
-	/* Streaming GCM */
-    JS_CFUNC_DEF("gcmEncrypt", 5, tjs_gcm_encrypt),
-    JS_CFUNC_DEF("gcmDecrypt", 5, tjs_gcm_decrypt),
+	/* GCM with AAD support */
+    JS_CFUNC_DEF("gcmEncrypt", 5, tjs_crypto_gcm_encrypt),
+    JS_CFUNC_DEF("gcmDecrypt", 5, tjs_crypto_gcm_decrypt),
 
 	/* Others */
     JS_CFUNC_DEF("randomUUID", 0, tjs_randomUUID)

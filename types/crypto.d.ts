@@ -650,31 +650,167 @@ declare namespace CModuleCrypto {
     export function hkdfSha512(ikm: ArrayBuffer | Uint8Array, keylen: number, salt?: ArrayBuffer | Uint8Array, info?: ArrayBuffer | Uint8Array): ArrayBuffer;
 
     // ============================================================================
-    // Streaming GCM Cipher - NEW
+    // GCM with AAD Support
     // ============================================================================
 
-    export interface CipherGCM extends Cipher {
-        /** Get authentication tag (after encryption final) */
-        getAuthTag(): ArrayBuffer;
-        /** Set authentication tag (for decryption) */
-        setAuthTag(tag: ArrayBuffer | Uint8Array): void;
+    /**
+     * Result of GCM encryption
+     */
+    export interface GcmEncryptResult {
+        /** Encrypted ciphertext */
+        ciphertext: ArrayBuffer;
+        /** Authentication tag (default 16 bytes) */
+        tag: ArrayBuffer;
     }
 
-    /** Create AES-256-GCM cipher for streaming encryption */
-    export function gcmEncrypt(key: ArrayBuffer, iv: ArrayBuffer, plaintext: ArrayBuffer, aad?: ArrayBuffer, tagLength?: number): { ciphertext: ArrayBuffer, tag: ArrayBuffer };
-    /** Create AES-256-GCM decipher for streaming decryption */
-    export function gcmDecrypt(key: ArrayBuffer, iv: ArrayBuffer, ciphertext: ArrayBuffer, aad?: ArrayBuffer, tagLength?: number): { plaintext: ArrayBuffer, verified: boolean };
+    /**
+     * Result of GCM decryption
+     */
+    export interface GcmDecryptResult {
+        /** Decrypted plaintext */
+        plaintext: ArrayBuffer;
+        /** true if authentication tag is valid */
+        verified: boolean;
+    }
 
-    /** StreamCipherGCM */
+    /**
+     * Encrypt data using AES-GCM with optional AAD (Additional Authenticated Data)
+     *
+     * @param key - Encryption key (16/24/32 bytes for AES-128/192/256)
+     * @param iv - Initialization vector (recommended 12 bytes)
+     * @param plaintext - Data to encrypt
+     * @param aad - Optional additional authenticated data (authenticated but not encrypted)
+     * @param tagLength - Optional authentication tag length in bytes (default: 16, range: 4-16)
+     * @returns Object containing ciphertext and authentication tag
+     *
+     * @example
+     * ```typescript
+     * const crypto = import.meta.use('crypto');
+     *
+     * const key = crypto.randomBytes(32);  // AES-256
+     * const iv = crypto.randomBytes(12);   // 12 bytes IV for GCM
+     * const plaintext = new TextEncoder().encode('Hello, World!');
+     * const aad = new TextEncoder().encode('Additional authenticated data');
+     *
+     * // Without AAD
+     * const encrypted1 = crypto.gcmEncrypt(key, iv, plaintext);
+     *
+     * // With AAD
+     * const encrypted2 = crypto.gcmEncrypt(key, iv, plaintext, aad);
+     *
+     * // With custom tag length
+     * const encrypted3 = crypto.gcmEncrypt(key, iv, plaintext, aad, 12);
+     * ```
+     */
+    export function gcmEncrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        plaintext: ArrayBuffer | Uint8Array,
+        aad?: ArrayBuffer | Uint8Array,
+        tagLength?: number
+    ): GcmEncryptResult;
+
+    /**
+     * Decrypt data using AES-GCM with optional AAD (Additional Authenticated Data)
+     *
+     * @param key - Decryption key (16/24/32 bytes for AES-128/192/256)
+     * @param iv - Initialization vector (must match encryption)
+     * @param ciphertext - Encrypted data
+     * @param tag - Authentication tag from encryption
+     * @param aad - Optional additional authenticated data (must match encryption)
+     * @returns Object containing plaintext and verification status
+     *
+     * @example
+     * ```typescript
+     * const crypto = import.meta.use('crypto');
+     *
+     * const key = crypto.randomBytes(32);
+     * const iv = crypto.randomBytes(12);
+     * const plaintext = new TextEncoder().encode('Hello, World!');
+     * const aad = new TextEncoder().encode('Additional authenticated data');
+     *
+     * // Encrypt
+     * const encrypted = crypto.gcmEncrypt(key, iv, plaintext, aad);
+     *
+     * // Decrypt
+     * const decrypted = crypto.gcmDecrypt(key, iv, encrypted.ciphertext, encrypted.tag, aad);
+     *
+     * if (decrypted.verified) {
+     *     console.log('Decryption successful:', new TextDecoder().decode(decrypted.plaintext));
+     * } else {
+     *     console.log('Authentication failed!');
+     * }
+     * ```
+     */
+    export function gcmDecrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        ciphertext: ArrayBuffer | Uint8Array,
+        tag: ArrayBuffer | Uint8Array,
+        aad?: ArrayBuffer | Uint8Array
+    ): GcmDecryptResult;
+
+    /**
+     * Streaming GCM cipher class
+     *
+     * @example
+     * ```typescript
+     * const crypto = import.meta.use('crypto');
+     *
+     * const key = crypto.randomBytes(32);
+     * const iv = crypto.randomBytes(12);
+     * const aad = new TextEncoder().encode('Additional authenticated data');
+     *
+     * // Encryption
+     * const encryptor = new crypto.GCM('encrypt', key, iv);
+     * encryptor.setAAD(aad);
+     * const ciphertext1 = encryptor.update(new TextEncoder().encode('Hello '));
+     * const ciphertext2 = encryptor.update(new TextEncoder().encode('World'));
+     * const result = encryptor.final();
+     * // result = { data: ArrayBuffer, tag: ArrayBuffer }
+     *
+     * // Decryption
+     * const decryptor = new crypto.GCM('decrypt', key, iv);
+     * decryptor.setAAD(aad);
+     * const plaintext1 = decryptor.update(ciphertext1);
+     * const plaintext2 = decryptor.update(ciphertext2);
+     * const decryptResult = decryptor.final(result.tag);
+     * // decryptResult = { data: ArrayBuffer, verified: boolean }
+     * ```
+     */
     export class GCM {
-        /** note: key: ArrayBuffer (16/24/32 bytes for AES-128/192/256) */
-        constructor(mode: 'encrypt' | 'decrypt', key: ArrayBuffer, iv: ArrayBuffer);
-        /** set aad */
-        setAAD(aad: ArrayBuffer): void;
-        /** update data */
-        update(data: ArrayBuffer): ArrayBuffer;
-        /** final */
-        final(): { ciphertext: ArrayBuffer, tag: ArrayBuffer };
+        /**
+         * Create GCM cipher instance
+         * @param mode - 'encrypt' or 'decrypt'
+         * @param key - Encryption/decryption key (16/24/32 bytes for AES-128/192/256)
+         * @param iv - Initialization vector (recommended 12 bytes)
+         */
+        constructor(mode: 'encrypt' | 'decrypt', key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array);
+
+        /**
+         * Set Additional Authenticated Data (AAD)
+         * Must be called before update() for the data to be authenticated
+         * @param aad - Additional authenticated data
+         */
+        setAAD(aad: ArrayBuffer | Uint8Array): void;
+
+        /**
+         * Process data (encrypt or decrypt)
+         * @param data - Data to process
+         * @returns Processed data
+         */
+        update(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+
+        /**
+         * Finalize encryption or decryption
+         *
+         * For encryption: returns { data: ArrayBuffer, tag: ArrayBuffer }
+         * For decryption: requires tag parameter, returns { data: ArrayBuffer, verified: boolean }
+         *
+         * @param tag - Authentication tag (required for decryption)
+         * @returns Result object with data and tag/verified status
+         */
+        final(tag?: ArrayBuffer | Uint8Array): { data: ArrayBuffer; tag?: ArrayBuffer; verified?: boolean };
     }
     
     /**
