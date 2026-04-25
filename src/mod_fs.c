@@ -227,16 +227,33 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st){
 	// The flag is not cross-platform, ignore it
 	JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
 
-#define SET_TIMESPEC_FIELD(x, rename)                                                                                          \
-    JS_DefinePropertyValueStr(ctx,                                                                                     \
-                              obj,                                                                                     \
-                              STRINGIFY(rename),                                                                            \
-                              JS_NewDate(ctx, st->st_##x.tv_sec * 1e3 + st->st_##x.tv_nsec / 1e6),                     \
-                              JS_PROP_C_W_E);
-    SET_TIMESPEC_FIELD(atim, atim);
-    SET_TIMESPEC_FIELD(mtim, mtim);
-    SET_TIMESPEC_FIELD(ctim, ctim);
-    SET_TIMESPEC_FIELD(ctim, birthtim);
+#ifdef __APPLE__
+	// macOS uses timespec suffix instead of tim
+	#define SET_TIMESPEC_FIELD(x, rename)                                                                                          \
+	    JS_DefinePropertyValueStr(ctx,                                                                                     \
+	                              obj,                                                                                     \
+	                              STRINGIFY(rename),                                                                            \
+	                              JS_NewDate(ctx, st->st_##x##timespec.tv_sec * 1e3 + st->st_##x##timespec.tv_nsec / 1e6),                     \
+	                              JS_PROP_C_W_E);
+#else
+	// Linux and other Unix systems use tim suffix
+	#define SET_TIMESPEC_FIELD(x, rename)                                                                                          \
+	    JS_DefinePropertyValueStr(ctx,                                                                                     \
+	                              obj,                                                                                     \
+	                              STRINGIFY(rename),                                                                            \
+	                              JS_NewDate(ctx, st->st_##x##tim.tv_sec * 1e3 + st->st_##x##tim.tv_nsec / 1e6),                     \
+	                              JS_PROP_C_W_E);
+#endif
+
+    SET_TIMESPEC_FIELD(a, atim);
+    SET_TIMESPEC_FIELD(m, mtim);
+    SET_TIMESPEC_FIELD(c, ctim);
+    
+#ifdef __APPLE__
+    // macOS has birthtime
+    SET_TIMESPEC_FIELD(birth, birthtim);
+#endif
+
 #undef SET_TIMESPEC_FIELD
 
 	return obj;

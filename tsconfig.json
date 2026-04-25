@@ -71,6 +71,9 @@
             "tests/**",
             "example/**",
             "src/**"
+        ],
+        "include": [
+            "types/*.d.ts"
         ]
     },
 }
