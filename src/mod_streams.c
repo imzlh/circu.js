@@ -77,6 +77,7 @@ typedef struct {
     uv_write_t req;
     JSValue buf;
     TJSPromise result;
+    int nwritten; /* total bytes written (sync part + async part) */
 } TJSWriteReq;
 
 static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj);
@@ -279,7 +280,8 @@ static void uv__stream_write_cb(uv_write_t *req, int status) {
         JSValue arg = tjs_new_error(ctx, status);
         TJS_RejectPromise(ctx, &wr->result, 1, &arg);
     } else {
-        TJS_ResolvePromise(ctx, &wr->result, 0, NULL);
+        JSValue arg = JS_NewInt32(ctx, wr->nwritten);
+        TJS_ResolvePromise(ctx, &wr->result, 1, &arg);
     }
 
     JS_FreeValue(ctx, wr->buf);
@@ -309,12 +311,15 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     r = uv_try_write(&s->h.stream, &b, 1);
 
     if (r == (int) buf_sz) {
-        /* All data written synchronously, return a resolved promise */
-        return TJS_NewResolvedPromise(ctx, 0, NULL);
+        /* All data written synchronously, return a resolved promise with bytes written */
+        JSValue arg = JS_NewInt32(ctx, (int32_t) buf_sz);
+        return TJS_NewResolvedPromise(ctx, 1, &arg);
     }
 
     /* Do an async write, pin the buffer. */
+    int nwritten = 0;
     if (r >= 0) {
+        nwritten = r;
         buf += r;
         buf_sz -= r;
     }
@@ -326,6 +331,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
 
     wr->req.data = wr;
     wr->buf = JS_DupValue(ctx, argv[0]);
+    wr->nwritten = nwritten + (int) buf_sz;
 
     b = uv_buf_init((char *) buf, buf_sz);
     r = uv_write(&wr->req, &s->h.stream, &b, 1, uv__stream_write_cb);

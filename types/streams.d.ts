@@ -80,9 +80,9 @@ declare namespace CModuleStreams {
         /**
          * 向流中写入数据
          * @param buffer 包含要写入数据的Uint8Array
-         * @returns Promise在写入完成时resolve，写入失败时reject
+         * @returns Promise解析为实际写入的字节数，写入失败时reject
          */
-        write(buffer: Uint8Array): Promise<void>;
+        write(buffer: Uint8Array): Promise<number>;
 
         /**
          * 同步从流中读取数据，使用OS级别的阻塞read()/recv()
