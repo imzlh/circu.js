@@ -1047,23 +1047,8 @@ class CJSRepl {
     }
 
     // ==================== Utilities ====================
-    #writePromise: PromiseWithResolvers<void> | undefined;
-    async #bindWriteEvent() {
-        this.#stdout.onwrite = (error?: CModuleError.Error) => {
-            if (!this.#writePromise) return;
-            if (error) {
-                this.#writePromise.reject(error);
-            } else {
-                this.#writePromise.resolve();
-            }
-            this.#writePromise = undefined;
-        }
-    }
-
     async #write(buf:Uint8Array) {
-        if (!this.#stdout.write(buf)) throw new Error('write failed');
-        this.#writePromise = Promise.withResolvers();
-        return this.#writePromise.promise;
+        return this.#stdout.write(buf);
     }
 
     async #print(str: string): Promise<void> {

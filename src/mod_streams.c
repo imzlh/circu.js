@@ -49,7 +49,6 @@ static JSValue tjs_new_tcp(JSContext *ctx, int af);
 
 enum {
     STREAM_CB_READ = 0,
-    STREAM_CB_WRITE,
     STREAM_CB_CONNECT,
     STREAM_CB_CONNECTION,
     STREAM_CB_SHUTDOWN,
@@ -77,6 +76,7 @@ typedef struct {
 typedef struct {
     uv_write_t req;
     JSValue buf;
+    TJSPromise result;
 } TJSWriteReq;
 
 static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj);
@@ -275,14 +275,13 @@ static void uv__stream_write_cb(uv_write_t *req, int status) {
     JSContext *ctx = s->ctx;
     TJSWriteReq *wr = req->data;
 
-    JSValue arg;
     if (status < 0) {
-        arg = tjs_new_error(ctx, status);
+        JSValue arg = tjs_new_error(ctx, status);
+        TJS_RejectPromise(ctx, &wr->result, 1, &arg);
     } else {
-        arg = JS_UNDEFINED;
+        TJS_ResolvePromise(ctx, &wr->result, 0, NULL);
     }
 
-    maybe_invoke_callback(s, STREAM_CB_WRITE, 1, &arg);
     JS_FreeValue(ctx, wr->buf);
     js_free(ctx, wr);
 }
@@ -310,7 +309,8 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     r = uv_try_write(&s->h.stream, &b, 1);
 
     if (r == (int) buf_sz) {
-        return JS_TRUE;
+        /* All data written synchronously, return a resolved promise */
+        return TJS_NewResolvedPromise(ctx, 0, NULL);
     }
 
     /* Do an async write, pin the buffer. */
@@ -335,7 +335,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
         return tjs_throw_errno(ctx, r);
     }
 
-    return JS_FALSE;
+    return TJS_InitPromise(ctx, &wr->result);
 }
 
 static void uv__stream_shutdown_cb(uv_shutdown_t *req, int status) {
@@ -1214,7 +1214,6 @@ static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue
 /* clang-format off */
 static const JSCFunctionListEntry tjs_stream_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("onread", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_READ),
-    JS_CGETSET_MAGIC_DEF("onwrite", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_WRITE),
     JS_CGETSET_MAGIC_DEF("onconnect", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CONNECT),
     JS_CGETSET_MAGIC_DEF("onconnection", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CONNECTION),
     JS_CGETSET_MAGIC_DEF("onshutdown", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_SHUTDOWN),

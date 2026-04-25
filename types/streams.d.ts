@@ -17,12 +17,6 @@ declare namespace CModuleStreams {
         onread(result: Uint8Array<ArrayBuffer>, error: undefined): void;
 
         /**
-         * 写入完成回调
-         */
-        onwrite(error: undefined): void;
-        onwrite(error: CModuleError.Error): void;
-
-        /**
          * 连接完成回调
          */
         onconnect(error: undefined): void;
@@ -86,9 +80,9 @@ declare namespace CModuleStreams {
         /**
          * 向流中写入数据
          * @param buffer 包含要写入数据的Uint8Array
-         * @returns true=全部内联写入, false=部分或全部异步写入
+         * @returns Promise在写入完成时resolve，写入失败时reject
          */
-        write(buffer: Uint8Array): boolean;
+        write(buffer: Uint8Array): Promise<void>;
 
         /**
          * 同步从流中读取数据，使用OS级别的阻塞read()/recv()
