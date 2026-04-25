@@ -23,8 +23,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Set compiler flags based on compiler type
 if(MSVC)
-    # MSVC compiler flags
-    list(APPEND cjs_cflags /W4 /Zi)
+    # MSVC compiler flags - enable C11 for stdatomic.h support
+    list(APPEND cjs_cflags /std:c11 /W4 /Zi)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
         list(APPEND cjs_cflags /Od)
         add_compile_definitions(DEBUG)

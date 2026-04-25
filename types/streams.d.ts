@@ -12,38 +12,33 @@ declare namespace CModuleStreams {
         /**
          * 读取数据回调
          */
-        onread:
-            ((result: null, error: undefined) => void) |
-            ((result: undefined, error: CModuleError.Error) => void) |
-            ((result: Uint8Array, error: undefined) => void);
+        onread(result: null, error: undefined): void;
+        onread(result: undefined, error: CModuleError.Error): void;
+        onread(result: Uint8Array, error: undefined): void;
 
         /**
          * 写入完成回调
          */
-        onwrite:
-            ((error: undefined) => void) |
-            ((error: CModuleError.Error) => void);
+        onwrite(error: undefined): void;
+        onwrite(error: CModuleError.Error): void;
 
         /**
          * 连接完成回调
          */
-        onconnect:
-            ((error: undefined) => void) |
-            ((error: CModuleError.Error) => void);
+        onconnect(error: undefined): void;
+        onconnect(error: CModuleError.Error): void;
 
         /**
          * 新连接到达回调（服务器模式）
          */
-        onconnection:
-            ((error: undefined, client: Stream) => void) |
-            ((error: CModuleError.Error, client: undefined) => void);
+        onconnection(error: undefined, client: Stream): void;
+        onconnection(error: CModuleError.Error, client: undefined): void;
 
         /**
          * 关闭完成回调
          */
-        onshutdown:
-            ((error: undefined) => void) |
-            ((error: CModuleError.Error) => void);
+        onshutdown(error: undefined): void;
+        onshutdown(error: CModuleError.Error): void;
 
         /**
          * 开始监听传入连接（仅服务器模式）
