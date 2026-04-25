@@ -14,7 +14,7 @@ declare namespace CModuleStreams {
          */
         onread(result: null, error: undefined): void;
         onread(result: undefined, error: CModuleError.Error): void;
-        onread(result: Uint8Array, error: undefined): void;
+        onread(result: Uint8Array<ArrayBuffer>, error: undefined): void;
 
         /**
          * 写入完成回调

@@ -508,7 +508,7 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     msg.msg_iovlen = (argc - 3);
     msg.msg_iov = js_malloc(ctx, sizeof(struct iovec) * msg.msg_iovlen);
 
-    for (size_t i = 0; i < msg.msg_iovlen; i++) {
+    for (int i = 0; i < msg.msg_iovlen; i++) {
         size_t sz;
         uint8_t *buf = JS_GetUint8Array(ctx, &sz, argv[i + 3]);
         if (!buf) {
