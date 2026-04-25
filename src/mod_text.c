@@ -1,6 +1,7 @@
 /*
  * txiki.js Text Module - libiconv wrapper
- * Requires: libiconv-dev
+ *
+ * Copyright (c) 2025-2026 iz <himzlh@163.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -123,25 +124,8 @@ static const char* normalize_encoding_name(const char *enc) {
     return enc;
 }
 
-/* ============================================================================
- * Core Conversion Logic
- * ============================================================================ */
-
 /*
  * Perform iconv conversion with dynamic buffer growth.
- * 
- * Parameters:
- *   ctx         - QuickJS context
- *   cd          - iconv descriptor (must be valid)
- *   inbuf       - Input buffer
- *   inlen       - Input length
- *   fatal       - If true, throw on invalid sequences; else use replacement
- *   is_to_utf8  - If true, output is string (UTF-8); else Uint8Array
- *   out_result  - Output JSValue (string or Uint8Array)
- * 
- * Returns:
- *   0 on success, -1 on error (exception thrown)
- * 
  * Note: Handles E2BIG (buffer growth), EILSEQ/EINVAL (replacement or error)
  */
 static int perform_iconv_conversion(JSContext *ctx, iconv_t cd,
@@ -238,10 +222,6 @@ static int perform_iconv_conversion(JSContext *ctx, iconv_t cd,
     return JS_IsException(*out_result) ? -1 : 0;
 }
 
-/* ============================================================================
- * TextDecoder Implementation
- * ============================================================================ */
-
 static void tjs_text_decoder_finalizer(JSRuntime *rt, JSValue val) {
     decoder_t *dec = JS_GetOpaque(val, tjs_text_decoder_class_id);
     if (!dec) return;
@@ -262,7 +242,6 @@ static JSClassDef tjs_text_decoder_class = {
 
 /*
  * TextDecoder constructor(utfLabel, options)
- * 
  * Web API: new TextDecoder([utfLabel [, options]])
  */
 static JSValue tjs_text_decoder_constructor(JSContext *ctx, JSValueConst new_target,
@@ -318,13 +297,6 @@ fail_obj:
 
 /*
  * Decode input buffer with streaming support.
- * 
- * Algorithm:
- * 1. If pending bytes exist from previous stream, prepend to input
- * 2. Process BOM if present and not ignored
- * 3. Convert via iconv
- * 4. If stream=true and incomplete sequence at end, save to pending
- * 5. If stream=false and incomplete sequence remains, handle per fatal flag
  */
 static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv) {
@@ -548,10 +520,6 @@ static const JSCFunctionListEntry tjs_text_decoder_proto_funcs[] = {
     JS_CGETSET_DEF("ignoreBOM", tjs_text_decoder_get_ignore_bom, NULL),
 };
 
-/* ============================================================================
- * TextEncoder Implementation
- * ============================================================================ */
-
 static void tjs_text_encoder_finalizer(JSRuntime *rt, JSValue val) {
     encoder_t *enc = JS_GetOpaque(val, tjs_text_encoder_class_id);
     if (!enc) return;
@@ -742,14 +710,8 @@ static const JSCFunctionListEntry tjs_text_encoder_proto_funcs[] = {
     JS_CGETSET_DEF("encoding", tjs_text_encoder_get_encoding, NULL),
 };
 
-/* ============================================================================
- * Utility Functions
- * ============================================================================ */
-
 /*
  * Convert data between arbitrary encodings.
- * Usage: convert(fromEncoding, toEncoding, uint8Array)
- * Returns: string if toEncoding is UTF-8, else Uint8Array
  */
 static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv) {
@@ -849,10 +811,6 @@ static const JSCFunctionListEntry tjs_text_funcs[] = {
     JS_CFUNC_DEF("convert", 3, tjs_text_convert),
     JS_CFUNC_DEF("listEncodings", 0, tjs_text_list_encodings),
 };
-
-/* ============================================================================
- * Module Initialization
- * ============================================================================ */
 
 void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);

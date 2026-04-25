@@ -228,7 +228,7 @@ declare namespace CModuleXML {
     /**
      * XML Parser Class
      */
-    export class XMLParser {
+    export class Parser {
         /**
          * Create a new XML parser
          * @param options Parser configuration options

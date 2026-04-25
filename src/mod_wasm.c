@@ -30,7 +30,7 @@
 #include <wasm_export.h>
 
 /* Internal WAMR headers for direct access to import/instance structures */
-#include "wasm.h"
+#include "../deps/wamr/core/iwasm/interpreter/wasm.h"
 #include "wasm_runtime.h"
 
 #define TJS__WASM_MAX_ARGS       		32

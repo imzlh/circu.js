@@ -100,38 +100,11 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
 	int flags = 0;
 
 	if (JS_IsString(flags_obj)) {
-		const char* str = JS_ToCString(ctx, flags_obj);
+		size_t strlen;
+		const char* str = JS_ToCStringLen(ctx, &strlen, flags_obj);
 		if (!str) return -1;
 
-		if (strcmp(str, "r") == 0) {
-			flags = O_RDONLY;
-		}
-		else if (strcmp(str, "r+") == 0) {
-			flags = O_RDWR;
-		}
-		else if (strcmp(str, "w") == 0) {
-			flags = O_WRONLY | O_CREAT | O_TRUNC;
-		}
-		else if (strcmp(str, "w+") == 0) {
-			flags = O_RDWR | O_CREAT | O_TRUNC;
-		}
-		else if (strcmp(str, "a") == 0) {
-			flags = O_WRONLY | O_CREAT | O_APPEND;
-		}
-		else if (strcmp(str, "a+") == 0) {
-			flags = O_RDWR | O_CREAT | O_APPEND;
-		}
-		else if (strcmp(str, "wx") == 0) {
-			flags = O_WRONLY | O_CREAT | O_EXCL;
-		}
-		else if (strcmp(str, "wx+") == 0) {
-			flags = O_RDWR | O_CREAT | O_EXCL;
-		}
-		else {
-			JS_FreeCString(ctx, str);
-			return -1;
-		}
-		JS_FreeCString(ctx, str);
+		flags = TJS_ParseOpenFlags(str, strlen);
 	}
 	else {
 		if (JS_ToInt32(ctx, &flags, flags_obj) < 0) {
@@ -229,8 +202,45 @@ static int crt2uv(int crt_err) {
 #define THROW2(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
 #else
 #define THROW(msg) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-#define THROW2(msg) do { fprintf(stderr, "THROW2 called on non-Windows platform\n"); abort(); } while(0)	// windows only, should never happen
+#define THROW2(msg) abort();	// windows only, should never happen
 #endif
+
+static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st){
+	JSValue obj = JS_NewObject(ctx);
+
+	// The struct is same as stat() in asyncfs
+#define SET_UINT64_FIELD(x)                                                                                            \
+    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->st_##x), JS_PROP_C_W_E);
+
+	SET_UINT64_FIELD(dev);
+    SET_UINT64_FIELD(mode);
+    SET_UINT64_FIELD(nlink);
+    SET_UINT64_FIELD(uid);
+    SET_UINT64_FIELD(gid);
+    SET_UINT64_FIELD(rdev);
+    SET_UINT64_FIELD(ino);
+    SET_UINT64_FIELD(size);
+    SET_UINT64_FIELD(blksize);
+    SET_UINT64_FIELD(blocks);
+#undef SET_UINT64_FIELD
+
+	// The flag is not cross-platform, ignore it
+	JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
+
+#define SET_TIMESPEC_FIELD(x, rename)                                                                                          \
+    JS_DefinePropertyValueStr(ctx,                                                                                     \
+                              obj,                                                                                     \
+                              STRINGIFY(rename),                                                                            \
+                              JS_NewDate(ctx, st->st_##x.tv_sec * 1e3 + st->st_##x.tv_nsec / 1e6),                     \
+                              JS_PROP_C_W_E);
+    SET_TIMESPEC_FIELD(atim, atim);
+    SET_TIMESPEC_FIELD(mtim, mtim);
+    SET_TIMESPEC_FIELD(ctim, ctim);
+    SET_TIMESPEC_FIELD(ctim, birthtim);
+#undef SET_TIMESPEC_FIELD
+
+	return obj;
+}
 
 
 /* stat() - get file status */
@@ -254,27 +264,7 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
 		THROW("stat");
 	}
 
-	JSValue obj = JS_NewObject(ctx);
-	JS_SetPropertyStr(ctx, obj, "dev", JS_NewInt64(ctx, st.st_dev));
-	JS_SetPropertyStr(ctx, obj, "ino", JS_NewInt64(ctx, st.st_ino));
-	JS_SetPropertyStr(ctx, obj, "mode", JS_NewUint32(ctx, st.st_mode));
-	JS_SetPropertyStr(ctx, obj, "nlink", JS_NewInt64(ctx, st.st_nlink));
-	JS_SetPropertyStr(ctx, obj, "uid", JS_NewUint32(ctx, st.st_uid));
-	JS_SetPropertyStr(ctx, obj, "gid", JS_NewUint32(ctx, st.st_gid));
-	JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
-	JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
-	JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
-	JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512 < 0 ? 0 : (st.st_size + 511) / 512));
-	JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, (int64_t) st.st_atime * 1000));
-	JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, (int64_t) st.st_mtime * 1000));
-	JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, (int64_t) st.st_ctime * 1000));
-
-	/* Helper methods */
-	JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
-	JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
-	JS_SetPropertyStr(ctx, obj, "isSymbolicLink", JS_NewBool(ctx, S_ISLNK(st.st_mode)));
-
-	return obj;
+	return build_stat_obj(ctx, &st);
 }
 
 /* lstat() - like stat but doesn't follow symlinks */
@@ -302,26 +292,7 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
 		THROW("lstat");
 	}
 
-	JSValue obj = JS_NewObject(ctx);
-	JS_SetPropertyStr(ctx, obj, "dev", JS_NewInt64(ctx, st.st_dev));
-	JS_SetPropertyStr(ctx, obj, "ino", JS_NewInt64(ctx, st.st_ino));
-	JS_SetPropertyStr(ctx, obj, "mode", JS_NewUint32(ctx, st.st_mode));
-	JS_SetPropertyStr(ctx, obj, "nlink", JS_NewInt64(ctx, st.st_nlink));
-	JS_SetPropertyStr(ctx, obj, "uid", JS_NewUint32(ctx, st.st_uid));
-	JS_SetPropertyStr(ctx, obj, "gid", JS_NewUint32(ctx, st.st_gid));
-	JS_SetPropertyStr(ctx, obj, "rdev", JS_NewInt64(ctx, st.st_rdev));
-	JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, st.st_size));
-	JS_SetPropertyStr(ctx, obj, "blksize", JS_NewInt64(ctx, 4096));
-	JS_SetPropertyStr(ctx, obj, "blocks", JS_NewInt64(ctx, (st.st_size + 511) / 512 < 0 ? 0 : (st.st_size + 511) / 512));
-	JS_SetPropertyStr(ctx, obj, "atime", JS_NewInt64(ctx, (int64_t) st.st_atime * 1000));
-	JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, (int64_t) st.st_mtime * 1000));
-	JS_SetPropertyStr(ctx, obj, "ctime", JS_NewInt64(ctx, (int64_t) st.st_ctime * 1000));
-
-	JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
-	JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
-	JS_SetPropertyStr(ctx, obj, "isSymbolicLink", JS_NewBool(ctx, S_ISLNK(st.st_mode)));
-
-	return obj;
+	return build_stat_obj(ctx, &st);
 }
 
 /* exists() - check if file exists */

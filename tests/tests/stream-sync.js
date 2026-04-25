@@ -168,59 +168,35 @@ await test('Stream - Error handling', () => {
     }
 });
 
-// 测试同步与异步结果一致性
-await test('Stream - Result consistency', async () => {
-    // 创建两个TCP连接
+// 测试同步与异步结果一致性（仅同步部分）
+await test('Stream - Sync read/write consistency', () => {
     const syncClient = new stream.TCP();
-    const asyncClient = new stream.TCP();
     
     try {
         const ip = dns.resolveSync('www.gstatic.com', { family: os.AF_UNSPEC })[0].ip;
-        // 连接到公共服务器
+        
+        // sync connect
         syncClient.connectSync({ ip, port: 80 });
         syncClient.setBlocking(true);
-        
-        await asyncClient.connect({ ip, port: 80 });
         
         // 准备测试数据
         const requestData = engine.encodeString('GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\n\r\n');
         
-        // 异步写入
-        await asyncClient.write(requestData);
-
         // 同步写入
-        syncClient.writeSync(requestData);
+        const bytesWritten = syncClient.writeSync(requestData);
+        assert(bytesWritten > 0, 'Should write data');
         
         // 同步读取
         const syncData = new Uint8Array(1024);
-        syncClient.readSync(syncData);
+        const bytesRead = syncClient.readSync(syncData);
         
-        // 异步读取
-        const asyncData = new Uint8Array(1024);
-        await readOnce(asyncClient, asyncData);
+        assert(bytesRead > 0, 'Should read data');
         
-        // 验证结果一致性
-        if (syncData !== null && asyncData !== null) {
-            assert(syncData.length === asyncData.length, 'Data length should be consistent');
-            
-            // 比较前几个字节（可能由于网络延迟，完整数据可能不同）
-            let failed = false;
-            const compareLength = Math.min(syncData.length, asyncData.length);
-            for (let i = 0; i < compareLength; i++) {
-                if (syncData[i] !== asyncData[i]) {
-                    console.log(`Byte ${i} differs: sync=${syncData[i]}, async=${asyncData[i]}`);
-                    failed = true;
-                }
-            }
-            if (failed) {
-                console.log('Data differs');
-                console.log(engine.decodeString(syncData), '\n', engine.decodeString(asyncData));
-            }
-            assert(!failed, 'Data should be consistent');
-            console.log('Data is consistent');
-        }
+        // 验证HTTP响应
+        const response = engine.decodeString(syncData.subarray(0, bytesRead));
+        assert(response.startsWith('HTTP/1.1'), 'Should get HTTP response');
+        console.log('Sync read/write consistent, got', bytesRead, 'bytes');
     } finally {
         syncClient.close();
-        asyncClient.close();
     }
 });

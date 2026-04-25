@@ -9,9 +9,6 @@ permissions:
   contents: write
 
 jobs:
-  # ==========================================
-  # Linux 构建 - 多架构（启用 WASM）
-  # ==========================================
   build-linux-x86_64:
     name: Linux x86_64
     runs-on: ubuntu-latest
@@ -119,7 +116,6 @@ jobs:
           path: dist/cjs-linux-armv7.tar.gz
           if-no-files-found: ignore
 
-  # Linux musl 静态编译 - 使用 musl.cc 工具链
   build-linux-musl:
     name: Linux Musl ${{ matrix.target }}
     runs-on: ubuntu-latest
@@ -196,9 +192,6 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: ignore
 
-  # ==========================================
-  # macOS 构建 - 多架构
-  # ==========================================
   build-macos-x86_64:
     name: macOS x86_64
     runs-on: macos-latest
@@ -290,9 +283,6 @@ jobs:
           name: cjs-macos-universal
           path: dist/cjs-macos-universal.tar.gz
 
-  # ==========================================
-  # Windows 构建 - 多架构（MSVC + vcpkg）
-  # ==========================================
   build-windows-x86_64:
     name: Windows x86_64
     runs-on: windows-latest
@@ -407,9 +397,6 @@ jobs:
           name: cjs-windows-arm64
           path: dist/cjs-windows-arm64.zip
 
-  # ==========================================
-  # 发布到 GitHub Releases
-  # ==========================================
   release:
     name: Create Release
     needs:

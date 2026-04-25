@@ -1,7 +1,7 @@
 /*
  * circu.js
  *
- * Copyright (c) 2025 iz
+ * Copyright (c) 2025-present iz
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -898,41 +898,6 @@ static JSValue tjs_stat_issymlink(JSContext *ctx, JSValue this_val) {
     return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFLNK);
 }
 
-/* Module functions */
-
-static int js__uv_open_flags(const char *strflags, size_t len) {
-    int flags = 0, read = 0, write = 0;
-
-    for (int i = 0; i < len; i++) {
-        switch (strflags[i]) {
-            case 'r':
-                read = 1;
-                break;
-            case 'w':
-                write = 1;
-                flags |= O_TRUNC | O_CREAT;
-                break;
-            case 'a':
-                write = 1;
-                flags |= O_APPEND | O_CREAT;
-                break;
-            case '+':
-                read = 1;
-                write = 1;
-                break;
-            case 'x':
-                flags |= O_EXCL;
-                break;
-            default:
-                break;
-        }
-    }
-
-    flags |= read ? (write ? O_RDWR : O_RDONLY) : (write ? O_WRONLY : 0);
-
-    return flags;
-}
-
 static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     const char *path;
     const char *strflags;
@@ -950,7 +915,7 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
-    flags = js__uv_open_flags(strflags, len);
+    flags = TJS_ParseOpenFlags(strflags, len);
     JS_FreeCString(ctx, strflags);
 
     mode = 0666;

@@ -28,6 +28,10 @@
 
 #include <string.h>
 
+#ifndef PATH_MAX // windows
+#define PATH_MAX 2048
+#endif
+
 // # internal modules
 struct TJSModule {
 	const char *name;

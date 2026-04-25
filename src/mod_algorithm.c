@@ -417,8 +417,6 @@ static JSValue xoshiro_init(JSContext *ctx) {
 	return constructor;
 }
 
-/* Simple non-cryptographic hash functions */
-
 // FNV-1a 32-bit hash
 static uint32_t fnv1a_32(const uint8_t *data, size_t len) {
     uint32_t hash = 2166136261U;

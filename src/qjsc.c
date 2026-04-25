@@ -38,6 +38,7 @@
 
 #include "../deps/quickjs/quickjs.h"
 #include "../deps/quickjs/cutils.h"
+#include "version.h"
 
 #ifdef _WIN32
     #include <windows.h>
@@ -531,7 +532,7 @@ static const char main_c_template2[] =
 #define PROG_NAME "qjsc"
 
 void help(void) {
-    printf("Enhanced QuickJS Compiler\n"
+    printf("Circu.JS OpCode compiler V%s with QuickJS %s\n"
            "usage: " PROG_NAME " [options] [files]\n"
            "\n"
            "options are:\n"
@@ -545,7 +546,6 @@ void help(void) {
            "  -D module   compile a dynamically loaded module or worker\n"
            "  -M module[,cname] add initialization code for an external C module\n"
            "  -p prefix   set the prefix of the generated C names (default: qjsc_)\n"
-           "  -P          do not add default system modules\n"
            "  -s          strip source code (-ss also strips debug info)\n"
            "  -S n        set the maximum stack size (e.g., -S 65536, -S 1m, -S 2g)\n"
            "  -h          show this help\n"
@@ -556,6 +556,7 @@ void help(void) {
            "  " PROG_NAME " -o runtime script.js       # Attach to 'runtime' executable\n"
            "  " PROG_NAME " -e -o main.c script.js     # Generate standalone C program\n"
            "\n",
+		   tjs_version(),
            JS_GetVersion());
     exit(1);
 }
@@ -630,7 +631,6 @@ int main(int argc, char **argv) {
     const char *script_name = NULL;
     int module = -1;
     size_t stack_size = 0;
-    bool load_system_modules = true;
     namelist_t dynamic_module_list;
     bool output_type_forced = false;
 
@@ -727,10 +727,6 @@ int main(int argc, char **argv) {
                 namelist_add(&dynamic_module_list, optarg, NULL, 0);
                 continue;
             }
-            if (opt == 'P') {
-                load_system_modules = false;
-                continue;
-            }
             if (opt == 's') {
                 strip++;
                 continue;
@@ -763,15 +759,6 @@ int main(int argc, char **argv) {
         }
     } else {
         output_filename = "out.c";
-    }
-
-    if (load_system_modules) {
-        namelist_add(&cmodule_list, "qjs:std", "std", 0);
-        namelist_add(&cmodule_list, "qjs:os", "os", 0);
-        namelist_add(&cmodule_list, "qjs:bjson", "bjson", 0);
-        namelist_add(&cmodule_list, "std", "std", 0);
-        namelist_add(&cmodule_list, "os", "os", 0);
-        namelist_add(&cmodule_list, "bjson", "bjson", 0);
     }
 
     if (optind >= argc) help();

@@ -1,5 +1,5 @@
 /*
- * txiki.ts
+ * circu.js built-in OPCode processor
  *
  * Copyright (c) 2025-present imzlh
  *

@@ -163,4 +163,37 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 	return (uint8_t*)ret + poffset;
 }
 
+static inline int TJS_ParseOpenFlags(const char *strflags, int len) {
+    int flags = 0, read = 0, write = 0;
+
+    for (int i = 0; i < len; i++) {
+        switch (strflags[i]) {
+            case 'r':
+                read = 1;
+                break;
+            case 'w':
+                write = 1;
+                flags |= O_TRUNC | O_CREAT;
+                break;
+            case 'a':
+                write = 1;
+                flags |= O_APPEND | O_CREAT;
+                break;
+            case '+':
+                read = 1;
+                write = 1;
+                break;
+            case 'x':
+                flags |= O_EXCL;
+                break;
+            default:
+                break;
+        }
+    }
+
+    flags |= read ? (write ? O_RDWR : O_RDONLY) : (write ? O_WRONLY : 0);
+
+    return flags;
+}
+
 #endif

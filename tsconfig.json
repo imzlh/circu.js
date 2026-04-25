@@ -67,7 +67,10 @@
             "node_modules/**",
             "deps/**",
             "build/**",
-            "dist/**"
+            "dist/**",
+            "tests/**",
+            "example/**",
+            "src/**"
         ]
     },
 }
