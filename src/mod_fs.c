@@ -84,6 +84,44 @@ typedef off_t fs_off_t;
 #include <sys/file.h>
 #endif
 
+#ifndef S_ISBLK
+#  define S_ISBLK(m) 0
+#endif
+#ifndef S_ISCHR
+#  ifdef _S_IFCHR
+#    define S_ISCHR(m) (((m) & _S_IFMT) == _S_IFCHR)
+#  else
+#    define S_ISCHR(m) 0
+#  endif
+#endif
+#ifndef S_ISDIR
+#  define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISFIFO
+#  ifdef _S_IFIFO
+#    define S_ISFIFO(m) (((m) & _S_IFMT) == _S_IFIFO)
+#  else
+#    define S_ISFIFO(m) 0
+#  endif
+#endif
+#ifndef S_ISREG
+#  define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISSOCK
+#  ifdef _S_IFSOCK
+#    define S_ISSOCK(m) (((m) & _S_IFMT) == _S_IFSOCK)
+#  else
+#    define S_ISSOCK(m) 0
+#  endif
+#endif
+#ifndef S_ISLNK
+#  ifdef _S_IFLNK
+#    define S_ISLNK(m) (((m) & _S_IFMT) == _S_IFLNK)
+#  else
+#    define S_ISLNK(m) 0
+#  endif
+#endif
+
 /* File mode flags using magic */
 enum {
 	OPEN_RDONLY = O_RDONLY,
@@ -256,6 +294,14 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st){
 
 #undef SET_TIMESPEC_FIELD
 
+	/* Helper methods */
+    JS_SetPropertyStr(ctx, obj, "isBlockDevice",     JS_NewBool(ctx, S_ISBLK(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isCharacterDevice", JS_NewBool(ctx, S_ISCHR(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isDirectory",       JS_NewBool(ctx, S_ISDIR(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isFIFO",            JS_NewBool(ctx, S_ISFIFO(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isFile",            JS_NewBool(ctx, S_ISREG(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isSocket",          JS_NewBool(ctx, S_ISSOCK(st->st_mode)));
+    JS_SetPropertyStr(ctx, obj, "isSymbolicLink",    JS_NewBool(ctx, S_ISLNK(st->st_mode)));
 	return obj;
 }
 

@@ -321,40 +321,7 @@ declare namespace CModuleFS {
     /**
      * File statistics information
      */
-    export interface Stats {
-        /** Device ID */
-        dev: number;
-        /** Inode number */
-        ino: number;
-        /** File mode (permissions and type) */
-        mode: number;
-        /** Number of hard links */
-        nlink: number;
-        /** User ID of owner */
-        uid: number;
-        /** Group ID of owner */
-        gid: number;
-        /** Device ID (if special file) */
-        rdev: number;
-        /** Total size in bytes */
-        size: number;
-        /** Block size for filesystem I/O */
-        blksize: number;
-        /** Number of 512B blocks allocated */
-        blocks: number;
-        /** Last access time (milliseconds since epoch) */
-        atime: number;
-        /** Last modification time (milliseconds since epoch) */
-        mtime: number;
-        /** Last status change time (milliseconds since epoch) */
-        ctime: number;
-        /** Check if this is a regular file */
-        isFile: boolean;
-        /** Check if this is a directory */
-        isDirectory: boolean;
-        /** Check if this is a symbolic link */
-        isSymbolicLink: boolean;
-    }
+    type Stats = CModuleAsyncFS.StatResult;
 
     /**
      * File open flags - string shortcuts
