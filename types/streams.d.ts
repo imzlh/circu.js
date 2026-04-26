@@ -10,28 +10,57 @@ declare namespace CModuleStreams {
      */
     export interface Stream {
         /**
-         * 读取数据回调
+         * 读取数据回调 - 成功读取数据时调用
+         * @param result 读取的数据（Uint8Array）
+         * @param error undefined
+         */
+        onread(result: Uint8Array<ArrayBuffer>, error: undefined): void;
+        /**
+         * 读取数据回调 - 到达EOF时调用
+         * @param result null（表示EOF）
+         * @param error undefined
          */
         onread(result: null, error: undefined): void;
+        /**
+         * 读取数据回调 - 读取失败时调用
+         * @param result undefined
+         * @param error 错误对象
+         */
         onread(result: undefined, error: CModuleError.Error): void;
-        onread(result: Uint8Array<ArrayBuffer>, error: undefined): void;
 
         /**
-         * 连接完成回调
+         * 连接完成回调 - 连接成功时调用
+         * @param error undefined
          */
         onconnect(error: undefined): void;
+        /**
+         * 连接完成回调 - 连接失败时调用
+         * @param error 错误对象
+         */
         onconnect(error: CModuleError.Error): void;
 
         /**
-         * 新连接到达回调（服务器模式）
+         * 新连接到达回调 - 接受新连接成功时调用
+         * @param error undefined
+         * @param client 新的客户端Stream对象
          */
         onconnection(error: undefined, client: Stream): void;
+        /**
+         * 新连接到达回调 - 接受新连接失败时调用
+         * @param error 错误对象
+         * @param client undefined
+         */
         onconnection(error: CModuleError.Error, client: undefined): void;
 
         /**
-         * 关闭完成回调
+         * 关闭完成回调 - 关闭成功时调用
+         * @param error undefined
          */
         onshutdown(error: undefined): void;
+        /**
+         * 关闭完成回调 - 关闭失败时调用
+         * @param error 错误对象
+         */
         onshutdown(error: CModuleError.Error): void;
 
         /**
@@ -40,13 +69,6 @@ declare namespace CModuleStreams {
          * @throws 同步抛出错误（如已监听、无效句柄等）
          */
         listen(backlog?: number): void;
-
-        /**
-         * 接受一个传入连接（仅服务器模式）
-         * @returns Promise解析为新的Stream对象
-         * @throws 通过Promise拒绝错误（如未监听、接受失败等）
-         */
-        accept(): Promise<Stream>;
 
         /**
          * 关闭写入/读取方向
@@ -197,13 +219,13 @@ declare namespace CModuleStreams {
         /**
          * 绑定到本地地址
          * @param addr 地址对象
-         * @param flags 绑定标志（如TCP_IPV6ONLY）
+         * @param flags 绑定标志（如TCP_IPV6ONLY），可选
          * @throws 同步抛出错误
          */
         bind(addr: {
             ip: string;
             port: number;
-        }): void;
+        }, flags?: number): void;
 
         /**
          * 设置TCP keepalive选项
@@ -246,7 +268,7 @@ declare namespace CModuleStreams {
         /**
          * 同步连接到指定Pipe，使用OS级别的阻塞connect()
          * @param name Pipe路径或名称
-         * @throws 同步抛出错误
+         * @throws 同步抛出错误（Windows平台不支持）
          */
         connectSync(name: string): void;
 
