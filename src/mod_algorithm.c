@@ -27,8 +27,13 @@
 #include "utils.h"
 
 #include <string.h>
-#include <time.h>
 #include <stdint.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 static inline bool JS_IsUint8Array(JSValueConst val){
 	return JS_GetTypedArrayType(val) == JS_TYPED_ARRAY_UINT8;
@@ -292,9 +297,17 @@ static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int 
         }
     } else {
 		// no seed provided, use current time as seed
+        uint64_t seed;
+#ifdef _WIN32
+        // Windows: use GetSystemTimeAsFileTime for high-resolution timestamp
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        seed = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+#else
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        uint64_t seed = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        seed = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
         
         if (rng->is_256) {
             rng->s256.s[0] = seed * 0x9e3779b97f4a7c15;

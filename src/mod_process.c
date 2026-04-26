@@ -544,6 +544,10 @@ cleanup:
 }
 
 static JSValue tjs_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef _WIN32
+    // exec is not available on Windows
+    return JS_ThrowInternalError(ctx, "exec() is not supported on Windows");
+#else
     JSValue ret;
 
     char **args = NULL;
@@ -611,6 +615,7 @@ fail:
     }
 
     return ret;
+#endif
 }
 
 static JSValue tjs_kill(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
