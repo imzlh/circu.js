@@ -55,6 +55,8 @@ enum {
     STREAM_CB_MAX,
 };
 
+typedef struct TJSReadReq TJSReadReq;
+
 typedef struct {
     JSContext *ctx;
     int closed;
@@ -71,6 +73,7 @@ typedef struct {
     struct {
         uint8_t *buf;
     } read;
+    TJSReadReq *read_req; /* pending read(buf) request, or NULL */
 } TJSStream;
 
 typedef struct {
@@ -79,6 +82,13 @@ typedef struct {
     TJSPromise result;
     int nwritten; /* total bytes written (sync part + async part) */
 } TJSWriteReq;
+
+struct TJSReadReq {
+    JSValue buf;       /* user-provided Uint8Array, pinned for GC */
+    TJSPromise result;
+    size_t buf_size;   /* total size of the user buffer */
+    int started;       /* 1 if uv_read_start was called, 0 if uv_try_read sufficed */
+};
 
 static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj);
 static TJSStream *tjs_pipe_get(JSContext *ctx, JSValue obj);
@@ -342,6 +352,111 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
 
     return TJS_InitPromise(ctx, &wr->result);
+}
+
+/* ---- read(buf): zero-copy async read into user buffer ---- */
+
+static void uv__stream_read_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+    TJSStream *s = handle->data;
+    CHECK_NOT_NULL(s);
+    TJSReadReq *rr = s->read_req;
+    if (rr) {
+        size_t buf_sz;
+        uint8_t *data = JS_GetAnyBuffer(s->ctx, &buf_sz, rr->buf);
+        if (data && buf_sz > 0) {
+            buf->base = (char *) data;
+            buf->len = buf_sz;
+            return;
+        }
+    }
+    buf->base = NULL;
+    buf->len = 0;
+}
+
+static void uv__stream_read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
+    TJSStream *s = handle->data;
+    CHECK_NOT_NULL(s);
+
+    /* Stop reading immediately - we only wanted one read */
+    uv_read_stop(&s->h.stream);
+
+    JSContext *ctx = s->ctx;
+    TJSReadReq *rr = s->read_req;
+    s->read_req = NULL;
+
+    if (nread == 0) {
+        /* EAGAIN - shouldn't normally happen after uv_read_start, but handle it */
+        TJS_ResolvePromise(ctx, &rr->result, 0, NULL);
+    } else if (nread < 0) {
+        if (nread == UV_EOF) {
+            /* EOF: resolve with 0 */
+            JSValue arg = JS_NewInt32(ctx, 0);
+            TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
+        } else {
+            JSValue arg = tjs_new_error(ctx, nread);
+            TJS_RejectPromise(ctx, &rr->result, 1, &arg);
+        }
+    } else {
+        /* Success: resolve with bytes read */
+        JSValue arg = JS_NewInt32(ctx, (int32_t) nread);
+        TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
+    }
+
+    JS_FreeValue(ctx, rr->buf);
+    js_free(ctx, rr);
+
+    /* Unpin the stream object */
+    JS_FreeValue(ctx, s->obj);
+    s->obj = JS_UNDEFINED;
+}
+
+static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    JSClassID class_id;
+    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
+    if (!s) {
+        return JS_EXCEPTION;
+    }
+    if (uv_is_closing(&s->h.handle)) {
+        return JS_ThrowInternalError(ctx, "stream is closed");
+    }
+
+    size_t buf_sz;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &buf_sz, argv[0]);
+    if (!buf) {
+        return JS_EXCEPTION;
+    }
+    if (buf_sz == 0) {
+        return JS_ThrowTypeError(ctx, "read buffer must not be empty");
+    }
+
+    TJSReadReq *rr = js_malloc(ctx, sizeof(*rr));
+    if (!rr) {
+        return JS_EXCEPTION;
+    }
+
+    rr->buf = JS_DupValue(ctx, argv[0]);
+    rr->buf_size = buf_sz;
+    rr->started = 0;
+
+    s->read_req = rr;
+
+    /* Pin the stream object so GC doesn't collect it during async read */
+    if (JS_IsUndefined(s->obj)) {
+        s->obj = JS_DupValue(ctx, this_val);
+    }
+
+    int r = uv_read_start(&s->h.stream, uv__stream_read_alloc_cb, uv__stream_read_once_cb);
+    if (r != 0) {
+        s->read_req = NULL;
+        JS_FreeValue(ctx, rr->buf);
+        js_free(ctx, rr);
+        JS_FreeValue(ctx, s->obj);
+        s->obj = JS_UNDEFINED;
+        return tjs_throw_errno(ctx, r);
+    }
+
+    rr->started = 1;
+    return TJS_InitPromise(ctx, &rr->result);
 }
 
 static void uv__stream_shutdown_cb(uv_shutdown_t *req, int status) {
@@ -620,6 +735,7 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
     s->h.handle.data = s;
     s->obj = JS_UNDEFINED;
     s->read.buf = NULL;
+    s->read_req = NULL;
 
     for (int i = 0; i < STREAM_CB_MAX; i++) {
         s->callbacks[i] = JS_UNDEFINED;
@@ -637,6 +753,12 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
         }
         js_free_rt(rt, s->read.buf);
         s->read.buf = NULL;
+        if (s->read_req) {
+            TJS_FreePromiseRT(rt, &s->read_req->result);
+            JS_FreeValueRT(rt, s->read_req->buf);
+            js_free_rt(rt, s->read_req);
+            s->read_req = NULL;
+        }
         s->finalized = 1;
         if (s->closed) {
             tjs__free(s);
@@ -650,6 +772,10 @@ static void tjs_stream_mark(JSRuntime *rt, TJSStream *s, JS_MarkFunc *mark_func)
     if (s) {
         for (int i = 0; i < STREAM_CB_MAX; i++) {
             JS_MarkValue(rt, s->callbacks[i], mark_func);
+        }
+        if (s->read_req) {
+            TJS_MarkPromise(rt, &s->read_req->result, mark_func);
+            JS_MarkValue(rt, s->read_req->buf, mark_func);
         }
     }
 }
@@ -1230,6 +1356,7 @@ static const JSCFunctionListEntry tjs_stream_proto_funcs[] = {
     TJS_CFUNC_DEF("setBlocking", 1, tjs_stream_set_blocking),
     TJS_CFUNC_DEF("close", 0, tjs_stream_close),
     TJS_CFUNC_DEF("write", 1, tjs_stream_write),
+    TJS_CFUNC_DEF("read", 1, tjs_stream_read),
     TJS_CFUNC_DEF("readSync", 1, tjs_stream_read_sync),
     TJS_CFUNC_DEF("writeSync", 1, tjs_stream_write_sync),
     TJS_CFUNC_DEF("fileno", 0, tjs_stream_fileno),

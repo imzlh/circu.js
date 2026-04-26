@@ -27,7 +27,13 @@
 #include "tjs.h"
 
 #include <string.h>
+
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#include <io.h>
+#include <winsock2.h>
+#endif
 
 enum {
     MSGPIPE_EVENT_MESSAGE = 0,
@@ -486,8 +492,13 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     JSValue obj = tjs_new_worker(ctx, fds[0]);
     if (JS_IsException(obj)) {
+#ifndef _WIN32
         close(fds[0]);
         close(fds[1]);
+#else
+        closesocket(fds[0]);
+        closesocket(fds[1]);
+#endif
 		js_free(ctx, udata);
         return JS_EXCEPTION;
     }

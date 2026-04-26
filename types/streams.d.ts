@@ -85,6 +85,13 @@ declare namespace CModuleStreams {
         write(buffer: Uint8Array): Promise<number>;
 
         /**
+         * 从流中异步读取数据，直接写入用户提供的buffer（零拷贝）
+         * @param buffer 用于存放读取数据的Uint8Array
+         * @returns Promise解析为实际读取的字节数（0表示EOF），读取失败时reject
+         */
+        read(buffer: Uint8Array): Promise<number>;
+
+        /**
          * 同步从流中读取数据，使用OS级别的阻塞read()/recv()
          * @param buffer 用于存放读取数据的Uint8Array
          * @returns 读取的字节数，null表示EOF

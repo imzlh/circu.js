@@ -31,7 +31,19 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+
+#ifdef _WIN32
+#include <io.h>
+#define isatty _isatty
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#else
 #include <unistd.h>
+#endif
 
 #define MAX_DEPTH 64
 #define DEFAULT_BREAK_LENGTH 80

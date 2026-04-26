@@ -215,7 +215,7 @@ static JSValue tjs_pty_openpty(JSContext *ctx, JSValueConst this_val, int argc, 
     JS_SetPropertyStr(ctx, ret_obj, "fd", JS_NewInt32(ctx, fd));
     JS_SetPropertyStr(ctx, ret_obj, "pid", JS_NewInt64(ctx, pi.dwProcessId));
     JS_SetPropertyStr(ctx, ret_obj, "pty", JS_NewInt64(ctx, (intptr_t)hPC));
-    
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     hPipeOut = INVALID_HANDLE_VALUE;
@@ -398,51 +398,108 @@ unix_cleanup:
 
 static JSValue tjs_pty_resize(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 3) {
-        return JS_ThrowTypeError(ctx, "resize requires fd/pty, cols, rows");
+        return JS_ThrowTypeError(ctx, "resize requires fd, cols, rows[, pty]");
     }
-    
-    int32_t cols, rows;
-    if (JS_ToInt32(ctx, &cols, argv[1]) || JS_ToInt32(ctx, &rows, argv[2])) {
+
+    int32_t fd, cols, rows;
+    if (JS_ToInt32(ctx, &fd, argv[0]) ||
+        JS_ToInt32(ctx, &cols, argv[1]) ||
+        JS_ToInt32(ctx, &rows, argv[2])) {
         return JS_EXCEPTION;
     }
-    
+
 #ifdef _WIN32
+    /* On Windows, resize needs the ConPTY handle (HPCON) as the 4th argument. */
+    if (argc < 4) {
+        return JS_ThrowTypeError(ctx, "resize on Windows requires fd, cols, rows, pty");
+    }
+
     int64_t pty_handle;
-    if (JS_ToInt64(ctx, &pty_handle, argv[0])) {
+    if (JS_ToInt64(ctx, &pty_handle, argv[3])) {
         return JS_EXCEPTION;
     }
-    
+
     if (!load_conpty_functions() || !pResizePseudoConsole) {
         return JS_ThrowInternalError(ctx, "ConPTY resize not supported");
     }
-    
+
     COORD consoleSize = {cols, rows};
     HRESULT hr = pResizePseudoConsole((HPCON)pty_handle, consoleSize);
     if (FAILED(hr)) {
         return JS_ThrowInternalError(ctx, "ResizePseudoConsole failed: 0x%08lx", hr);
     }
 #else
-    int32_t fd;
-    if (JS_ToInt32(ctx, &fd, argv[0])) {
-        return JS_EXCEPTION;
-    }
-    
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_col = cols;
     ws.ws_row = rows;
-    
+
     if (ioctl(fd, TIOCSWINSZ, &ws) == -1) {
         return JS_ThrowInternalError(ctx, "ioctl TIOCSWINSZ failed: %s", strerror(errno));
     }
 #endif
-    
+
     return JS_UNDEFINED;
+}
+
+static JSValue tjs_pty_getwinsize(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "getwinsize requires fd");
+    }
+
+#ifdef _WIN32
+    int32_t fd;
+    if (JS_ToInt32(ctx, &fd, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    /* Convert CRT fd back to OS handle */
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return JS_ThrowInternalError(ctx, "invalid fd");
+    }
+
+    /* Try to get console screen buffer info */
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!GetConsoleScreenBufferInfo(h, &csbi)) {
+        return JS_ThrowInternalError(ctx, "GetConsoleScreenBufferInfo failed: %lu", GetLastError());
+    }
+
+    int cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+    int rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    JS_DefinePropertyValueStr(ctx, obj, "cols", JS_NewInt32(ctx, cols), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "rows", JS_NewInt32(ctx, rows), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "xpixel", JS_NewInt32(ctx, 0), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "ypixel", JS_NewInt32(ctx, 0), JS_PROP_C_W_E);
+    return obj;
+#else
+    int32_t fd;
+    if (JS_ToInt32(ctx, &fd, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+
+    if (ioctl(fd, TIOCGWINSZ, &ws) == -1) {
+        return JS_ThrowInternalError(ctx, "ioctl TIOCGWINSZ failed: %s", strerror(errno));
+    }
+
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    JS_DefinePropertyValueStr(ctx, obj, "cols", JS_NewInt32(ctx, ws.ws_col), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "rows", JS_NewInt32(ctx, ws.ws_row), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "xpixel", JS_NewInt32(ctx, ws.ws_xpixel), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "ypixel", JS_NewInt32(ctx, ws.ws_ypixel), JS_PROP_C_W_E);
+    return obj;
+#endif
 }
 
 static const JSCFunctionListEntry tjs_pty_funcs[] = {
     TJS_CFUNC_DEF("openpty", 1, tjs_pty_openpty),
-    TJS_CFUNC_DEF("resize", 3, tjs_pty_resize),
+    TJS_CFUNC_DEF("resize", 4, tjs_pty_resize),
+    TJS_CFUNC_DEF("getwinsize", 1, tjs_pty_getwinsize),
 	
 	TJS_CONST(WNOHANG),
 	TJS_CONST(WEXITED),

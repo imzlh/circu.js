@@ -24,6 +24,7 @@
 #include "private.h"
 #include "utils.h"
 #include <zlib.h>
+#include <string.h>
 
 /* Magic values for compression methods */
 enum {
@@ -84,7 +85,7 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "compress() requires at least 1 argument: data");
     }
     
-    data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
     }
@@ -132,10 +133,16 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowInternalError(ctx, "Compression failed");
     }
     
-    JSValue result = JS_NewArrayBufferCopy(ctx, out, strm.total_out);
+    size_t out_len = strm.total_out;
+    uint8_t* out_copy = js_malloc(ctx, out_len);
+    if (!out_copy) {
+        js_free(ctx, out);
+        return JS_EXCEPTION;
+    }
+    memcpy(out_copy, out, out_len);
     js_free(ctx, out);
     
-    return result;
+    return TJS_NewUint8Array(ctx, out_copy, out_len);
 }
 
 /* One-shot decompression */
@@ -147,7 +154,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
         return JS_ThrowTypeError(ctx, "decompress() requires 1 argument: data");
     }
     
-    data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
     }
@@ -208,10 +215,16 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
     
     inflateEnd(&strm);
     
-    JSValue result = JS_NewArrayBufferCopy(ctx, out, strm.total_out);
+    size_t out_len = strm.total_out;
+    uint8_t* out_copy = js_malloc(ctx, out_len);
+    if (!out_copy) {
+        js_free(ctx, out);
+        return JS_EXCEPTION;
+    }
+    memcpy(out_copy, out, out_len);
     js_free(ctx, out);
     
-    return result;
+    return TJS_NewUint8Array(ctx, out_copy, out_len);
 }
 
 /* CRC32 computation */
@@ -231,7 +244,7 @@ static JSValue tjs_zlib_crc32(JSContext* ctx, JSValueConst this_val, int argc, J
         }
     }
     
-    data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
     }
@@ -258,7 +271,7 @@ static JSValue tjs_zlib_adler32(JSContext* ctx, JSValueConst this_val, int argc,
         }
     }
     
-    data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
     }
@@ -418,14 +431,15 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         return JS_ThrowInternalError(ctx, "Deflate stream already finished");
     }
     
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "deflate() requires at least 1 argument: data");
-    }
+    size_t data_len = 0;
+    const uint8_t* data = NULL;
     
-    size_t data_len;
-    const uint8_t* data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
-    if (!data) {
-        return JS_EXCEPTION;
+    /* Data argument is optional for finish/flush */
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
+        if (!data) {
+            return JS_EXCEPTION;
+        }
     }
     
     int flush = magic;  /* Flush mode from magic */
@@ -436,7 +450,12 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     /* Allocate output buffer */
-    size_t out_size = deflateBound(&d->strm, data_len);
+    size_t out_size;
+    if (data_len > 0) {
+        out_size = deflateBound(&d->strm, data_len);
+    } else {
+        out_size = 65536;  /* Fixed size for flush/finish with no new data */
+    }
     if (out_size < 1024) out_size = 1024;
     
     uint8_t* out = js_malloc(ctx, out_size);
@@ -444,7 +463,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         return JS_EXCEPTION;
     }
     
-    d->strm.next_in = (Bytef*)data;
+    d->strm.next_in = (Bytef*)(data ? data : (const uint8_t*)"");
     d->strm.avail_in = data_len;
     d->strm.next_out = out;
     d->strm.avail_out = out_size;
@@ -461,10 +480,15 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     size_t produced = out_size - d->strm.avail_out;
-    JSValue result = JS_NewArrayBufferCopy(ctx, out, produced);
+    uint8_t* out_copy = js_malloc(ctx, produced);
+    if (!out_copy) {
+        js_free(ctx, out);
+        return JS_EXCEPTION;
+    }
+    memcpy(out_copy, out, produced);
     js_free(ctx, out);
     
-    return result;
+    return TJS_NewUint8Array(ctx, out_copy, produced);
 }
 
 /* Deflate.reset() */
@@ -529,8 +553,8 @@ static JSValue tjs_deflate_total_out(JSContext* ctx, JSValueConst this_val, int 
 
 static const JSCFunctionListEntry tjs_deflate_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("deflate", 2, tjs_deflate_process, Z_NO_FLUSH),
-    JS_CFUNC_MAGIC_DEF("flush", 1, tjs_deflate_process, Z_SYNC_FLUSH),
-    JS_CFUNC_MAGIC_DEF("finish", 1, tjs_deflate_process, Z_FINISH),
+    JS_CFUNC_MAGIC_DEF("flush", 0, tjs_deflate_process, Z_SYNC_FLUSH),
+    JS_CFUNC_MAGIC_DEF("finish", 0, tjs_deflate_process, Z_FINISH),
     JS_CFUNC_DEF("reset", 0, tjs_deflate_reset),
     JS_CFUNC_DEF("params", 2, tjs_deflate_params),
     JS_CFUNC_DEF("getTotalIn", 0, tjs_deflate_total_in),
@@ -553,7 +577,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     size_t data_len;
-    const uint8_t* data = JS_GetArrayBuffer(ctx, &data_len, argv[0]);
+    const uint8_t* data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
     }
@@ -606,10 +630,15 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     size_t produced = out_size - i->strm.avail_out;
-    JSValue result = JS_NewArrayBufferCopy(ctx, out, produced);
+    uint8_t* out_copy = js_malloc(ctx, produced);
+    if (!out_copy) {
+        js_free(ctx, out);
+        return JS_EXCEPTION;
+    }
+    memcpy(out_copy, out, produced);
     js_free(ctx, out);
     
-    return result;
+    return TJS_NewUint8Array(ctx, out_copy, produced);
 }
 
 /* Inflate.reset() */

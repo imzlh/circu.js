@@ -87,10 +87,11 @@ await test('fs.stat - file type checks', () => {
     const fileStats = fs.stat(TEST_FILE);
     const dirStats = fs.stat(TEST_DIR);
     
-    assert(fileStats.isFile, 'File should have isFile method');
-    assert(dirStats.isDirectory, 'Directory should have isDirectory method');
-    assert(fileStats.isFile(), 'Should be file');
-    assert(dirStats.isDirectory(), 'Should be directory');
+    // isFile/isDirectory are boolean properties (not methods) in circu.js
+    assert(fileStats.isFile === true, 'Should be file');
+    assert(dirStats.isDirectory === true, 'Should be directory');
+    assert(fileStats.isDirectory === false, 'File should not be directory');
+    assert(dirStats.isFile === false, 'Directory should not be file');
 });
 
 await test('fs.lstat - symlink stats', () => {
@@ -115,8 +116,10 @@ await test('fs.readFile - read entire file', () => {
     fs.writeFile(TEST_FILE, encode(content));
     
     const data = fs.readFile(TEST_FILE);
-    assert(data instanceof Uint8Array, 'Should return Uint8Array');
-    assertEquals(decoder.decode(data), content, 'Content should match');
+    // readFile returns ArrayBuffer in circu.js, wrap in Uint8Array for decoding
+    const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+    assert(data instanceof ArrayBuffer || data instanceof Uint8Array, 'Should return ArrayBuffer or Uint8Array');
+    assertEquals(decoder.decode(view), content, 'Content should match');
 });
 
 await test('fs.writeFile - write entire file', () => {
@@ -142,7 +145,7 @@ await test('fs.mkdir - create directory', () => {
     
     assert(fs.exists(newDir), 'Directory should exist');
     const stats = fs.stat(newDir);
-    assert(stats.isDirectory(), 'Should be directory');
+    assert(stats.isDirectory === true, 'Should be directory');
 });
 
 await test('fs.rmdir - remove directory', () => {

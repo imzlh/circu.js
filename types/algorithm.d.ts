@@ -1,11 +1,42 @@
 declare namespace CModuleAlgorithm {
     /**
-     * Unpacks a WebSocket message using the given key.
-     * @param data The WebSocket message to unpack.
-     * @param key The key to use for unpacking.
-     * @returns The unpacked message.
+     * Applies or removes a WebSocket masking key.
+     * XOR is symmetric, so masking and unmasking use the same operation.
+     * @param data The data to mask/unmask.
+     * @param key The 4-byte masking key.
+     * @returns The masked/unmasked data.
      */
-    export function ws_unpack(data: Uint8Array, key: Uint8Array): Uint8Array;
+    export function ws_mask(data: Uint8Array<ArrayBuffer>, key: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer>;
+
+    /**
+     * Computes the FNV-1a 32-bit hash of the given data.
+     * @param data The data to hash.
+     * @returns The 32-bit hash value.
+     */
+    export function fnv1a32(data: Uint8Array<ArrayBuffer>): number;
+
+    /**
+     * Computes the FNV-1a 64-bit hash of the given data.
+     * @param data The data to hash.
+     * @returns The 64-bit hash value as a BigInt.
+     */
+    export function fnv1a64(data: Uint8Array<ArrayBuffer>): bigint;
+
+    /**
+     * Computes the MurmurHash3 32-bit hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0.
+     * @returns The 32-bit hash value.
+     */
+    export function murmur3(data: Uint8Array<ArrayBuffer>, seed?: number): number;
+
+    /**
+     * Computes the xxHash32 hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0.
+     * @returns The 32-bit hash value.
+     */
+    export function xxhash32(data: Uint8Array<ArrayBuffer>, seed?: number): number;
 
     /**
      * A class for generating random numbers using the Xoshiro256** algorithm.
@@ -21,7 +52,7 @@ declare namespace CModuleAlgorithm {
          * Generates the next random number in the sequence.
          * @returns The next random number in the sequence.
          */
-        next(): number;
+        next(): number | bigint;
 
         /**
          * Generates the next random double in the sequence.

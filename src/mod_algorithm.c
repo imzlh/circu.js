@@ -38,7 +38,7 @@ void tjs__free_ab(JSRuntime *rt, void *opaque, void *ptr){
 	js_free_rt(rt, ptr);
 }
 
-static JSValue tjs_ws_unpack(JSContext* ctx, JSValue this_arg, int argc, JSValue* argv){
+static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* argv){
 	if(argc < 2 || !JS_IsUint8Array(argv[0]) || !JS_IsUint8Array(argv[1])){
 		return JS_ThrowTypeError(ctx, "Invalid arguments. expected: (Uint8Array, Uint8Array)");
 	}
@@ -55,7 +55,7 @@ static JSValue tjs_ws_unpack(JSContext* ctx, JSValue this_arg, int argc, JSValue
 		return JS_ThrowOutOfMemory(ctx);
 	}
 
-	// unpack
+	// apply/remove mask (XOR is symmetric)
 	for (int i = 0; i < inbuflen; i++){
 		outbuf[i] = inbuf[i] ^ keybuf[i % 4];
 	}
@@ -604,7 +604,7 @@ static JSValue tjs_hash_xxhash32(JSContext *ctx, JSValueConst this_val, int argc
 }
 
 static const JSCFunctionListEntry tjs_algorithm_funcs[] = {
-	TJS_CFUNC_DEF("ws_unpack", 2, tjs_ws_unpack),
+	TJS_CFUNC_DEF("ws_mask", 2, tjs_ws_mask),
     TJS_CFUNC_DEF("fnv1a32", 1, tjs_hash_fnv1a32),
     TJS_CFUNC_DEF("fnv1a64", 1, tjs_hash_fnv1a64),
     TJS_CFUNC_DEF("murmur3", 2, tjs_hash_murmur3),

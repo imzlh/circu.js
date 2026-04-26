@@ -24,7 +24,14 @@
 #include <iconv.h>
 #include <errno.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <ctype.h>
+// Windows doesn't have strings.h, use _stricmp instead of strcasecmp
+#define strcasecmp _stricmp
+#else
 #include <strings.h>
+#endif
 
 #include "private.h"
 #include "tjs.h"

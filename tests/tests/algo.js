@@ -7,21 +7,32 @@ function encode(str) {
     return new text.Encoder().encode(str);
 }
 
-// ========== WebSocket Mask Unpack ==========
-await test('algo.ws_unpack - basic unmasking', () => {
-    const masked = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+// ========== WebSocket Mask ==========
+await test('algo.ws_mask - basic masking', () => {
+    const data = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
     const key = new Uint8Array([0xFF, 0x00, 0xFF, 0x00]);
-    const result = algo.ws_unpack(masked, key);
+    const result = algo.ws_mask(data, key);
     
     assert(result instanceof Uint8Array, 'Result should be Uint8Array');
-    assertEquals(result.length, masked.length, 'Length should match input');
+    assertEquals(result.length, data.length, 'Length should match input');
     assertEquals(result[0], 0xFE, 'First byte should be XORed correctly');
     assertEquals(result[1], 0x02, 'Second byte should be XORed correctly');
 });
 
-await test('algo.ws_unpack - key must be 4 bytes', () => {
+await test('algo.ws_mask - symmetric (mask then mask restores original)', () => {
+    const original = new Uint8Array([0x48, 0x65, 0x6C, 0x6C, 0x6F]);
+    const key = new Uint8Array([0x37, 0xFA, 0x21, 0x3D]);
+    const masked = algo.ws_mask(original, key);
+    const restored = algo.ws_mask(masked, key);
+    
+    for (let i = 0; i < original.length; i++) {
+        assertEquals(restored[i], original[i], 'Double mask should restore original');
+    }
+});
+
+await test('algo.ws_mask - key must be 4 bytes', () => {
     try {
-        algo.ws_unpack(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3]));
+        algo.ws_mask(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3]));
         assert(false, 'Should throw for invalid key length');
     } catch (e) {
         assert(e instanceof Error, 'Should throw Error');

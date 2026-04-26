@@ -40,24 +40,28 @@ await test('pty.openpty - default parameters', async () => {
 
 // ========== PTY Resize ==========
 await test('pty.resize - resize with fd', async () => {
-    const ptyInfo = await openpty({
+    const ptyInfo = openpty({
         cols: 80,
         rows: 24
     });
 
-    await resize(ptyInfo.fd, 120, 40);
+    if (sys.platform === 'win32') {
+        resize(ptyInfo.fd, 120, 40, ptyInfo.pty);
+    } else {
+        resize(ptyInfo.fd, 120, 40);
+    }
 });
 
-await test('pty.resize - resize with pty handle (Windows)', async () => {
-    if (sys.platform !== 'win32') {
-        return;
-    }
-    
-    const ptyInfo = await openpty();
-    
-    if (ptyInfo.pty) {
-        await resize(ptyInfo.pty, 100, 30);
-    }
+// ========== PTY GetWinSize ==========
+await test('pty.getwinsize - query window size', async () => {
+    const ptyInfo = openpty({
+        cols: 80,
+        rows: 24
+    });
+
+    const size = pty.getwinsize(ptyInfo.fd);
+    assert(size.cols === 80, `Expected cols=80, got ${size.cols}`);
+    assert(size.rows === 24, `Expected rows=24, got ${size.rows}`);
 });
 
 // ========== PTY Command Execution ==========
