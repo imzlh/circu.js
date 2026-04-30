@@ -49,6 +49,89 @@
 #define mkdir(path, mode) _mkdir(path)
 #define rmdir _rmdir
 #define unlink _unlink
+/* flock constants - not defined in Windows headers */
+#ifndef LOCK_SH
+#define LOCK_SH 1   /* Shared lock */
+#endif
+#ifndef LOCK_EX
+#define LOCK_EX 2   /* Exclusive lock */
+#endif
+#ifndef LOCK_NB
+#define LOCK_NB 4   /* Non-blocking */
+#endif
+#ifndef LOCK_UN
+#define LOCK_UN 8   /* Unlock */
+#endif
+/* Reparse point buffer for symbolic links - may not be defined in older SDKs */
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE 16384
+#endif
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000C
+#endif
+/* Define REPARSE_DATA_BUFFER if not available */
+typedef struct _REPARSE_DATA_BUFFER {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;
+            WCHAR  PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPointReparseBuffer;
+        struct {
+            UCHAR  DataBuffer[1];
+        } GenericReparseBuffer;
+    } DUMMYUNIONNAME;
+} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
+/* Permission constants - not defined in Windows headers */
+#ifndef S_IRWXU
+#define S_IRWXU 00700  /* Read, write, execute owner */
+#endif
+#ifndef S_IRUSR
+#define S_IRUSR 00400  /* Read permission owner */
+#endif
+#ifndef S_IWUSR
+#define S_IWUSR 00200  /* Write permission owner */
+#endif
+#ifndef S_IXUSR
+#define S_IXUSR 00100  /* Execute permission owner */
+#endif
+#ifndef S_IRWXG
+#define S_IRWXG 00070  /* Read, write, execute group */
+#endif
+#ifndef S_IRGRP
+#define S_IRGRP 00040  /* Read permission group */
+#endif
+#ifndef S_IWGRP
+#define S_IWGRP 00020  /* Write permission group */
+#endif
+#ifndef S_IXGRP
+#define S_IXGRP 00010  /* Execute permission group */
+#endif
+#ifndef S_IRWXO
+#define S_IRWXO 00007  /* Read, write, execute other */
+#endif
+#ifndef S_IROTH
+#define S_IROTH 00004  /* Read permission other */
+#endif
+#ifndef S_IWOTH
+#define S_IWOTH 00002  /* Write permission other */
+#endif
+#ifndef S_IXOTH
+#define S_IXOTH 00001  /* Execute permission other */
+#endif
 typedef int64_t fs_off_t;
 static int64_t fs_pread(int fd, void* buf, int64_t len, int64_t off)
 {
@@ -180,55 +263,151 @@ static int crt2uv(int crt_err) {
 			UV(EWOULDBLOCK, UV_EAGAIN)
 			UV(EINTR, UV_EINTR)
 
+#ifdef ENOTSOCK
 			UV(ENOTSOCK, UV_ENOTSOCK)
+#endif
+#ifdef EDESTADDRREQ
 			UV(EDESTADDRREQ, UV_EDESTADDRREQ)
+#endif
+#ifdef EMSGSIZE
 			UV(EMSGSIZE, UV_EMSGSIZE)
+#endif
+#ifdef EPROTOTYPE
 			UV(EPROTOTYPE, UV_EPROTOTYPE)
+#endif
+#ifdef ENOPROTOOPT
 			UV(ENOPROTOOPT, UV_ENOPROTOOPT)
+#endif
+#ifdef EPROTONOSUPPORT
 			UV(EPROTONOSUPPORT, UV_EPROTONOSUPPORT)
+#endif
+#ifdef ESOCKTNOSUPPORT
 			UV(ESOCKTNOSUPPORT, UV_ESOCKTNOSUPPORT)
+#endif
+#ifdef EOPNOTSUPP
 			UV(EOPNOTSUPP, UV_EOPNOTSUPP)
+#endif
+#ifdef EPFNOSUPPORT
 			UV(EPFNOSUPPORT, UV_EPFNOSUPPORT)
+#endif
+#ifdef EAFNOSUPPORT
 			UV(EAFNOSUPPORT, UV_EAFNOSUPPORT)
+#endif
+#ifdef EADDRINUSE
 			UV(EADDRINUSE, UV_EADDRINUSE)
+#endif
+#ifdef EADDRNOTAVAIL
 			UV(EADDRNOTAVAIL, UV_EADDRNOTAVAIL)
+#endif
+#ifdef ENETDOWN
 			UV(ENETDOWN, UV_ENETDOWN)
+#endif
+#ifdef ENETUNREACH
 			UV(ENETUNREACH, UV_ENETUNREACH)
+#endif
+#ifdef ENETRESET
 			UV(ENETRESET, UV_ENETRESET)
+#endif
+#ifdef ECONNABORTED
 			UV(ECONNABORTED, UV_ECONNABORTED)
+#endif
+#ifdef ECONNRESET
 			UV(ECONNRESET, UV_ECONNRESET)
+#endif
+#ifdef ENOBUFS
 			UV(ENOBUFS, UV_ENOBUFS)
+#endif
+#ifdef EISCONN
 			UV(EISCONN, UV_EISCONN)
+#endif
+#ifdef ENOTCONN
 			UV(ENOTCONN, UV_ENOTCONN)
+#endif
+#ifdef ESHUTDOWN
 			UV(ESHUTDOWN, UV_ESHUTDOWN)
+#endif
+#ifdef ETIMEDOUT
 			UV(ETIMEDOUT, UV_ETIMEDOUT)
+#endif
+#ifdef ECONNREFUSED
 			UV(ECONNREFUSED, UV_ECONNREFUSED)
+#endif
+#ifdef EHOSTDOWN
 			UV(EHOSTDOWN, UV_EHOSTDOWN)
+#endif
+#ifdef EHOSTUNREACH
 			UV(EHOSTUNREACH, UV_EHOSTUNREACH)
+#endif
+#ifdef EALREADY
 			UV(EALREADY, UV_EALREADY)
+#endif
+#ifdef EINPROGRESS
 			UV(EINPROGRESS, UV_EINPROGRESS)
+#endif
 
+#ifdef ELOOP
 			UV(ELOOP, UV_ELOOP)
+#endif
+#ifdef ENAMETOOLONG
 			UV(ENAMETOOLONG, UV_ENAMETOOLONG)
+#endif
+#ifdef ENOTEMPTY
 			UV(ENOTEMPTY, UV_ENOTEMPTY)
+#endif
+#ifdef EUSERS
 			UV(EUSERS, UV_EUSERS)
+#endif
+#ifdef EDQUOT
 			UV(EDQUOT, UV_EDQUOT)
+#endif
+#ifdef ESTALE
 			UV(ESTALE, UV_ESTALE)
+#endif
+#ifdef EREMOTE
 			UV(EREMOTE, UV_EREMOTE)
+#endif
+#ifdef EBADF
 			UV(EBADF, UV_EBADF)
+#endif
+#ifdef EFAULT
 			UV(EFAULT, UV_EFAULT)
+#endif
+#ifdef ESPIPE
 			UV(ESPIPE, UV_ESPIPE)
+#endif
+#ifdef E2BIG
 			UV(E2BIG, UV_E2BIG)
+#endif
+#ifdef ENXIO
 			UV(ENXIO, UV_ENXIO)
+#endif
+#ifdef ECHILD
 			UV(ECHILD, UV_ECHILD)
+#endif
+#ifdef EDEADLK
 			UV(EDEADLK, UV_EDEADLK)
+#endif
+#ifdef ENOLCK
 			UV(ENOLCK, UV_ENOLCK)
+#endif
+#ifdef ENOSYS
 			UV(ENOSYS, UV_ENOSYS)
+#endif
+#ifdef ENOMSG
 			UV(ENOMSG, UV_ENOMSG)
+#endif
+#ifdef EIDRM
 			UV(EIDRM, UV_EIDRM)
+#endif
+#ifdef EILSEQ
 			UV(EILSEQ, UV_EILSEQ)
+#endif
+#ifdef EOVERFLOW
 			UV(EOVERFLOW, UV_EOVERFLOW)
+#endif
+#ifdef ECANCELED
 			UV(ECANCELED, UV_ECANCELED)
+#endif
 
 	default:
 		return uv_translate_sys_error(crt_err);
@@ -258,13 +437,22 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st){
     SET_UINT64_FIELD(rdev);
     SET_UINT64_FIELD(ino);
     SET_UINT64_FIELD(size);
+#ifdef _WIN32
+    // Windows doesn't have blksize and blocks, set to 0
+    JS_DefinePropertyValueStr(ctx, obj, "blksize", JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "blocks", JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
+#else
     SET_UINT64_FIELD(blksize);
     SET_UINT64_FIELD(blocks);
+#endif
 #undef SET_UINT64_FIELD
 
-	// The flag is not cross-platform, ignore it
-	JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
-
+#ifdef _WIN32
+    // Windows uses st_atime, st_mtime, st_ctime (time_t, not timespec)
+    JS_DefinePropertyValueStr(ctx, obj, "atim", JS_NewDate(ctx, (double)st->st_atime * 1000.0), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "mtim", JS_NewDate(ctx, (double)st->st_mtime * 1000.0), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "ctim", JS_NewDate(ctx, (double)st->st_ctime * 1000.0), JS_PROP_C_W_E);
+#else
 #ifdef __APPLE__
 	// macOS uses timespec suffix instead of tim
 	#define SET_TIMESPEC_FIELD(x, rename)                                                                                          \
@@ -286,13 +474,14 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st){
     SET_TIMESPEC_FIELD(a, atim);
     SET_TIMESPEC_FIELD(m, mtim);
     SET_TIMESPEC_FIELD(c, ctim);
-    
+
 #ifdef __APPLE__
     // macOS has birthtime
     SET_TIMESPEC_FIELD(birth, birthtim);
 #endif
 
 #undef SET_TIMESPEC_FIELD
+#endif
 
 	/* Helper methods */
     JS_SetPropertyStr(ctx, obj, "isBlockDevice",     JS_NewBool(ctx, S_ISBLK(st->st_mode)));
@@ -1613,8 +1802,12 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
 	if (strncmp(out, "\\\\?\\", 4) == 0) {
 		out += 4;
 		if (strncmp(out, "UNC\\", 4) == 0) {
-			out += 2;
-			*(--out) = '\\';
+			// Convert \\?\UNC\server\share to \\server\share
+			// We need to modify the buffer, so use a non-const pointer
+			char* out_mut = (char*)out;
+			out_mut -= 2;
+			*out_mut = '\\';
+			out = out_mut;
 		}
 	}
 	return JS_NewString(ctx, out);

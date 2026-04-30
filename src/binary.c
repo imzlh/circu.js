@@ -49,11 +49,15 @@ char* tjs__get_self() {
 #ifdef _WIN32
     HMODULE hModule = GetModuleHandle(NULL);
     if (hModule) {
-		// todo: use GetModuleFileNameW for Unicode paths
-        DWORD size = GetModuleFileNameA(hModule, path, sizeof(path) - 1);
+        /* Use wide char version for Unicode path support */
+        wchar_t wpath[4096];
+        DWORD size = GetModuleFileNameW(hModule, wpath, sizeof(wpath) / sizeof(wchar_t) - 1);
         if (size > 0) {
-            path[size] = '\0';
-            return path;
+            /* Convert wide char to UTF-8 */
+            int conv_size = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path) - 1, NULL, NULL);
+            if (conv_size > 0) {
+                return path;
+            }
         }
     }
 #else
@@ -96,7 +100,11 @@ static uint8_t* read_file(FILE* file, size_t *file_size) {
     if (!file) return NULL;
     
     fseek(file, 0, SEEK_END);
+#ifdef _WIN32
+    *file_size = _ftelli64(file);
+#else
     *file_size = ftello(file);
+#endif
     fseek(file, 0, SEEK_SET);
     
     if (*file_size < 4){

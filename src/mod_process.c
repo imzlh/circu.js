@@ -27,12 +27,22 @@
 #include "utils.h"
 
 #include <string.h>
-#include <unistd.h>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
+    /* Signal constants for Windows - defined by libuv */
+    #ifndef SIGTERM
+    #define SIGTERM 15
+    #endif
+    #ifndef SIGINT
+    #define SIGINT 2
+    #endif
+    #ifndef SIGKILL
+    #define SIGKILL 9
+    #endif
 #else
+    #include <unistd.h>
     #include <sys/types.h>
     #include <sys/wait.h>
     #include <errno.h>

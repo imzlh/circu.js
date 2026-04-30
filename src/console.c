@@ -68,8 +68,17 @@ static void* console_realloc(void* opaque, void* ptr, size_t size) {
 }
 
 /* STDOUT lock */
-uv_mutex_t stdout_mutex;
-#define __mutex(op) uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex);
+static uv_mutex_t stdout_mutex;
+static int stdout_mutex_initialized = 0;
+
+static void ensure_stdout_mutex_init(void) {
+    if (!stdout_mutex_initialized) {
+        uv_mutex_init(&stdout_mutex);
+        stdout_mutex_initialized = 1;
+    }
+}
+
+#define __mutex(op) ensure_stdout_mutex_init(); uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex);
 #define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
 #define fprintf2(...) __mutex(fprintf(__VA_ARGS__))
 
