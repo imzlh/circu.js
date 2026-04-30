@@ -70,21 +70,6 @@ declare namespace CModuleDNS {
         options: GetAddrInfoOptions
     ): CModuleStreams.AddressInfo[];
 
-    /**
-     * 同步查询DNS记录，使用原始UDP查询
-     * @param hostname 要查询的主机名
-     * @param type 查询类型（如A, AAAA, CNAME等）
-     * @param server DNS服务器地址（如'8.8.8.8'）
-     * @param timeout 超时时间（毫秒）
-     * @returns 解析后的记录数组
-     */
-    export function querySync(
-        hostname: string,
-        type: number,
-        server?: string,
-        timeout?: number
-    ): BaseAnswer[];
-
     /** A记录 (IPv4地址) = 1 */
     const A: 1;
     /** NS记录 (域名服务器) = 2 */
@@ -236,6 +221,7 @@ declare namespace CModuleDNS {
 
     /**
      * 发送原始 UDP DNS 查询请求
+     * 如果需要同步，使用`engine.waitIO()`
      * 
      * @param hostname - 要查询的域名
      * @param type - 记录类型（默认 DNS.A）

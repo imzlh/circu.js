@@ -29,17 +29,6 @@ declare namespace CModuleStreams {
         onread(result: undefined, error: CModuleError.Error): void;
 
         /**
-         * 连接完成回调 - 连接成功时调用
-         * @param error undefined
-         */
-        onconnect(error: undefined): void;
-        /**
-         * 连接完成回调 - 连接失败时调用
-         * @param error 错误对象
-         */
-        onconnect(error: CModuleError.Error): void;
-
-        /**
          * 新连接到达回调 - 接受新连接成功时调用
          * @param error undefined
          * @param client 新的客户端Stream对象
@@ -51,17 +40,6 @@ declare namespace CModuleStreams {
          * @param client undefined
          */
         onconnection(error: CModuleError.Error, client: undefined): void;
-
-        /**
-         * 关闭完成回调 - 关闭成功时调用
-         * @param error undefined
-         */
-        onshutdown(error: undefined): void;
-        /**
-         * 关闭完成回调 - 关闭失败时调用
-         * @param error 错误对象
-         */
-        onshutdown(error: CModuleError.Error): void;
 
         /**
          * 开始监听传入连接（仅服务器模式）
@@ -133,7 +111,7 @@ declare namespace CModuleStreams {
          * 获取底层的文件描述符
          * @returns 文件描述符数值（同步返回）
          */
-        fileno(): number;
+        get fileno(): number;
 
         /**
          * 增加事件循环引用计数，防止句柄被回收
@@ -188,13 +166,13 @@ declare namespace CModuleStreams {
          * 获取本地套接字地址信息
          * @returns 包含address、port、family等信息的对象
          */
-        getsockname(): AddressInfo;
+        get sockname(): AddressInfo;
 
         /**
          * 获取远端对端地址信息
          * @returns 包含address、port、family等信息的对象
          */
-        getpeername(): AddressInfo;
+        get peername(): AddressInfo;
 
         /**
          * 连接到指定地址
@@ -258,7 +236,7 @@ declare namespace CModuleStreams {
          * 获取终端窗口大小
          * @returns 包含width和height的对象
          */
-        getWinSize(): { width: number; height: number };
+        get size(): { width: number; height: number };
     }
 
     /**
@@ -283,13 +261,13 @@ declare namespace CModuleStreams {
          * 获取本地Pipe名称/路径
          * @returns 名称字符串
          */
-        getsockname(): string;
+        get sockname(): string;
 
         /**
          * 获取远端Pipe名称/路径
          * @returns 名称字符串
          */
-        getpeername(): string;
+        get peername(): string;
 
         /**
          * 连接到指定Pipe

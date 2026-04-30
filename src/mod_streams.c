@@ -41,18 +41,16 @@
 #endif
 
 
-/* Forward declarations */
+/* ---- Forward declarations ---- */
 static JSValue tjs_new_tcp(JSContext *ctx, int af);
+JSValue tjs_new_pipe(JSContext *ctx);  /* exported: used by other modules */
 
 
-/* Stream */
-
+/* ---- Data structures ---- */
 enum {
-    STREAM_CB_READ = 0,
-    STREAM_CB_CONNECT,
-    STREAM_CB_CONNECTION,
-    STREAM_CB_SHUTDOWN,
-    STREAM_CB_MAX,
+    STREAM_CB_READ = 0,    /* onread(data, error) */
+    STREAM_CB_CONNECTION,  /* onconnection(error, client) */
+    STREAM_CB_MAX
 };
 
 typedef struct TJSReadReq TJSReadReq;
@@ -64,82 +62,109 @@ typedef struct {
     union {
         uv_handle_t handle;
         uv_stream_t stream;
-        uv_tcp_t tcp;
-        uv_tty_t tty;
-        uv_pipe_t pipe;
+        uv_tcp_t    tcp;
+        uv_tty_t    tty;
+        uv_pipe_t   pipe;
     } h;
-    JSValue obj; /* prevent GC while the handle is active (reading / listening) */
+    JSValue obj;                     /* GC pin — not in gc_mark to prevent false cycle detection */
     JSValue callbacks[STREAM_CB_MAX];
-    struct {
-        uint8_t *buf;
-    } read;
-    TJSReadReq *read_req; /* pending read(buf) request, or NULL */
+    uint8_t *read_buf;               /* dynamically allocated for the streaming onread path */
+    TJSReadReq *read_req;            /* non-NULL while a one-shot read(buf) is in flight */
+    TJSPromise connect_promise;
+    TJSPromise shutdown_promise;
 } TJSStream;
 
 typedef struct {
     uv_write_t req;
-    JSValue buf;
+    JSValue buf;        /* pinned to prevent GC during async write */
     TJSPromise result;
-    int nwritten; /* total bytes written (sync part + async part) */
+    int total;          /* original byte count, reported on resolve */
 } TJSWriteReq;
 
 struct TJSReadReq {
-    JSValue buf;       /* user-provided Uint8Array, pinned for GC */
+    JSValue buf;        /* user-provided buffer, pinned */
     TJSPromise result;
-    size_t buf_size;   /* total size of the user buffer */
-    int started;       /* 1 if uv_read_start was called, 0 if uv_try_read sufficed */
 };
 
-static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj);
-static TJSStream *tjs_pipe_get(JSContext *ctx, JSValue obj);
 
-static void uv__stream_close_cb(uv_handle_t *handle) {
+/* ---- Class IDs (assigned at init time, used by finalizers and gc_mark) ---- */
+static JSClassID tjs_tcp_class_id;
+static JSClassID tjs_tty_class_id;
+static JSClassID tjs_pipe_class_id;
+
+#pragma region Inline helpers
+/* Get the TJSStream from any stream-derived JS object (TCP/TTY/Pipe). */
+static inline TJSStream *stream_get_any(JSContext *ctx, JSValue obj) {
+    JSClassID cid;
+    (void)ctx;
+    return JS_GetAnyOpaque(obj, &cid);
+}
+
+/* Throw and return false if the handle is already closing. */
+static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
+    if (uv_is_closing(&s->h.handle)) {
+        JS_ThrowInternalError(ctx, "stream is closed");
+        return false;
+    }
+    return true;
+}
+
+/* Pin the JS object to prevent GC while async work is in flight. Idempotent. */
+static inline void stream_pin(JSContext *ctx, TJSStream *s, JSValue obj) {
+    if (JS_IsUndefined(s->obj))
+        s->obj = JS_DupValue(ctx, obj);
+}
+
+/* Release the GC pin. */
+static inline void stream_unpin(TJSStream *s) {
+    JS_FreeValue(s->ctx, s->obj);
+    s->obj = JS_UNDEFINED;
+}
+
+/* Get the OS file descriptor, -1 on error. */
+static inline int stream_get_fd(TJSStream *s) {
+    uv_os_fd_t fd;
+    if (uv_fileno(&s->h.handle, &fd) != 0) return -1;
+#ifdef _WIN32
+    return (int)(intptr_t)fd;
+#else
+    return (int)fd;
+#endif
+}
+
+static inline void close_fd(int fd) {
+#ifndef _WIN32
+    close(fd);
+#else
+    closesocket((SOCKET)fd);
+#endif
+}
+
+
+#pragma endregion
+#pragma callbacks
+static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
     s->closed = 1;
-    if (s->finalized) {
+    if (s->finalized)
         tjs__free(s);
-    }
 }
 
 static void maybe_close(TJSStream *s) {
-    if (!uv_is_closing(&s->h.handle)) {
-        uv_close(&s->h.handle, uv__stream_close_cb);
-    }
-}
-
-static void maybe_invoke_callback(TJSStream *s, int callback, int argc, JSValue *argv) {
-    JSContext *ctx = s->ctx;
-    JSValue func = s->callbacks[callback];
-    if (!JS_IsFunction(ctx, func)) {
-        for (int i = 0; i < argc; i++) {
-            JS_FreeValue(ctx, argv[i]);
-        }
-        return;
-    }
-
-    tjs_call_handler(ctx, func, argc, argv);
-
-    for (int i = 0; i < argc; i++) {
-        JS_FreeValue(ctx, argv[i]);
-    }
+    if (!uv_is_closing(&s->h.handle))
+        uv_close(&s->h.handle, uv__close_cb);
 }
 
 static JSValue tjs_stream_callback_get(JSContext *ctx, JSValue this_val, int magic) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
     return JS_DupValue(ctx, s->callbacks[magic]);
 }
 
 static JSValue tjs_stream_callback_set(JSContext *ctx, JSValue this_val, JSValue value, int magic) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
     if (JS_IsFunction(ctx, value) || JS_IsUndefined(value) || JS_IsNull(value)) {
         JS_FreeValue(ctx, s->callbacks[magic]);
         s->callbacks[magic] = JS_DupValue(ctx, value);
@@ -147,150 +172,104 @@ static JSValue tjs_stream_callback_set(JSContext *ctx, JSValue this_val, JSValue
     return JS_UNDEFINED;
 }
 
+/* Invoke a stream callback if set, always frees argv values. */
+static void invoke_cb(TJSStream *s, int cb, int argc, JSValue *argv) {
+    JSContext *ctx = s->ctx;
+    JSValue fn = s->callbacks[cb];
+    if (JS_IsFunction(ctx, fn))
+        tjs_call_handler(ctx, fn, argc, argv);
+    for (int i = 0; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+}
+
+
 static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-
-    {
-        JSValue args[2] = { JS_UNDEFINED, JS_UNDEFINED };
-        maybe_invoke_callback(s, STREAM_CB_CONNECTION, 2, args);
-    }
-
-    JS_FreeValue(ctx, s->obj);
-    s->obj = JS_UNDEFINED;
-
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    stream_unpin(s);
     maybe_close(s);
     return JS_UNDEFINED;
 }
 
+
 static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-    s->read.buf = js_malloc(s->ctx, suggested_size);
-    if (s->read.buf) {
-        buf->base = (char *) s->read.buf;
-        buf->len = suggested_size;
+    s->read_buf = js_malloc(s->ctx, suggested_size);
+    if (s->read_buf) {
+        buf->base = (char *)s->read_buf;
+        buf->len  = suggested_size;
     } else {
         buf->base = NULL;
-        buf->len = 0;
+        buf->len  = 0;
     }
 }
 
 static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-
     JSContext *ctx = s->ctx;
 
-    if (nread == 0) {
-        js_free(ctx, s->read.buf);
-        s->read.buf = NULL;
-        return; /* EAGAIN, ignore */
+    if (nread == 0) { /* EAGAIN — nothing to read, discard buffer */
+        js_free(ctx, s->read_buf);
+        s->read_buf = NULL;
+        return;
     }
 
     JSValue args[2];
     if (nread < 0) {
-        js_free(ctx, s->read.buf);
-        s->read.buf = NULL;
+        js_free(ctx, s->read_buf);
+        s->read_buf = NULL;
         if (nread == UV_EOF) {
-            args[0] = JS_NULL;
+            args[0] = JS_NULL;       /* EOF: onread(null, undefined) */
             args[1] = JS_UNDEFINED;
         } else {
             args[0] = JS_UNDEFINED;
             args[1] = tjs_new_error(ctx, nread);
         }
     } else {
-        args[0] = TJS_NewUint8Array(ctx, s->read.buf, nread);
+        /* Hand off ownership of read_buf to the new Uint8Array. */
+        args[0] = TJS_NewUint8Array(ctx, s->read_buf, nread);
         args[1] = JS_UNDEFINED;
-        s->read.buf = NULL;
+        s->read_buf = NULL;
     }
 
-    maybe_invoke_callback(s, STREAM_CB_READ, 2, args);
+    invoke_cb(s, STREAM_CB_READ, 2, args);
 }
 
 static JSValue tjs_stream_start_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+
     int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
-    /* Pin the JS object so the GC cannot collect it while the handle is
-       actively reading.  The reference is intentionally NOT marked in gc_mark
-       so the cycle-collector cannot account for it. */
-    if (JS_IsUndefined(s->obj)) {
-        s->obj = JS_DupValue(ctx, this_val);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
+    stream_pin(ctx, s, this_val);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_stream_stop_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_UNDEFINED;
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (uv_is_closing(&s->h.handle)) return JS_UNDEFINED;
     uv_read_stop(&s->h.stream);
-
-    js_free(ctx, s->read.buf);
-    s->read.buf = NULL;
-
-    JS_FreeValue(ctx, s->obj);
-    s->obj = JS_UNDEFINED;
-
+    js_free(ctx, s->read_buf);
+    s->read_buf = NULL;
+    stream_unpin(s);
     return JS_UNDEFINED;
 }
 
-static JSValue tjs_stream_ref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (!uv_is_closing(&s->h.handle)) {
-        uv_ref(&s->h.handle);
-    }
-    return JS_UNDEFINED;
-}
-
-static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (!uv_is_closing(&s->h.handle)) {
-        uv_unref(&s->h.handle);
-    }
-    return JS_UNDEFINED;
-}
-
-static void uv__stream_write_cb(uv_write_t *req, int status) {
-    TJSStream *s = req->handle->data;
-    CHECK_NOT_NULL(s);
-
-    JSContext *ctx = s->ctx;
+static void uv__write_cb(uv_write_t *req, int status) {
     TJSWriteReq *wr = req->data;
+    TJSStream *s    = req->handle->data;
+    CHECK_NOT_NULL(s);
+    JSContext *ctx = s->ctx;
 
     if (status < 0) {
         JSValue arg = tjs_new_error(ctx, status);
         TJS_RejectPromise(ctx, &wr->result, 1, &arg);
     } else {
-        JSValue arg = JS_NewInt32(ctx, wr->nwritten);
+        JSValue arg = JS_NewInt32(ctx, wr->total);
         TJS_ResolvePromise(ctx, &wr->result, 1, &arg);
     }
 
@@ -299,54 +278,37 @@ static void uv__stream_write_cb(uv_write_t *req, int status) {
 }
 
 static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
 
-	size_t buf_sz;
-	uint8_t* buf = JS_GetAnyBuffer(ctx, &buf_sz, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
+    size_t sz;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
+    if (!buf) return JS_EXCEPTION;
 
-    /* First try to do the write inline */
-    int r;
-    uv_buf_t b;
-    b = uv_buf_init((char *) buf, buf_sz);
-    r = uv_try_write(&s->h.stream, &b, 1);
-
-    if (r == (int) buf_sz) {
-        /* All data written synchronously, return a resolved promise with bytes written */
-        JSValue arg = JS_NewInt32(ctx, (int32_t) buf_sz);
+    /* Fast path: everything written inline. */
+    uv_buf_t b = uv_buf_init((char *)buf, sz);
+    int r = uv_try_write(&s->h.stream, &b, 1);
+    if (r == (int)sz) {
+        JSValue arg = JS_NewInt32(ctx, (int32_t)sz);
         return TJS_NewResolvedPromise(ctx, 1, &arg);
     }
 
-    /* Do an async write, pin the buffer. */
-    int nwritten = 0;
-    if (r >= 0) {
-        nwritten = r;
-        buf += r;
-        buf_sz -= r;
-    }
+    /* Partial or EAGAIN: async write for the remainder. */
+    int sync = (r >= 0) ? r : 0;
+    buf += sync;
+    sz  -= sync;
 
     TJSWriteReq *wr = js_malloc(ctx, sizeof(*wr));
-    if (!wr) {
-        return JS_EXCEPTION;
-    }
-
+    if (!wr) return JS_EXCEPTION;
     wr->req.data = wr;
-    wr->buf = JS_DupValue(ctx, argv[0]);
-    wr->nwritten = nwritten + (int) buf_sz;
+    wr->buf      = JS_DupValue(ctx, argv[0]); /* pin: buf pointer must stay valid */
+    wr->total    = (int)(sync + sz);          /* == original sz */
 
-    b = uv_buf_init((char *) buf, buf_sz);
-    r = uv_write(&wr->req, &s->h.stream, &b, 1, uv__stream_write_cb);
+    b = uv_buf_init((char *)buf, sz);
+    r = uv_write(&wr->req, &s->h.stream, &b, 1, uv__write_cb);
     if (r != 0) {
-		JS_FreeValue(ctx, wr->buf);
+        JS_FreeValue(ctx, wr->buf);
         js_free(ctx, wr);
         return tjs_throw_errno(ctx, r);
     }
@@ -354,470 +316,377 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     return TJS_InitPromise(ctx, &wr->result);
 }
 
-/* ---- read(buf): zero-copy async read into user buffer ---- */
-
-static void uv__stream_read_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+static void uv__read_once_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+    (void)suggested_size;
     TJSReadReq *rr = s->read_req;
     if (rr) {
-        size_t buf_sz;
-        uint8_t *data = JS_GetAnyBuffer(s->ctx, &buf_sz, rr->buf);
-        if (data && buf_sz > 0) {
-            buf->base = (char *) data;
-            buf->len = buf_sz;
+        size_t sz;
+        uint8_t *data = JS_GetAnyBuffer(s->ctx, &sz, rr->buf);
+        if (data && sz > 0) {
+            buf->base = (char *)data;
+            buf->len  = sz;
             return;
         }
     }
     buf->base = NULL;
-    buf->len = 0;
+    buf->len  = 0;
 }
 
-static void uv__stream_read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
+static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-
-    /* Stop reading immediately - we only wanted one read */
     uv_read_stop(&s->h.stream);
 
     JSContext *ctx = s->ctx;
     TJSReadReq *rr = s->read_req;
-    s->read_req = NULL;
+    s->read_req    = NULL;
+    stream_unpin(s);
 
-    if (nread == 0) {
-        /* EAGAIN - shouldn't normally happen after uv_read_start, but handle it */
-        TJS_ResolvePromise(ctx, &rr->result, 0, NULL);
-    } else if (nread < 0) {
-        if (nread == UV_EOF) {
-            /* EOF: resolve with 0 */
-            JSValue arg = JS_NewInt32(ctx, 0);
-            TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
-        } else {
-            JSValue arg = tjs_new_error(ctx, nread);
-            TJS_RejectPromise(ctx, &rr->result, 1, &arg);
-        }
-    } else {
-        /* Success: resolve with bytes read */
-        JSValue arg = JS_NewInt32(ctx, (int32_t) nread);
+    JSValue arg;
+    if (nread > 0) {
+        arg = JS_NewInt32(ctx, (int32_t)nread);
         TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
+    } else if (nread == 0 || nread == UV_EOF) {
+        /* EAGAIN or EOF: resolve with 0 */
+        arg = JS_NewInt32(ctx, 0);
+        TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
+    } else {
+        arg = tjs_new_error(ctx, nread);
+        TJS_RejectPromise(ctx, &rr->result, 1, &arg);
     }
 
     JS_FreeValue(ctx, rr->buf);
     js_free(ctx, rr);
-
-    /* Unpin the stream object */
-    JS_FreeValue(ctx, s->obj);
-    s->obj = JS_UNDEFINED;
 }
 
 static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    if (s->read_req)
+        return JS_ThrowInternalError(ctx, "read already in progress");
 
-    size_t buf_sz;
-    uint8_t *buf = JS_GetAnyBuffer(ctx, &buf_sz, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-    if (buf_sz == 0) {
-        return JS_ThrowTypeError(ctx, "read buffer must not be empty");
-    }
+    size_t sz;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
+    if (!buf) return JS_EXCEPTION;
+    if (sz == 0) return JS_ThrowTypeError(ctx, "read buffer must not be empty");
 
     TJSReadReq *rr = js_malloc(ctx, sizeof(*rr));
-    if (!rr) {
-        return JS_EXCEPTION;
-    }
-
-    rr->buf = JS_DupValue(ctx, argv[0]);
-    rr->buf_size = buf_sz;
-    rr->started = 0;
-
+    if (!rr) return JS_EXCEPTION;
+    rr->buf     = JS_DupValue(ctx, argv[0]);
     s->read_req = rr;
+    stream_pin(ctx, s, this_val);
 
-    /* Pin the stream object so GC doesn't collect it during async read */
-    if (JS_IsUndefined(s->obj)) {
-        s->obj = JS_DupValue(ctx, this_val);
-    }
-
-    int r = uv_read_start(&s->h.stream, uv__stream_read_alloc_cb, uv__stream_read_once_cb);
+    int r = uv_read_start(&s->h.stream, uv__read_once_alloc_cb, uv__read_once_cb);
     if (r != 0) {
         s->read_req = NULL;
         JS_FreeValue(ctx, rr->buf);
         js_free(ctx, rr);
-        JS_FreeValue(ctx, s->obj);
-        s->obj = JS_UNDEFINED;
+        stream_unpin(s);
         return tjs_throw_errno(ctx, r);
     }
 
-    rr->started = 1;
     return TJS_InitPromise(ctx, &rr->result);
 }
 
-static void uv__stream_shutdown_cb(uv_shutdown_t *req, int status) {
+static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
-
     JSContext *ctx = s->ctx;
-    JSValue arg;
-    if (status == 0) {
-        arg = JS_UNDEFINED;
-    } else {
-        arg = tjs_new_error(ctx, status);
-    }
 
-    maybe_invoke_callback(s, STREAM_CB_SHUTDOWN, 1, &arg);
+    if (status == 0) {
+        TJS_ResolvePromise(ctx, &s->shutdown_promise, 0, NULL);
+    } else {
+        JSValue arg = tjs_new_error(ctx, status);
+        TJS_RejectPromise(ctx, &s->shutdown_promise, 1, &arg);
+    }
 
     js_free(ctx, req);
 }
 
 static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    if (!JS_IsUndefined(s->shutdown_promise.p))
+        return JS_ThrowInternalError(ctx, "shutdown already in progress");
 
     uv_shutdown_t *req = js_malloc(ctx, sizeof(*req));
-    if (!req) {
-        return JS_EXCEPTION;
-    }
+    if (!req) return JS_EXCEPTION;
+    req->data = s;
 
-    int r = uv_shutdown(req, &s->h.stream, uv__stream_shutdown_cb);
+    int r = uv_shutdown(req, &s->h.stream, uv__shutdown_cb);
     if (r != 0) {
         js_free(ctx, req);
         return tjs_throw_errno(ctx, r);
     }
 
-    return JS_UNDEFINED;
+    return TJS_InitPromise(ctx, &s->shutdown_promise);
 }
 
-static JSValue tjs_stream_fileno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    int r;
-    uv_os_fd_t fd;
-    r = uv_fileno(&s->h.handle, &fd);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-    int32_t rfd;
-#if defined(_WIN32)
-    rfd = (int32_t) (intptr_t) fd;
-#else
-    rfd = fd;
-#endif
-    return JS_NewInt32(ctx, rfd);
-}
-
-/* Helper: get OS fd from a TJSStream, returns -1 on error */
-static int tjs_stream_get_fd(JSContext *ctx, TJSStream *s) {
-    uv_os_fd_t fd;
-    int r = uv_fileno(&s->h.handle, &fd);
-    if (r != 0) {
-        return -1;
-    }
-#if defined(_WIN32)
-    return (int) (intptr_t) fd;
-#else
-    return (int) fd;
-#endif
-}
-
-/* Helper: close a socket fd cross-platform */
-static void tjs_close_fd(int fd) {
-#ifndef _WIN32
-    close(fd);
-#else
-    closesocket((SOCKET) fd);
-#endif
-}
-
-/* readSync(buffer) - synchronous read using OS recv()/read() */
-static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
-
-    int fd = tjs_stream_get_fd(ctx, s);
-    if (fd < 0) {
-        return tjs_throw_errno(ctx, UV_EBADF);
-    }
-
-    size_t size;
-    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-
-    ssize_t nread;
-#ifndef _WIN32
-    nread = read(fd, buf, size);
-    if (nread < 0) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-    }
-#else
-    nread = recv((SOCKET) fd, (char *) buf, (int) size, 0);
-    if (nread < 0) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
-    }
-#endif
-    if (nread == 0) {
-        return JS_NULL;  /* EOF */
-    }
-    return JS_NewInt32(ctx, (int32_t) nread);
-}
-
-/* writeSync(buffer) - synchronous write using OS send()/write() */
-static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&s->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
-
-    int fd = tjs_stream_get_fd(ctx, s);
-    if (fd < 0) {
-        return tjs_throw_errno(ctx, UV_EBADF);
-    }
-
-    size_t size;
-    uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-
-    ssize_t nwritten;
-#ifndef _WIN32
-    nwritten = write(fd, buf, size);
-    if (nwritten < 0) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-    }
-#else
-    nwritten = send((SOCKET) fd, (const char *) buf, (int) size, 0);
-    if (nwritten < 0) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
-    }
-#endif
-    return JS_NewInt64(ctx, nwritten);
-}
-
-static void uv__stream_connect_cb(uv_connect_t *req, int status) {
+static void uv__connect_cb(uv_connect_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
-
     JSContext *ctx = s->ctx;
-    JSValue arg;
+
     if (status == 0) {
-        arg = JS_UNDEFINED;
+        TJS_ResolvePromise(ctx, &s->connect_promise, 0, NULL);
     } else {
-        arg = tjs_new_error(ctx, status);
+        JSValue arg = tjs_new_error(ctx, status);
+        TJS_RejectPromise(ctx, &s->connect_promise, 1, &arg);
     }
 
-    maybe_invoke_callback(s, STREAM_CB_CONNECT, 1, &arg);
-
-    /* Unpin unless start_read (or listen) has re-pinned in the meantime.
-       We check uv_is_active: if the user called startRead inside the connect
-       callback the handle is active and obj was already re-pinned there. */
-    if (!uv_is_active(&s->h.handle)) {
-        JS_FreeValue(ctx, s->obj);
-        s->obj = JS_UNDEFINED;
-    }
+    /* Unpin unless startRead() re-pinned inside the connect handler. */
+    if (!uv_is_active(&s->h.handle))
+        stream_unpin(s);
 
     js_free(ctx, req);
 }
 
-static void uv__stream_connection_cb(uv_stream_t *handle, int status) {
+static void uv__connection_cb(uv_stream_t *handle, int status) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-
-    if (!JS_IsFunction(s->ctx, s->callbacks[STREAM_CB_CONNECTION])) {
+    if (!JS_IsFunction(s->ctx, s->callbacks[STREAM_CB_CONNECTION]))
         return;
-    }
 
     JSContext *ctx = s->ctx;
     JSValue args[2];
-    if (status == 0) {
-        TJSStream *t2;
-        switch (handle->type) {
-            case UV_TCP:
-                args[1] = tjs_new_tcp(ctx, AF_UNSPEC);
-                t2 = tjs_tcp_get(ctx, args[1]);
-                break;
-            case UV_NAMED_PIPE:
-                args[1] = tjs_new_pipe(ctx);
-                t2 = tjs_pipe_get(ctx, args[1]);
-                break;
-            default:
-                abort();
-        }
 
-        int r = uv_accept(handle, &t2->h.stream);
-        if (r != 0) {
-            JS_FreeValue(ctx, args[1]);
-            args[0] = tjs_new_error(ctx, r);
-            args[1] = JS_UNDEFINED;
-        } else {
-            args[0] = JS_UNDEFINED;
-        }
-    } else {
+    if (status != 0) {
         args[0] = tjs_new_error(ctx, status);
         args[1] = JS_UNDEFINED;
+        invoke_cb(s, STREAM_CB_CONNECTION, 2, args);
+        return;
     }
 
-    maybe_invoke_callback(s, STREAM_CB_CONNECTION, 2, args);
+    /* Create a new client stream of the same handle type. */
+    JSValue client_obj;
+    switch (handle->type) {
+        case UV_TCP:         client_obj = tjs_new_tcp(ctx, AF_UNSPEC); break;
+        case UV_NAMED_PIPE:  client_obj = tjs_new_pipe(ctx);           break;
+        default:             abort();
+    }
+
+    if (JS_IsException(client_obj)) {
+        args[0] = JS_GetException(ctx);
+        args[1] = JS_UNDEFINED;
+        invoke_cb(s, STREAM_CB_CONNECTION, 2, args);
+        return;
+    }
+
+    JSClassID cid;
+    TJSStream *client = JS_GetAnyOpaque(client_obj, &cid);
+    int r = uv_accept(handle, &client->h.stream);
+    if (r != 0) {
+        JS_FreeValue(ctx, client_obj);
+        args[0] = tjs_new_error(ctx, r);
+        args[1] = JS_UNDEFINED;
+    } else {
+        args[0] = JS_UNDEFINED;
+        args[1] = client_obj;
+    }
+
+    invoke_cb(s, STREAM_CB_CONNECTION, 2, args);
 }
 
 static JSValue tjs_stream_listen(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+
     uint32_t backlog = 511;
-    if (!JS_IsUndefined(argv[0])) {
-        if (JS_ToUint32(ctx, &backlog, argv[0])) {
-            return JS_EXCEPTION;
-        }
-    }
-    int r = uv_listen(&s->h.stream, (int) backlog, uv__stream_connection_cb);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
+    if (!JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
+        return JS_EXCEPTION;
 
-    if (JS_IsUndefined(s->obj)) {
-        s->obj = JS_DupValue(ctx, this_val);
-    }
-
+    int r = uv_listen(&s->h.stream, (int)backlog, uv__connection_cb);
+    if (r != 0) return tjs_throw_errno(ctx, r);
+    stream_pin(ctx, s, this_val);
     return JS_UNDEFINED;
 }
 
+#pragma endregion
+#pragma region misc funcs
 static JSValue tjs_stream_set_blocking(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JSClassID class_id;
-    TJSStream *s = JS_GetAnyOpaque(this_val, &class_id);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-
-    int blocking;
-    if ((blocking = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
-    }
-
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    int blocking = JS_ToBool(ctx, argv[0]);
+    if (blocking == -1) return JS_EXCEPTION;
     int r = uv_stream_set_blocking(&s->h.stream, blocking);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
+
+static JSValue tjs_stream_get_fileno(JSContext *ctx, JSValue this_val) {
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    uv_os_fd_t fd;
+    int r = uv_fileno(&s->h.handle, &fd);
+    if (r != 0) return tjs_throw_errno(ctx, r);
+#ifdef _WIN32
+    return JS_NewInt32(ctx, (int32_t)(intptr_t)fd);
+#else
+    return JS_NewInt32(ctx, (int32_t)fd);
+#endif
+}
+
+static JSValue tjs_stream_ref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!uv_is_closing(&s->h.handle)) uv_ref(&s->h.handle);
+    return JS_UNDEFINED;
+}
+
+static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!uv_is_closing(&s->h.handle)) uv_unref(&s->h.handle);
+    return JS_UNDEFINED;
+}
+
+
+#pragma endregion
+#pragma region sync funcs
+
+/* readSync(buf) → number of bytes read, or null on EOF */
+static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    int fd = stream_get_fd(s);
+    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
+
+    size_t sz;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
+    if (!buf) return JS_EXCEPTION;
+
+    ssize_t n;
+#ifndef _WIN32
+    n = read(fd, buf, sz);
+    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+#else
+    n = recv((SOCKET)fd, (char *)buf, (int)sz, 0);
+    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
+#endif
+    return n == 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)n);
+}
+
+/* writeSync(buf) → number of bytes written */
+static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *s = stream_get_any(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    int fd = stream_get_fd(s);
+    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
+
+    size_t sz;
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
+    if (!buf) return JS_EXCEPTION;
+
+    ssize_t n;
+#ifndef _WIN32
+    n = write(fd, buf, sz);
+    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+#else
+    n = send((SOCKET)fd, (const char *)buf, (int)sz, 0);
+    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
+#endif
+    return JS_NewInt64(ctx, n);
+}
+
+
+#pragma endregion
+#pragma region C apis
 
 static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
-    s->ctx = ctx;
+    s->ctx           = ctx;
     s->h.handle.data = s;
-    s->obj = JS_UNDEFINED;
-    s->read.buf = NULL;
-    s->read_req = NULL;
+    s->obj           = JS_UNDEFINED;
+    s->read_buf      = NULL;
+    s->read_req      = NULL;
 
-    for (int i = 0; i < STREAM_CB_MAX; i++) {
+    for (int i = 0; i < STREAM_CB_MAX; i++)
         s->callbacks[i] = JS_UNDEFINED;
-    }
+
+    /*
+     * Set promise .p to JS_UNDEFINED so that the "already in progress" guards
+     * (`!JS_IsUndefined(s->xxx_promise.p)`) start in the correct state.
+     * The remaining fields of TJSPromise (resolve/reject) are left zeroed
+     * by tjs__mallocz; JS_FreeValueRT treats zero JSValues as no-ops.
+     */
+    s->connect_promise.p  = JS_UNDEFINED;
+    s->shutdown_promise.p = JS_UNDEFINED;
 
     JS_SetOpaque(obj, s);
     return obj;
 }
 
 static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
-    if (s) {
-        JS_FreeValueRT(rt, s->obj);
-        for (int i = 0; i < STREAM_CB_MAX; i++) {
-            JS_FreeValueRT(rt, s->callbacks[i]);
-        }
-        js_free_rt(rt, s->read.buf);
-        s->read.buf = NULL;
-        if (s->read_req) {
-            TJS_FreePromiseRT(rt, &s->read_req->result);
-            JS_FreeValueRT(rt, s->read_req->buf);
-            js_free_rt(rt, s->read_req);
-            s->read_req = NULL;
-        }
-        s->finalized = 1;
-        if (s->closed) {
-            tjs__free(s);
-        } else {
-            maybe_close(s);
-        }
+    if (!s) return;
+
+    JS_FreeValueRT(rt, s->obj);
+    for (int i = 0; i < STREAM_CB_MAX; i++)
+        JS_FreeValueRT(rt, s->callbacks[i]);
+    js_free_rt(rt, s->read_buf);
+
+    if (s->read_req) {
+        TJS_FreePromiseRT(rt, &s->read_req->result);
+        JS_FreeValueRT(rt, s->read_req->buf);
+        js_free_rt(rt, s->read_req);
     }
+
+    TJS_FreePromiseRT(rt, &s->connect_promise);
+    TJS_FreePromiseRT(rt, &s->shutdown_promise);
+
+    s->finalized = 1;
+    if (s->closed)
+        tjs__free(s);
+    else
+        maybe_close(s);
 }
 
 static void tjs_stream_mark(JSRuntime *rt, TJSStream *s, JS_MarkFunc *mark_func) {
-    if (s) {
-        for (int i = 0; i < STREAM_CB_MAX; i++) {
-            JS_MarkValue(rt, s->callbacks[i], mark_func);
-        }
-        if (s->read_req) {
-            TJS_MarkPromise(rt, &s->read_req->result, mark_func);
-            JS_MarkValue(rt, s->read_req->buf, mark_func);
-        }
+    if (!s) return;
+
+    for (int i = 0; i < STREAM_CB_MAX; i++)
+        JS_MarkValue(rt, s->callbacks[i], mark_func);
+
+    if (s->read_req) {
+        TJS_MarkPromise(rt, &s->read_req->result, mark_func);
+        JS_MarkValue(rt, s->read_req->buf, mark_func);
     }
+
+    TJS_MarkPromise(rt, &s->connect_promise, mark_func);
+    TJS_MarkPromise(rt, &s->shutdown_promise, mark_func);
 }
 
 
-/* TCP object  */
-
-static JSClassID tjs_tcp_class_id;
+#pragma endregion
+#pragma region class tcp
 
 static void tjs_tcp_finalizer(JSRuntime *rt, JSValue val) {
-    TJSStream *t = JS_GetOpaque(val, tjs_tcp_class_id);
-    tjs_stream_finalizer(rt, t);
+    tjs_stream_finalizer(rt, JS_GetOpaque(val, tjs_tcp_class_id));
 }
-
 static void tjs_tcp_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    TJSStream *t = JS_GetOpaque(val, tjs_tcp_class_id);
-    tjs_stream_mark(rt, t, mark_func);
+    tjs_stream_mark(rt, JS_GetOpaque(val, tjs_tcp_class_id), mark_func);
 }
-
 static JSClassDef tjs_tcp_class = {
     "TCP",
     .finalizer = tjs_tcp_finalizer,
-    .gc_mark = tjs_tcp_mark,
+    .gc_mark   = tjs_tcp_mark,
 };
 
 static JSValue tjs_new_tcp(JSContext *ctx, int af) {
-    TJSStream *s;
-    JSValue obj;
-    int r;
+    JSValue obj = JS_NewObjectClass(ctx, tjs_tcp_class_id);
+    if (JS_IsException(obj)) return obj;
 
-    obj = JS_NewObjectClass(ctx, tjs_tcp_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    s = tjs__mallocz(sizeof(*s));
+    TJSStream *s = tjs__mallocz(sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
         return JS_ThrowOutOfMemory(ctx);
     }
 
-    r = uv_tcp_init_ex(tjs_get_loop(ctx), &s->h.tcp, af);
+    int r = uv_tcp_init_ex(tjs_get_loop(ctx), &s->h.tcp, af);
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
@@ -829,9 +698,8 @@ static JSValue tjs_new_tcp(JSContext *ctx, int af) {
 
 static JSValue tjs_tcp_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
     int af = AF_UNSPEC;
-    if (!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
+    if (!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0]))
         return JS_EXCEPTION;
-    }
     return tjs_new_tcp(ctx, af);
 }
 
@@ -839,232 +707,138 @@ static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_tcp_class_id);
 }
 
-static JSValue tjs_tcp_getsockpeername(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
+static JSValue tjs_tcp_get_sockpeername(JSContext *ctx, JSValue this_val, int magic) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-    int r;
-    int namelen;
+    if (!t) return JS_EXCEPTION;
     struct sockaddr_storage addr;
-    namelen = sizeof(addr);
-    if (magic == 0) {
-        r = uv_tcp_getsockname(&t->h.tcp, (struct sockaddr *) &addr, &namelen);
-    } else {
-        r = uv_tcp_getpeername(&t->h.tcp, (struct sockaddr *) &addr, &namelen);
-    }
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    int namelen = sizeof(addr);
+    int r = magic == 0
+        ? uv_tcp_getsockname(&t->h.tcp, (struct sockaddr *)&addr, &namelen)
+        : uv_tcp_getpeername(&t->h.tcp, (struct sockaddr *)&addr, &namelen);
+    if (r != 0) return tjs_throw_errno(ctx, r);
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
-    tjs_addr2obj(ctx, obj, (struct sockaddr *) &addr, false);
+    tjs_addr2obj(ctx, obj, (struct sockaddr *)&addr, false);
     return obj;
 }
 
 static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
+    if (!t) return JS_EXCEPTION;
+    if (!JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
 
     struct sockaddr_storage ss;
-    int r;
-    r = tjs_obj2addr(ctx, argv[0], &ss);
-    if (r != 0) {
-        return JS_EXCEPTION;
-    }
+    if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
 
     uv_connect_t *req = js_malloc(ctx, sizeof(*req));
-    if (!req) {
-        return JS_EXCEPTION;
-    }
+    if (!req) return JS_EXCEPTION;
 
-    r = uv_tcp_connect(req, &t->h.tcp, (struct sockaddr *) &ss, uv__stream_connect_cb);
+    int r = uv_tcp_connect(req, &t->h.tcp, (struct sockaddr *)&ss, uv__connect_cb);
     if (r != 0) {
         js_free(ctx, req);
         return tjs_throw_errno(ctx, r);
     }
 
-    if (JS_IsUndefined(t->obj)) {
-        t->obj = JS_DupValue(ctx, this_val);
-    }
-
-    return JS_UNDEFINED;
+    stream_pin(ctx, t, this_val);
+    return TJS_InitPromise(ctx, &t->connect_promise);
 }
 
-/* connectSync(addr) - synchronous TCP connect using OS socket() + connect() */
+/* connectSync: blocking OS connect, hands the fd to libuv. */
 static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&t->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
+    if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
 
     struct sockaddr_storage ss;
-    int r;
-    r = tjs_obj2addr(ctx, argv[0], &ss);
-    if (r != 0) {
-        return JS_EXCEPTION;
+    if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
+
+#ifndef _WIN32
+    int fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+    if (connect(fd, (struct sockaddr *)&ss, sizeof(ss)) != 0) {
+        int e = errno; close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
     }
-
-    /* Determine domain from address family */
-    int domain = ss.ss_family;
-
-    /* Create a blocking socket using OS socket() */
-#ifndef _WIN32
-    int fd = socket(domain, SOCK_STREAM, 0);
+    int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
+    if (r != 0) { close(fd); return tjs_throw_errno(ctx, r); }
 #else
-    SOCKET fd = socket(domain, SOCK_STREAM, 0);
-#endif
-    if (fd < 0) {
-#ifndef _WIN32
-        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-#else
+    SOCKET fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET)
         return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
+    if (connect(fd, (struct sockaddr *)&ss, sizeof(ss)) != 0) {
+        int e = WSAGetLastError(); closesocket(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+    int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
+    if (r != 0) { closesocket(fd); return tjs_throw_errno(ctx, r); }
 #endif
-    }
-
-    /* Blocking connect */
-    int ret = connect(fd, (struct sockaddr *) &ss, sizeof(ss));
-    if (ret != 0) {
-        int save_errno;
-#ifndef _WIN32
-        save_errno = errno;
-#else
-        save_errno = WSAGetLastError();
-#endif
-        tjs_close_fd(fd);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(save_errno));
-    }
-
-    /* Hand the connected fd to libuv - this replaces the internal socket */
-    r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t) fd);
-    if (r != 0) {
-        tjs_close_fd(fd);
-        return tjs_throw_errno(ctx, r);
-    }
-
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_tcp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
+    if (!t) return JS_EXCEPTION;
     struct sockaddr_storage ss;
-    int r;
-    r = tjs_obj2addr(ctx, argv[0], &ss);
-    if (r != 0) {
-        return JS_EXCEPTION;
-    }
-
+    if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
     int flags = 0;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) {
-        return JS_EXCEPTION;
-    }
-
-    r = uv_tcp_bind(&t->h.tcp, (struct sockaddr *) &ss, flags);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) return JS_EXCEPTION;
+    int r = uv_tcp_bind(&t->h.tcp, (struct sockaddr *)&ss, flags);
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_tcp_keepalive(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
-    int enable;
-    if ((enable = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
-    }
-
+    if (!t) return JS_EXCEPTION;
+    int enable = JS_ToBool(ctx, argv[0]);
+    if (enable == -1) return JS_EXCEPTION;
     int delay;
-    if (JS_ToInt32(ctx, &delay, argv[1])) {
-        return JS_EXCEPTION;
-    }
-
+    if (JS_ToInt32(ctx, &delay, argv[1])) return JS_EXCEPTION;
     int r = uv_tcp_keepalive(&t->h.tcp, enable, delay);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_tcp_nodelay(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
-    int enable;
-    if ((enable = JS_ToBool(ctx, argv[0])) == -1) {
-        return JS_EXCEPTION;
-    }
-
+    if (!t) return JS_EXCEPTION;
+    int enable = JS_ToBool(ctx, argv[0]);
+    if (enable == -1) return JS_EXCEPTION;
     int r = uv_tcp_nodelay(&t->h.tcp, enable);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
 
-/* TTY */
-
-static JSClassID tjs_tty_class_id;
-
+#pragma endregion
+#pragma region class tty
 static void tjs_tty_finalizer(JSRuntime *rt, JSValue val) {
-    TJSStream *t = JS_GetOpaque(val, tjs_tty_class_id);
-    tjs_stream_finalizer(rt, t);
+    tjs_stream_finalizer(rt, JS_GetOpaque(val, tjs_tty_class_id));
 }
-
 static void tjs_tty_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    TJSStream *t = JS_GetOpaque(val, tjs_tty_class_id);
-    tjs_stream_mark(rt, t, mark_func);
+    tjs_stream_mark(rt, JS_GetOpaque(val, tjs_tty_class_id), mark_func);
 }
-
 static JSClassDef tjs_tty_class = {
     "TTY",
     .finalizer = tjs_tty_finalizer,
-    .gc_mark = tjs_tty_mark,
+    .gc_mark   = tjs_tty_mark,
 };
 
 static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
-    TJSStream *s;
-    JSValue obj;
-    int fd, r, readable;
+    int fd, readable;
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    if ((readable = JS_ToBool(ctx, argv[1])) == -1) return JS_EXCEPTION;
 
-    if (JS_ToInt32(ctx, &fd, argv[0])) {
-        return JS_EXCEPTION;
-    }
+    JSValue obj = JS_NewObjectClass(ctx, tjs_tty_class_id);
+    if (JS_IsException(obj)) return obj;
 
-    if ((readable = JS_ToBool(ctx, argv[1])) == -1) {
-        return JS_EXCEPTION;
-    }
-
-    obj = JS_NewObjectClass(ctx, tjs_tty_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    s = tjs__mallocz(sizeof(*s));
+    TJSStream *s = tjs__mallocz(sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
         return JS_ThrowOutOfMemory(ctx);
     }
 
-    r = uv_tty_init(tjs_get_loop(ctx), &s->h.tty, fd, readable);
+    int r = uv_tty_init(tjs_get_loop(ctx), &s->h.tty, fd, readable);
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
@@ -1078,81 +852,54 @@ static TJSStream *tjs_tty_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_tty_class_id);
 }
 
-static JSValue tjs_tty_setMode(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_tty_set_mode(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-
+    if (!s) return JS_EXCEPTION;
     int mode;
-    if (JS_ToInt32(ctx, &mode, argv[0])) {
-        return JS_EXCEPTION;
-    }
-
+    if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
     int r = uv_tty_set_mode(&s->h.tty, mode);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
-static JSValue tjs_tty_getWinSize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_tty_get_win_size(JSContext *ctx, JSValue this_val) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
-    if (!s) {
-        return JS_EXCEPTION;
-    }
-
-    int r, width, height;
-    r = uv_tty_get_winsize(&s->h.tty, &width, &height);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (!s) return JS_EXCEPTION;
+    int w, h;
+    int r = uv_tty_get_winsize(&s->h.tty, &w, &h);
+    if (r != 0) return tjs_throw_errno(ctx, r);
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
-    JS_DefinePropertyValueStr(ctx, obj, "width", JS_NewInt32(ctx, width), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, obj, "height", JS_NewInt32(ctx, height), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "width",  JS_NewInt32(ctx, w), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "height", JS_NewInt32(ctx, h), JS_PROP_C_W_E);
     return obj;
 }
 
 
-/* Pipe */
-
-static JSClassID tjs_pipe_class_id;
-
+#pragma endregion
+#pragma region class pipe
 static void tjs_pipe_finalizer(JSRuntime *rt, JSValue val) {
-    TJSStream *t = JS_GetOpaque(val, tjs_pipe_class_id);
-    tjs_stream_finalizer(rt, t);
+    tjs_stream_finalizer(rt, JS_GetOpaque(val, tjs_pipe_class_id));
 }
-
 static void tjs_pipe_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    TJSStream *t = JS_GetOpaque(val, tjs_pipe_class_id);
-    tjs_stream_mark(rt, t, mark_func);
+    tjs_stream_mark(rt, JS_GetOpaque(val, tjs_pipe_class_id), mark_func);
 }
-
 static JSClassDef tjs_pipe_class = {
     "Pipe",
     .finalizer = tjs_pipe_finalizer,
-    .gc_mark = tjs_pipe_mark,
+    .gc_mark   = tjs_pipe_mark,
 };
 
 JSValue tjs_new_pipe(JSContext *ctx) {
-    TJSStream *s;
-    JSValue obj;
-    int r;
+    JSValue obj = JS_NewObjectClass(ctx, tjs_pipe_class_id);
+    if (JS_IsException(obj)) return obj;
 
-    obj = JS_NewObjectClass(ctx, tjs_pipe_class_id);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    s = tjs__mallocz(sizeof(*s));
+    TJSStream *s = tjs__mallocz(sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
         return JS_ThrowOutOfMemory(ctx);
     }
 
-    r = uv_pipe_init(tjs_get_loop(ctx), &s->h.pipe, 0);
+    int r = uv_pipe_init(tjs_get_loop(ctx), &s->h.pipe, 0);
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
@@ -1172,221 +919,150 @@ static TJSStream *tjs_pipe_get(JSContext *ctx, JSValue obj) {
 
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj) {
     TJSStream *s = JS_GetOpaque(obj, tjs_pipe_class_id);
-    if (s) {
-        return &s->h.stream;
-    }
-    return NULL;
+    return s ? &s->h.stream : NULL;
 }
 
 static JSValue tjs_pipe_getsockpeername(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
+    if (!t) return JS_EXCEPTION;
     char buf[1024];
     size_t len = sizeof(buf);
-    int r;
-
-    if (magic == 0) {
-        r = uv_pipe_getsockname(&t->h.pipe, buf, &len);
-    } else {
-        r = uv_pipe_getpeername(&t->h.pipe, buf, &len);
-    }
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    int r = magic == 0
+        ? uv_pipe_getsockname(&t->h.pipe, buf, &len)
+        : uv_pipe_getpeername(&t->h.pipe, buf, &len);
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_NewStringLen(ctx, buf, len);
 }
 
 static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
-    }
+    if (!t) return JS_EXCEPTION;
+    if (!JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
+    if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!name) {
-        return JS_EXCEPTION;
-    }
+    if (!name) return JS_EXCEPTION;
 
     uv_connect_t *req = js_malloc(ctx, sizeof(*req));
-    if (!req) {
-        JS_FreeCString(ctx, name);
-        return JS_EXCEPTION;
-    }
+    if (!req) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
 
-    int r = uv_pipe_connect2(req, &t->h.pipe, name, len, 0, uv__stream_connect_cb);
+    int r = uv_pipe_connect2(req, &t->h.pipe, name, len, 0, uv__connect_cb);
     JS_FreeCString(ctx, name);
     if (r != 0) {
         js_free(ctx, req);
         return tjs_throw_errno(ctx, r);
     }
 
-    if (JS_IsUndefined(t->obj)) {
-        t->obj = JS_DupValue(ctx, this_val);
-    }
-
-    return JS_UNDEFINED;
+    stream_pin(ctx, t, this_val);
+    return TJS_InitPromise(ctx, &t->connect_promise);
 }
 
-/* connectSync(name) - synchronous Pipe connect using OS socket() + connect() */
+/* connectSync: blocking Unix domain socket connect, hands fd to libuv. */
 static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-	return JS_ThrowTypeError(ctx, "named-pipe is not supported currently.");
-#endif
-
+    return JS_ThrowTypeError(ctx, "named-pipe sync connect not supported on Windows");
+#else
     TJSStream *t = tjs_pipe_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-    if (uv_is_closing(&t->h.handle)) {
-        return JS_ThrowInternalError(ctx, "stream is closed");
-    }
-
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
-    }
+    if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!name) {
-        return JS_EXCEPTION;
-    }
+    if (!name) return JS_EXCEPTION;
 
-#ifndef _WIN32
-    /* Create a Unix domain socket */
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
+    if (len >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
         JS_FreeCString(ctx, name);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+        return JS_ThrowTypeError(ctx, "pipe name too long");
     }
 
-    /* Set up the address */
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    if (len >= sizeof(addr.sun_path)) {
-        JS_FreeCString(ctx, name);
-        tjs_close_fd(fd);
-        return JS_ThrowTypeError(ctx, "pipe name too long");
-    }
     memcpy(addr.sun_path, name, len + 1);
     JS_FreeCString(ctx, name);
 
-    /* Blocking connect */
-    int ret = connect(fd, (struct sockaddr *) &addr, sizeof(addr));
-    if (ret != 0) {
-        int save_errno = errno;
-        tjs_close_fd(fd);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(save_errno));
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int e = errno; close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
     }
-
-    /* Hand the connected fd to libuv */
     int r = uv_pipe_open(&t->h.pipe, fd);
-    if (r != 0) {
-        tjs_close_fd(fd);
-        return tjs_throw_errno(ctx, r);
-    }
-#endif
-
+    if (r != 0) { close(fd); return tjs_throw_errno(ctx, r); }
     return JS_UNDEFINED;
+#endif
 }
 
 static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
-    if (!JS_IsString(argv[0])) {
-        return JS_ThrowTypeError(ctx, "the pipe name must be a string");
-    }
-
+    if (!t) return JS_EXCEPTION;
+    if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!name) {
-        return JS_EXCEPTION;
-    }
-
+    if (!name) return JS_EXCEPTION;
     int r = uv_pipe_bind2(&t->h.pipe, name, len, 0);
     JS_FreeCString(ctx, name);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
-    if (!t) {
-        return JS_EXCEPTION;
-    }
-
+    if (!t) return JS_EXCEPTION;
     int fd;
-    if (JS_ToInt32(ctx, &fd, argv[0])) {
-        return JS_EXCEPTION;
-    }
-
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
     int r = uv_pipe_open(&t->h.pipe, fd);
-    if (r != 0) {
-        return tjs_throw_errno(ctx, r);
-    }
-
+    if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
+
+#pragma endregion
+#pragma region define class
 /* clang-format off */
 static const JSCFunctionListEntry tjs_stream_proto_funcs[] = {
-    JS_CGETSET_MAGIC_DEF("onread", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_READ),
-    JS_CGETSET_MAGIC_DEF("onconnect", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CONNECT),
+    JS_CGETSET_MAGIC_DEF("onread",       tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_READ),
     JS_CGETSET_MAGIC_DEF("onconnection", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CONNECTION),
-    JS_CGETSET_MAGIC_DEF("onshutdown", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_SHUTDOWN),
-    TJS_CFUNC_DEF("listen", 1, tjs_stream_listen),
-    TJS_CFUNC_DEF("startRead", 0, tjs_stream_start_read),
-    TJS_CFUNC_DEF("stopRead", 0, tjs_stream_stop_read),
-    TJS_CFUNC_DEF("shutdown", 0, tjs_stream_shutdown),
+    TJS_CFUNC_DEF("listen",      1, tjs_stream_listen),
+    TJS_CFUNC_DEF("startRead",   0, tjs_stream_start_read),
+    TJS_CFUNC_DEF("stopRead",    0, tjs_stream_stop_read),
+    TJS_CFUNC_DEF("read",        1, tjs_stream_read),
+    TJS_CFUNC_DEF("readSync",    1, tjs_stream_read_sync),
+    TJS_CFUNC_DEF("write",       1, tjs_stream_write),
+    TJS_CFUNC_DEF("writeSync",   1, tjs_stream_write_sync),
+    TJS_CFUNC_DEF("shutdown",    0, tjs_stream_shutdown),
     TJS_CFUNC_DEF("setBlocking", 1, tjs_stream_set_blocking),
-    TJS_CFUNC_DEF("close", 0, tjs_stream_close),
-    TJS_CFUNC_DEF("write", 1, tjs_stream_write),
-    TJS_CFUNC_DEF("read", 1, tjs_stream_read),
-    TJS_CFUNC_DEF("readSync", 1, tjs_stream_read_sync),
-    TJS_CFUNC_DEF("writeSync", 1, tjs_stream_write_sync),
-    TJS_CFUNC_DEF("fileno", 0, tjs_stream_fileno),
-    TJS_CFUNC_DEF("ref", 0, tjs_stream_ref),
-    TJS_CFUNC_DEF("unref", 0, tjs_stream_unref),
+    TJS_CFUNC_DEF("close",       0, tjs_stream_close),
+    JS_CGETSET_DEF("fileno",        tjs_stream_get_fileno, NULL),
+    TJS_CFUNC_DEF("ref",         0, tjs_stream_ref),
+    TJS_CFUNC_DEF("unref",       0, tjs_stream_unref),
 };
-/* clang-format on */
 
 static const JSCFunctionListEntry tjs_tcp_proto_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("getsockname", 0, tjs_tcp_getsockpeername, 0),
-    JS_CFUNC_MAGIC_DEF("getpeername", 0, tjs_tcp_getsockpeername, 1),
-    TJS_CFUNC_DEF("connect", 1, tjs_tcp_connect),
-    TJS_CFUNC_DEF("connectSync", 1, tjs_tcp_connect_sync),
-    TJS_CFUNC_DEF("bind", 2, tjs_tcp_bind),
+    JS_CGETSET_MAGIC_DEF("sockname", tjs_tcp_get_sockpeername, NULL, 0),
+    JS_CGETSET_MAGIC_DEF("peername", tjs_tcp_get_sockpeername, NULL, 1),
+    TJS_CFUNC_DEF("connect",      1, tjs_tcp_connect),
+    TJS_CFUNC_DEF("connectSync",  1, tjs_tcp_connect_sync),
+    TJS_CFUNC_DEF("bind",         2, tjs_tcp_bind),
     TJS_CFUNC_DEF("setKeepAlive", 2, tjs_tcp_keepalive),
-    TJS_CFUNC_DEF("setNoDelay", 1, tjs_tcp_nodelay),
+    TJS_CFUNC_DEF("setNoDelay",   1, tjs_tcp_nodelay),
 };
 
 static const JSCFunctionListEntry tjs_tty_proto_funcs[] = {
-    TJS_CFUNC_DEF("setMode", 1, tjs_tty_setMode),
-    TJS_CFUNC_DEF("getWinSize", 0, tjs_tty_getWinSize),
+    TJS_CFUNC_DEF("setMode",    1, tjs_tty_set_mode),
+    JS_CGETSET_DEF("size",         tjs_tty_get_win_size, NULL)
 };
 
 static const JSCFunctionListEntry tjs_pipe_proto_funcs[] = {
-    TJS_CFUNC_DEF("open", 1, tjs_pipe_open),
     JS_CFUNC_MAGIC_DEF("getsockname", 0, tjs_pipe_getsockpeername, 0),
     JS_CFUNC_MAGIC_DEF("getpeername", 0, tjs_pipe_getsockpeername, 1),
-    TJS_CFUNC_DEF("connect", 1, tjs_pipe_connect),
+    TJS_CFUNC_DEF("open",        1, tjs_pipe_open),
+    TJS_CFUNC_DEF("connect",     1, tjs_pipe_connect),
     TJS_CFUNC_DEF("connectSync", 1, tjs_pipe_connect_sync),
-    TJS_CFUNC_DEF("bind", 1, tjs_pipe_bind),
+    TJS_CFUNC_DEF("bind",        1, tjs_pipe_bind),
 };
 
 static const JSCFunctionListEntry tjs_streams_funcs[] = {
@@ -1394,49 +1070,36 @@ static const JSCFunctionListEntry tjs_streams_funcs[] = {
     TJS_UVCONST(TTY_MODE_NORMAL),
     TJS_UVCONST(TTY_MODE_RAW),
 };
+/* clang-format on */
+
+
+/* Register one class with its own prototype that inherits from stream_proto. */
+#define STREAM_CLASS_INIT(id, def, extra, ctor_name, ctor_fn) do { \
+    JS_NewClassID(rt, &(id));                                        \
+    JS_NewClass(rt, id, &(def));                                     \
+    proto = JS_NewObjectProto(ctx, stream_proto);                    \
+    JS_SetPropertyFunctionList(ctx, proto, extra, countof(extra));   \
+    JS_SetClassProto(ctx, id, proto);                                \
+    obj = JS_NewCFunction2(ctx, ctor_fn, ctor_name, 1,              \
+                           JS_CFUNC_constructor, 0);                 \
+    JS_DefinePropertyValueStr(ctx, ns, ctor_name, obj, JS_PROP_C_W_E); \
+} while (0)
 
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JSValue proto, obj, stream_proto;
+    JSValue proto, obj;
 
-    /* Stream prototype */
-    stream_proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, stream_proto, tjs_stream_proto_funcs, countof(tjs_stream_proto_funcs));
+    /* Shared base prototype for all stream types. */
+    JSValue stream_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, stream_proto, tjs_stream_proto_funcs,
+                               countof(tjs_stream_proto_funcs));
 
-    /* TCP class */
-    JS_NewClassID(rt, &tjs_tcp_class_id);
-    JS_NewClass(rt, tjs_tcp_class_id, &tjs_tcp_class);
-    proto = JS_NewObjectProto(ctx, stream_proto);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_tcp_proto_funcs, countof(tjs_tcp_proto_funcs));
-    JS_SetClassProto(ctx, tjs_tcp_class_id, proto);
-
-    /* TCP object */
-    obj = JS_NewCFunction2(ctx, tjs_tcp_constructor, "TCP", 1, JS_CFUNC_constructor, 0);
-    JS_DefinePropertyValueStr(ctx, ns, "TCP", obj, JS_PROP_C_W_E);
-
-    /* TTY class */
-    JS_NewClassID(rt, &tjs_tty_class_id);
-    JS_NewClass(rt, tjs_tty_class_id, &tjs_tty_class);
-    proto = JS_NewObjectProto(ctx, stream_proto);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_tty_proto_funcs, countof(tjs_tty_proto_funcs));
-    JS_SetClassProto(ctx, tjs_tty_class_id, proto);
-
-    /* TTY object */
-    obj = JS_NewCFunction2(ctx, tjs_tty_constructor, "TTY", 1, JS_CFUNC_constructor, 0);
-    JS_DefinePropertyValueStr(ctx, ns, "TTY", obj, JS_PROP_C_W_E);
-
-    /* Pipe class */
-    JS_NewClassID(rt, &tjs_pipe_class_id);
-    JS_NewClass(rt, tjs_pipe_class_id, &tjs_pipe_class);
-    proto = JS_NewObjectProto(ctx, stream_proto);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_pipe_proto_funcs, countof(tjs_pipe_proto_funcs));
-    JS_SetClassProto(ctx, tjs_pipe_class_id, proto);
-
-    /* Pipe object */
-    obj = JS_NewCFunction2(ctx, tjs_pipe_constructor, "Pipe", 1, JS_CFUNC_constructor, 0);
-    JS_DefinePropertyValueStr(ctx, ns, "Pipe", obj, JS_PROP_C_W_E);
+    STREAM_CLASS_INIT(tjs_tcp_class_id,  tjs_tcp_class,  tjs_tcp_proto_funcs,  "TCP",  tjs_tcp_constructor);
+    STREAM_CLASS_INIT(tjs_tty_class_id,  tjs_tty_class,  tjs_tty_proto_funcs,  "TTY",  tjs_tty_constructor);
+    STREAM_CLASS_INIT(tjs_pipe_class_id, tjs_pipe_class, tjs_pipe_proto_funcs, "Pipe", tjs_pipe_constructor);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_streams_funcs, countof(tjs_streams_funcs));
-
     JS_FreeValue(ctx, stream_proto);
 }
+
+#undef STREAM_CLASS_INIT
