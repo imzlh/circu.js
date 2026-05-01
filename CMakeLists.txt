@@ -114,7 +114,7 @@ if(NOT SQLITE_HAS_LOAD_EXTENSION)
 endif()
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
-find_package(Iconv)  # optional
+find_package(Iconv REQUIRED)
 find_package(llhttp) # optional
 
 # Check expat version for XML_ExpatVersion function availability
@@ -352,6 +352,5 @@ endif()
 add_executable(cjsc EXCLUDE_FROM_ALL
     src/binary.c
     src/qjsc.c
-    src/version.c
 )
 target_link_libraries(cjsc qjs)

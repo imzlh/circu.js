@@ -27,13 +27,13 @@ interface TjsModules {
     xml: typeof CModuleXML,
     jsonc: typeof CModuleJsonC,
     algorithm: typeof CModuleAlgorithm,
+    text: typeof CModuleText,
     http: typeof CModuleHTTP,
 }
 
 interface TJSOptionalModules {
     'posix-socket': typeof CModulePosixSocket,
     'wasm': typeof CModuleWASM,
-    'text': typeof CModuleText,
     'curl': typeof CModuleCURL
 }
 

@@ -947,6 +947,19 @@ static const JSCFunctionListEntry console_funcs[] = {
 };
 
 void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
+#ifdef _WIN32
+    // use utf-8 to display correctly in Windows
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    
+    // ANSI color
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, dwMode);
+#endif
+    
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }
 
