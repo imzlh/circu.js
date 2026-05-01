@@ -25,6 +25,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(MSVC)
     # MSVC compiler flags - enable C11 for stdatomic.h support
     list(APPEND cjs_cflags /std:c11 /experimental:c11atomics /W4 /Zi)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
         list(APPEND cjs_cflags /Od)
         add_compile_definitions(DEBUG)

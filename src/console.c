@@ -444,11 +444,12 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 
     // Calculate estimated width
     int est_width = 2; // []
-    for (int64_t i = 0; i < len && i < 6; i++) {
+    uint32_t len_u32 = len;
+    for (uint32_t i = 0; i < len_u32 && i < 6; i++) {
         JSValue elem = JS_GetPropertyUint32(ctx, val, i);
         est_width += estimate_width(ctx, elem, depth);
         JS_FreeValue(ctx, elem);
-        if (i < len - 1) est_width += 2; // ", "
+        if (i < len_u32 - 1) est_width += 2; // ", "
         if (est_width > opts->break_length) break;
     }
     bool inline_disp = opts->compact && est_width <= opts->break_length && len <= 6;
@@ -544,7 +545,7 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
     for (uint32_t i = 0; i < count && i < 6; i++) {
         const char* k = JS_AtomToCString(ctx, props[i].atom);
         if (k) {
-            est_width += strlen(k) + 4;
+            est_width += (int)strlen(k) + 4;
             JS_FreeCString(ctx, k);
         }
         JSValue v = JS_GetProperty(ctx, val, props[i].atom);
@@ -643,7 +644,7 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     dbuf_printf(buf, "%s(%zu) [ ", name, len);
     put_reset(buf, opts);
     size_t show = MIN(len, opts->max_array_length);
-    for (size_t i = 0; i < show; i++) {
+    for (uint32_t i = 0; i < show; i++) {
         if (i > 0) dbuf_putstr(buf, ", ");
         JSValue elem = JS_GetPropertyUint32(ctx, val, i + offset);
         format_number(ctx, elem, buf, opts);
@@ -811,7 +812,7 @@ static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
     InspectOptions opts = {
         .depth = default_depth,
         .break_length = 80,
-        .colors = isatty(fileno(stream)),
+        .colors = isatty(_fileno(stream)),
         .show_hidden = show_hidden,
         .max_array_length = 100,
         .max_string_length = 10000,
