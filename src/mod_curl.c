@@ -1337,11 +1337,11 @@ static JSValue tjs_curl_set_interface(JSContext *ctx, JSValueConst this_val,
     TJSCURL *curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
     if (!curl) return JS_EXCEPTION;
     
-    const char *interface = JS_ToCString(ctx, argv[0]);
-    if (!interface) return JS_EXCEPTION;
+    const char *intf = JS_ToCString(ctx, argv[0]);
+    if (!intf) return JS_EXCEPTION;
     
-    curl_easy_setopt(curl->handle, CURLOPT_INTERFACE, interface);
-    JS_FreeCString(ctx, interface);
+    curl_easy_setopt(curl->handle, CURLOPT_INTERFACE, intf);
+    JS_FreeCString(ctx, intf);
     
     return JS_DupValue(ctx, this_val);
 }

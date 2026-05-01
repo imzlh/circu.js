@@ -832,12 +832,16 @@ static JSValue tjs_dirent_issymlink(JSContext *ctx, JSValue this_val) {
 /* StatResult functions */
 
 static JSValue tjs_stat_isblockdevice(JSContext *ctx, JSValue this_val) {
+#ifdef _WIN32
+    return JS_FALSE;
+#else
     TJSStatResult *sr = tjs_stat_get(ctx, this_val);
     if (!sr) {
         return JS_EXCEPTION;
     }
 
     return JS_NewBool(ctx, (sr->st_mode & S_IFMT) == S_IFBLK);
+#endif
 }
 
 static JSValue tjs_stat_ischaracterdevice(JSContext *ctx, JSValue this_val) {

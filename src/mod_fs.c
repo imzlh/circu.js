@@ -284,9 +284,6 @@ static int crt2uv(int crt_err) {
 #ifdef ESOCKTNOSUPPORT
 			UV(ESOCKTNOSUPPORT, UV_ESOCKTNOSUPPORT)
 #endif
-#ifdef EOPNOTSUPP
-			UV(EOPNOTSUPP, UV_EOPNOTSUPP)
-#endif
 #ifdef EPFNOSUPPORT
 			UV(EPFNOSUPPORT, UV_EPFNOSUPPORT)
 #endif
@@ -304,9 +301,6 @@ static int crt2uv(int crt_err) {
 #endif
 #ifdef ENETUNREACH
 			UV(ENETUNREACH, UV_ENETUNREACH)
-#endif
-#ifdef ENETRESET
-			UV(ENETRESET, UV_ENETRESET)
 #endif
 #ifdef ECONNABORTED
 			UV(ECONNABORTED, UV_ECONNABORTED)
@@ -341,10 +335,6 @@ static int crt2uv(int crt_err) {
 #ifdef EALREADY
 			UV(EALREADY, UV_EALREADY)
 #endif
-#ifdef EINPROGRESS
-			UV(EINPROGRESS, UV_EINPROGRESS)
-#endif
-
 #ifdef ELOOP
 			UV(ELOOP, UV_ELOOP)
 #endif
@@ -381,23 +371,8 @@ static int crt2uv(int crt_err) {
 #ifdef ENXIO
 			UV(ENXIO, UV_ENXIO)
 #endif
-#ifdef ECHILD
-			UV(ECHILD, UV_ECHILD)
-#endif
-#ifdef EDEADLK
-			UV(EDEADLK, UV_EDEADLK)
-#endif
-#ifdef ENOLCK
-			UV(ENOLCK, UV_ENOLCK)
-#endif
 #ifdef ENOSYS
 			UV(ENOSYS, UV_ENOSYS)
-#endif
-#ifdef ENOMSG
-			UV(ENOMSG, UV_ENOMSG)
-#endif
-#ifdef EIDRM
-			UV(EIDRM, UV_EIDRM)
 #endif
 #ifdef EILSEQ
 			UV(EILSEQ, UV_EILSEQ)

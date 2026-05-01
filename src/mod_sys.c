@@ -26,9 +26,14 @@
 #include "version.h"
 
 #include <string.h>
-#include <unistd.h>
 #include <assert.h>
 #include <uv.h>
+
+#ifdef _WIN32
+
+#else
+#include <unistd.h>
+#endif
 
 static JSValue tjs_loadModule(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     const char *filename;

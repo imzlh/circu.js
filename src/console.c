@@ -45,6 +45,7 @@
 #include <unistd.h>
 #endif
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX_DEPTH 64
 #define DEFAULT_BREAK_LENGTH 80
 #define MAX_ARRAY_LENGTH 100

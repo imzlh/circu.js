@@ -41,6 +41,9 @@
     #ifndef SIGKILL
     #define SIGKILL 9
     #endif
+    #define STDIN_FILENO 0
+    #define STDOUT_FILENO 1
+    #define STDERR_FILENO 2
 #else
     #include <unistd.h>
     #include <sys/types.h>
@@ -185,10 +188,10 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 
 #ifdef _WIN32
     DWORD winStatus;
-    if (WaitForSingleObject(p->process.process, INFINITE) != WAIT_OBJECT_0)
+    if (WaitForSingleObject(p->process.process_handle, INFINITE) != WAIT_OBJECT_0)
         return JS_ThrowTypeError(ctx, "WaitForSingleObject failed");
 
-    if (!GetExitCodeProcess(p->process.process, &winStatus))
+    if (!GetExitCodeProcess(p->process.process_handle, &winStatus))
         return JS_ThrowTypeError(ctx, "GetExitCodeProcess failed");
 
     exitCode = (int)winStatus;

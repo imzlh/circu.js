@@ -34,11 +34,18 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+
+#ifdef _WIN32
+
+#else
 #include <unistd.h>
+#endif
 
 #include "../deps/quickjs/quickjs.h"
 #include "../deps/quickjs/cutils.h"
 #include "version.h"
+#define STRINGIFY(x) #x
+#define VERSION STRINGIFY(TJS_VERSION_MAJOR) "." STRINGIFY(TJS_VERSION_MINOR) "." STRINGIFY(TJS_VERSION_PATCH) TJS_VERSION_SUFFIX
 
 #ifdef _WIN32
     #include <windows.h>
@@ -138,7 +145,7 @@ static namelist_t cmodule_list;
 static namelist_t init_module_list;
 static OutputTypeEnum output_type = OUTPUT_C;  // Will be auto-detected
 static FILE *outfile;
-static const char *c_ident_prefix = "qjsc_";
+static const char *c_ident_prefix = "cjsc_";
 static int strip;
 static const char *output_filename = NULL;
 
@@ -529,7 +536,7 @@ static const char main_c_template2[] =
     "  return r;\n"
     "}\n";
 
-#define PROG_NAME "qjsc"
+#define PROG_NAME "cjsc"
 
 void help(void) {
     printf("Circu.JS OpCode compiler V%s with QuickJS %s\n"
@@ -545,7 +552,7 @@ void help(void) {
            "  -m          compile as ES module (default=autodetect)\n"
            "  -D module   compile a dynamically loaded module or worker\n"
            "  -M module[,cname] add initialization code for an external C module\n"
-           "  -p prefix   set the prefix of the generated C names (default: qjsc_)\n"
+           "  -p prefix   set the prefix of the generated C names (default: cjsc_)\n"
            "  -s          strip source code (-ss also strips debug info)\n"
            "  -S n        set the maximum stack size (e.g., -S 65536, -S 1m, -S 2g)\n"
            "  -h          show this help\n"
@@ -556,7 +563,7 @@ void help(void) {
            "  " PROG_NAME " -o runtime script.js       # Attach to 'runtime' executable\n"
            "  " PROG_NAME " -e -o main.c script.js     # Generate standalone C program\n"
            "\n",
-		   tjs_version(),
+		   VERSION,
            JS_GetVersion());
     exit(1);
 }

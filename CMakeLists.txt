@@ -144,7 +144,7 @@ endif()
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
-add_library(cjs
+add_library(libcjs
     src/binary.c
     src/mod_error.c
     src/mem.c
@@ -179,7 +179,7 @@ add_library(cjs
 )
 
 if(UNIX)
-    target_sources(cjs PUBLIC 
+    target_sources(libcjs PUBLIC 
         src/mod_posix-socket.c
     )
 endif()
@@ -187,7 +187,7 @@ endif()
 if(llhttp_FOUND)
     # System-installed llhttp may not provide CMake targets
     # Use the traditional variables instead
-    target_link_libraries(cjs llhttp)
+    target_link_libraries(libcjs llhttp)
 else()
     message(NOTICE "build with llhttp github repo")
     FetchContent_Declare(llhttp
@@ -198,26 +198,26 @@ else()
     FetchContent_MakeAvailable(llhttp)
 
     # Link with the llhttp::llhttp alias (points to llhttp_static when BUILD_STATIC_LIBS=ON)
-    target_link_libraries(cjs llhttp::llhttp)
+    target_link_libraries(libcjs llhttp::llhttp)
 endif()
 
 if (Iconv_FOUND)
     add_compile_definitions(CJS__HAS_ICONV)
-    target_sources(cjs PUBLIC src/mod_text.c)
-    target_link_libraries(cjs Iconv::Iconv)
+    target_sources(libcjs PUBLIC src/mod_text.c)
+    target_link_libraries(libcjs Iconv::Iconv)
 else()
     message(NOTICE "build without iconv")
 endif()
 
 if (BUILD_WITH_CURL AND CURL_FOUND)
     add_compile_definitions(CJS__HAS_CURL)
-    target_sources(cjs PUBLIC src/mod_curl.c)
-    target_link_libraries(cjs CURL::libcurl)
+    target_sources(libcjs PUBLIC src/mod_curl.c)
+    target_link_libraries(libcjs CURL::libcurl)
 endif()
 
 if (BUILD_WITH_WASM)
     add_compile_definitions(CJS__HAS_WASM)
-    target_sources(cjs PUBLIC src/mod_wasm.c)
+    target_sources(libcjs PUBLIC src/mod_wasm.c)
 
     # WAMR Configuration (interpreter only for maximum portability)
     set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/wamr)
@@ -259,8 +259,8 @@ if (BUILD_WITH_WASM)
     if(WIN32)
         target_link_libraries(vmlib PUBLIC ntdll)
     endif()
-    target_include_directories(cjs PRIVATE ${WAMR_ROOT_DIR}/core/iwasm/include)
-    target_link_libraries(cjs vmlib)
+    target_include_directories(libcjs PRIVATE ${WAMR_ROOT_DIR}/core/iwasm/include)
+    target_link_libraries(libcjs vmlib)
 endif()
 
 # add_library(ffi-test SHARED
@@ -301,8 +301,8 @@ endif()
 # else()
     find_library(FFI_LIB NAMES libffi ffi REQUIRED)
     find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
-    target_include_directories(cjs PRIVATE ${FFI_INCLUDE_DIR})
-    target_link_libraries(cjs ${FFI_LIB})
+    target_include_directories(libcjs PRIVATE ${FFI_INCLUDE_DIR})
+    target_link_libraries(libcjs ${FFI_LIB})
 
     file(READ "${FFI_INCLUDE_DIR}/ffi.h" FFI_HEADER)
     string(FIND "${FFI_HEADER}" "FFI_BAD_ARGTYPE" FFI_HAS_BAD_ARGTYPE)
@@ -314,32 +314,43 @@ endif()
 # endif()
 
 if (BUILD_WITH_MIMALLOC)
-    target_compile_definitions(cjs PRIVATE CJS__HAS_MIMALLOC)
-    target_link_libraries(cjs mimalloc-static)
+    target_compile_definitions(libcjs PRIVATE CJS__HAS_MIMALLOC)
+    target_link_libraries(libcjs mimalloc-static)
 endif()
 
-set_target_properties(cjs PROPERTIES
+set_target_properties(libcjs PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
 )
 
 string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
-target_compile_options(cjs PRIVATE ${cjs_cflags})
-target_compile_definitions(cjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
-target_include_directories(cjs PUBLIC src)
+target_compile_options(libcjs PRIVATE ${cjs_cflags})
+target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
+target_include_directories(libcjs PUBLIC src)
 # libutil is required for openpty
-target_link_libraries(cjs qjs uv sqlite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT util)
+target_link_libraries(libcjs qjs uv_a SQLite3::SQLite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT)
+if(NOT WIN32)
+    target_link_libraries(libcjs util)
+endif() 
 
 add_executable(cjs-cli
     src/cli.c
 )
-target_link_libraries(cjs-cli cjs)
+target_link_libraries(cjs-cli libcjs)
 set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
 )
 
+if(WIN32)
+    add_executable(align_binary EXCLUDE_FROM_ALL cmake/align_binary.c)
+    add_custom_command(TARGET cjs-cli POST_BUILD
+        COMMAND $<TARGET_FILE:align_binary> "$<TARGET_FILE:cjs-cli>" 64
+    )
+endif()
+
 add_executable(cjsc EXCLUDE_FROM_ALL
     src/binary.c
     src/qjsc.c
+    src/version.c
 )
 target_link_libraries(cjsc qjs)
