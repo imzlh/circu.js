@@ -44,7 +44,8 @@
     },
     "include": [
         "types/**/*",
-        "tests/**/*",
+        "tests/**/*.ts",
+        "tests/tests/*.js",
         "example/**/*",
         "src/repl.ts"
     ],

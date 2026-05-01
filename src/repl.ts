@@ -31,7 +31,7 @@ const fs = import.meta.use('asyncfs');
 const sfs = import.meta.use('fs');
 
 // preset some envs
-globalThis.console = console;
+Reflect.set(globalThis, 'console', console);
 
 // ==================== Types ====================
 
@@ -95,7 +95,7 @@ class TerminalController {
 
     get size() {
         if (!this.#tty) return { width: 80, height: 24 };
-        return this.#tty.getWinSize();
+        return this.#tty.size;
     }
 
     [Symbol.dispose]() {
