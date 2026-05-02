@@ -45,11 +45,19 @@
 #include <unistd.h>
 #endif
 
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX_DEPTH 64
 #define DEFAULT_BREAK_LENGTH 80
 #define MAX_ARRAY_LENGTH 100
 #define MAX_STRING_LENGTH 10000
+
+// not defined in MSVC
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
 
 /* ANSI Colors */
 #define ANSI_RESET     "\x1b[0m"
@@ -812,7 +820,7 @@ static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
     InspectOptions opts = {
         .depth = default_depth,
         .break_length = 80,
-        .colors = isatty(_fileno(stream)),
+        .colors = isatty(fileno(stream)),
         .show_hidden = show_hidden,
         .max_array_length = 100,
         .max_string_length = 10000,

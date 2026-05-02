@@ -329,7 +329,7 @@ target_compile_options(libcjs PRIVATE ${cjs_cflags})
 target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(libcjs PUBLIC src)
 # libutil is required for openpty
-target_link_libraries(libcjs qjs uv_a SQLite3::SQLite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT)
+target_link_libraries(libcjs qjs uv_a SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT)
 if(NOT WIN32)
     target_link_libraries(libcjs util)
 endif() 
