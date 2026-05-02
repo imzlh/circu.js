@@ -588,6 +588,16 @@ static JSValue tjs_exepath(JSContext *ctx, JSValue this_val) {
     return ret;
 }
 
+static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    int64_t time;
+    if (argc == 0 || -1 == JS_ToInt64(ctx, &time, argv[0])) {
+        return JS_ThrowTypeError(ctx, "invalid argument");
+    }
+    
+    uv_sleep(time);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CONST(AF_INET),
     TJS_CONST(AF_INET6),
@@ -611,6 +621,7 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CFUNC_DEF("networkInterfaces", 0, tjs_network_interfaces),
     TJS_CFUNC_DEF("availableParallelism", 0, tjs_availableParallelism),
 	TJS_CFUNC_DEF("memoryUsage", 0, tjs_memory),
+    TJS_CFUNC_DEF("sleep", 0, tjs_sleep),
     TJS_CGETSET_DEF("cwd", tjs_cwd, NULL),
     TJS_CGETSET_DEF("homeDir", tjs_homedir, NULL),
     TJS_CGETSET_DEF("hostName", tjs_gethostname, NULL),

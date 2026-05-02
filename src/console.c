@@ -186,10 +186,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 /* Utility: Get class name including Symbol.toStringTag */
 static char* get_class_name(JSContext* ctx, JSValue obj) {
     // Try Symbol.toStringTag first (for fs.Stats, etc.)
-    JSAtom tag_atom = JS_NewAtom(ctx, "Symbol.toStringTag");
-    JSValue tag = JS_GetProperty(ctx, obj, tag_atom);
-    JS_FreeAtom(ctx, tag_atom);
-    
+    JSValue tag = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_toStringTag);
     if (!JS_IsException(tag) && JS_IsString(tag)) {
         const char* str = JS_ToCString(ctx, tag);
         JS_FreeValue(ctx, tag);
@@ -203,13 +200,13 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
     JS_FreeValue(ctx, tag);
 
     // Fallback to constructor.name
-    JSValue ctor = JS_GetPropertyStr(ctx, obj, "constructor");
+    JSValue ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
     if (JS_IsException(ctor) || JS_IsUndefined(ctor) || JS_IsNull(ctor)) {
         JS_FreeValue(ctx, ctor);
         return NULL;
     }
 
-    JSValue name = JS_GetPropertyStr(ctx, ctor, "name");
+    JSValue name = JS_GetProperty(ctx, ctor, JS_ATOM_name);
     JS_FreeValue(ctx, ctor);
     
     if (JS_IsException(name) || !JS_IsString(name)) {
@@ -230,11 +227,11 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
 }
 
 /* Color helpers */
-static void put_color(DynBuf* buf, const InspectOptions* opts, const char* color) {
+static inline void put_color(DynBuf* buf, const InspectOptions* opts, const char* color) {
     if (opts->colors) dbuf_putstr(buf, color);
 }
 
-static void put_reset(DynBuf* buf, const InspectOptions* opts) {
+static inline void put_reset(DynBuf* buf, const InspectOptions* opts) {
     if (opts->colors) dbuf_putstr(buf, ANSI_RESET);
 }
 
@@ -304,7 +301,7 @@ static void format_bigint(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 }
 
 static void format_function(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
-    JSValue name = JS_GetPropertyStr(ctx, val, "name");
+    JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     
     put_color(buf, opts, ANSI_CYAN);
@@ -342,8 +339,8 @@ static void format_date(JSContext* ctx, JSValue val, DynBuf* buf, const InspectO
 }
 
 static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
-    JSValue src = JS_GetPropertyStr(ctx, val, "source");
-    JSValue flags = JS_GetPropertyStr(ctx, val, "flags");
+    JSValue src = JS_GetProperty(ctx, val, JS_ATOM_source);
+    JSValue flags = JS_GetProperty(ctx, val, JS_ATOM_flags);
     const char* src_str = JS_IsString(src) ? JS_ToCString(ctx, src) : NULL;
     const char* flags_str = JS_IsString(flags) ? JS_ToCString(ctx, flags) : NULL;
     
@@ -359,9 +356,9 @@ static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 
 static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf, 
                         const InspectOptions* opts) {
-    JSValue name = JS_GetPropertyStr(ctx, val, "name");
-    JSValue msg = JS_GetPropertyStr(ctx, val, "message");
-    JSValue stack = JS_GetPropertyStr(ctx, val, "stack");
+    JSValue name = JS_GetPropertyStr(ctx, val, JS_ATOM_name);
+    JSValue msg = JS_GetProperty(ctx, val, JS_ATOM_message);
+    JSValue stack = JS_GetPropertyStr(ctx, val, JS_ATOM_stack);
     
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     const char* msg_str = JS_IsString(msg) ? JS_ToCString(ctx, msg) : NULL;
@@ -416,9 +413,7 @@ static int estimate_width(JSContext* ctx, JSValue val, int depth) {
 			if (JS_IsFunction(ctx, val)) return 20;
 			// Simple estimate for objects
 			int64_t len = 0;
-			JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
-			if (JS_IsNumber(len_val)) JS_ToInt64(ctx, &len, len_val);
-			JS_FreeValue(ctx, len_val);
+			JS_GetLength(ctx, val, &len);
 			
 			if (len > 0 && len <= 4) return (int)len * 5 + 4;
 			return 15;
@@ -430,7 +425,7 @@ static int estimate_width(JSContext* ctx, JSValue val, int depth) {
 static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
                         DynBuf* buf, const InspectOptions* opts) {
     int64_t len = 0;
-    JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
+    JSValue len_val = JS_GetProperty(ctx, val, JS_ATOM_length);
     if (!JS_IsException(len_val)) JS_ToInt64(ctx, &len, len_val);
     JS_FreeValue(ctx, len_val);
 
@@ -904,7 +899,7 @@ static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc,
 	fprintf2(stderr, ANSI_MAGENTA "trace " ANSI_RESET);
     
     JSValue err = JS_NewError(ctx);
-    JSValue stack = JS_GetPropertyStr(ctx, err, "stack");
+    JSValue stack = JS_GetProperty(ctx, err, JS_ATOM_stack);
     if (JS_IsString(stack)) {
         const char* s = JS_ToCString(ctx, stack);
         if (s) {

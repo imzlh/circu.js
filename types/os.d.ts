@@ -324,6 +324,11 @@ declare namespace CModuleOS {
      */
     function availableParallelism(): number;
 
+    /**
+     * 休眠指定时间。注意是线程级别的睡眠，job不会进行
+     */
+    function sleep(ms: number): void;
+
     // ==================== 网络信息 ====================
 
     /**

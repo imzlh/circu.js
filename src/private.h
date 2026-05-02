@@ -125,7 +125,7 @@ void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
 void tjs__mod_http_init(JSContext *ctx, JSValue ns);
-void tjs__mod_pty_init(JSContext *ctx, JSValue ns);
+
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
@@ -154,6 +154,7 @@ JSValue tjs_throw_errno(JSContext *ctx, int err);
 
 JSValue tjs_new_pipe(JSContext *ctx);
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);
+uv_pipe_t *tjs_pipe_get_pipe(JSContext *ctx, JSValue obj);
 
 void tjs__execute_jobs(JSContext *ctx);
 JSModuleDef *tjs__load_builtin(JSContext *ctx, const char *name);

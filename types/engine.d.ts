@@ -72,7 +72,7 @@ declare namespace CModuleEngine {
         [EventType.PROMISE]: [this: Promise, error: Error | any],
         [EventType.EXIT]: number,
         [EventType.UNHANDLED_REJECTION]: [this: Promise, state: PromiseState, parent: Promise],
-        [EventType.JOB_EXCEPTION]: [error: Error | any],
+        [EventType.JOB_EXCEPTION]: Error | unknown,
         [EventType.LOAD]: undefined
     }
 

@@ -57,7 +57,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "http", tjs__mod_http_init, true },
 	{ "os", tjs__mod_os_init, true },
 	{ "process", tjs__mod_process_init, true },
-	{ "pty", tjs__mod_pty_init, true },
+	/* pty merged into process module */
 	{ "signals", tjs__mod_signals_init, false }, // worker is not allowed to control process behavior
 	{ "sourcemap", tjs__mod_sourcemap_init, true },
 	{ "sqlite3", tjs__mod_sqlite3_init, true },

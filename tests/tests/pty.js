@@ -1,7 +1,4 @@
 // tests/tests/pty.js - PTY module tests
-
-import { readOnce } from "../polyfill/stream.read.js";
-
 const pty = import.meta.use('pty');
 const sys = import.meta.use('sys');
 const streams = import.meta.use('streams');
@@ -12,13 +9,15 @@ const timer = import.meta.use('timers');
 
 const { openpty, resize } = pty;
 const { Pipe } = streams;
+console.log(pty)
 
 // ========== Basic PTY Creation ==========
 await test('pty.openpty - basic creation', async () => {
-    const ptyInfo = await openpty({
+    const ptyInfo = openpty({
+        argv: [],
         cols: 80,
         rows: 24,
-        name: sys.platform === 'win32' ? 'cmd.exe' : '/bin/bash',
+        name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/bin/bash',
         cwd: os.cwd,
         env: {}
     });
@@ -26,7 +25,7 @@ await test('pty.openpty - basic creation', async () => {
     assert(ptyInfo.fd > 0, 'File descriptor should be positive');
     assert(ptyInfo.pid > 0, 'Process ID should be positive');
     
-    if (sys.platform === 'win32') {
+    if (sys.platform === 'Windows_NT') {
         assert(ptyInfo.pty !== undefined, 'Should have pty handle on Windows');
     }
 });
@@ -45,7 +44,7 @@ await test('pty.resize - resize with fd', async () => {
         rows: 24
     });
 
-    if (sys.platform === 'win32') {
+    if (sys.platform === 'Windows_NT') {
         resize(ptyInfo.fd, 120, 40, ptyInfo.pty);
     } else {
         resize(ptyInfo.fd, 120, 40);
@@ -67,8 +66,8 @@ await test('pty.getwinsize - query window size', async () => {
 // ========== PTY Command Execution ==========
 await test('pty.openpty - execute command', async () => {
     const ptyInfo = await openpty({
-        name: sys.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
-        argv: sys.platform === 'win32' ? ['/c', 'echo Hello PTY'] : ['-c', 'echo "Hello PTY"'],
+        name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/bin/sh',
+        argv: sys.platform === 'Windows_NT' ? ['/c', 'echo Hello PTY'] : ['-c', 'echo "Hello PTY"'],
         env: {}
     });
 
@@ -81,7 +80,7 @@ await test('pty.openpty - execute command', async () => {
     
     while (Date.now() - startTime < timeout) {
         const data = new Uint8Array(1024);
-        const n = await readOnce(pipe, data);
+        const n = await pipe.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -100,7 +99,7 @@ await test('pty.openpty - execute command', async () => {
 
 // ========== PTY Interactive Session ==========
 await test('pty.openpty - interactive session', async () => {
-    if (sys.platform === 'win32') {
+    if (sys.platform === 'Windows_NT') {
         return;
     }
     
@@ -118,7 +117,7 @@ await test('pty.openpty - interactive session', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await readOnce(pipe, data);
+        const n = await pipe.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             if (text.includes('TEST$') || text.includes('$') || text.includes('#')) {
@@ -142,8 +141,8 @@ await test('pty.openpty - environment variables', async () => {
     };
     
     const ptyInfo = await openpty({
-        name: sys.platform === 'win32' ? 'cmd.exe' : '/usr/bin/env',
-        argv: sys.platform === 'win32' ? ['/c', 'set'] : [],
+        name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/usr/bin/env',
+        argv: sys.platform === 'Windows_NT' ? ['/c', 'set'] : [],
         env: testEnv
     });
 
@@ -155,7 +154,7 @@ await test('pty.openpty - environment variables', async () => {
     
     while (Date.now() - startTime < 3000) try{
         const data = new Uint8Array(1024);
-        const n = await readOnce(pipe, data);
+        const n = await pipe.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -175,10 +174,10 @@ await test('pty.openpty - environment variables', async () => {
 
 // ========== PTY Working Directory ==========
 await test('pty.openpty - working directory', async () => {
-    const testDir = sys.platform === 'win32' ? 'C:\\Windows\\Temp' : '/tmp';
+    const testDir = sys.platform === 'Windows_NT' ? 'C:\\Windows\\Temp' : '/tmp';
     
     const ptyInfo = await openpty({
-        name: sys.platform === 'win32' ? 'cmd.exe' : '/bin/pwd',
+        name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/bin/pwd',
         cwd: testDir,
         env: {}
     });
@@ -191,7 +190,7 @@ await test('pty.openpty - working directory', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await readOnce(pipe, data);
+        const n = await pipe.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;
@@ -237,7 +236,7 @@ await test('pty.openpty - invalid command error', async () => {
 await test('pty.openpty - invalid directory error', async () => {
     try {
         await openpty({
-            name: sys.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
+            name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/bin/sh',
             cwd: '/invalid/nonexistent/directory'
         });
         
@@ -250,12 +249,12 @@ await test('pty.openpty - invalid directory error', async () => {
 // ========== PTY Integration with Process Module ==========
 await test('pty - integration with process module', async () => {
     const ptyInfo = await openpty({
-        name: sys.platform === 'win32' ? 'cmd.exe' : '/bin/sleep',
-        argv: sys.platform === 'win32' ? ['/c', 'timeout', '2'] : ['2']
+        name: sys.platform === 'Windows_NT' ? 'cmd.exe' : '/bin/sleep',
+        argv: sys.platform === 'Windows_NT' ? ['/c', 'timeout', '2'] : ['2']
     });
 
     const childProcess = proc.spawn(
-        sys.platform === 'win32'
+        sys.platform === 'Windows_NT'
             ? ['tasklist', '/fi', `PID eq ${ptyInfo.pid}`]
             : ['ps', '-p', ptyInfo.pid.toString()],
         { stdout: 'pipe' }
@@ -264,7 +263,7 @@ await test('pty - integration with process module', async () => {
     let processOutput = '';
     const data = new Uint8Array(1024);
     while (true) {
-        const n = await readOnce(childProcess.stdout, data);
+        const n = await childProcess.stdout.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             processOutput += text;
@@ -278,7 +277,7 @@ await test('pty - integration with process module', async () => {
 
 // ========== PTY Input/Output ==========
 await test('pty - input and output', async () => {
-    if (sys.platform === 'win32') {
+    if (sys.platform === 'Windows_NT') {
         return;
     }
     
@@ -298,7 +297,7 @@ await test('pty - input and output', async () => {
     
     while (Date.now() - startTime < 3000) {
         const data = new Uint8Array(1024);
-        const n = await readOnce(pipe, data);
+        const n = await pipe.read(data);
         if (n) {
             const text = engine.decodeString(data.subarray(0, n));
             output += text;

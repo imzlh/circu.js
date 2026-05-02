@@ -1,5 +1,3 @@
-import { readOnce } from "../polyfill/stream.read.js";
-
 const { TCP } = import.meta.use('streams');
 const { resolve } = import.meta.use('dns');
 const { Parser, REQUEST, RESPONSE, strerr, strstatus } = import.meta.use('http');
@@ -269,7 +267,7 @@ await test(async () => {
     };
 
     const respBuf = new Uint8Array(4096);
-    const respBytes = await readOnce(client, respBuf);
+    const respBytes = client.read(respBuf);
     if (respBytes) {
         responseParser.execute(respBuf.slice(0, respBytes));
     }

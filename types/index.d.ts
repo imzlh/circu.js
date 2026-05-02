@@ -12,7 +12,6 @@ interface TjsModules {
     fswatch: typeof CModuleFSWatch,
     os: typeof CModuleOS,
     process: typeof CModuleProcess,
-    pty: typeof CModulePty,
     signals: typeof CModuleSignals,
     sqlite3: typeof CModuleSQLite3,
     streams: typeof CModuleStreams,
