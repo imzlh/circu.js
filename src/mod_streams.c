@@ -132,15 +132,6 @@ static inline int stream_get_fd(TJSStream *s) {
 #endif
 }
 
-static inline void close_fd(int fd) {
-#ifndef _WIN32
-    close(fd);
-#else
-    closesocket((SOCKET)fd);
-#endif
-}
-
-
 #pragma endregion
 #pragma callbacks
 static void uv__close_cb(uv_handle_t *handle) {
@@ -550,6 +541,9 @@ static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSVa
 
 /* readSync(buf) → number of bytes read, or null on EOF */
 static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef _WIN32
+    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitIO() instead");
+#else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -561,18 +555,17 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!buf) return JS_EXCEPTION;
 
     ssize_t n;
-#ifndef _WIN32
     n = read(fd, buf, sz);
     if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-#else
-    n = recv((SOCKET)fd, (char *)buf, (int)sz, 0);
-    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
-#endif
     return n == 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)n);
+#endif
 }
 
 /* writeSync(buf) → number of bytes written */
 static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef _WIN32
+    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitIO() instead");
+#else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -584,14 +577,10 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
     if (!buf) return JS_EXCEPTION;
 
     ssize_t n;
-#ifndef _WIN32
-    n = write(fd, buf, sz);
-    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-#else
     n = send((SOCKET)fd, (const char *)buf, (int)sz, 0);
     if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
-#endif
     return JS_NewInt64(ctx, n);
+#endif
 }
 
 

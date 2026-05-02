@@ -108,7 +108,6 @@ static JSValue tjs_udp_close(JSContext *ctx, JSValue this_val, int argc, JSValue
         JSValue arg = JS_NewObjectProto(ctx, JS_NULL);
         JS_DefinePropertyValueStr(ctx, arg, "nread", JS_NULL, JS_PROP_C_W_E);
         TJS_SettlePromise(ctx, &u->read.result, false, 1, &arg);
-        TJS_ClearPromise(ctx, &u->read.result);
     }
     maybe_close(u);
     return JS_UNDEFINED;
@@ -147,7 +146,6 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
     }
 
     TJS_SettlePromise(ctx, &u->read.result, is_reject, 1, &arg);
-    TJS_ClearPromise(ctx, &u->read.result);
 
     JS_FreeValue(ctx, u->read.b.tarray);
     u->read.b.tarray = JS_UNDEFINED;

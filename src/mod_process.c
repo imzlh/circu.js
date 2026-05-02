@@ -312,7 +312,6 @@ static void uv__exit_cb(uv_process_t *handle, int64_t exit_status, int term_sign
         JS_DefinePropertyValueStr(ctx, arg, "term_signal", term_signal, JS_PROP_C_W_E);
 
         TJS_SettlePromise(ctx, &p->status.result, false, 1, &arg);
-        TJS_ClearPromise(ctx, &p->status.result);
     }
 
     JS_FreeValue(ctx, p->obj);

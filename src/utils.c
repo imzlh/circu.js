@@ -217,9 +217,8 @@ void TJS_SettlePromise(JSContext *ctx, TJSPromise *p, bool is_reject, int argc, 
         JS_FreeValue(ctx, argv[i]);
     }
     JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
-    JS_FreeValue(ctx, p->rfuncs[0]);
-    JS_FreeValue(ctx, p->rfuncs[1]);
     TJS_FreePromise(ctx, p);
+    TJS_ClearPromise(ctx, p);
 }
 
 void TJS_ResolvePromise(JSContext *ctx, TJSPromise *p, int argc, JSValue *argv) {

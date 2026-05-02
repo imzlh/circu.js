@@ -633,12 +633,12 @@ static JSValue tjs_immutArrayBuffer(JSContext *ctx, JSValue this_val, int argc, 
 }
 
 static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *argv) {
-	if (argc == 0 || !JS_IsPromise(argv[0])) 
+	if (argc == 0 || !JS_IsPromise(argv[0]))
 		return JS_ThrowTypeError(ctx, "not a Promise.");
 
 	JS_DupValue(ctx, argv[0]);
 	JSValue abort_check = argc >= 2 && JS_IsFunction(ctx, argv[1]) ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
-	
+
 	// call uv_run to make promise sync
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	uv_loop_t* loop = TJS_GetLoop(trt);
@@ -646,9 +646,18 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	trt->jobs.paused = true;
 	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
 		uv_run(loop, UV_RUN_ONCE);
-		if (!JS_IsUndefined(abort_check) && JS_IsEqual(ctx, 
-			JS_Call(ctx, abort_check, this_val, 0, NULL), JS_TRUE
-		)) break;
+		if (!JS_IsUndefined(abort_check)) {
+			JSValue ret = JS_Call(ctx, abort_check, this_val, 0, NULL);
+			if (JS_IsException(ret)) {
+				JS_FreeValue(ctx, ret);
+				break;
+			}
+			if (JS_IsEqual(ctx, ret, JS_TRUE) == 1) {
+				JS_FreeValue(ctx, ret);
+				break;
+			}
+			JS_FreeValue(ctx, ret);
+		}
 	}
 	trt->jobs.paused = false;
 	tjs__execute_jobs(ctx);

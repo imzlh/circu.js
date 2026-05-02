@@ -37,7 +37,7 @@
 #include "wasm_export.h"
 #endif
 
-#define TJS__DEFAULT_STACK_SIZE 1024 * 1024  // 1 MB
+#define TJS__DEFAULT_STACK_SIZE 896 * 1024  // 1 MB may crash, downgrade to 896k
 
 int8_t vm_exit_code;
 static int tjs__argc = 0;
@@ -489,17 +489,17 @@ void tjs__execute_jobs(JSContext *ctx) {
         err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (err <= 0) {
             if (err < 0) {
-				JSValue err = JS_GetException(ctx1);
-				JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
-				JS_FreeValue(ctx, err);
-				if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+				JSValue js_err = JS_GetException(ctx1);
+				JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
+				if (JS_IsEqual(ctx1, retv, JS_FALSE)) {
 #ifdef DEBUG
 					fprintf(stderr, "[CORE] JOB: ");
-					tjs_dump_error1(ctx, err);
+					tjs_dump_error1(ctx1, js_err);
 #endif
 					TJS_Stop(trt);
 				}
-				JS_FreeValue(ctx, retv);
+				JS_FreeValue(ctx1, js_err);
+				JS_FreeValue(ctx1, retv);
             }
 
             break;

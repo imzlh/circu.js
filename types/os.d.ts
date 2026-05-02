@@ -1,6 +1,6 @@
 /**
  * OS 模块 - 提供系统级操作和信息查询
- * 
+ *
  * @remarks
  * 此模块封装了 libuv 的系统调用，提供跨平台能力。
  * 所有操作均为**同步**，因为底层操作系统调用本身是同步的。
@@ -41,13 +41,34 @@ declare namespace CModuleOS {
      * 系统信息（uname 结果）
      */
     interface SystemInfo {
-        /** 操作系统名称（如 'Linux', 'Darwin'） */
+        /**
+         * 操作系统名称
+         * - Windows (MSVC): `'Windows_NT'`
+         * - Windows (MinGW): `'MINGW32_NT-{major}.{minor}'`
+         * - Linux: `'Linux'`
+         * - macOS: `'Darwin'`
+         */
         readonly sysname: string;
-        /** 发行版（如 '5.10.0-21-amd64'） */
+        /**
+         * 内核版本
+         * - Windows: `'{major}.{minor}.{build}'`（如 `'10.0.19041'`）
+         * - Linux: 内核版本字符串（如 `'5.10.0-21-amd64'`）
+         * - macOS: Darwin 内核版本（如 `'21.6.0'`）
+         */
         readonly release: string;
-        /** 版本信息 */
+        /**
+         * 版本/发行版信息
+         * - Windows: 注册表 ProductName（如 `'Windows 10 Pro'`、`'Windows 11 Home'`），
+         *   Build >= 22000 时自动将 "Windows 10" 修正为 "Windows 11"；可能附带 Service Pack
+         * - Linux: `#version SMP ...` 格式的内核构建信息
+         * - macOS: `'Mac OS X 12.x'` 或类似
+         */
         readonly version: string;
-        /** 机器架构（如 'x86_64', 'arm64'） */
+        /**
+         * 机器硬件架构
+         * - `'x86_64'` / `'ia64'` / `'i386'`~`'i686'` / `'mips'` / `'alpha'` / `'powerpc'` / `'sh'` / `'arm'` / `'unknown'`
+         * - Linux/macOS 还可能为 `'aarch64'`、`'arm64'` 等
+         */
         readonly machine: string;
     }
 
@@ -69,47 +90,90 @@ declare namespace CModuleOS {
         readonly scopeId?: number;
     }
 
+    /**
+     * 内存使用信息
+     * 所有值均为字节数
+     */
     interface MemoryUsage {
-        /** 操作系统可用内存 */
+        /** 操作系统可用内存（uv_get_available_memory） */
         "os.free": number;
-        /** 操作系统总内存 */
+        /** 操作系统总内存（uv_get_total_memory） */
         "os.total": number;
-        /** 操作系统受限内存 */
+        /** 操作系统受限内存（uv_get_constrained_memory） */
         "os.constrained": number;
-        /** 进程常驻内存大小 */
+        /** 进程常驻内存集（uv_resident_set_memory） */
         "os.rss": number;
-        /** 操作系统已用内存 */
+        /** 操作系统已用内存（total - free） */
         "os.used": number;
-        
-        /** 虚拟机已用内存 */
+
+        /** QuickJS 虚拟机已用内存（memory_used_size） */
         "vm.used": number;
-        
-        /** 堆内存使用量 */
+
+        /** 堆内存使用量（malloc_size） */
         "used": number;
-        /** 堆内存限制 */
+        /** 堆内存限制（malloc_limit） */
         "limit": number;
-        
-        /** 字符串使用量 */
+
+        /** 字符串占用字节数（str_size） */
         "string.used": number;
-        /** 字符串数量 */
+        /** 字符串数量（str_count） */
         "string.count": number;
-        
-        /** 缓冲区使用量 */
+
+        /** 二进制对象占用字节数（binary_object_size） */
         "buffer.used": number;
-        /** 缓冲区数量 */
+        /** 二进制对象数量（binary_object_count） */
         "buffer.count": number;
-        
-        /** 对象数量 */
+
+        /** JS 对象数量（obj_count） */
         "object.count": number;
-        /** 对象使用量 */
+        /** JS 对象占用字节数（obj_size） */
         "object.used": number;
+    }
+
+    /**
+     * CPU 核心信息
+     */
+    interface CpuInfo {
+        /** CPU 型号标识（如 'AMD Ryzen 9 5950X 16-Core Processor'） */
+        readonly model: string;
+        /** 时钟频率（MHz） */
+        readonly speed: number;
+        /** 各状态累计时间（毫秒） */
+        readonly times: {
+            /** 用户态时间 */
+            readonly user: number;
+            /** nice 低优先级用户态时间 */
+            readonly nice: number;
+            /** 内核态时间 */
+            readonly sys: number;
+            /** 空闲时间 */
+            readonly idle: number;
+            /** 硬件中断时间 */
+            readonly irq: number;
+        };
     }
 
     /**
      * 系统负载平均值
      * @example [1.5, 1.2, 0.8] // 1分钟, 5分钟, 15分钟平均值
+     * @remarks Windows 下始终返回 [0, 0, 0]
      */
     type LoadAverage = [number, number, number];
+
+    /**
+     * guessHandle 返回的文件描述符类型
+     */
+    type HandleType = 'tty' | 'pipe' | 'file' | 'tcp' | 'udp' | 'unknown';
+
+    /**
+     * 平台标识字符串
+     * - Windows: `'windows'`
+     * - Linux: `'linux'`
+     * - macOS: `'darwin'`
+     * - FreeBSD: `'freebsd'`
+     * - 其他: 对应 CMAKE_SYSTEM_NAME 的小写形式
+     */
+    const platform: string;
 
     // ==================== 进程控制 ====================
 
@@ -144,16 +208,17 @@ declare namespace CModuleOS {
      * @param fd 文件描述符（如 0, 1, 2）
      * @returns 描述符类型
      */
-    function guessHandle(fd: number): 'tty' | 'pipe' | 'file' | 'tcp' | 'udp' | 'unknown';
+    function guessHandle(fd: number): HandleType;
 
     // ==================== 环境变量 ====================
 
     /**
      * 获取环境变量（同步）
      * @param name 变量名（如 'PATH'）
-     * @returns 变量值，不存在则返回 null
+     * @returns 变量值
+     * @throws {Error} 变量不存在时抛出 errno 异常
      */
-    function getenv(name: string): string | null;
+    function getenv(name: string): string;
 
     /**
      * 设置环境变量（同步）
@@ -166,6 +231,7 @@ declare namespace CModuleOS {
     /**
      * 删除环境变量（同步）
      * @param name 变量名
+     * @throws {Error} 删除失败时抛出异常
      */
     function unsetenv(name: string): void;
 
@@ -186,6 +252,7 @@ declare namespace CModuleOS {
     /**
      * 更改当前工作目录（同步）
      * @param dir 新目录路径
+     * @throws {Error} 目录不存在或无权限时抛出异常
      */
     function chdir(dir: string): void;
 
@@ -199,12 +266,12 @@ declare namespace CModuleOS {
     /**
      * 用户主目录路径（getter属性）
      */
-    const homedir: string;
+    const homeDir: string;
 
     /**
      * 系统临时目录路径（getter属性）
      */
-    const tmpdir: string;
+    const tmpDir: string;
 
     // ==================== 随机数 ====================
 
@@ -212,7 +279,7 @@ declare namespace CModuleOS {
      * 生成密码学安全随机数据（同步）
      * @param buffer 目标缓冲区（Uint8Array或ArrayBuffer）
      * @param offset 起始偏移（默认0）
-     * @param length 生成长度（默认buffer长度）
+     * @param length 生成长度（默认buffer长度减去offset）
      * @throws {RangeError} offset+length超出边界
      * @example
      * const buf = new Uint8Array(32);
@@ -230,27 +297,18 @@ declare namespace CModuleOS {
      * 获取CPU信息（同步）
      * @returns 每个CPU核心的详细信息
      */
-    function cpuInfo(): Array<{
-        model: string;
-        speed: number; // MHz
-        times: {
-            user: number;
-            nice: number;
-            sys: number;
-            idle: number;
-            irq: number;
-        };
-    }>;
+    function cpuInfo(): CpuInfo[];
 
     /**
-     * 注意：这是一个getter属性
      * 获取JS/OS内存信息（同步）
+     * @returns 内存使用详情，所有值为字节数
      */
     function memoryUsage(): MemoryUsage;
 
     /**
      * 获取系统负载平均值（同步）
      * @returns [1分钟, 5分钟, 15分钟]平均值
+     * @remarks Windows 下始终返回 [0, 0, 0]
      */
     function loadavg(): LoadAverage;
 
@@ -271,7 +329,7 @@ declare namespace CModuleOS {
     /**
      * 主机名（getter属性）
      */
-    const hostname: string;
+    const hostName: string;
 
     // ==================== 进程信息 ====================
 
@@ -291,8 +349,7 @@ declare namespace CModuleOS {
     const userInfo: UserInfo;
 
     /**
-     * 获取当前可执行文件的路径
-     * @returns 返回当前可执行文件的路径。
+     * 当前可执行文件路径（getter属性）
      */
     const exePath: string;
 
