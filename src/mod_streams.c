@@ -577,8 +577,8 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
     if (!buf) return JS_EXCEPTION;
 
     ssize_t n;
-    n = send((SOCKET)fd, (const char *)buf, (int)sz, 0);
-    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
+    n = write(fd, buf, sz);
+    if (n < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
     return JS_NewInt64(ctx, n);
 #endif
 }
