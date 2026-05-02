@@ -80,33 +80,6 @@ const STYLE_MAP: Record<TokenStyle, keyof typeof COLOR> = {
     function: 'brightYellow', type: 'brightMagenta', identifier: 'brightGreen',
     error: 'red', directive: 'gray'
 };
-
-class TerminalController {
-    #tty?: CModuleStreams.TTY;
-
-    constructor(private fd: number) {
-        if (os.guessHandle(fd) === 'tty') {
-            this.#tty = new streams.TTY(fd, true);
-            this.#tty.setMode(streams.TTY_MODE_RAW);
-        }
-    }
-
-    get isTTY() { return !!this.#tty; }
-
-    get size() {
-        if (!this.#tty) return { width: 80, height: 24 };
-        return this.#tty.size;
-    }
-
-    [Symbol.dispose]() {
-        // Disable bracketed paste mode before exiting
-        if (this.#tty) {
-            this.#tty.write(engine.encodeString('\x1b[?2004l'));
-        }
-        this.#tty?.setMode(streams.TTY_MODE_NORMAL);
-    }
-}
-
 function getenv(env: string) {
     try {
         return os.getenv(env);
@@ -416,9 +389,9 @@ class CJSRepl {
     #running = true;
 
     // Terminal
-    #term: TerminalController;
-    #stdin: CModuleStreams.Stream;
-    #stdout: CModuleStreams.Pipe;
+    #stdin: CModuleStreams.Pipe | CModuleStreams.Stream;
+    #stdout: CModuleStreams.Pipe | CModuleStreams.Stream;
+    #isatty: boolean = false;
     #termWidth = 80;
     #termCursorX = 0;
 
@@ -443,29 +416,40 @@ class CJSRepl {
     #evalStartTime = 0;
 
     constructor() {
-        this.#stdout = new streams.Pipe();
-        this.#stdout.open(os.STDOUT_FILENO);
-
-        this.#term = new TerminalController(os.STDIN_FILENO);
-        this.#termWidth = this.#term.size.width;
-
-        if (this.#term.isTTY) {
-            this.#stdin = new streams.TTY(os.STDIN_FILENO, true);
+        // Set up stdout: use TTY for terminal, Pipe for redirection
+        if (os.guessHandle(os.STDOUT_FILENO) === 'tty') {
+            this.#stdout = new streams.TTY(os.STDOUT_FILENO, false);
         } else {
-            this.#stdin = new streams.Pipe();
-            (this.#stdin as CModuleStreams.Pipe).open(os.STDIN_FILENO);
+            const pipe = new streams.Pipe();
+            pipe.open(os.STDOUT_FILENO);
+            this.#stdout = pipe as unknown as CModuleStreams.Stream;
+        }
+
+        if (os.guessHandle(os.STDIN_FILENO) === 'tty') {
+            const stdin = this.#stdin = new streams.TTY(os.STDIN_FILENO, true);
+            stdin.setMode(streams.TTY_MODE_RAW);
+            this.#isatty = true;
+        } else {
+            const pipe = new streams.Pipe();
+            pipe.open(os.STDIN_FILENO);
+            this.#stdin = pipe;
+            console.warn('stdin is not a TTY, some features may not work');
         }
 
         // Cleanup on exit
         this.#onExit(() => {
-            this.#term[Symbol.dispose]();
+        // Disable bracketed paste mode before exiting
+            if (this.#isatty) {
+                this.#stdin.write(engine.encodeString('\x1b[?2004l'));
+                (this.#stdin as CModuleStreams.TTY).setMode(streams.TTY_MODE_NORMAL);
+            }
         });
     }
 
     async start(): Promise<void> {
         await this.#print('Circu.js REPL. enter ".help" for help.\n');
         // Enable bracketed paste mode
-        if (this.#term.isTTY) {
+        if (this.#isatty) {
             await this.#print('\x1b[?2004h');
         }
         this.#readInput();
@@ -497,15 +481,14 @@ class CJSRepl {
     }
 
     async #readInput(): Promise<void> {
-        const buf = new Uint8Array(256);
         this.#stdin.onread = (res: null | undefined | Uint8Array, err: undefined | CModuleError.Error) => {
             if (!res) {
                 console.error('Failed to read from console:', err ?? 'EOF');
                 os.exit(1);
                 throw 0;    // fallback
             }
-            for (let i = 0 ; i < res.length && this.#running ; i ++)
-                this.#handleByte(buf[i]!);
+            for (let i = 0; i < res.length && this.#running; i++)
+                this.#handleByte(res[i]!);
             if (!this.#running) this.#stdin.stopRead();
         };
         this.#stdin.startRead();
@@ -1047,7 +1030,7 @@ class CJSRepl {
     }
 
     // ==================== Utilities ====================
-    async #write(buf:Uint8Array) {
+    async #write(buf: Uint8Array) {
         return this.#stdout.write(buf);
     }
 
@@ -1088,11 +1071,11 @@ class CJSRepl {
         }
     }
 
-    exportHistory(){
+    exportHistory() {
         return this.#history;
     }
 
-    importHistory(history: string[]){
+    importHistory(history: string[]) {
         this.#history = history;
     }
 }
@@ -1104,16 +1087,19 @@ engine.onEvent(e => false);
 const repl = new CJSRepl();
 repl.start().then(() => {
     const history = repl.exportHistory();
-    sfs.writeFile(home + '/.cjs_history', engine.encodeString(history.join('\n')), 0o600);
+    if (home) sfs.writeFile(home + '/.cjs_history', engine.encodeString(history.join('\n')), 0o600);
 });
 
 // Load History
-const home = os.getenv('HOME') || os.getenv('USERPROFILE');
-if (home) try{
-    const file = await fs.readFile(home + '/.cjs_history');
+let home: undefined | string;
+try {
+    const uhome = os.getenv('HOME') || os.getenv('USERPROFILE');
+    if (!uhome) throw 0; // no home
+    home = sfs.realpath(uhome);
+    const file = await fs.readFile(uhome + '/.cjs_history');
     const lines = engine.decodeString(file).split('\n');
     repl.importHistory(lines);
-} catch {}
+} catch { }
 
 // bind exit handler
 signal.signal(signal.signals.SIGINT, () => {

@@ -178,8 +178,8 @@ JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
     if (JS_IsException(p->p)) {
         return JS_EXCEPTION;
     }
-    p->rfuncs[0] = JS_DupValue(ctx, rfuncs[0]);
-    p->rfuncs[1] = JS_DupValue(ctx, rfuncs[1]);
+    p->rfuncs[0] = rfuncs[0];
+    p->rfuncs[1] = rfuncs[1];
     return JS_DupValue(ctx, p->p);
 }
 

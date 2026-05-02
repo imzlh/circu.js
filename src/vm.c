@@ -37,7 +37,7 @@
 #include "wasm_export.h"
 #endif
 
-#define TJS__DEFAULT_STACK_SIZE 896 * 1024  // 1 MB may crash, downgrade to 896k
+#define TJS__DEFAULT_STACK_SIZE 4 * 1024 * 1024  // 4MB
 
 int8_t vm_exit_code;
 static int tjs__argc = 0;

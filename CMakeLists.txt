@@ -342,6 +342,12 @@ set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
 )
 
+# Increase stack size for MSVC (default 1MB is too small for deep recursion
+# in the TypeScript compiler when parsing large files like repl.ts)
+if(MSVC)
+    target_link_options(cjs-cli PRIVATE "/STACK:8388608")
+endif()
+
 if(WIN32)
     add_executable(align_binary EXCLUDE_FROM_ALL cmake/align_binary.c)
     add_custom_command(TARGET cjs-cli POST_BUILD
@@ -354,3 +360,6 @@ add_executable(cjsc EXCLUDE_FROM_ALL
     src/qjsc.c
 )
 target_link_libraries(cjsc qjs)
+if(MSVC)
+    target_link_options(cjsc PRIVATE "/STACK:8388608")
+endif()

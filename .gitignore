@@ -13,3 +13,4 @@ cjs
 *.log
 .codeartsdoer
 api/
+**/*.lock
