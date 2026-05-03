@@ -356,9 +356,9 @@ static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 
 static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf, 
                         const InspectOptions* opts) {
-    JSValue name = JS_GetPropertyStr(ctx, val, JS_ATOM_name);
+    JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     JSValue msg = JS_GetProperty(ctx, val, JS_ATOM_message);
-    JSValue stack = JS_GetPropertyStr(ctx, val, JS_ATOM_stack);
+    JSValue stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
     
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     const char* msg_str = JS_IsString(msg) ? JS_ToCString(ctx, msg) : NULL;
