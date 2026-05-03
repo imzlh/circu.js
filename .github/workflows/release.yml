@@ -12,6 +12,8 @@ jobs:
   build-linux-x86_64:
     name: Linux x86_64
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +44,8 @@ jobs:
   build-linux-arm64:
     name: Linux ARM64
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,8 +57,8 @@ jobs:
           sudo dpkg --add-architecture arm64
           sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
           echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
-          sudo apt update || true
-          sudo apt install -y libsqlite3-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 libexpat1-dev:arm64 libcurl4-openssl-dev:arm64 libffi-dev:arm64 || true
+          sudo apt update
+          sudo apt install -y libsqlite3-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 libexpat1-dev:arm64 libcurl4-openssl-dev:arm64 libffi-dev:arm64
       - name: Build with cross toolchain
         run: |
           cmake -B build -G Ninja \
@@ -64,25 +68,24 @@ jobs:
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DBUILD_WITH_CURL=OFF
-          cmake --build build || echo "Cross compile may fail due to missing libs"
+          cmake --build build
       - name: Package
-        if: success()
         run: |
           mkdir -p dist/cjs-linux-arm64
           cp build/cjs dist/cjs-linux-arm64/
-          aarch64-linux-gnu-strip dist/cjs-linux-arm64/cjs || true
+          aarch64-linux-gnu-strip dist/cjs-linux-arm64/cjs
           cd dist && tar czf cjs-linux-arm64.tar.gz cjs-linux-arm64
       - name: Upload artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cjs-linux-arm64
           path: dist/cjs-linux-arm64.tar.gz
-          if-no-files-found: ignore
 
   build-linux-armv7:
     name: Linux ARMv7
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,21 +103,18 @@ jobs:
             -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
             -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
             -DBUILD_WITH_CURL=OFF
-          cmake --build build || echo "Cross compile may fail due to missing libs"
+          cmake --build build
       - name: Package
-        if: success()
         run: |
           mkdir -p dist/cjs-linux-armv7
           cp build/cjs dist/cjs-linux-armv7/
-          arm-linux-gnueabihf-strip dist/cjs-linux-armv7/cjs || true
+          arm-linux-gnueabihf-strip dist/cjs-linux-armv7/cjs
           cd dist && tar czf cjs-linux-armv7.tar.gz cjs-linux-armv7
       - name: Upload artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cjs-linux-armv7
           path: dist/cjs-linux-armv7.tar.gz
-          if-no-files-found: ignore
 
   build-linux-musl:
     name: Linux Musl ${{ matrix.target }}
@@ -176,25 +176,24 @@ jobs:
             -DCMAKE_AR=$AR \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_WITH_CURL=OFF
-          cmake --build build 2>&1 || echo "Build may fail for some archs, continuing..."
+          cmake --build build
       - name: Package
-        if: success()
         run: |
           mkdir -p dist/cjs-linux-musl-${{ matrix.target }}
-          cp build/cjs dist/cjs-linux-musl-${{ matrix.target }}/ 2>/dev/null || true
-          /opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip dist/cjs-linux-musl-${{ matrix.target }}/cjs 2>/dev/null || true
-          cd dist && tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz cjs-linux-musl-${{ matrix.target }} || true
+          cp build/cjs dist/cjs-linux-musl-${{ matrix.target }}/
+          /opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip dist/cjs-linux-musl-${{ matrix.target }}/cjs
+          cd dist && tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz cjs-linux-musl-${{ matrix.target }}
       - name: Upload artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cjs-linux-musl-${{ matrix.target }}
-          path: dist/*.tar.gz
-          if-no-files-found: ignore
+          path: dist/cjs-linux-musl-${{ matrix.target }}.tar.gz
 
   build-macos-x86_64:
     name: macOS x86_64
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -223,6 +222,8 @@ jobs:
   build-macos-arm64:
     name: macOS ARM64
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -251,6 +252,8 @@ jobs:
   build-macos-universal:
     name: macOS Universal (x86_64 + ARM64)
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -286,6 +289,8 @@ jobs:
   build-windows-x86_64:
     name: Windows x86_64
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -304,16 +309,16 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" ^
+          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
             -DBUILD_WITH_CURL=ON
-          cmake --build build
+          cmake --build build --config Release
       - name: Package
         shell: cmd
         run: |
           mkdir dist\cjs-windows-x86_64
-          copy build\cjs.exe dist\cjs-windows-x86_64\
+          copy build\Release\cjs.exe dist\cjs-windows-x86_64\
           cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86_64 -DestinationPath cjs-windows-x86_64.zip"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -324,6 +329,8 @@ jobs:
   build-windows-x86:
     name: Windows x86
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -342,16 +349,16 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" ^
+          cmake -B build -G "Visual Studio 17 2022" -A Win32 ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
             -DBUILD_WITH_CURL=ON
-          cmake --build build
+          cmake --build build --config Release
       - name: Package
         shell: cmd
         run: |
           mkdir dist\cjs-windows-x86
-          copy build\cjs.exe dist\cjs-windows-x86\
+          copy build\Release\cjs.exe dist\cjs-windows-x86\
           cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86 -DestinationPath cjs-windows-x86.zip"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -362,6 +369,8 @@ jobs:
   build-windows-arm64:
     name: Windows ARM64
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -376,20 +385,20 @@ jobs:
           vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
       - name: Install dependencies via vcpkg
         run: |
-          vcpkg install sqlite3:arm64-windows openssl:arm64-windows zlib:arm64-windows expat:arm64-windows curl:arm64-windows libffi:arm64-windows || true
+          vcpkg install sqlite3:arm64-windows openssl:arm64-windows zlib:arm64-windows expat:arm64-windows curl:arm64-windows libffi:arm64-windows
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "NMake Makefiles" ^
+          cmake -B build -G "Visual Studio 17 2022" -A ARM64 ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_CURL=ON || echo "ARM64 may have missing packages"
-          cmake --build build
+            -DBUILD_WITH_CURL=ON
+          cmake --build build --config Release
       - name: Package
         shell: cmd
         run: |
           mkdir dist\cjs-windows-arm64
-          copy build\cjs.exe dist\cjs-windows-arm64\
+          copy build\Release\cjs.exe dist\cjs-windows-arm64\
           cd dist && powershell -Command "Compress-Archive -Path cjs-windows-arm64 -DestinationPath cjs-windows-arm64.zip"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
