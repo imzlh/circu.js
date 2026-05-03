@@ -86,46 +86,6 @@ declare namespace CModuleError {
         EHWPOISON: -4000;
     };
 
-    /**
-     * only available on windows
-     */
-    export const windows: undefined | {
-        WSAEINTR: 10004;
-        WSAEBADF: 10009;
-        WSAEACCES: 10013;
-        WSAEFAULT: 10014;
-        WSAEINVAL: 10022;
-        WSAEMFILE: 10024;
-        WSAEWOULDBLOCK: 10035;
-        WSAEINPROGRESS: 10036;
-        WSAEALREADY: 10037;
-        WSAENOTSOCK: 10038;
-        WSAEDESTADDRREQ: 10039;
-        WSAEMSGSIZE: 10040;
-        WSAEPROTOTYPE: 10041;
-        WSAENOPROTOOPT: 10042;
-        WSAEPROTONOSUPPORT: 10043;
-        WSAESOCKTNOSUPPORT: 10044;
-        WSAEOPNOTSUPP: 10045;
-        WSAEPFNOSUPPORT: 10046;
-        WSAEAFNOSUPPORT: 10047;
-        WSAEADDRINUSE: 10048;
-        WSAEADDRNOTAVAIL: 10049;
-        WSAENETDOWN: 10050;
-        WSAENETUNREACH: 10051;
-        WSAENETRESET: 10052;
-        WSAECONNABORTED: 10053;
-        WSAECONNRESET: 10054;
-        WSAENOBUFS: 10055;
-        WSAEISCONN: 10056;
-        WSAENOTCONN: 10057;
-        WSAESHUTDOWN: 10058;
-        WSAETIMEDOUT: 10060;
-        WSAECONNREFUSED: 10061;
-        WSAEHOSTDOWN: 10064;
-        WSAEHOSTUNREACH: 10065;
-    };
-
     export class Error extends globalThis.Error {
         /**
          * ERRNO code, mostly for syscall results.

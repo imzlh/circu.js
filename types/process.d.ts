@@ -16,20 +16,28 @@ declare namespace CModuleProcess {
     /**
      * spawn 配置选项
      */
-    export interface SpawnOptions {
+    export interface SpawnOptions<T> {
+        /** 标准输入文件描述符或模式 */
         stdin?: number | 'inherit' | 'pipe' | 'ignore';
+        /** 标准输出文件描述符或模式 */
         stdout?: number | 'inherit' | 'pipe' | 'ignore';
+        /** 标准错误文件描述符或模式 */
         stderr?: number | 'inherit' | 'pipe' | 'ignore';
+        /** 工作目录 */
         cwd?: string;
+        /** 环境变量 */
         env?: Record<string, string>;
+        /** 用户ID */
         uid?: number;
+        /** 组ID */
         gid?: number;
+        /** 是否独立运行 */
         detached?: boolean;
-        /** When true, spawn the process in a PTY */
-        pty?: boolean;
-        /** PTY columns (default 80) */
+        /** 是否使用 PTY 模式（默认 false） */
+        pty?: T;
+        /** PTY 列数（默认 80） */
         cols?: number;
-        /** PTY rows (default 24) */
+        /** PTY 行数（默认 24） */
         rows?: number;
     }
 
@@ -54,26 +62,26 @@ declare namespace CModuleProcess {
     /**
      * 子进程对象
      */
-    export interface ChildProcess {
+    export interface ChildProcess<PTY = false> {
         /** 进程ID */
         readonly pid: number;
-        /** 标准输入流（normal mode, stdin: pipe） */
-        readonly stdin?: Pipe;
-        /** 标准输出流（normal mode, stdout: pipe） */
-        readonly stdout?: Pipe;
-        /** 标准错误流（normal mode, stderr: pipe） */
-        readonly stderr?: Pipe;
+        /** 标准输入流（如果配置为 pipe） */
+        readonly stdin: PTY extends true ? undefined : Pipe;
+        /** 标准输出流（如果配置为 pipe） */
+        readonly stdout?: PTY extends true ? undefined : Pipe;
+        /** 标准错误流（如果配置为 pipe） */
+        readonly stderr?: PTY extends true ? undefined : Pipe;
 
         /**
          * PTY 可读流（仅 PTY 模式可用）
          * 在 Linux 上与 writable 是同一个对象
          */
-        readonly readable?: Pipe;
+        readonly readable?: PTY extends true ? Pipe : undefined;
         /**
          * PTY 可写流（仅 PTY 模式可用）
          * 在 Linux 上与 readable 是同一个对象
          */
-        readonly writable?: Pipe;
+        readonly writable?: PTY extends true ? Pipe : undefined;
 
         /**
          * 等待进程退出
@@ -98,22 +106,28 @@ declare namespace CModuleProcess {
          * @param cols 列数
          * @param rows 行数
          */
-        resize(cols: number, rows: number): void;
+        resize(cols: number, rows: number): PTY extends true ? void : never;
 
         /**
          * 获取 PTY 窗口大小（仅 PTY 模式可用）
-         * @returns 包含 cols, rows 的窗口大小对象
+         * @returns 包含 cols, rows, xpixel, ypixel 的窗口大小对象
          */
-        getwinsize(): WinSize;
+        get size():  PTY extends true ? WinSize : never;
     }
 
     /**
      * 创建子进程
      * @param args 命令字符串或参数数组（第一个元素是要执行的命令）
      * @param options 可选配置
-     * @returns 子进程对象
      */
-    export function spawn(args: string | string[], options?: SpawnOptions): ChildProcess;
+    export function spawn<T>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
+
+    /**
+     * 执行命令（spawn + wait 的简写）
+     * @param args 命令字符串或参数数组
+     * @param options 可选配置
+     */
+    export function exec(args: string | string[], options?: SpawnOptions<false>): ChildProcess;
 
     /**
      * 向指定进程发送信号

@@ -103,7 +103,7 @@ static inline TJSStream *stream_get_any(JSContext *ctx, JSValue obj) {
 /* Throw and return false if the handle is already closing. */
 static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
     if (uv_is_closing(&s->h.handle)) {
-        JS_ThrowInternalError(ctx, "stream is closed");
+        tjs_throw_errno(ctx, UV_ECONNRESET);
         return false;
     }
     return true;
@@ -679,7 +679,7 @@ static JSValue tjs_new_tcp(JSContext *ctx, int af) {
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
-        return JS_ThrowInternalError(ctx, "couldn't initialize TCP handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     return tjs_init_stream(ctx, obj, s);
@@ -831,7 +831,7 @@ static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc,
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
-        return JS_ThrowInternalError(ctx, "couldn't initialize TTY handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     return tjs_init_stream(ctx, obj, s);
@@ -892,7 +892,7 @@ JSValue tjs_new_pipe(JSContext *ctx) {
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(s);
-        return JS_ThrowInternalError(ctx, "couldn't initialize Pipe handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     return tjs_init_stream(ctx, obj, s);
