@@ -399,11 +399,14 @@ static int estimate_width(JSContext* ctx, JSValue val, int depth) {
     
     switch (JS_VALUE_GET_TAG(val)) {
 		case JS_TAG_INT:
+        case JS_TAG_SHORT_BIG_INT:
+        case JS_TAG_BIG_INT:
 		case JS_TAG_FLOAT64: return 10;
 		case JS_TAG_BOOL: return 5;
 		case JS_TAG_NULL:
 		case JS_TAG_UNDEFINED: return 9;
-		case JS_TAG_STRING: {
+		case JS_TAG_STRING:
+        case JS_TAG_STRING_ROPE: {
 			const char* s = JS_ToCString(ctx, val);
 			int len = s ? (int)strlen(s) : 0;
 			if (s) JS_FreeCString(ctx, s);
@@ -701,7 +704,7 @@ static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* s
 		put_reset(buf, opts);
 }
 
-/* Main dispatch - Fixed: Symbol must be checked first in JS_TAG_OBJECT */
+/* Main dispatch */
 static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
                         DynBuf* buf, bool quoted, const InspectOptions* opts) {
     if (depth > opts->depth) {
@@ -736,6 +739,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			format_number(ctx, val, buf, opts);
 			break;
 		case JS_TAG_STRING:
+        case JS_TAG_STRING_ROPE:
 			format_string(ctx, val, buf, quoted, opts);
 			break;
 		case JS_TAG_OBJECT:
