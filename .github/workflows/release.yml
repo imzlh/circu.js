@@ -2,443 +2,271 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
 
 permissions:
   contents: write
 
 jobs:
-  build-linux-x86_64:
-    name: Linux x86_64
-    runs-on: ubuntu-latest
+  # ── Linux glibc ──────────────────────────────────────────────────────────────
+  # x86/ARM: Docker Debian in native/compat mode, no real emulation
+  build-linux-glibc:
+    name: Linux ${{ matrix.target }} (glibc)
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64, platform: linux/amd64,  runner: ubuntu-latest      }
+          - { target: i386,   platform: linux/386,    runner: ubuntu-latest      }
+          - { target: arm64,  platform: linux/arm64,  runner: ubuntu-24.04-arm   }
+          - { target: armv7,  platform: linux/arm/v7, runner: ubuntu-24.04-arm   }
+          - { target: armv6,  platform: linux/arm/v6, runner: ubuntu-24.04-arm   }
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake ninja-build \
-            libcurl4-openssl-dev libltdl-dev libffi-dev \
-            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
+      - uses: docker/setup-qemu-action@v3
       - name: Build
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v ${{ github.workspace }}:/work -w /work \
+            debian:bookworm-slim bash -c "
+              apt update && apt install -y cmake ninja-build gcc g++ \
+                libcurl4-openssl-dev libltdl-dev libffi-dev \
+                libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev &&
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release &&
+              cmake --build build &&
+              strip build/cjs"
       - name: Package
-        run: |
-          mkdir -p dist/cjs-linux-x86_64
-          cp build/cjs dist/cjs-linux-x86_64/
-          strip dist/cjs-linux-x86_64/cjs
-          cd dist && tar czf cjs-linux-x86_64.tar.gz cjs-linux-x86_64
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        run: tar czf cjs-linux-${{ matrix.target }}.tar.gz -C build cjs
+      - uses: actions/upload-artifact@v4
         with:
-          name: cjs-linux-x86_64
-          path: dist/cjs-linux-x86_64.tar.gz
+          name: cjs-linux-${{ matrix.target }}
+          path: cjs-linux-${{ matrix.target }}.tar.gz
 
-  build-linux-arm64:
-    name: Linux ARM64
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install cross compile toolchain
-        run: |
-          sudo apt update
-          sudo apt install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake ninja-build
-          sudo dpkg --add-architecture arm64
-          sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
-          sudo apt update
-          sudo apt install -y libsqlite3-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 libexpat1-dev:arm64 libcurl4-openssl-dev:arm64 libffi-dev:arm64
-      - name: Build with cross toolchain
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DBUILD_WITH_CURL=OFF
-          cmake --build build
-      - name: Package
-        run: |
-          mkdir -p dist/cjs-linux-arm64
-          cp build/cjs dist/cjs-linux-arm64/
-          aarch64-linux-gnu-strip dist/cjs-linux-arm64/cjs
-          cd dist && tar czf cjs-linux-arm64.tar.gz cjs-linux-arm64
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-linux-arm64
-          path: dist/cjs-linux-arm64.tar.gz
-
-  build-linux-armv7:
-    name: Linux ARMv7
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install cross compile toolchain
-        run: |
-          sudo apt update
-          sudo apt install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=arm \
-            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
-            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
-            -DBUILD_WITH_CURL=OFF
-          cmake --build build
-      - name: Package
-        run: |
-          mkdir -p dist/cjs-linux-armv7
-          cp build/cjs dist/cjs-linux-armv7/
-          arm-linux-gnueabihf-strip dist/cjs-linux-armv7/cjs
-          cd dist && tar czf cjs-linux-armv7.tar.gz cjs-linux-armv7
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-linux-armv7
-          path: dist/cjs-linux-armv7.tar.gz
-
+  # ── Linux musl (Alpine, static) ───────────────────────────────────────────────
+  # Same native/compat trick; Alpine uses musl natively
   build-linux-musl:
-    name: Linux Musl ${{ matrix.target }}
+    name: Linux ${{ matrix.target }} (musl)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64,  platform: linux/amd64,  runner: ubuntu-latest    }
+          - { target: i386,    platform: linux/386,    runner: ubuntu-latest    }
+          - { target: aarch64, platform: linux/arm64,  runner: ubuntu-24.04-arm }
+          - { target: armv7,   platform: linux/arm/v7, runner: ubuntu-24.04-arm }
+          - { target: armv6,   platform: linux/arm/v6, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: docker/setup-qemu-action@v3
+      - name: Build
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v ${{ github.workspace }}:/work -w /work \
+            alpine:3.21 sh -c "
+              apk add --no-cache cmake ninja-build gcc g++ musl-dev \
+                sqlite-dev sqlite-static \
+                openssl-dev openssl-libs-static \
+                zlib-dev zlib-static \
+                curl-dev curl-static \
+                libffi-dev expat-dev expat-static libtool-dev &&
+              cmake -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXE_LINKER_FLAGS='-static' &&
+              cmake --build build &&
+              strip build/cjs"
+      - name: Package
+        run: tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz -C build cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-musl-${{ matrix.target }}
+          path: cjs-linux-musl-${{ matrix.target }}.tar.gz
+
+  # ── Linux musl exotic (cross, static) ────────────────────────────────────────
+  # No container support; musl.cc toolchain + sqlite amalgamation cross-compiled
+  build-linux-musl-exotic:
+    name: Linux ${{ matrix.target }} (musl-exotic)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64
-            toolchain: x86_64-linux-musl
-            cc: x86_64-linux-musl-gcc
-          - target: aarch64
-            toolchain: aarch64-linux-musl
-            cc: aarch64-linux-musl-gcc
-          - target: armv7l
-            toolchain: armv7l-linux-musleabihf
-            cc: armv7l-linux-musleabihf-gcc
-          - target: armv6
-            toolchain: arm-linux-musleabihf
-            cc: arm-linux-musleabihf-gcc
-          - target: armv5
-            toolchain: armv5te-linux-musleabi
-            cc: armv5te-linux-musleabi-gcc
-          - target: mips
-            toolchain: mips-linux-musl
-            cc: mips-linux-musl-gcc
-          - target: mipsel
-            toolchain: mipsel-linux-musl
-            cc: mipsel-linux-musl-gcc
-          - target: mips64
-            toolchain: mips64-linux-musl
-            cc: mips64-linux-musl-gcc
-          - target: riscv64
-            toolchain: riscv64-linux-musl
-            cc: riscv64-linux-musl-gcc
+          - { target: mips,    toolchain: mips-linux-musl          }
+          - { target: mipsel,  toolchain: mipsel-linux-musl        }
+          - { target: mips64,  toolchain: mips64-linux-musl        }
+          - { target: riscv64, toolchain: riscv64-linux-musl       }
+          - { target: armv5,   toolchain: armv5te-linux-musleabi   }
+    env:
+      TC: /opt/${{ matrix.toolchain }}-cross
+      SQLITE_VER: sqlite-amalgamation-3450100
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Download musl.cc toolchain
+
+      - name: Setup musl.cc toolchain
         run: |
-          cd /tmp
-          wget -q "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
-          tar xzf "${{ matrix.toolchain }}-cross.tgz"
-          sudo mv "${{ matrix.toolchain }}-cross" /opt/
-          echo "/opt/${{ matrix.toolchain }}-cross/bin" >> $GITHUB_PATH
-      - name: Build with musl
+          wget -qP /tmp "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
+          tar xzf "/tmp/${{ matrix.toolchain }}-cross.tgz" -C /tmp
+          sudo mv "/tmp/${{ matrix.toolchain }}-cross" /opt/
+          echo "${{ env.TC }}/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile sqlite3 amalgamation
         run: |
-          export CC=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.cc }}
-          export CXX=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-g++
-          export AR=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-ar
-          export STRIP=/opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip
-          
+          wget -q "https://www.sqlite.org/2024/${{ env.SQLITE_VER }}.zip"
+          unzip -q "${{ env.SQLITE_VER }}.zip"
+          cd "${{ env.SQLITE_VER }}"
+          ${{ env.TC }}/bin/${{ matrix.toolchain }}-gcc \
+            -DSQLITE_OMIT_LOAD_EXTENSION -O2 \
+            -c sqlite3.c -o sqlite3.o
+          ${{ env.TC }}/bin/${{ matrix.toolchain }}-ar rcs libsqlite3.a sqlite3.o
+          sudo cp libsqlite3.a ${{ env.TC }}/lib/
+          sudo cp sqlite3.h   ${{ env.TC }}/include/
+
+      - name: Build
+        run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_C_COMPILER=$CC \
-            -DCMAKE_CXX_COMPILER=$CXX \
-            -DCMAKE_AR=$AR \
+            -DCMAKE_C_COMPILER=${{ env.TC }}/bin/${{ matrix.toolchain }}-gcc \
+            -DCMAKE_CXX_COMPILER=${{ env.TC }}/bin/${{ matrix.toolchain }}-g++ \
+            -DCMAKE_AR=${{ env.TC }}/bin/${{ matrix.toolchain }}-ar \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_WITH_CURL=OFF
+            -DBUILD_WITH_CURL=OFF \
+            -DSQLite3_INCLUDE_DIR=${{ env.TC }}/include \
+            -DSQLite3_LIBRARY=${{ env.TC }}/lib/libsqlite3.a
           cmake --build build
+
       - name: Package
         run: |
-          mkdir -p dist/cjs-linux-musl-${{ matrix.target }}
-          cp build/cjs dist/cjs-linux-musl-${{ matrix.target }}/
-          /opt/${{ matrix.toolchain }}-cross/bin/${{ matrix.toolchain }}-strip dist/cjs-linux-musl-${{ matrix.target }}/cjs
-          cd dist && tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz cjs-linux-musl-${{ matrix.target }}
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          ${{ env.TC }}/bin/${{ matrix.toolchain }}-strip build/cjs
+          tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz -C build cjs
+      - uses: actions/upload-artifact@v4
         with:
           name: cjs-linux-musl-${{ matrix.target }}
-          path: dist/cjs-linux-musl-${{ matrix.target }}.tar.gz
+          path: cjs-linux-musl-${{ matrix.target }}.tar.gz
 
-  build-macos-x86_64:
-    name: macOS x86_64
-    runs-on: macos-latest
+  # ── macOS ─────────────────────────────────────────────────────────────────────
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: macos-13      }
+          - { arch: arm64,  runner: macos-latest  }
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: Install dependencies
-        run: |
-          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
+        run: brew install cmake ninja libffi sqlite3 openssl zlib expat curl
       - name: Build
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
           cmake --build build
       - name: Package
         run: |
-          mkdir -p dist/cjs-macos-x86_64
-          cp build/cjs dist/cjs-macos-x86_64/
-          strip dist/cjs-macos-x86_64/cjs
-          cd dist && tar czf cjs-macos-x86_64.tar.gz cjs-macos-x86_64
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          strip build/cjs
+          tar czf cjs-macos-${{ matrix.arch }}.tar.gz -C build cjs
+      - uses: actions/upload-artifact@v4
         with:
-          name: cjs-macos-x86_64
-          path: dist/cjs-macos-x86_64.tar.gz
-
-  build-macos-arm64:
-    name: macOS ARM64
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install dependencies
-        run: |
-          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64
-          cmake --build build
-      - name: Package
-        run: |
-          mkdir -p dist/cjs-macos-arm64
-          cp build/cjs dist/cjs-macos-arm64/
-          strip dist/cjs-macos-arm64/cjs
-          cd dist && tar czf cjs-macos-arm64.tar.gz cjs-macos-arm64
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-macos-arm64
-          path: dist/cjs-macos-arm64.tar.gz
+          name: cjs-macos-${{ matrix.arch }}
+          path: cjs-macos-${{ matrix.arch }}.tar.gz
 
   build-macos-universal:
-    name: macOS Universal (x86_64 + ARM64)
+    name: macOS Universal
+    needs: build-macos
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          submodules: recursive
-      - name: Install dependencies
+          pattern: cjs-macos-*
+          merge-multiple: true
+      - name: Build universal binary
         run: |
-          brew install cmake ninja libffi sqlite3 openssl zlib expat curl
-      - name: Build Universal Binary
-        run: |
-          # Build for ARM64
-          cmake -B build-arm64 -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64
-          cmake --build build-arm64
-
-          # Build for x86_64
-          cmake -B build-x86_64 -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64
-          cmake --build build-x86_64
-
-          # Create universal binary
-          mkdir -p dist/cjs-macos-universal
-          lipo -create build-arm64/cjs build-x86_64/cjs -output dist/cjs-macos-universal/cjs
-          strip dist/cjs-macos-universal/cjs
-          cd dist && tar czf cjs-macos-universal.tar.gz cjs-macos-universal
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          mkdir x86 arm
+          tar xzf cjs-macos-x86_64.tar.gz -C x86
+          tar xzf cjs-macos-arm64.tar.gz  -C arm
+          lipo -create x86/cjs arm/cjs -output cjs
+          strip cjs
+          tar czf cjs-macos-universal.tar.gz cjs
+      - uses: actions/upload-artifact@v4
         with:
           name: cjs-macos-universal
-          path: dist/cjs-macos-universal.tar.gz
+          path: cjs-macos-universal.tar.gz
 
-  build-windows-x86_64:
-    name: Windows x86_64
+  # ── Windows ───────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows ${{ matrix.arch }}
     runs-on: windows-latest
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, msvc: x64,   gen: x64,   triplet: x64-windows   }
+          - { arch: x86,    msvc: x86,   gen: Win32, triplet: x86-windows   }
+          - { arch: arm64,  msvc: arm64, gen: ARM64, triplet: arm64-windows }
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Setup MSVC x64
-        uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+          arch: ${{ matrix.msvc }}
+      - uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
-      - name: Install dependencies via vcpkg
+      - name: Install dependencies
         run: |
-          vcpkg install sqlite3:x64-windows openssl:x64-windows zlib:x64-windows expat:x64-windows curl:x64-windows libffi:x64-windows
+          vcpkg install sqlite3:${{ matrix.triplet }} openssl:${{ matrix.triplet }} zlib:${{ matrix.triplet }} expat:${{ matrix.triplet }} curl:${{ matrix.triplet }} libffi:${{ matrix.triplet }}
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+          cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.gen }} ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
             -DBUILD_WITH_CURL=ON
           cmake --build build --config Release
       - name: Package
-        shell: cmd
+        shell: pwsh
         run: |
-          mkdir dist\cjs-windows-x86_64
-          copy build\Release\cjs.exe dist\cjs-windows-x86_64\
-          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86_64 -DestinationPath cjs-windows-x86_64.zip"
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          New-Item -ItemType Directory dist\cjs-windows-${{ matrix.arch }}
+          Copy-Item build\Release\cjs.exe dist\cjs-windows-${{ matrix.arch }}\
+          Compress-Archive -Path dist\cjs-windows-${{ matrix.arch }} -DestinationPath cjs-windows-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
         with:
-          name: cjs-windows-x86_64
-          path: dist/cjs-windows-x86_64.zip
+          name: cjs-windows-${{ matrix.arch }}
+          path: cjs-windows-${{ matrix.arch }}.zip
 
-  build-windows-x86:
-    name: Windows x86
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Setup MSVC x86
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
-      - name: Install dependencies via vcpkg
-        run: |
-          vcpkg install sqlite3:x86-windows openssl:x86-windows zlib:x86-windows expat:x86-windows curl:x86-windows libffi:x86-windows
-      - name: Build
-        shell: cmd
-        run: |
-          cmake -B build -G "Visual Studio 17 2022" -A Win32 ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_CURL=ON
-          cmake --build build --config Release
-      - name: Package
-        shell: cmd
-        run: |
-          mkdir dist\cjs-windows-x86
-          copy build\Release\cjs.exe dist\cjs-windows-x86\
-          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-x86 -DestinationPath cjs-windows-x86.zip"
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-windows-x86
-          path: dist/cjs-windows-x86.zip
-
-  build-windows-arm64:
-    name: Windows ARM64
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Setup MSVC ARM64
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
-      - name: Install dependencies via vcpkg
-        run: |
-          vcpkg install sqlite3:arm64-windows openssl:arm64-windows zlib:arm64-windows expat:arm64-windows curl:arm64-windows libffi:arm64-windows
-      - name: Build
-        shell: cmd
-        run: |
-          cmake -B build -G "Visual Studio 17 2022" -A ARM64 ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_CURL=ON
-          cmake --build build --config Release
-      - name: Package
-        shell: cmd
-        run: |
-          mkdir dist\cjs-windows-arm64
-          copy build\Release\cjs.exe dist\cjs-windows-arm64\
-          cd dist && powershell -Command "Compress-Archive -Path cjs-windows-arm64 -DestinationPath cjs-windows-arm64.zip"
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-windows-arm64
-          path: dist/cjs-windows-arm64.zip
-
+  # ── Release ───────────────────────────────────────────────────────────────────
   release:
     name: Create Release
     needs:
-      - build-linux-x86_64
-      - build-linux-arm64
-      - build-linux-armv7
+      - build-linux-glibc
       - build-linux-musl
-      - build-macos-x86_64
-      - build-macos-arm64
+      - build-linux-musl-exotic
+      - build-macos
       - build-macos-universal
-      - build-windows-x86_64
-      - build-windows-x86
-      - build-windows-arm64
+      - build-windows
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: cjs-*
-
-      - name: Organize artifacts
-        run: |
-          cd dist
-          find . -name "*.tar.gz" -exec mv {} . \;
-          find . -name "*.zip" -exec mv {} . \;
-          ls -la
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Flatten artifacts
+        run: find dist -mindepth 2 \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
+      - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true

@@ -89,53 +89,26 @@ jobs:
           name: cjs-macos-arm64-test
           path: build/cjs
 
-  build-macos-x86_64:
-    name: Test Build - macOS x86_64
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install dependencies
-        run: |
-          brew install cmake ninja libffi sqlite3 openssl@3 zlib expat curl
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64
-          cmake --build build
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-macos-x86_64-test
-          path: build/cjs
-
-  build-linux-armv7:
-    name: Test Build - Linux ARMv7
+  build-linux-i386:
+    name: Test Build - Linux i386
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install cross compile toolchain
+      - name: Build in i386 container
         run: |
-          sudo apt update
-          sudo apt install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=arm \
-            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
-            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
-            -DBUILD_WITH_CURL=OFF
-          cmake --build build
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          docker run --rm --platform linux/386 \
+            -v ${{ github.workspace }}:/work -w /work \
+            debian:bookworm-slim bash -c "
+              apt update && apt install -y cmake ninja-build gcc g++ \
+                libcurl4-openssl-dev libltdl-dev libffi-dev \
+                libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev && \
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && \
+              cmake --build build"
+      - uses: actions/upload-artifact@v4
         with:
-          name: cjs-linux-armv7-test
+          name: cjs-linux-i386-test
           path: build/cjs
 
   build-windows-x86_64:
