@@ -132,13 +132,10 @@ void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
+void tjs__mod_socket_init(JSContext *ctx, JSValue ns);
 
 #ifdef CJS__HAS_CURL
 void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
-#endif
-
-#ifndef _WIN32
-void tjs__mod_posix_socket_init(JSContext *ctx, JSValue ns);
 #endif
 
 #ifdef CJS__HAS_ICONV

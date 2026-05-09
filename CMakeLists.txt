@@ -177,13 +177,8 @@ add_library(libcjs
     src/mod_xml.c
     src/mod_crypto.c
     src/mod_http.c
+    src/mod_socket.c
 )
-
-if(UNIX)
-    target_sources(libcjs PUBLIC 
-        src/mod_posix-socket.c
-    )
-endif()
 
 if(llhttp_FOUND)
     # System-installed llhttp may not provide CMake targets

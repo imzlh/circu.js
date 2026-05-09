@@ -28,10 +28,10 @@ interface TjsModules {
     algorithm: typeof CModuleAlgorithm,
     text: typeof CModuleText,
     http: typeof CModuleHTTP,
+    socket: typeof CModuleSocket
 }
 
 interface TJSOptionalModules {
-    'posix-socket': typeof CModulePosixSocket,
     'wasm': typeof CModuleWASM,
     'curl': typeof CModuleCURL
 }

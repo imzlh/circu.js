@@ -4,6 +4,7 @@
 
 build/
 build_test/
+build_release/
 src/version.h
 node_modules/
 test_dir*/
