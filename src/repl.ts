@@ -538,9 +538,9 @@ class CJSRepl {
                 const content = this.#pasteBuffer.slice(0, -7); // -7 for \x1b[201~
                 this.#escState = 'normal';
                 this.#inPasteMode = false;
-                // Insert the pasted content (with newlines as regular chars)
+                // Insert the pasted content, stripping \r from Windows CRLF
                 for (const c of content) {
-                    this.#insert(c);
+                    if (c !== '\r') this.#insert(c);
                 }
                 this.#update();
             }

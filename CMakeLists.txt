@@ -180,6 +180,10 @@ add_library(libcjs
     src/mod_socket.c
 )
 
+if (WIN32)
+    target_sources(libcjs PRIVATE src/mod_win32.c)
+endif()
+
 if(llhttp_FOUND)
     # System-installed llhttp may not provide CMake targets
     # Use the traditional variables instead

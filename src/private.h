@@ -134,6 +134,10 @@ void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 void tjs__mod_socket_init(JSContext *ctx, JSValue ns);
 
+#ifdef _WIN32
+void tjs__mod_win32_init(JSContext *ctx, JSValue ns);
+#endif
+
 #ifdef CJS__HAS_CURL
 void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
 #endif

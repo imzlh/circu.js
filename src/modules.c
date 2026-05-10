@@ -75,7 +75,10 @@ static const struct TJSModule tjs_modules[] = {
 	{ "worker", tjs__mod_worker_init, true },
 	{ "xml", tjs__mod_xml_init, true },
 	{ "zlib", tjs__mod_zlib_init, true },
-	{ "socket", tjs__mod_socket_init, true }
+	{ "socket", tjs__mod_socket_init, true },
+#ifdef _WIN32
+    { "win32", tjs__mod_win32_init, true },
+#endif
 };
 
 JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value) {
