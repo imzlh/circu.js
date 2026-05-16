@@ -1063,6 +1063,7 @@ static const JSCFunctionListEntry tjs_streams_funcs[] = {
     TJS_UVCONST(TCP_IPV6ONLY),
     TJS_UVCONST(TTY_MODE_NORMAL),
     TJS_UVCONST(TTY_MODE_RAW),
+    TJS_UVCONST(TTY_MODE_RAW_VT),
 };
 /* clang-format on */
 

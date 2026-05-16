@@ -1,8 +1,20 @@
+/**
+ * Process module - Child process management
+ * 
+ * @example
+ * const process = import.meta.use('process');
+ * 
+ * // Spawn a child process
+ * const child = process.spawn(['ls', '-la'], { cwd: '/tmp' });
+ * 
+ * child.stdout.onread = (data) => console.log(data);
+ * const { exit_status } = await child.wait();
+ */
 declare namespace CModuleProcess {
     type Pipe = CModuleStreams.Pipe;
 
     /**
-     * 进程信号
+     * Process signals
      */
     export type Signal =
         | 'SIGHUP' | 'SIGINT' | 'SIGQUIT' | 'SIGILL' | 'SIGTRAP'
@@ -14,35 +26,35 @@ declare namespace CModuleProcess {
         | 'SIGLOST' | 'SIGPWR' | 'SIGINFO' | 'SIGSYS';
 
     /**
-     * spawn 配置选项
+     * Spawn options
      */
     export interface SpawnOptions<T> {
-        /** 标准输入文件描述符或模式 */
+        /** Stdin file descriptor or mode */
         stdin?: number | 'inherit' | 'pipe' | 'ignore';
-        /** 标准输出文件描述符或模式 */
+        /** Stdout file descriptor or mode */
         stdout?: number | 'inherit' | 'pipe' | 'ignore';
-        /** 标准错误文件描述符或模式 */
+        /** Stderr file descriptor or mode */
         stderr?: number | 'inherit' | 'pipe' | 'ignore';
-        /** 工作目录 */
+        /** Working directory */
         cwd?: string;
-        /** 环境变量 */
+        /** Environment variables */
         env?: Record<string, string>;
-        /** 用户ID */
+        /** User ID */
         uid?: number;
-        /** 组ID */
+        /** Group ID */
         gid?: number;
-        /** 是否独立运行 */
+        /** Detached mode */
         detached?: boolean;
-        /** 是否使用 PTY 模式（默认 false） */
+        /** Use PTY mode (default false) */
         pty?: T;
-        /** PTY 列数（默认 80） */
+        /** PTY columns (default 80) */
         cols?: number;
-        /** PTY 行数（默认 24） */
+        /** PTY rows (default 24) */
         rows?: number;
     }
 
     /**
-     * 子进程退出信息
+     * Child process exit info
      */
     export interface ExitInfo {
         exit_status: number;
@@ -50,7 +62,7 @@ declare namespace CModuleProcess {
     }
 
     /**
-     * PTY 窗口大小
+     * PTY window size
      */
     export interface WinSize {
         readonly cols: number;
@@ -60,79 +72,79 @@ declare namespace CModuleProcess {
     }
 
     /**
-     * 子进程对象
+     * Child process object
      */
     export interface ChildProcess<PTY = false> {
-        /** 进程ID */
+        /** Process ID */
         readonly pid: number;
-        /** 标准输入流（如果配置为 pipe） */
+        /** Stdin stream (if configured as pipe) */
         readonly stdin: PTY extends true ? undefined : Pipe;
-        /** 标准输出流（如果配置为 pipe） */
+        /** Stdout stream (if configured as pipe) */
         readonly stdout?: PTY extends true ? undefined : Pipe;
-        /** 标准错误流（如果配置为 pipe） */
+        /** Stderr stream (if configured as pipe) */
         readonly stderr?: PTY extends true ? undefined : Pipe;
 
         /**
-         * PTY 可读流（仅 PTY 模式可用）
-         * 在 Linux 上与 writable 是同一个对象
+         * PTY readable stream (PTY mode only)
+         * On Linux, same object as writable
          */
         readonly readable?: PTY extends true ? Pipe : undefined;
         /**
-         * PTY 可写流（仅 PTY 模式可用）
-         * 在 Linux 上与 readable 是同一个对象
+         * PTY writable stream (PTY mode only)
+         * On Linux, same object as readable
          */
         readonly writable?: PTY extends true ? Pipe : undefined;
 
         /**
-         * 等待进程退出
-         * @returns 返回退出码和终止信号
+         * Wait for process exit
+         * @returns Exit code and termination signal
          */
         wait(): Promise<ExitInfo>;
 
         /**
-         * 阻塞等待进程退出
-         * @returns 返回退出码和终止信号
+         * Block wait for process exit
+         * @returns Exit code and termination signal
          */
         waitSync(): ExitInfo;
 
         /**
-         * 向进程发送信号
-         * @param signal 要发送的信号，默认 SIGTERM（可以是字符串或数字）
+         * Send signal to process
+         * @param signal Signal to send (default SIGTERM, can be string or number)
          */
         kill(signal?: Signal | number): void;
 
         /**
-         * 调整 PTY 窗口大小（仅 PTY 模式可用）
-         * @param cols 列数
-         * @param rows 行数
+         * Resize PTY window (PTY mode only)
+         * @param cols Columns
+         * @param rows Rows
          */
         resize(cols: number, rows: number): PTY extends true ? void : never;
 
         /**
-         * 获取 PTY 窗口大小（仅 PTY 模式可用）
-         * @returns 包含 cols, rows, xpixel, ypixel 的窗口大小对象
+         * Get PTY window size (PTY mode only)
+         * @returns Window size object with cols, rows, xpixel, ypixel
          */
         get size():  PTY extends true ? WinSize : never;
     }
 
     /**
-     * 创建子进程
-     * @param args 命令字符串或参数数组（第一个元素是要执行的命令）
-     * @param options 可选配置
+     * Spawn child process
+     * @param args Command string or argument array (first element is command to execute)
+     * @param options Optional configuration
      */
     export function spawn<T>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
 
     /**
-     * 执行命令（spawn + wait 的简写）
-     * @param args 命令字符串或参数数组
-     * @param options 可选配置
+     * Execute command (shorthand for spawn + wait)
+     * @param args Command string or argument array
+     * @param options Optional configuration
      */
     export function exec(args: string | string[], options?: SpawnOptions<false>): ChildProcess;
 
     /**
-     * 向指定进程发送信号
-     * @param pid 进程ID
-     * @param signal 信号（字符串或数字），默认 SIGTERM
+     * Send signal to specified process
+     * @param pid Process ID
+     * @param signal Signal (string or number, default SIGTERM)
      */
     export function kill(pid: number, signal?: Signal | number): void;
 }

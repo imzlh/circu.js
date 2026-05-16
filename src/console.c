@@ -370,8 +370,7 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
     
     if (JS_IsString(stack)) {
         const char* stack_str = JS_ToCString(ctx, stack);
-        if (stack_str) {
-            // Print stack with indentation
+        if (stack_str && stack_str[0]) {
             const char* p = stack_str;
             while (*p) {
                 const char* end = strchr(p, '\n');
@@ -379,7 +378,10 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
                 dbuf_putc(buf, '\n');
                 dbuf_putstr(buf, get_indent(depth + 1));
                 dbuf_put(buf, p, end - p);
-                if (*end == '\0') break;
+                if (*end == '\0') {
+                    dbuf_putc(buf, '\n');
+                    break;
+                }
                 p = end + 1;
             }
             JS_FreeCString(ctx, stack_str);

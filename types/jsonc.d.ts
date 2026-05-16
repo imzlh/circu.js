@@ -1,16 +1,6 @@
 /**
- * JSONC (JSON with Comments) Parser
- * 
- * Note: jsonc is a subset of JSON allowing comments.
- * for example:
- * ```jsonc
- * {
- *   // This is a comment
- *   "name": "John Doe",
- *   "age": 30, // comment can also be here
- *   "city": "New York"
- * }
- * ```
+ * JSONC module - JSON with Comments parser
+ * Supports JSON files with single-line (//) and multi-line (/* * /) comments
  */
 declare namespace CModuleJsonC {
     /**

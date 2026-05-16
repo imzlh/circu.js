@@ -427,7 +427,7 @@ class CJSRepl {
 
         if (os.guessHandle(os.STDIN_FILENO) === 'tty') {
             const stdin = this.#stdin = new streams.TTY(os.STDIN_FILENO, true);
-            stdin.setMode(streams.TTY_MODE_RAW);
+            stdin.setMode(streams.TTY_MODE_RAW_VT);
             this.#isatty = true;
         } else {
             const pipe = new streams.Pipe();
@@ -1065,9 +1065,10 @@ class CJSRepl {
         if (this.#readlineResolver) {
             this.#cmd = '';
             this.#cursorPos = 0;
-            this.#print('^C\n').then(() => {
-                if (this.#readlineResolver) this.#readlineResolver(null);
-            });
+            this.#write(new Uint8Array([0x07]));  // bell
+            const resolver = this.#readlineResolver;
+            this.#readlineResolver = null;
+            resolver(null);
         }
     }
 
@@ -1083,23 +1084,30 @@ class CJSRepl {
 // prevent default unhandled rejections
 engine.onEvent(e => false);
 
-// Start REPL
-const repl = new CJSRepl();
-repl.start().then(() => {
-    const history = repl.exportHistory();
-    if (home) sfs.writeFile(home + '/.cjs_history', engine.encodeString(history.join('\n')), 0o600);
-});
-
-// Load History
+// Load History — must complete before REPL starts
 let home: undefined | string;
 try {
     const uhome = os.getenv('HOME') || os.getenv('USERPROFILE');
     if (!uhome) throw 0; // no home
     home = sfs.realpath(uhome);
-    const file = await fs.readFile(uhome + '/.cjs_history');
-    const lines = engine.decodeString(file).split('\n');
-    repl.importHistory(lines);
 } catch { }
+
+const repl = new CJSRepl();
+
+// Load history first, then start REPL
+if (home) {
+    try {
+        const file = await fs.readFile(home + '/.cjs_history');
+        const lines = engine.decodeString(file).split('\n');
+        repl.importHistory(lines);
+    } catch { }
+}
+
+// Start REPL
+repl.start().then(() => {
+    const history = repl.exportHistory();
+    if (home) sfs.writeFile(home + '/.cjs_history', engine.encodeString(history.join('\n')), 0o600);
+});
 
 // bind exit handler
 signal.signal(signal.signals.SIGINT, () => {

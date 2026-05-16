@@ -1,71 +1,68 @@
+/**
+ * Worker module - Multi-threading support
+ * 
+ * @example
+ * const { Worker, isWorker, pipe } = import.meta.use('worker');
+ * 
+ * if (!isWorker) {
+ *   const worker = new Worker({ task: 'heavy-computation' });
+ *   worker.messagePipe.onmessage = (data) => console.log(data);
+ *   await worker.messagePipe.postMessage({ start: true });
+ * }
+ */
 declare namespace CModuleWorker {
     /**
-     * MessagePipe 对象
+     * MessagePipe object
      */
     export interface MessagePipe {
         /**
-         * 发送消息
-         * @param data 要发送的数据
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Send message
+         * @param data Data to send
          */
         postMessage(data: any): Promise<void>;
 
         /**
-         * 消息事件处理函数
+         * Message event handler
          */
         onmessage: ((data: any) => void) | undefined;
 
         /**
-         * 消息错误事件处理函数
+         * Message error event handler
          */
         onmessageerror: ((error: Error) => void) | undefined;
 
-        /**
-         * MessagePipe 对象的类型标签
-         */
         readonly [Symbol.toStringTag]: 'MessagePipe';
     }
 
     /**
-     * Worker 对象
+     * Worker object
      */
     export class Worker {
         /**
-         * 创建一个 Worker
-         * @param user_data 任意object，包括函数也被允许（但危险！）
+         * Create a Worker
+         * @param user_data Any object (including functions, but dangerous!)
          */
         constructor(user_data: any);
 
         /**
-         * 终止 Worker
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Terminate Worker
          */
         terminate(): Promise<void>;
 
         /**
-         * 获取 MessagePipe 对象
-         * @returns 返回 MessagePipe 对象。
+         * Get MessagePipe object
          */
         readonly messagePipe: MessagePipe;
 
-        /**
-         * Worker 对象的类型标签
-         */
         readonly [Symbol.toStringTag]: 'Worker';
     }
 
-    /**
-     * Worker 是否在 Worker 线程中
-     */
+    /** Whether running in Worker thread */
     export const isWorker: boolean;
 
-    /**
-     * 获取当前 Worker 的 MessagePipe 对象
-     */
+    /** Get current Worker's MessagePipe */
     export const pipe: MessagePipe | undefined;
 
-    /**
-     * 获取当前 Worker 的用户数据(constructor中传入)
-     */
+    /** Get current Worker's user data (passed in constructor) */
     export const workerData: any;
 }

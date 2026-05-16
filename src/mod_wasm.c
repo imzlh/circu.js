@@ -56,6 +56,11 @@ typedef struct {
         uint32_t map_dir_count;
     } wasi;
     TJSWasmImportGroup *pending_imports; /* Set by resolveImports, moved to instance by buildInstance */
+    /* Manually allocated table/memory stubs for import resolution */
+    WASMTable **resolved_tables;
+    uint32_t resolved_table_count;
+    WASMMemory **resolved_memories;
+    uint32_t resolved_memory_count;
 } TJSWasmModule;
 
 static void tjs_wasm_module_finalizer(JSRuntime *rt, JSValue val) {
@@ -84,6 +89,15 @@ static void tjs_wasm_module_finalizer(JSRuntime *rt, JSValue val) {
             }
             js_free_rt(rt, m->wasi.map_dir_list);
         }
+        /* Free manually allocated table/memory import stubs */
+        for (uint32_t i = 0; i < m->resolved_table_count; i++) {
+            wasm_runtime_free(m->resolved_tables[i]);
+        }
+        js_free_rt(rt, m->resolved_tables);
+        for (uint32_t i = 0; i < m->resolved_memory_count; i++) {
+            wasm_runtime_free(m->resolved_memories[i]);
+        }
+        js_free_rt(rt, m->resolved_memories);
         js_free_rt(rt, m);
     }
 }
@@ -1043,13 +1057,7 @@ static JSValue tjs_wasm_resolveimports(JSContext *ctx, JSValue this_val, int arg
         }
 
         if (!descs[i].func_type) {
-            JS_FreeCString(ctx, descs[i].module_name);
-            JS_FreeCString(ctx, descs[i].func_name);
-            JS_FreeValue(ctx, descs[i].js_module_name);
-            JS_FreeValue(ctx, descs[i].js_func_name);
-            JS_FreeValue(ctx, descs[i].func);
-            js_free(ctx, descs);
-            return tjs_throw_wasm_error(ctx, "LinkError", "imported function not found in module");
+            goto fail_descs;
         }
     }
 
@@ -1289,6 +1297,313 @@ static JSValue tjs_wasm_resolveglobalimports(JSContext *ctx, JSValue this_val, i
 
         if (!found) {
             return tjs_throw_wasm_error(ctx, "LinkError", "imported global not found in module");
+        }
+    }
+
+    return JS_UNDEFINED;
+}
+
+/*
+ * resolveTableImports(module, tableDescs)
+ *
+ * tableDescs is an array of { module: string, name: string, element: string, initial: number, maximum?: number }
+ * Creates a WASMTable stub with the matching type and links it into the module's import.
+ * The table elements will be initialized to NULL_REF by WAMR during instantiation.
+ */
+static JSValue tjs_wasm_resolvetableimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
+    if (!m) {
+        return JS_EXCEPTION;
+    }
+
+    JSValue arr = argv[1];
+    JSValue js_length = JS_GetPropertyStr(ctx, arr, "length");
+    uint64_t total;
+    if (JS_ToIndex(ctx, &total, js_length)) {
+        JS_FreeValue(ctx, js_length);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, js_length);
+
+    if (total == 0) {
+        return JS_UNDEFINED;
+    }
+
+    WASMModule *wasm_module = (WASMModule *) m->module;
+
+    for (uint64_t i = 0; i < total; i++) {
+        JSValue item = JS_GetPropertyUint32(ctx, arr, (uint32_t) i);
+        if (JS_IsException(item)) {
+            return JS_EXCEPTION;
+        }
+
+        JSValue js_mod = JS_GetPropertyStr(ctx, item, "module");
+        JSValue js_name = JS_GetPropertyStr(ctx, item, "name");
+        JSValue js_element = JS_GetPropertyStr(ctx, item, "element");
+        JSValue js_initial = JS_GetPropertyStr(ctx, item, "initial");
+        JSValue js_maximum = JS_GetPropertyStr(ctx, item, "maximum");
+        JS_FreeValue(ctx, item);
+
+        const char *mod_name = JS_ToCString(ctx, js_mod);
+        const char *field_name = JS_ToCString(ctx, js_name);
+        const char *elem_kind_str = JS_ToCString(ctx, js_element);
+        uint32_t initial_val;
+        if (JS_ToUint32(ctx, &initial_val, js_initial)) {
+            JS_FreeValue(ctx, js_initial);
+            JS_FreeValue(ctx, js_mod);
+            JS_FreeValue(ctx, js_name);
+            JS_FreeValue(ctx, js_element);
+            JS_FreeValue(ctx, js_maximum);
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            JS_FreeCString(ctx, elem_kind_str);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, js_initial);
+        JS_FreeValue(ctx, js_mod);
+        JS_FreeValue(ctx, js_name);
+        JS_FreeValue(ctx, js_element);
+
+        bool has_max = !JS_IsUndefined(js_maximum);
+        uint32_t maximum_val = 0;
+        if (has_max) {
+            if (JS_ToUint32(ctx, &maximum_val, js_maximum)) {
+                JS_FreeValue(ctx, js_maximum);
+                JS_FreeCString(ctx, mod_name);
+                JS_FreeCString(ctx, field_name);
+                JS_FreeCString(ctx, elem_kind_str);
+                return JS_EXCEPTION;
+            }
+        }
+        JS_FreeValue(ctx, js_maximum);
+
+        if (!mod_name || !field_name || !elem_kind_str) {
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            JS_FreeCString(ctx, elem_kind_str);
+            return JS_EXCEPTION;
+        }
+
+        /* Parse element kind string to WAMR valtype */
+        uint8_t elem_type;
+        if (strcmp(elem_kind_str, "funcref") == 0) {
+            elem_type = VALUE_TYPE_FUNCREF;
+        } else if (strcmp(elem_kind_str, "externref") == 0) {
+            elem_type = VALUE_TYPE_EXTERNREF;
+        } else {
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            JS_FreeCString(ctx, elem_kind_str);
+            return tjs_throw_wasm_error(ctx, "TypeError", "invalid table element type, expected 'funcref' or 'externref'");
+        }
+        JS_FreeCString(ctx, elem_kind_str);
+
+        if (has_max && maximum_val < initial_val) {
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            return tjs_throw_wasm_error(ctx, "RangeError", "table maximum must be >= initial");
+        }
+
+        /* Find matching import table in the module */
+        bool found = false;
+        for (uint32_t j = 0; j < wasm_module->import_table_count; j++) {
+            WASMTableImport *tbl_import = &wasm_module->import_tables[j].u.table;
+            if (strcmp(tbl_import->module_name, mod_name) == 0 &&
+                strcmp(tbl_import->field_name, field_name) == 0) {
+
+                /* Verify type compatibility */
+                if (tbl_import->table_type.elem_type != elem_type) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return tjs_throw_wasm_error(ctx, "LinkError", "table element type mismatch");
+                }
+                if (initial_val < tbl_import->table_type.init_size) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return tjs_throw_wasm_error(ctx, "LinkError", "table initial size too small");
+                }
+                uint32_t import_max = tbl_import->table_type.max_size;
+                if (has_max && maximum_val > import_max) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return tjs_throw_wasm_error(ctx, "LinkError", "table maximum size too large");
+                }
+
+                /* Create a WASMTable stub for linking */
+                WASMTable *tbl = wasm_runtime_malloc(sizeof(WASMTable));
+                if (!tbl) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return JS_ThrowOutOfMemory(ctx);
+                }
+                memset(tbl, 0, sizeof(WASMTable));
+                tbl->table_type.elem_type = elem_type;
+                tbl->table_type.init_size = initial_val;
+                tbl->table_type.max_size = has_max ? maximum_val : initial_val;
+                tbl->table_type.flags = has_max ? 1 : 0;
+                tbl->table_type.possible_grow = has_max;
+
+                /* Track for cleanup */
+                WASMTable **new_arr = js_realloc(ctx, m->resolved_tables, sizeof(WASMTable *) * (m->resolved_table_count + 1));
+                if (!new_arr) {
+                    wasm_runtime_free(tbl);
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return JS_ThrowOutOfMemory(ctx);
+                }
+                m->resolved_tables = new_arr;
+                m->resolved_tables[m->resolved_table_count++] = tbl;
+
+                tbl_import->import_table_linked = tbl;
+                found = true;
+                break;
+            }
+        }
+
+        JS_FreeCString(ctx, mod_name);
+        JS_FreeCString(ctx, field_name);
+
+        if (!found) {
+            return tjs_throw_wasm_error(ctx, "LinkError", "imported table not found in module");
+        }
+    }
+
+    return JS_UNDEFINED;
+}
+
+/*
+ * resolveMemoryImports(module, memoryDescs)
+ *
+ * memoryDescs is an array of { module: string, name: string, initial: number, maximum?: number }
+ * Creates a WASMMemory stub with the matching type and links it into the module's import.
+ */
+static JSValue tjs_wasm_resolvememoryimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
+    if (!m) {
+        return JS_EXCEPTION;
+    }
+
+    JSValue arr = argv[1];
+    JSValue js_length = JS_GetPropertyStr(ctx, arr, "length");
+    uint64_t total;
+    if (JS_ToIndex(ctx, &total, js_length)) {
+        JS_FreeValue(ctx, js_length);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, js_length);
+
+    if (total == 0) {
+        return JS_UNDEFINED;
+    }
+
+    WASMModule *wasm_module = (WASMModule *) m->module;
+
+    for (uint64_t i = 0; i < total; i++) {
+        JSValue item = JS_GetPropertyUint32(ctx, arr, (uint32_t) i);
+        if (JS_IsException(item)) {
+            return JS_EXCEPTION;
+        }
+
+        JSValue js_mod = JS_GetPropertyStr(ctx, item, "module");
+        JSValue js_name = JS_GetPropertyStr(ctx, item, "name");
+        JSValue js_initial = JS_GetPropertyStr(ctx, item, "initial");
+        JSValue js_maximum = JS_GetPropertyStr(ctx, item, "maximum");
+        JS_FreeValue(ctx, item);
+
+        const char *mod_name = JS_ToCString(ctx, js_mod);
+        const char *field_name = JS_ToCString(ctx, js_name);
+        uint32_t initial_val;
+        if (JS_ToUint32(ctx, &initial_val, js_initial)) {
+            JS_FreeValue(ctx, js_initial);
+            JS_FreeValue(ctx, js_mod);
+            JS_FreeValue(ctx, js_name);
+            JS_FreeValue(ctx, js_maximum);
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, js_initial);
+        JS_FreeValue(ctx, js_mod);
+        JS_FreeValue(ctx, js_name);
+
+        bool has_max = !JS_IsUndefined(js_maximum);
+        uint32_t maximum_val = 0;
+        if (has_max) {
+            if (JS_ToUint32(ctx, &maximum_val, js_maximum)) {
+                JS_FreeValue(ctx, js_maximum);
+                JS_FreeCString(ctx, mod_name);
+                JS_FreeCString(ctx, field_name);
+                return JS_EXCEPTION;
+            }
+        }
+        JS_FreeValue(ctx, js_maximum);
+
+        if (!mod_name || !field_name) {
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            return JS_EXCEPTION;
+        }
+
+        if (has_max && maximum_val < initial_val) {
+            JS_FreeCString(ctx, mod_name);
+            JS_FreeCString(ctx, field_name);
+            return tjs_throw_wasm_error(ctx, "RangeError", "memory maximum must be >= initial");
+        }
+
+        /* Find matching import memory in the module */
+        bool found = false;
+        for (uint32_t j = 0; j < wasm_module->import_memory_count; j++) {
+            WASMMemoryImport *mem_import = &wasm_module->import_memories[j].u.memory;
+            if (strcmp(mem_import->module_name, mod_name) == 0 &&
+                strcmp(mem_import->field_name, field_name) == 0) {
+
+                /* Verify type compatibility */
+                if (initial_val < mem_import->mem_type.init_page_count) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return tjs_throw_wasm_error(ctx, "LinkError", "memory initial page count too small");
+                }
+                if (has_max && maximum_val > mem_import->mem_type.max_page_count) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return tjs_throw_wasm_error(ctx, "LinkError", "memory maximum page count too large");
+                }
+
+                /* Create a WASMMemory stub for linking */
+                WASMMemory *mem = wasm_runtime_malloc(sizeof(WASMMemory));
+                if (!mem) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return JS_ThrowOutOfMemory(ctx);
+                }
+                memset(mem, 0, sizeof(WASMMemory));
+                mem->num_bytes_per_page = 65536;
+                mem->init_page_count = initial_val;
+                mem->max_page_count = has_max ? maximum_val : initial_val;
+                mem->flags = has_max ? 1 : 0;
+
+                /* Track for cleanup */
+                WASMMemory **new_arr = js_realloc(ctx, m->resolved_memories, sizeof(WASMMemory *) * (m->resolved_memory_count + 1));
+                if (!new_arr) {
+                    wasm_runtime_free(mem);
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    return JS_ThrowOutOfMemory(ctx);
+                }
+                m->resolved_memories = new_arr;
+                m->resolved_memories[m->resolved_memory_count++] = mem;
+
+                mem_import->import_memory_linked = mem;
+                found = true;
+                break;
+            }
+        }
+
+        JS_FreeCString(ctx, mod_name);
+        JS_FreeCString(ctx, field_name);
+
+        if (!found) {
+            return tjs_throw_wasm_error(ctx, "LinkError", "imported memory not found in module");
         }
     }
 
@@ -1907,6 +2222,8 @@ static const JSCFunctionListEntry tjs_wasm_funcs[] = {
     TJS_CFUNC_DEF("parseModule", 1, tjs_wasm_parsemodule),
     TJS_CFUNC_DEF("resolveGlobalImports", 2, tjs_wasm_resolveglobalimports),
     TJS_CFUNC_DEF("resolveImports", 2, tjs_wasm_resolveimports),
+    TJS_CFUNC_DEF("resolveMemoryImports", 2, tjs_wasm_resolvememoryimports),
+    TJS_CFUNC_DEF("resolveTableImports", 2, tjs_wasm_resolvetableimports),
     TJS_CFUNC_DEF("setGlobal", 3, tjs_wasm_setglobal),
     TJS_CFUNC_DEF("setWasiOptions", 4, tjs_wasm_setwasioptions),
     TJS_CFUNC_DEF("tableGet", 3, tjs_wasm_tableget),

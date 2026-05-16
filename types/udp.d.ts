@@ -1,97 +1,91 @@
+/**
+ * UDP module - UDP socket operations
+ * 
+ * @example
+ * const udp = import.meta.use('udp');
+ * 
+ * const sock = await udp.create();
+ * await sock.bind({ ip: '0.0.0.0', port: 12345 });
+ * 
+ * const buffer = new Uint8Array(1024);
+ * const { nread, addr } = await sock.recv(buffer);
+ */
 declare namespace CModuleUDP {
     /**
-     * UDP 对象
+     * UDP socket object
      */
     export interface UDP {
         /**
-         * 关闭 UDP 连接
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Close UDP connection
          */
         close(): Promise<void>;
 
         /**
-         * 接收数据
-         * @param buffer 用于存储接收数据的 Uint8Array
-         * @returns 返回一个 Promise，解析为包含接收信息的对象。
+         * Receive data
+         * @param buffer Uint8Array to store received data
+         * @returns Receive info object
          */
         recv(buffer: Uint8Array): Promise<{
-            /**
-             * 接收的数据长度
-             */
+            /** Received data length */
             readonly nread: number;
-
-            /**
-             * 是否部分数据
-             */
+            /** Partial data flag */
             readonly partial: boolean;
-
-            /**
-             * 发送方地址信息
-             */
+            /** Sender address info */
             readonly addr: Record<string, any>;
         }>;
 
         /**
-         * 发送数据
-         * @param buffer 包含要发送数据的 Uint8Array
-         * @param addr 目标地址对象
-         * @returns 返回一个 Promise，解析为发送的数据长度。
+         * Send data
+         * @param buffer Uint8Array containing data to send
+         * @param addr Target address object
+         * @returns Sent data length
          */
         send(buffer: Uint8Array, addr?: Record<string, any>): Promise<number>;
 
         /**
-         * 获取文件描述符
-         * @returns 返回文件描述符。
+         * Get file descriptor
+         * @returns File descriptor
          */
         fileno(): Promise<number>;
 
         /**
-         * 获取套接字名称
-         * @returns 返回一个 Promise，解析为包含套接字名称的对象。
+         * Get socket name
+         * @returns Socket name object
          */
         getsockname(): Promise<Record<string, any>>;
 
         /**
-         * 获取对等名称
-         * @returns 返回一个 Promise，解析为包含对等名称的对象。
+         * Get peer name
+         * @returns Peer name object
          */
         getpeername(): Promise<Record<string, any>>;
 
         /**
-         * 连接到地址
-         * @param addr 地址对象
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Connect to address
+         * @param addr Address object
          */
         connect(addr: Record<string, any>): Promise<void>;
 
         /**
-         * 绑定到地址
-         * @param addr 地址对象
-         * @param flags 绑定标志（可选）
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Bind to address
+         * @param addr Address object
+         * @param flags Bind flags (optional)
          */
         bind(addr: Record<string, any>, flags?: number): Promise<void>;
 
-        /**
-         * UDP 对象的类型标签
-         */
         readonly [Symbol.toStringTag]: 'UDP';
     }
 
     /**
-     * 创建 UDP 对象
-     * @param af 地址族（如 AF_UNSPEC, AF_INET, AF_INET6）
-     * @returns 返回一个 Promise，解析为 UDP 对象。
+     * Create UDP socket
+     * @param af Address family (e.g., AF_UNSPEC, AF_INET, AF_INET6)
+     * @returns UDP socket object
      */
     export function create(af?: number): Promise<UDP>;
 
-    /**
-     * 只监听IPv6而不接受映射后的IPv4地址
-     */
+    /** Listen on IPv6 only, reject mapped IPv4 addresses */
     export const UDP_IPV6ONLY: number;
 
-    /**
-     * 复用端口
-     */
+    /** Reuse port */
     export const UDP_REUSEADDR: number;
 }

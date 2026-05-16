@@ -1,3 +1,6 @@
+/**
+ * Error module - System error codes and error handling
+ */
 declare namespace CModuleError {
     export const errno: {
         OK: 0;

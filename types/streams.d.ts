@@ -1,125 +1,132 @@
 /**
- * @module tjs:streams
+ * Streams module - TCP, Pipe, and TTY stream operations
  * 
- * txiki.js Streams 模块 - 提供TCP、Pipe和TTY流操作API
+ * @example
+ * const { TCP } = import.meta.use('streams');
+ * 
+ * const server = new TCP();
+ * server.bind({ ip: '0.0.0.0', port: 8080 });
+ * server.listen(128);
+ * server.onconnection = (err, client) => {
+ *   if (!err) console.log('New connection');
+ * };
  */
-
 declare namespace CModuleStreams {
     /**
-     * 基础Stream接口
+     * Base Stream interface
      */
     export interface Stream {
         /**
-         * 读取数据回调 - 成功读取数据时调用
-         * @param result 读取的数据（Uint8Array）
+         * Read data callback - on successful read
+         * @param result Read data (Uint8Array)
          * @param error undefined
          */
         onread(result: Uint8Array<ArrayBuffer>, error: undefined): void;
         /**
-         * 读取数据回调 - 到达EOF时调用
-         * @param result null（表示EOF）
+         * Read data callback - on EOF
+         * @param result null (indicates EOF)
          * @param error undefined
          */
         onread(result: null, error: undefined): void;
         /**
-         * 读取数据回调 - 读取失败时调用
+         * Read data callback - on read failure
          * @param result undefined
-         * @param error 错误对象
+         * @param error Error object
          */
         onread(result: undefined, error: CModuleError.Error): void;
 
         /**
-         * 新连接到达回调 - 接受新连接成功时调用
+         * New connection callback - on successful accept
          * @param error undefined
-         * @param client 新的客户端Stream对象
+         * @param client New client Stream object
          */
         onconnection(error: undefined, client: Stream): void;
         /**
-         * 新连接到达回调 - 接受新连接失败时调用
-         * @param error 错误对象
+         * New connection callback - on accept failure
+         * @param error Error object
          * @param client undefined
          */
         onconnection(error: CModuleError.Error, client: undefined): void;
 
         /**
-         * 开始监听传入连接（仅服务器模式）
-         * @param backlog 挂起连接队列的最大长度，默认511
-         * @throws 同步抛出错误（如已监听、无效句柄等）
+         * Start listening for incoming connections (server mode only)
+         * @param backlog Maximum pending connection queue length, default 511
+         * @throws Synchronous throw on error (already listening, invalid handle, etc.)
          */
         listen(backlog?: number): void;
 
         /**
-         * 关闭写入/读取方向
-         * @returns Promise在关闭完成时解析
+         * Shutdown write/read direction
+         * @returns Promise resolves when shutdown complete
          */
         shutdown(): Promise<void>;
 
         /**
-         * 设置流为阻塞或非阻塞模式
-         * @param blocking true为阻塞模式，false为非阻塞
-         * @throws 同步抛出错误
+         * Set stream to blocking or non-blocking mode
+         * @param blocking true for blocking, false for non-blocking
+         * @throws Synchronous throw on error
          */
         setBlocking(blocking: boolean): void;
 
         /**
-         * 完全关闭流并释放资源
-         * @throws 同步抛出错误
+         * Fully close stream and release resources
+         * @throws Synchronous throw on error
          */
         close(): void;
 
         /**
-         * 开始读取数据
+         * Start reading data
          */
         startRead(): void;
 
         /**
-         * 停止读取数据
+         * Stop reading data
          */
         stopRead(): void;
 
         /**
-         * 向流中写入数据
-         * @param buffer 包含要写入数据的Uint8Array
-         * @returns Promise解析为实际写入的字节数，写入失败时reject
+         * Write data to stream
+         * @param buffer Uint8Array containing data to write
+         * @returns Promise resolves to bytes written, rejects on failure
          */
         write(buffer: Uint8Array): Promise<number>;
 
         /**
-         * 从流中异步读取数据，直接写入用户提供的buffer（零拷贝）
-         * @param buffer 用于存放读取数据的Uint8Array
-         * @returns Promise解析为实际读取的字节数（0表示EOF），读取失败时reject
+         * Async read data into user buffer (zero-copy)
+         * @param buffer Uint8Array to store read data
+         * @returns Promise resolves to bytes read (0 = EOF), rejects on failure
          */
         read(buffer: Uint8Array): Promise<number>;
 
         /**
-         * 同步从流中读取数据，使用OS级别的阻塞read()/recv()
-         * @param buffer 用于存放读取数据的Uint8Array
-         * @returns 读取的字节数，null表示EOF
-         * @throws 同步抛出错误
+         * Sync read using OS-level blocking read()/recv()
+         * @param buffer Uint8Array to store read data
+         * @returns Bytes read, null indicates EOF
+         * @throws Synchronous throw on error
          */
         readSync(buffer: Uint8Array): number | null;
 
         /**
-         * 同步向流中写入数据，使用OS级别的阻塞write()/send()
-         * @param buffer 包含要写入数据的Uint8Array
-         * @returns 实际写入的字节数
-         * @throws 同步抛出错误
+         * Sync write using OS-level blocking write()/send()
+         * @param buffer Uint8Array containing data to write
+         * @returns Bytes written
+         * @throws Synchronous throw on error
          */
         writeSync(buffer: Uint8Array): number;
 
         /**
-         * 获取底层的文件描述符
-         * @returns 文件描述符数值（同步返回）
+         * Get underlying file descriptor
+         * @returns File descriptor number
          */
         get fileno(): number;
 
         /**
-         * 增加事件循环引用计数，防止句柄被回收
+         * Increase event loop ref count, prevent handle from being reclaimed
          */
         ref(): void;
 
         /**
-         * 减少事件循环引用计数，允许句柄被回收
+         * Decrease event loop ref count, allow handle to be reclaimed
          */
         unref(): void;
 
@@ -128,56 +135,56 @@ declare namespace CModuleStreams {
 
     export type AddressInfo = {
         /**
-         * IP 地址 (如 "127.0.0.1")
+         * IP address (e.g., "127.0.0.1")
          */
         ip: string;
 
         /**
-         * 端口号
+         * Port number
          */
         port: number;
     } & ({
         /**
-         * 地址族类型， IPV4
+         * Address family, IPv4
          */
         family: 4;
     } | {
         /**
-         * 地址族类型， IPV6
+         * Address family, IPv6
          */
         family: 6;
 
         /**
-         * 流信息
+         * Flow info
          */
         flowInfo: number;
 
         /**
-         * 地址范围
+         * Scope ID
          */
         scopeId: number;
     })
 
     /**
-     * TCP流接口
+     * TCP stream interface
      */
     export interface TCP extends Stream {
         /**
-         * 获取本地套接字地址信息
-         * @returns 包含address、port、family等信息的对象
+         * Get local socket address info
+         * @returns Object with address, port, family info
          */
         get sockname(): AddressInfo;
 
         /**
-         * 获取远端对端地址信息
-         * @returns 包含address、port、family等信息的对象
+         * Get remote peer address info
+         * @returns Object with address, port, family info
          */
         get peername(): AddressInfo;
 
         /**
-         * 连接到指定地址
-         * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
-         * @returns Promise在连接建立时解析
+         * Connect to specified address
+         * @param addr Address object (e.g., {ip: '127.0.0.1', port: 8080})
+         * @returns Promise resolves when connection established
          */
         connect(addr: {
             ip: string;
@@ -185,9 +192,9 @@ declare namespace CModuleStreams {
         }): Promise<void>;
 
         /**
-         * 同步连接到指定地址，使用OS级别的阻塞connect()
-         * @param addr 地址对象（如{ip: '127.0.0.1', port: 8080}）
-         * @throws 同步抛出错误
+         * Sync connect using OS-level blocking connect()
+         * @param addr Address object (e.g., {ip: '127.0.0.1', port: 8080})
+         * @throws Synchronous throw on error
          */
         connectSync(addr: {
             ip: string;
@@ -195,10 +202,10 @@ declare namespace CModuleStreams {
         }): void;
 
         /**
-         * 绑定到本地地址
-         * @param addr 地址对象
-         * @param flags 绑定标志（如TCP_IPV6ONLY），可选
-         * @throws 同步抛出错误
+         * Bind to local address
+         * @param addr Address object
+         * @param flags Bind flags (e.g., TCP_IPV6ONLY), optional
+         * @throws Synchronous throw on error
          */
         bind(addr: {
             ip: string;
@@ -206,86 +213,86 @@ declare namespace CModuleStreams {
         }, flags?: number): void;
 
         /**
-         * 设置TCP keepalive选项
-         * @param enable 是否启用
-         * @param delay 探测间隔（毫秒）
-         * @throws 同步抛出错误
+         * Set TCP keepalive option
+         * @param enable Enable or disable
+         * @param delay Probe interval (milliseconds)
+         * @throws Synchronous throw on error
          */
         setKeepAlive(enable: boolean, delay: number): void;
 
         /**
-         * 设置TCP_NODELAY选项（禁用Nagle算法）
-         * @param enable 是否启用
-         * @throws 同步抛出错误
+         * Set TCP_NODELAY option (disable Nagle's algorithm)
+         * @param enable Enable or disable
+         * @throws Synchronous throw on error
          */
         setNoDelay(enable: boolean): void;
     }
 
     /**
-     * TTY流接口
+     * TTY stream interface
      */
     export interface TTY extends Stream {
         /**
-         * 设置TTY模式
-         * @param mode TTY_MODE_NORMAL或TTY_MODE_RAW
-         * @throws 同步抛出错误
+         * Set TTY mode
+         * @param mode TTY_MODE_NORMAL, TTY_MODE_RAW or TTY_MODE_RAW_VT
+         * @throws Synchronous throw on error
          */
         setMode(mode: number): void;
 
         /**
-         * 获取终端窗口大小
-         * @returns 包含width和height的对象
+         * Get terminal window size
+         * @returns Object with width and height
          */
         get size(): { width: number; height: number };
     }
 
     /**
-     * Pipe流接口（Unix域套接字/命名管道）
+     * Pipe stream interface (Unix domain socket / named pipe)
      */
     export interface Pipe extends Stream {
         /**
-         * 同步连接到指定Pipe，使用OS级别的阻塞connect()
-         * @param name Pipe路径或名称
-         * @throws 同步抛出错误（Windows平台不支持）
+         * Sync connect using OS-level blocking connect()
+         * @param name Pipe path or name
+         * @throws Synchronous throw on error (Windows not supported)
          */
         connectSync(name: string): void;
 
         /**
-         * 用现有文件描述符初始化Pipe
-         * @param fd 文件描述符
-         * @throws 同步抛出错误
+         * Initialize Pipe with existing file descriptor
+         * @param fd File descriptor
+         * @throws Synchronous throw on error
          */
         open(fd: number): void;
 
         /**
-         * 获取本地Pipe名称/路径
-         * @returns 名称字符串
+         * Get local Pipe name/path
+         * @returns Name string
          */
         get sockname(): string;
 
         /**
-         * 获取远端Pipe名称/路径
-         * @returns 名称字符串
+         * Get remote Pipe name/path
+         * @returns Name string
          */
         get peername(): string;
 
         /**
-         * 连接到指定Pipe
-         * @param name Pipe路径或名称
-         * @returns Promise在连接建立时解析
+         * Connect to specified Pipe
+         * @param name Pipe path or name
+         * @returns Promise resolves when connection established
          */
         connect(name: string): Promise<void>;
 
         /**
-         * 绑定到本地Pipe名称
-         * @param name Pipe路径或名称
-         * @throws 同步抛出错误
+         * Bind to local Pipe name
+         * @param name Pipe path or name
+         * @throws Synchronous throw on error
          */
         bind(name: string): void;
     }
 
     /**
-     * TCP构造函数
+     * TCP constructor
      * @example const tcp = new TCP();
      */
     export const TCP: {
@@ -294,7 +301,7 @@ declare namespace CModuleStreams {
     };
 
     /**
-     * TTY构造函数
+     * TTY constructor
      * @example const tty = new TTY(fd, true);
      */
     export const TTY: {
@@ -303,7 +310,7 @@ declare namespace CModuleStreams {
     };
 
     /**
-     * Pipe构造函数
+     * Pipe constructor
      * @example const pipe = new Pipe();
      */
     export const Pipe: {
@@ -312,14 +319,17 @@ declare namespace CModuleStreams {
     };
 
     /**
-     * 常量定义
+     * Constants
      */
-    /** TCP绑定选项：仅使用IPv6 */
+    /** TCP bind option: IPv6 only */
     export const TCP_IPV6ONLY: number;
 
-    /** TTY模式：正常行缓冲模式 */
+    /** TTY mode: normal line-buffered mode */
     export const TTY_MODE_NORMAL: number;
 
-    /** TTY模式：原始无缓冲模式 */
+    /** TTY mode: raw unbuffered mode */
     export const TTY_MODE_RAW: number;
+
+    /** TTY mode: raw mode + Windows VT input (supports bracketed paste) */
+    export const TTY_MODE_RAW_VT: number;
 }

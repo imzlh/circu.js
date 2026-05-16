@@ -1,236 +1,37 @@
 /**
  * txiki.js syncfs module type definitions
  * Synchronous filesystem operations for IO-intensive scripts and module loading
- * Cross-platform: POSIX + Windows
+ * @hint declaration starts at line 236
  * 
  * @example Read and write files
  * ```typescript
  * const fs = import.meta.use('fs')
- * 
- * // Read entire file
  * const content = fs.readFile('input.txt');
  * const text = new TextDecoder().decode(content);
- * 
- * // Write entire file
- * const data = new TextEncoder().encode('Hello, World!');
- * fs.writeFile('output.txt', data);
+ * fs.writeFile('output.txt', new TextEncoder().encode('Hello'));
  * ```
- * @example  Check file existence and stats
+ * @example Check file stats
  * ```typescript
  * const fs = import.meta.use('fs')
- * 
  * if (fs.exists('file.txt')) {
  *   const stats = fs.stat('file.txt');
- *   console.log(`Size: ${stats.size} bytes`);
- *   console.log(`Modified: ${new Date(stats.mtime)}`);
- *   console.log(`Is file: ${stats.isFile}`);
- *   console.log(`Is directory: ${stats.isDirectory}`);
+ *   console.log(`Size: ${stats.size} bytes, isFile: ${stats.isFile}`);
  * }
  * ```
- * @example  Low-level file operations
+ * @example Directory operations
  * ```typescript
  * const fs = import.meta.use('fs')
- * 
- * // Open file for reading
- * const fd = fs.open('data.bin', 'r');
- * 
- * // Read into buffer
- * const buffer = new Uint8Array(1024);
- * const bytesRead = fs.read(fd, buffer);
- * // or positioned read
- * const bytesRead = fs.pread(fd, buffer, 100, 1024);
- * console.log(`Read ${bytesRead} bytes`);
- * 
- * // Close file
- * fs.close(fd);
- * ```
- * @example  Write file in chunks
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * const fd = fs.open('output.bin', 'w', 0o644);
- * 
- * const chunk1 = new Uint8Array([1, 2, 3, 4]);
- * const chunk2 = new Uint8Array([5, 6, 7, 8]);
- * 
- * fs.write(fd, chunk1);
- * fs.write(fd, chunk2);
- * // or positioned write
- * fs.pwrite(fd, chunk1, 100);
- * 
- * fs.close(fd);
- * ```
- * @example  Directory operations
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * // Create directory
  * fs.mkdir('mydir', 0o755);
- * 
- * // List directory contents
  * const files = fs.readdir('mydir');
- * for (const file of files) {
- *   console.log(file);
- * }
- * 
- * // Remove directory
  * fs.rmdir('mydir');
  * ```
- * @example  File management
+ * @example Low-level file operations
  * ```typescript
  * const fs = import.meta.use('fs')
- * 
- * // Rename/move file
- * fs.rename('old.txt', 'new.txt');
- * 
- * // Delete file
- * fs.unlink('temp.txt');
- * ```
- * @example  Custom module loader using syncfs
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function loadModule(path: string): any {
- *   // Resolve absolute path
- *   const absPath = fs.realpath(path);
- *   
- *   // Check if file exists
- *   if (!fs.exists(absPath)) {
- *     throw new Error(`Module not found: ${path}`);
- *   }
- *   
- *   // Read module source
- *   const source = fs.readFile(absPath);
- *   const code = new TextDecoder().decode(source);
- *   
- *   // Compile and execute
- *   const module = { exports: {} };
- *   const func = new Function('module', 'exports', code);
- *   func(module, module.exports);
- *   
- *   return module.exports;
- * }
- * ```
- * @example  File copy implementation
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function copyFile(src: string, dest: string): void {
- *   const data = fs.readFile(src);
- *   const stats = fs.stat(src);
- *   fs.writeFile(dest, data, stats.mode & 0o777);
- * }
- * 
- * copyFile('source.txt', 'destination.txt');
- * ```
- * @example  Directory tree walker
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function walkDir(dir: string, callback: (path: string, stats: Stats) => void): void {
- *   const entries = fs.readdir(dir);
- *   
- *   for (const entry of entries) {
- *     const fullPath = `${dir}/${entry}`;
- *     const stats = fs.stat(fullPath);
- *     
- *     callback(fullPath, stats);
- *     
- *     if (stats.isDirectory) {
- *       walkDir(fullPath, callback);
- *     }
- *   }
- * }
- * 
- * // Usage
- * walkDir('.', (path, stats) => {
- *   console.log(`${path}: ${stats.size} bytes`);
- * });
- * ```
- * @example  Atomic file write
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function writeFileAtomic(path: string, data: ArrayBuffer | Uint8Array): void {
- *   const tmpPath = `${path}.tmp`;
- *   
- *   // Write to temporary file
- *   fs.writeFile(tmpPath, data);
- *   
- *   // Atomic rename
- *   fs.rename(tmpPath, path);
- * }
- * 
- * const data = new TextEncoder().encode('Important data');
- * writeFileAtomic('config.json', data);
- * ```
- * @example  Check write permissions
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function canWrite(path: string): boolean {
- *   try {
- *     const stats = fs.stat(path);
- *     // Check user write permission
- *     return (stats.mode & fs.S_IWUSR) !== 0;
- *   } catch (e) {
- *     return false;
- *   }
- * }
- * ```
- * @example  Read file with specific encoding
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function readTextFile(path: string, encoding: string = 'utf-8'): string {
- *   const buffer = fs.readFile(path);
- *   const decoder = new TextDecoder(encoding);
- *   return decoder.decode(buffer);
- * }
- * 
- * const content = readTextFile('data.txt', 'utf-8');
- * ```
- * @example  Safe directory creation (recursive)
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * function mkdirRecursive(path: string, mode: number = 0o777): void {
- *   const parts = path.split('/').filter(p => p);
- *   let current = path.startsWith('/') ? '/' : '';
- *   
- *   for (const part of parts) {
- *     current += part;
- *     
- *     if (!fs.exists(current)) {
- *       fs.mkdir(current, mode);
- *     }
- *     
- *     current += '/';
- *   }
- * }
- * 
- * mkdirRecursive('path/to/nested/dir');
- * ```
- * @example Use with flags constants
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * // Open with explicit flags
- * const fd = fs.open('file.bin', fs.O_RDWR | fs.O_CREAT, 0o644);
- * 
- * const buffer = new Uint8Array(100);
- * fs.read(fd, buffer);
- * 
- * fs.close(fd);
- * ```
- * @example Blocking STDIN read
- * ```typescript
- * const fs = import.meta.use('fs')
- * 
- * fs.setBlocking(0, true); // Set stdin to blocking mode
+ * const fd = fs.open('data.bin', 'r');
  * const buffer = new Uint8Array(1024);
- * const bytesRead = fs.read(0, buffer);
- * console.log(`Read ${bytesRead} bytes`);
+ * const bytesRead = fs.read(fd, buffer);
+ * fs.close(fd);
  * ```
  */
 declare namespace CModuleFS {

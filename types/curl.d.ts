@@ -1,343 +1,371 @@
 // curl.d.ts
 declare namespace CModuleCURL {
     /**
-     * CURL模块版本信息
+     * CURL module version information
      */
     export interface VersionInfo {
-        /** LibCURL 版本字符串 */
+        /** LibCURL version string */
         curl: string;
-        /** 支持的协议列表（以逗号分隔） */
+        /** Supported protocols list (comma-separated) */
         protocols: string;
-        /** 功能特性位掩码 */
+        /** Feature flags bitmask */
         features: number;
     }
 
     /**
-     * HTTP响应对象
+     * HTTP response object
      */
     export interface Response {
-        /** 响应体内容 */
+        /** Response body content */
         body?: string;
-        /** 原始响应头 */
+        /** Raw response headers */
         headers: string;
-        /** HTTP状态码 */
+        /** HTTP status code */
         status: number;
-        /** 最终请求URL（可能经过重定向） */
+        /** Final request URL (may differ after redirects) */
         url?: string;
-        /** 是否流式模式，此时body没内容 */
+        /** Whether streaming mode (body is empty when true) */
         streamed: boolean;
     }
 
     /**
-     * HTTP请求错误对象
+     * HTTP request error object
      */
     export interface CURLException {
-        /** 错误消息 */
+        /** Error message */
         message: string;
-        /** LibCURL错误码 */
+        /** LibCURL error code */
         code: number;
     }
 
     /**
-     * 进度回调函数参数
-     * @param dltotal 总下载字节数（未知时为0）
-     * @param dlnow 已下载字节数
-     * @param ultotal 总上传字节数（未知时为0）
-     * @param ulnow 已上传字节数
-     * @returns 返回true继续传输，false中止传输
+     * Progress callback function
+     * @param dltotal Total download bytes (0 if unknown)
+     * @param dlnow Downloaded bytes
+     * @param ultotal Total upload bytes (0 if unknown)
+     * @param ulnow Uploaded bytes
+     * @returns Return true to continue, false to abort
      */
     export type ProgressCallback = (dltotal: number, dlnow: number, ultotal: number, ulnow: number) => boolean;
 
     /**
-     * HTTP头部回调函数
-     * @param header 单行HTTP头部（包含结尾CRLF）
-     * @returns 处理的字节数，返回0表示中止
+     * HTTP header callback function
+     * @param header Single HTTP header line (includes trailing CRLF)
+     * @returns Bytes processed, return 0 to abort
      */
     export type HeaderCallback = (header: string) => number;
 
     /**
-     * 连接池配置选项
+     * Connection pool configuration options
      */
     export interface ConnPoolOptions {
-        /** 最大总连接数 */
+        /** Maximum total connections */
         maxConnections?: number;
-        /** 每个主机的最大连接数 */
+        /** Maximum connections per host */
         maxConnectionsPerHost?: number;
-        /** 是否启用HTTP/2多路复用管道 */
+        /** Enable HTTP/2 multiplexed pipelining */
         pipelining?: boolean;
     }
 
     /**
-     * HTTP请求选项（用于便捷方法）
+     * HTTP request options (for convenience methods)
      */
     export interface RequestOptions {
-        /** HTTP请求头 */
+        /** HTTP request headers */
         headers?: Record<string, string>;
-        /** 超时时间（毫秒） */
+        /** Timeout (milliseconds) */
         timeout?: number;
     }
 
     /**
-     * CURL请求信息统计
+     * CURL request statistics
      */
     export interface RequestInfo {
-        /** HTTP状态码 */
+        /** HTTP status code */
         status: number;
-        /** 最终请求URL */
+        /** Final request URL */
         url?: string;
-        /** 总请求时间（秒） */
+        /** Total request time (seconds) */
         totalTime: number;
-        /** 下载数据大小（字节） */
+        /** Downloaded data size (bytes) */
         downloadSize: number;
-        /** 上传数据大小（字节） */
+        /** Uploaded data size (bytes) */
         uploadSize: number;
     }
 
     /**
-     * 连接池类 - 管理多个CURL连接的复用
+     * Connection pool - Manages multiple CURL connections for reuse
+     * 
+     * @example
+     * const { ConnPool, CURL } = import.meta.use('curl');
+     * 
+     * const pool = new ConnPool({ maxConnections: 10 });
+     * const curl = new CURL(pool);
+     * 
+     * const res = await curl.setUrl('https://example.com')
+     *                      .setMethod('GET')
+     *                      .perform();
      */
     export class ConnPool {
         /**
-         * 创建新的连接池
-         * @param options 连接池配置选项
+         * Create new connection pool
+         * @param options Connection pool configuration options
          */
         constructor(options?: ConnPoolOptions);
 
         /**
-         * 获取当前活跃的连接数
+         * Get current active connection count
          */
         getActiveCount(): number;
 
         /**
-         * 处理所有挂起的异步操作
-         * 需要在事件循环中定期调用以确保回调被执行
+         * Process all pending async operations
+         * Should be called periodically in event loop to ensure callbacks are executed
          */
         process(): void;
 
         /**
-         * 关闭连接池并释放所有资源
+         * Close connection pool and release all resources
          */
         close(): void;
 
         /**
-         * 设置HTTP管道最大长度（仅HTTP/2）
-         * @param length 管道最大长度
+         * Set HTTP pipeline maximum length (HTTP/2 only)
+         * @param length Maximum pipeline length
          */
         setMaxPipelineLength(length: number): void;
 
         /**
-         * 设置HTTP/2最大并发流数
-         * @param streams 最大并发流数
+         * Set HTTP/2 maximum concurrent streams
+         * @param streams Maximum concurrent streams
          */
         setMaxConcurrentStreams(streams: number): void;
     }
 
     /**
-     * CURL类 - 表示单个HTTP请求
+     * CURL class - Represents a single HTTP request
+     * 
+     * @example
+     * const { ConnPool, CURL } = import.meta.use('curl');
+     * 
+     * const pool = new ConnPool();
+     * const curl = new CURL(pool);
+     * 
+     * // GET request
+     * const res = await curl.setUrl('https://api.example.com/data')
+     *                      .setHeaders({ 'Authorization': 'Bearer token' })
+     *                      .perform();
+     * 
+     * // POST request
+     * const postRes = await curl.setUrl('https://api.example.com/submit')
+     *                         .setMethod('POST')
+     *                         .setHeaders({ 'Content-Type': 'application/json' })
+     *                         .setBody(JSON.stringify({ key: 'value' }))
+     *                         .perform();
      */
     export class CURL {
         /**
-         * 创建新的CURL实例
-         * @param pool 连接池，必选
+         * Create new CURL instance
+         * @param pool Connection pool (required)
          */
         constructor(pool: ConnPool);
 
         /**
-         * 设置请求URL
-         * @param url 请求的URL地址
-         * @returns 当前CURL实例（支持链式调用）
+         * Set request URL
+         * @param url Request URL
+         * @returns Current CURL instance (supports chaining)
          */
         setUrl(url: string): this;
 
         /**
-         * 设置HTTP方法
-         * @param method HTTP方法（GET, POST, PUT, HEAD, DELETE等）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set HTTP method
+         * @param method HTTP method (GET, POST, PUT, HEAD, DELETE, etc.)
+         * @returns Current CURL instance (supports chaining)
          */
         setMethod(method: string): this;
 
         /**
-         * 设置HTTP请求头
-         * @param headers 请求头对象
-         * @returns 当前CURL实例（支持链式调用）
+         * Set HTTP request headers
+         * @param headers Headers object
+         * @returns Current CURL instance (supports chaining)
          */
         setHeaders(headers: Record<string, string>): this;
 
         /**
-         * 设置请求体（用于POST/PUT等）
-         * @param body 请求体字符串
-         * @returns 当前CURL实例（支持链式调用）
+         * Set request body (for POST/PUT, etc.)
+         * @param body Request body string
+         * @returns Current CURL instance (supports chaining)
          */
         setBody(body: string): this;
 
         /**
-         * 设置超时时间（毫秒）
-         * @param timeout 超时时间（毫秒）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set timeout (milliseconds)
+         * @param timeout Timeout in milliseconds
+         * @returns Current CURL instance (supports chaining)
          */
         setTimeout(timeout: number): this;
 
         /**
-         * 设置是否跟随重定向
-         * @param follow 是否跟随重定向
-         * @returns 当前CURL实例（支持链式调用）
+         * Set whether to follow redirects
+         * @param follow Whether to follow redirects
+         * @returns Current CURL instance (supports chaining)
          */
         setFollowRedirects(follow: boolean): this;
 
         /**
-         * 设置SSL/TLS验证
-         * @param verifyPeer 是否验证对等证书
-         * @param verifyHost 是否验证主机名（默认与verifyPeer相同）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set SSL/TLS verification
+         * @param verifyPeer Whether to verify peer certificate
+         * @param verifyHost Whether to verify hostname (defaults to verifyPeer)
+         * @returns Current CURL instance (supports chaining)
          */
         setSSLVerify(verifyPeer: boolean, verifyHost?: boolean): this;
 
         /**
-         * 设置CA证书包路径
-         * @param path CA证书文件路径
-         * @returns 当前CURL实例（支持链式调用）
+         * Set CA certificate bundle path
+         * @param path CA certificate file path
+         * @returns Current CURL instance (supports chaining)
          */
         setCABundle(path: string): this;
 
         /**
-         * 设置代理服务器
-         * @param proxy 代理服务器地址（如：http://proxy.example.com:8080）
-         * @param type 代理类型（http, https, socks4, socks5）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set proxy server
+         * @param proxy Proxy server address (e.g., http://proxy.example.com:8080)
+         * @param type Proxy type (http, https, socks4, socks5)
+         * @returns Current CURL instance (supports chaining)
          */
         setProxy(proxy: string, type?: 'http' | 'https' | 'socks4' | 'socks5'): this;
 
         /**
-         * 设置用户代理字符串
-         * @param userAgent 用户代理字符串
-         * @returns 当前CURL实例（支持链式调用）
+         * Set user agent string
+         * @param userAgent User agent string
+         * @returns Current CURL instance (supports chaining)
          */
         setUserAgent(userAgent: string): this;
 
         /**
-         * 设置Cookie字符串
-         * @param cookie Cookie字符串
-         * @returns 当前CURL实例（支持链式调用）
+         * Set cookie string
+         * @param cookie Cookie string
+         * @returns Current CURL instance (supports chaining)
          */
         setCookie(cookie: string): this;
 
         /**
-         * 设置Cookie文件路径
-         * @param path Cookie文件路径
-         * @returns 当前CURL实例（支持链式调用）
+         * Set cookie file path
+         * @param path Cookie file path
+         * @returns Current CURL instance (supports chaining)
          */
         setCookieFile(path: string): this;
 
         /**
-         * 设置Referer头
-         * @param referer Referer值
-         * @returns 当前CURL实例（支持链式调用）
+         * Set referer header
+         * @param referer Referer value
+         * @returns Current CURL instance (supports chaining)
          */
         setReferer(referer: string): this;
 
         /**
-         * 设置最大重定向次数
-         * @param max 最大重定向次数
-         * @returns 当前CURL实例（支持链式调用）
+         * Set maximum redirect count
+         * @param max Maximum redirects
+         * @returns Current CURL instance (supports chaining)
          */
         setMaxRedirects(max: number): this;
 
         /**
-         * 设置连接超时时间（毫秒）
-         * @param timeout 连接超时时间（毫秒）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set connection timeout (milliseconds)
+         * @param timeout Connection timeout in milliseconds
+         * @returns Current CURL instance (supports chaining)
          */
         setConnectTimeout(timeout: number): this;
 
         /**
-         * 设置是否启用详细输出
-         * @param verbose 是否启用详细输出
-         * @returns 当前CURL实例（支持链式调用）
+         * Set whether to enable verbose output
+         * @param verbose Whether to enable verbose output
+         * @returns Current CURL instance (supports chaining)
          */
         setVerbose(verbose: boolean): this;
 
         /**
-         * 设置HTTP协议版本
-         * @param version HTTP版本（1.0, 1.1, 2, 2TLS, 3）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set HTTP protocol version
+         * @param version HTTP version (1.0, 1.1, 2, 2TLS, 3)
+         * @returns Current CURL instance (supports chaining)
          */
         setHTTPVersion(version: '1.0' | '1.1' | '2' | '2.0' | '2TLS' | '3'): this;
 
         /**
-         * 设置请求范围（用于断点续传）
-         * @param start 起始字节位置
-         * @param end 结束字节位置（可选，不指定则到文件末尾）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set request range (for resumable downloads)
+         * @param start Start byte position
+         * @param end End byte position (optional, defaults to end of file)
+         * @returns Current CURL instance (supports chaining)
          */
         setRange(start: number, end?: number): this;
 
         /**
-         * 设置DNS服务器列表（以逗号分隔）
-         * @param servers DNS服务器列表（如："8.8.8.8,1.1.1.1"）
-         * @returns 当前CURL实例（支持链式调用）
+         * Set DNS server list (comma-separated)
+         * @param servers DNS server list (e.g., "8.8.8.8,1.1.1.1")
+         * @returns Current CURL instance (supports chaining)
          */
         setDNSServers(servers: string): this;
 
         /**
-         * 设置网络接口
-         * @param interfaceName 网络接口名或IP地址
-         * @returns 当前CURL实例（支持链式调用）
+         * Set network interface
+         * @param interfaceName Network interface name or IP address
+         * @returns Current CURL instance (supports chaining)
          */
         setInterface(interfaceName: string): this;
 
         /**
-         * 设置进度回调函数
-         * @param callback 进度回调函数
-         * @returns 当前CURL实例（支持链式调用）
+         * Set progress callback function
+         * @param callback Progress callback function
+         * @returns Current CURL instance (supports chaining)
          */
         onProgress(callback: ProgressCallback): this;
 
         /**
-         * 设置头部回调函数
-         * @param callback 头部回调函数
-         * @returns 当前CURL实例（支持链式调用）
+         * Set header callback function
+         * @param callback Header callback function
+         * @returns Current CURL instance (supports chaining)
          */
         onHeader(callback: HeaderCallback): this;
 
         /**
-         * 异步执行HTTP请求
-         * @returns Promise<Response> HTTP响应
-         * @throws CURLException 请求失败时抛出异常
+         * Execute HTTP request asynchronously
+         * @returns Promise<Response> HTTP response
+         * @throws CURLException Throws on request failure
          */
         perform(): Promise<Response>;
 
         /**
-         * 同步执行HTTP请求
-         * @returns Response HTTP响应
-         * @throws CURLException 请求失败时抛出异常
+         * Execute HTTP request synchronously
+         * @returns Response HTTP response
+         * @throws CURLException Throws on request failure
          */
         performSync(): Response;
 
         /**
-         * 获取请求统计信息
-         * @returns RequestInfo 请求信息统计
+         * Get request statistics
+         * @returns RequestInfo Request statistics
          */
         getInfo(): RequestInfo;
 
         /**
-         * 重置CURL实例到初始状态
+         * Reset CURL instance to initial state
          */
         reset(): void;
 
         /**
-         * 设置流式模式。不保存body而是触发`ondata`
-         * @param mode 流式模式
+         * Set streaming mode. Don't save body, trigger `ondata` instead
+         * @param mode Streaming mode
          */
         setStreamMode(mode: boolean): void;
 
         /**
-         * 流式回调。当回调返回`true`表示终止读取。
+         * Stream callback. Return `true` to abort reading.
          */
         onData(cb: (buf: ArrayBuffer) => boolean): void;
     }
     
     /**
-     * 获取模块版本信息
+     * Get module version information
      */
     export const version: VersionInfo;
 }

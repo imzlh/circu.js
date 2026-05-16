@@ -1,57 +1,64 @@
-
 /**
- * SourceMap 模块
+ * SourceMap module - Source map handling for debugging
+ * 
+ * @example
+ * const sourcemap = import.meta.use('sourcemap');
+ * 
+ * if (sourcemap.has('bundle.js')) {
+ *   const result = sourcemap.get('bundle.js', 10, 5);
+ *   console.log(result.original_file, result.original_line);
+ * }
  */
 declare namespace CModuleSourceMap {
     interface MappingResult {
-        /** 原始文件名 */
+        /** Original file name */
         original_file: string;
-        /** 原始行号 */
+        /** Original line number */
         original_line: number;
-        /** 原始列号 */
+        /** Original column number */
         original_column: number;
-        /** 函数名 */
+        /** Function name */
         function_name: string;
-        /** 是否找到映射 */
+        /** Whether mapping was found */
         found: boolean;
     }
 
     /**
-     * 检查指定文件是否有 SourceMap
-     * @param file_path 文件路径
-     * @returns 是否有 SourceMap
+     * Check if specified file has SourceMap
+     * @param file_path File path
+     * @returns Whether SourceMap exists
      */
     export function has(file_path: string): boolean;
 
     /**
-     * 从 JavaScript 对象加载 SourceMap
-     * @param file_path 文件路径
-     * @param sourcemap_obj SourceMap 对象
-     * @returns 操作结果代码
+     * Load SourceMap from JavaScript object
+     * @param file_path File path
+     * @param sourcemap_obj SourceMap object
+     * @returns Operation result code
      */
     export function load(file_path: string, sourcemap_obj: any): number;
 
     /**
-     * 从 JSON 字符串加载 SourceMap
-     * @param file_path 文件路径
-     * @param json_str SourceMap 的 JSON 字符串
-     * @returns 操作结果代码
+     * Load SourceMap from JSON string
+     * @param file_path File path
+     * @param json_str SourceMap JSON string
+     * @returns Operation result code
      */
     export function loadJSON(file_path: string, json_str: string): number;
 
     /**
-     * 获取源码映射信息
-     * @param file_path 文件路径
-     * @param line 编译后代码的行号
-     * @param column 编译后代码的列号
-     * @returns 映射结果对象
+     * Get source mapping info
+     * @param file_path File path
+     * @param line Compiled code line number
+     * @param column Compiled code column number
+     * @returns Mapping result object
      */
     export function get(file_path: string, line: number, column: number): MappingResult;
 
     /**
-     * 移除指定文件的 SourceMap
-     * @param file_path 文件路径
-     * @returns 是否成功移除
+     * Remove SourceMap for specified file
+     * @param file_path File path
+     * @returns Whether removal succeeded
      */
     export function remove(file_path: string): boolean;
 }

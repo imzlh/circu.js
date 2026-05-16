@@ -93,6 +93,23 @@ declare namespace CModuleWASM {
         mutable: boolean;
     }
 
+    // Table import descriptor for resolveTableImports()
+    interface TableImportDescriptor {
+        module: string;
+        name: string;
+        element: 'funcref' | 'externref';
+        initial: number;
+        maximum?: number;
+    }
+
+    // Memory import descriptor for resolveMemoryImports()
+    interface MemoryImportDescriptor {
+        module: string;
+        name: string;
+        initial: number;
+        maximum?: number;
+    }
+
     // Global info from getGlobalInfo()
     interface GlobalInfo {
         type: 'i32' | 'i64' | 'f32' | 'f64' | 'externref' | 'funcref' | 'unknown';
@@ -159,6 +176,27 @@ declare namespace CModuleWASM {
      * @throws LinkError if resolution fails
      */
     function resolveGlobalImports(module: Module, globalDescs: GlobalImportDescriptor[]): void;
+
+    /**
+     * Resolve table imports for a Module
+     * Must be called before buildInstance()
+     * @param module The Module to resolve imports for
+     * @param tableDescs Array of table import descriptors
+     * @throws LinkError if resolution fails
+     * @throws TypeError if element type is invalid
+     * @throws RangeError if size constraints are invalid
+     */
+    function resolveTableImports(module: Module, tableDescs: TableImportDescriptor[]): void;
+
+    /**
+     * Resolve memory imports for a Module
+     * Must be called before buildInstance()
+     * @param module The Module to resolve imports for
+     * @param memoryDescs Array of memory import descriptors
+     * @throws LinkError if resolution fails
+     * @throws RangeError if size constraints are invalid
+     */
+    function resolveMemoryImports(module: Module, memoryDescs: MemoryImportDescriptor[]): void;
 
     /**
      * Set WASI options for a Module

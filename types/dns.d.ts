@@ -1,59 +1,39 @@
 /**
-* DNS 解析模块 - 支持系统解析和原始 UDP 查询
+* DNS resolution module - Supports system resolution and raw UDP queries
 * 
 * @example
-* ```typescript
-* // 基础域名解析（A/AAAA记录）
-* const addresses = await DNS.resolve('example.com');
-* // => [{ address: '93.184.216.34', family: 4 }]
+* const dns = import.meta.use('dns');
 * 
-* // 指定查询类型和服务器
-* const answers = await DNS.query('example.com', DNS.CNAME, '8.8.8.8', 3000);
-* // => [{ name: 'example.com', type: 5, class: 1, ttl: 300, cname: 'www.example.org' }]
-* ```
+* // Basic resolution
+* const addresses = await dns.resolve('example.com', { family: 4 });
+* 
+* // Raw DNS query
+* const answers = await dns.query('example.com', dns.CNAME, '8.8.8.8');
 */
 declare namespace CModuleDNS {
     /**
-     * DNS 解析选项
+     * DNS resolution options
      */
     export interface GetAddrInfoOptions {
         /**
-         * 地址族类型
-         * - `os.AF_INET`   对应 IPv4
-         * - `os.AF_INET6`  对应 IPv6
-         * - `os.AF_UNSPEC` 自动选择
+         * Address family type
+         * - `os.AF_INET`   IPv4
+         * - `os.AF_INET6`  IPv6
+         * - `os.AF_UNSPEC` Auto-select
          */
         family: number;
 
         /**
-         * DNS服务器
+         * DNS server
          */
         server?: string;
     }
 
     /**
-     * 解析主机名或 IP 地址
+     * Resolve hostname or IP address
      * 
-     * @param hostname 要解析的主机名或 IP 地址
-     * @param options 解析选项
-     * 
-     * @example
-     * // 解析 IPv4 地址
-     * dns.getaddrinfo('example.com', { family: 4 })
-     *   .then(addresses => {
-     *     addresses.forEach(addr => {
-     *       console.log(addr.ip); // 如 "93.184.216.34"
-     *     });
-     *   });
-     * 
-     * @example
-     * // 解析 IPv6 地址
-     * dns.getaddrinfo('example.com', { family: 6 })
-     *   .then(addresses => {
-     *     addresses.forEach(addr => {
-     *       console.log(addr.ip); // 如 "2606:2800:220:1:248:1893:25c8:1946"
-     *     });
-     *   });
+     * @param hostname Hostname or IP to resolve
+     * @param options Resolution options
      */
     export function resolve(
         hostname: string,
@@ -61,125 +41,125 @@ declare namespace CModuleDNS {
     ): Promise<CModuleStreams.AddressInfo[]>;
 
     /**
-     * 同步解析，使用getaddrinfo，在Windows上可能乱码
-     * @param hostname 要解析的主机名或 IP 地址
-     * @param options 解析选项
+     * Synchronous resolution using getaddrinfo (may garble on Windows)
+     * @param hostname Hostname or IP to resolve
+     * @param options Resolution options
      */
     export function resolveSync(
         hostname: string,
         options: GetAddrInfoOptions
     ): CModuleStreams.AddressInfo[];
 
-    /** A记录 (IPv4地址) = 1 */
+    /** A record (IPv4 address) = 1 */
     const A: 1;
-    /** NS记录 (域名服务器) = 2 */
+    /** NS record (name server) = 2 */
     const NS: 2;
-    /** CNAME记录 (别名) = 5 */
+    /** CNAME record (canonical name) = 5 */
     const CNAME: 5;
-    /** SOA记录 (授权开始) = 6 */
+    /** SOA record (start of authority) = 6 */
     const SOA: 6;
-    /** PTR记录 (指针记录) = 12 */
+    /** PTR record (pointer record) = 12 */
     const PTR: 12;
-    /** MX记录 (邮件交换) = 15 */
+    /** MX record (mail exchange) = 15 */
     const MX: 15;
-    /** TXT记录 (文本信息) = 16 */
+    /** TXT record (text information) = 16 */
     const TXT: 16;
-    /** AAAA记录 (IPv6地址) = 28 */
+    /** AAAA record (IPv6 address) = 28 */
     const AAAA: 28;
-    /** SRV记录 (服务定位) = 33 */
+    /** SRV record (service location) = 33 */
     const SRV: 33;
     const NAPTR: 35;    // Naming Authority Pointer
     const CAA: 257;     // Certification Authority Authorization
 
-    /** 基础DNS应答记录（所有记录共享的字段） */
+    /** Base DNS answer record (shared fields) */
     interface BaseAnswer {
-        /** 查询的域名 */
+        /** Queried domain name */
         name: string;
-        /** 记录类型（1=A, 5=CNAME, 15=MX等） */
+        /** Record type (1=A, 5=CNAME, 15=MX, etc.) */
         type: number;
-        /** 类（通常为1，表示IN） */
+        /** Class (usually 1 for IN) */
         class: number;
-        /** 生存时间（秒） */
+        /** Time to live (seconds) */
         ttl: number;
     }
 
-    /** A/AAAA记录 */
+    /** A/AAAA record */
     interface AddressAnswer extends BaseAnswer {
         type: typeof A | typeof AAAA;
-        /** IP地址字符串 */
+        /** IP address string */
         address: string;
     }
 
-    /** CNAME记录 */
+    /** CNAME record */
     interface CNameAnswer extends BaseAnswer {
         type: typeof CNAME;
-        /** 目标域名 */
+        /** Target domain name */
         cname: string;
     }
 
-    /** NS记录 */
+    /** NS record */
     interface NsAnswer extends BaseAnswer {
         type: typeof NS;
-        /** 域名服务器 */
+        /** Name server */
         ns: string;
     }
 
-    /** PTR记录 */
+    /** PTR record */
     interface PtrAnswer extends BaseAnswer {
         type: typeof PTR;
-        /** 反向解析结果 */
+        /** Reverse resolution result */
         ptr: string;
     }
 
-    /** MX记录 */
+    /** MX record */
     interface MxAnswer extends BaseAnswer {
         type: typeof MX;
-        /** 优先级 */
+        /** Priority */
         priority: number;
-        /** 邮件交换服务器 */
+        /** Mail exchange server */
         exchange: string;
     }
 
-    /** SOA记录 */
+    /** SOA record */
     interface SoaAnswer extends BaseAnswer {
         type: typeof SOA;
-        /** 主域名服务器 */
+        /** Primary name server */
         primary: string;
-        /** 管理员邮箱 (格式: admin@example.com) */
+        /** Admin email (format: admin@example.com) */
         admin: string;
-        /** 序列号 */
+        /** Serial number */
         serial: number;
-        /** 刷新间隔（秒） */
+        /** Refresh interval (seconds) */
         refresh: number;
-        /** 重试间隔（秒） */
+        /** Retry interval (seconds) */
         retry: number;
-        /** 过期时间（秒） */
+        /** Expire time (seconds) */
         expire: number;
-        /** 最小TTL（秒） */
+        /** Minimum TTL (seconds) */
         minimum: number;
     }
 
-    /** TXT记录 */
+    /** TXT record */
     interface TxtAnswer extends BaseAnswer {
         type: typeof TXT;
-        /** 文本内容 */
+        /** Text content */
         txt: string;
     }
 
-    /** SRV记录 */
+    /** SRV record */
     interface SrvAnswer extends BaseAnswer {
         type: typeof SRV;
-        /** 优先级 */
+        /** Priority */
         priority: number;
-        /** 权重 */
+        /** Weight */
         weight: number;
-        /** 端口 */
+        /** Port */
         port: number;
-        /** 目标主机 */
+        /** Target host */
         target: string;
     }
 
-    /** NAPTR记录 */
+    /** NAPTR record */
     interface NaptrAnswer extends BaseAnswer {
         type: typeof NAPTR;
         order: number;
@@ -190,7 +170,7 @@ declare namespace CModuleDNS {
         replacement: string;
     }
 
-    /** CAA记录 */
+    /** CAA record */
     interface CaaAnswer extends BaseAnswer {
         type: typeof CAA;
         flags: number;
@@ -198,16 +178,16 @@ declare namespace CModuleDNS {
         value: string;
     }
 
-    /** 未知或未解析记录类型 */
+    /** Unknown or unresolved record type */
     interface RawAnswer extends BaseAnswer {
         type: number;
-        /** rdata长度 */
+        /** rdata length */
         rdlength: number;
-        /** 原始rdata数据 */
+        /** Raw rdata */
         data: ArrayBuffer;
     }
 
-    /** DNS应答记录联合类型 */
+    /** DNS answer record union type */
     type DNSAnswer = 
         | AddressAnswer 
         | CNameAnswer 
@@ -220,29 +200,14 @@ declare namespace CModuleDNS {
         | RawAnswer;
 
     /**
-     * 发送原始 UDP DNS 查询请求
-     * 如果需要同步，使用`engine.waitIO()`
+     * Send raw UDP DNS query
+     * Use `engine.waitIO()` for sync behavior
      * 
-     * @param hostname - 要查询的域名
-     * @param type - 记录类型（默认 DNS.A）
-     * @param server - DNS服务器地址（默认 "8.8.8.8"）
-     * @param timeout - 超时时间毫秒（默认 5000）
-     * @returns DNS应答记录数组
-     * 
-     * @example
-     * ```typescript
-     * // 查询CNAME记录
-     * const cname = await DNS.query('www.example.com', DNS.CNAME);
-     * console.log(cname[0].cname); // "example.com"
-     * 
-     * // 查询TXT记录
-     * const txt = await DNS.query('example.com', DNS.TXT, '1.1.1.1', 3000);
-     * console.log(txt[0].txt); // "v=spf1 -all"
-     * 
-     * // 批量查询MX记录
-     * const mx = await DNS.query('gmail.com', DNS.MX);
-     * mx.forEach(r => console.log(r.name, r.type, r.ttl));
-     * ```
+     * @param hostname - Domain to query
+     * @param type - Record type (default DNS.A)
+     * @param server - DNS server address (default "8.8.8.8")
+     * @param timeout - Timeout in milliseconds (default 5000)
+     * @returns DNS answer array
      */
     function query(
         hostname: string,

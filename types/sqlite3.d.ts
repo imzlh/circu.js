@@ -1,8 +1,14 @@
 /**
- * SQLite3 module for txiki.js
- * Provides an object-oriented interface to SQLite3 databases
+ * SQLite3 module - SQLite database operations
+ * 
+ * @example
+ * const sqlite3 = import.meta.use('sqlite3');
+ * 
+ * const db = sqlite3.open('test.db');
+ * const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+ * const rows = stmt.all([1]);
+ * db.close();
  */
-
 declare namespace CModuleSQLite3 {
     /**
      * SQLite3 database connection handle

@@ -1,3 +1,7 @@
+/**
+ * Algorithm module - C-implemented algorithms for performance
+ * Provides WebSocket masking, FNV/xxHash/MurmurHash, and Xoshiro RNG
+ */
 declare namespace CModuleAlgorithm {
     /**
      * Applies or removes a WebSocket masking key.

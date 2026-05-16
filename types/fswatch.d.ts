@@ -1,35 +1,41 @@
+/**
+ * FSWatch module - File system event monitoring
+ * 
+ * @example
+ * const fswatch = import.meta.use('fswatch');
+ * 
+ * const watcher = await fswatch.watch('./src', (filename, event) => {
+ *   console.log(`${filename}: ${event}`);
+ * });
+ */
 declare namespace CModuleFSWatch {
     /**
-     * 文件系统事件类型枚举
+     * File system event types
      */
     export type FsEvent = 'rename' | 'change'; 
 
     /**
-     * 文件系统监视器对象
+     * File system watcher object
      */
     export interface FsWatcher {
         /**
-         * 关闭文件系统监视器。
-         * @returns 返回一个 Promise，解析为 undefined。
+         * Close file system watcher
          */
         close(): Promise<void>;
 
         /**
-         * 获取被监视的文件或目录路径。
+         * Watched file or directory path
          */
         readonly path: string;
 
-        /**
-         * 文件系统监视器对象的类型标签。
-         */
         readonly [Symbol.toStringTag]: 'FsWatcher';
     }
 
     /**
-     * 启动文件系统监视器。
-     * @param path 要监视的文件或目录路径。
-     * @param callback 事件处理回调函数。
-     * @returns 返回一个 Promise，解析为 FsWatcher 对象。
+     * Start file system watcher
+     * @param path File or directory path to watch
+     * @param callback Event handler callback
+     * @returns FsWatcher object
      */
     export function watch(path: string, callback: (filename: string, event: FsEvent) => void): Promise<FsWatcher>;
 }

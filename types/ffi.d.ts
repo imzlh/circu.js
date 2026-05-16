@@ -1,3 +1,17 @@
+/**
+ * FFI (Foreign Function Interface) module - Call C functions from JavaScript
+ * 
+ * @example
+ * const ffi = import.meta.use('ffi');
+ * 
+ * // Load libc and call printf
+ * const libc = new ffi.UvLib(ffi.LIBC_NAME);
+ * const printf = libc.symbol('printf');
+ * 
+ * const cif = new ffi.FfiCif(ffi.type_void, [ffi.type_pointer]);
+ * const msg = ffi.getCString(ffi.getArrayBufPtr(new TextEncoder().encode('Hello!\0')));
+ * cif.call(printf, msg);
+ */
 declare namespace CModuleFFI {
     /**
      * FFI 类型对象 - 表示 C 语言中的类型

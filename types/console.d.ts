@@ -1,5 +1,6 @@
 /**
- * Partial support for WebAPI Console.
+ * Console module - WebAPI Console partial implementation
+ * Provides console.log, console.error, console.assert, etc.
  */
 declare namespace CModuleConsole {
 
