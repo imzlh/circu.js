@@ -33,7 +33,8 @@ interface TjsModules {
 
 interface TJSOptionalModules {
     'wasm': typeof CModuleWASM,
-    'curl': typeof CModuleCURL
+    'curl': typeof CModuleCURL,
+    'win32': typeof CModuleWin32,
 }
 
 interface UseFN {
@@ -63,10 +64,19 @@ interface ImportMeta {
      * Load a built-in module by name
      * **NOTE** unusable if you enabled `CJS_USE_SYMBOL_INTERNAL`
      */
-    use: UseFN; 
+    use: UseFN;
 
     /**
      * The names of all built-in modules available to this program
      */
     module: Array<keyof TjsModules | keyof TJSOptionalModules>;
+
+    /**
+     * Register an external native module (.so/.dll) so it can be loaded by name via `use()`.
+     * Only available in bootstrap (bytecode) context — not exposed to regular user modules.
+     * @param name  Short name used later with `use(name)`
+     * @param path  Filesystem path to the native library
+     * @throws If `name` shadows a built-in, is already registered, or arguments are missing
+     */
+    register(name: string, path: string): void;
 }

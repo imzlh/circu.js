@@ -32,7 +32,47 @@
 #include "../deps/quickjs/quickjs.h"
 #endif
 
+#include <uv.h>
+#include <stdbool.h>
+#include <stdint.h>
+
 typedef struct TJSRuntime TJSRuntime;
+
+/* External native module ABI.
+ *
+ * A loadable `.so`/`.dll` must export a single function:
+ *
+ *     TJS_EXPORT const TJSModuleInfo *tjs_module_info(void);
+ *
+ * Use the DEF_MODULE() macro below to declare it.  The loader validates
+ * `abi_version` against TJS_ABI_VERSION before reading any other field,
+ * so adding fields in future versions does not break old `.so`s.
+ */
+#define TJS_ABI_VERSION 1u
+
+#ifdef _WIN32
+#define TJS_EXPORT __declspec(dllexport)
+#else
+#define TJS_EXPORT __attribute__((visibility("default")))
+#endif
+
+typedef struct TJSModuleInfo {
+    uint32_t abi_version;
+    const char *name;
+    void (*init)(JSContext *ctx, JSValue ns);
+    bool worker_safe;
+} TJSModuleInfo;
+
+#define DEF_MODULE(_name, _entry, _worker_safe)                            \
+    TJS_EXPORT const TJSModuleInfo *tjs_module_info(void) {                \
+        static const TJSModuleInfo _tjs_module_info_inst = {               \
+            .abi_version = TJS_ABI_VERSION,                                \
+            .name = (_name),                                               \
+            .init = (_entry),                                              \
+            .worker_safe = (_worker_safe),                                 \
+        };                                                                 \
+        return &_tjs_module_info_inst;                                     \
+    }
 
 typedef struct TJSRunOptions {
     int mem_limit;
@@ -49,4 +89,19 @@ TJSRuntime *TJS_GetRuntime(JSContext *ctx);
 int TJS_Run(TJSRuntime *qrt);
 void TJS_Stop(TJSRuntime *qrt);
 
+uv_loop_t *TJS_GetLoop(TJSRuntime *qrt);
+TJSRuntime *TJS_NewRuntimeWorker(void);
+TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options);
+JSValue TJS_EvalScript(JSContext *ctx, const char *filename);
+JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main);
+JSValue TJS_EvalModuleContent(JSContext *ctx,
+                              const char *filename,
+                              bool is_main,
+                              bool use_realpath,
+                              const char *content,
+                              size_t len);
+
+
+void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val);
+void TJS_DumpException(JSContext *ctx);
 #endif

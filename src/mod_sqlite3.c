@@ -203,9 +203,12 @@ static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int 
     }
 
     const char *zFile = JS_ToCString(ctx, argv[0]);
-    const char *zProc = JS_IsUndefined(argv[1]) ? NULL : JS_ToCString(ctx, argv[1]);
-
     if (!zFile) {
+        return JS_EXCEPTION;
+    }
+    const char *zProc = JS_IsUndefined(argv[1]) ? NULL : JS_ToCString(ctx, argv[1]);
+    if (!JS_IsUndefined(argv[1]) && !zProc) {
+        JS_FreeCString(ctx, zFile);
         return JS_EXCEPTION;
     }
 

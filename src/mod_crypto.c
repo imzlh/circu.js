@@ -613,7 +613,16 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md);
     
     if (label) {
-        EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, (unsigned char*)label, label_len);
+        /* EVP_PKEY_CTX_set0_rsa_oaep_label takes ownership and will free with
+         * OPENSSL_free, so hand it an OpenSSL-owned copy of the JS buffer. */
+        unsigned char *label_copy = OPENSSL_malloc(label_len);
+        if (!label_copy) {
+            EVP_PKEY_CTX_free(pctx);
+            EVP_PKEY_free(pkey);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        memcpy(label_copy, label, label_len);
+        EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, label_copy, label_len);
     }
     
     size_t out_len;
@@ -685,7 +694,16 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
     EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md);
     
     if (label) {
-        EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, (unsigned char*)label, label_len);
+        /* EVP_PKEY_CTX_set0_rsa_oaep_label takes ownership and will free with
+         * OPENSSL_free, so hand it an OpenSSL-owned copy of the JS buffer. */
+        unsigned char *label_copy = OPENSSL_malloc(label_len);
+        if (!label_copy) {
+            EVP_PKEY_CTX_free(pctx);
+            EVP_PKEY_free(pkey);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        memcpy(label_copy, label, label_len);
+        EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, label_copy, label_len);
     }
     
     size_t out_len;

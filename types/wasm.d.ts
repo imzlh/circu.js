@@ -146,6 +146,14 @@ declare namespace CModuleWASM {
     function parseModule(buffer: ArrayBuffer | ArrayBufferView): Module;
 
     /**
+     * Get the content of a custom section by name
+     * @param module The Module to inspect
+     * @param sectionName The name of the custom section
+     * @returns ArrayBuffer containing the section content, or null if not found
+     */
+    function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer | null;
+
+    /**
      * Get list of exports from a Module
      * @param module The Module to inspect
      * @returns Array of export descriptors

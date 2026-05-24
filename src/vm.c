@@ -37,7 +37,7 @@
 #include "wasm_export.h"
 #endif
 
-#define TJS__DEFAULT_STACK_SIZE 4 * 1024 * 1024  // 4MB
+#define TJS__DEFAULT_STACK_SIZE 6 * 1024 * 1024  // 6MB
 
 int8_t vm_exit_code;
 static int tjs__argc = 0;
@@ -168,7 +168,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
 		JS_FreeValue(ctx, args);
 
         if (JS_IsException(ret)) {
-            tjs_dump_error(ctx);
+            TJS_DumpException(ctx);
             goto fail;
         } else {
             if (!JS_IsEqual(ctx, ret, JS_FALSE)) {
@@ -179,7 +179,7 @@ static void tjs__promise_rejection_tracker(JSContext *ctx,
                 JS_Throw(qrt->ctx, JS_DupValue(qrt->ctx, reason));
 #ifdef DEBUG
 				fprintf(stderr, "[CORE] UNHANDLED: ");
-				tjs_dump_error1(ctx, reason);
+				tjs_dump_error(ctx, reason);
 #endif
                 TJS_Stop(qrt);
             }
@@ -306,6 +306,10 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 	/* runtime-shared module namespace cache */
 	qrt->module.imod_ns = JS_NewObjectProto(ctx, JS_NULL);
 
+	/* external native module registry */
+	qrt->module.dyn_registry = JS_NewObjectProto(ctx, JS_NULL);
+	init_list_head(&qrt->module.dyn_libs);
+
 	/* if import.meta.use not enabled, inject to global */
 #ifdef CJS__DISABLE_MODULE_USE
 	// define use()
@@ -315,6 +319,14 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 	JS_DefinePropertyValue(ctx, global_obj, use_atom, use_func, JS_PROP_C_W_E);
 	JS_FreeAtom(ctx, use_atom);
 	JS_FreeValue(ctx, use_sym);
+
+	// define register() for external native modules
+	JSValue reg_sym = JS_NewSymbol(ctx, "cjs.internal.register", true);
+	JSAtom reg_atom = JS_ValueToAtom(ctx, reg_sym);
+	JSValue reg_func = JS_NewCFunction(ctx, tjs__module_register, "register", 2);
+	JS_DefinePropertyValue(ctx, global_obj, reg_atom, reg_func, JS_PROP_C_W_E);
+	JS_FreeAtom(ctx, reg_atom);
+	JS_FreeValue(ctx, reg_sym);
 #endif
 
     /* end bootstrap */
@@ -363,15 +375,18 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 
 	/* Stop all workers and wait for their threads to finish before freeing
      * any shared state.  TJS_Stop is async (uv_async_send), so we must
-     * join to ensure the thread has exited. */
+     * join to ensure the thread has exited. The TJSWorker struct itself is
+     * owned by the JS Worker object and freed by tjs_worker_finalizer below
+     * (which runs from JS_FreeRuntime). */
 	struct list_head *p, *tmp;
 	list_for_each_safe(p, tmp, &qrt->workers) {
 		TJSWorker *worker = list_entry(p, TJSWorker, link);
 		if (!worker->terminated) {
+			worker->terminated = true;
 			TJS_Stop(worker->wrt);
 			uv_thread_join(&worker->tid);  /* wait; prevents UAF of worker->wrt */
+			worker->wrt = NULL;
 		}
-		js_free(qrt->ctx, worker);
 	}
 
     /* Close all core loop handles. */
@@ -400,6 +415,9 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
 	/* Destroy shared module namespace */
 	JS_FreeValue(qrt->ctx, qrt->module.imod_ns);
 
+	/* Destroy external native module registry */
+	JS_FreeValue(qrt->ctx, qrt->module.dyn_registry);
+
 	/* remove debug sourcemap */
 	js_destroy_mapping_context(qrt->module.mapctx);
 
@@ -409,6 +427,20 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     /* Destroy the JS engine. */
     JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
+
+	/* Close external native module handles AFTER the JS runtime is fully
+	 * torn down — finalizers for classes/functions registered by the .so
+	 * may run during JS_FreeRuntime and would otherwise call into freed
+	 * code. */
+	{
+		struct list_head *p, *tmp;
+		list_for_each_safe(p, tmp, &qrt->module.dyn_libs) {
+			TJSDynLib *node = list_entry(p, TJSDynLib, link);
+			list_del(p);
+			uv_dlclose(&node->lib);
+			free(node);
+		}
+	}
 
     /* Destroy WASM runtime. */
 #ifdef CJS__HAS_WASM
@@ -494,7 +526,7 @@ void tjs__execute_jobs(JSContext *ctx) {
 				if (JS_IsEqual(ctx1, retv, JS_FALSE)) {
 #ifdef DEBUG
 					fprintf(stderr, "[CORE] JOB: ");
-					tjs_dump_error1(ctx1, js_err);
+					tjs_dump_error(ctx1, js_err);
 #endif
 					TJS_Stop(trt);
 				}
@@ -542,6 +574,10 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
 		JSValue use_func = JS_NewCFunctionData(ctx, tjs__module_use, 1, 0, 1, (JSValueConst[]) { trt->module.imod_ns });
 		JS_DefinePropertyValueStr(ctx, meta, "use", use_func, JS_PROP_C_W_E);
 		JS_DefinePropertyValueStr(ctx, meta, "module", tjs__mod_list_init(ctx), JS_PROP_C_W_E);
+
+		// define register() for external native modules
+		JSValue reg_func = JS_NewCFunction(ctx, tjs__module_register, "register", 2);
+		JS_DefinePropertyValueStr(ctx, meta, "register", reg_func, JS_PROP_C_W_E);
 #endif
 
 		// end
@@ -559,7 +595,7 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
             // It's a promise!
             if (promise_state == JS_PROMISE_REJECTED) {
                 JSValue res = JS_PromiseResult(ctx, val);
-                tjs_dump_error1(ctx, res);
+                tjs_dump_error(ctx, res);
                 JS_FreeValue(ctx, res);
                 JS_FreeValue(ctx, val);
 
@@ -573,7 +609,7 @@ static int tjs__eval_bytecode(JSContext *ctx, const uint8_t *buf, size_t buf_len
     return 0;
 
 error:
-    tjs_dump_error(ctx);
+    TJS_DumpException(ctx);
     return -1;
 }
 

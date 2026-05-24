@@ -2,6 +2,7 @@
  * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2026-present iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -186,7 +187,9 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
             JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) "", 0,
                 JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE, &sab_tab);
             if (JS_IsException(obj)) {
-                emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, JS_GetException(ctx));
+                JSValue exc = JS_GetException(ctx);
+                emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, exc);
+                JS_FreeValue(ctx, exc);
             } else {
                 emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE, obj);
             }
@@ -300,7 +303,7 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     }
 
     size_t len;
-    int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_STRIP_SOURCE;
+    int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE;
     JSSABTab sab_tab;
     uint8_t *buf = JS_WriteObject2(ctx, &len, argv[0], flags, &sab_tab);
     if (!buf) {
@@ -417,10 +420,22 @@ static void worker_entry(void *arg) {
 
 static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     TJSWorker *w = JS_GetOpaque(val, tjs_worker_class_id);
-    if (w) {
-        JS_FreeValueRT(rt, w->message_pipe);
-		w->message_pipe = JS_UNDEFINED;
+    if (!w) return;
+
+    /* Stop the worker thread if it is still running, so TJS_FreeRuntime
+     * doesn't trip over a stale TJSWorker on its workers list. */
+    if (w->wrt != NULL && !w->terminated) {
+        w->terminated = true;
+        TJS_Stop(w->wrt);
+        uv_thread_join(&w->tid);
+        w->wrt = NULL;
     }
+
+    JS_FreeValueRT(rt, w->message_pipe);
+    w->message_pipe = JS_UNDEFINED;
+
+    if (w->link.next) list_del(&w->link);
+    tjs__free(w);
 }
 
 static void tjs_worker_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {

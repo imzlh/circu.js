@@ -86,9 +86,16 @@ struct TJSRuntime {
 		JSValue attrchecker;
 
 		JSValue imod_ns;
+		JSValue dyn_registry;       /* name -> path map for external native modules */
+		struct list_head dyn_libs;  /* loaded uv_lib_t handles, freed after JS shutdown */
 		MappingContext* mapctx;
 	} module;
 };
+
+typedef struct TJSDynLib {
+	uv_lib_t lib;
+	struct list_head link;
+} TJSDynLib;
 
 typedef struct {
     JSContext *ctx;
@@ -162,6 +169,7 @@ JSModuleDef *tjs__load_builtin(JSContext *ctx, const char *name);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);
 
 JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value);
+JSValue tjs__module_register(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 JSValue tjs__mod_list_init(JSContext* ctx);
 
 JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *opaque, JSValueConst attributes);
@@ -176,18 +184,6 @@ void tjs__destroy_timers(TJSRuntime *qrt);
 
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);
-
-uv_loop_t *TJS_GetLoop(TJSRuntime *qrt);
-TJSRuntime *TJS_NewRuntimeWorker(void);
-TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options);
-JSValue TJS_EvalScript(JSContext *ctx, const char *filename);
-JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main);
-JSValue TJS_EvalModuleContent(JSContext *ctx,
-                              const char *filename,
-                              bool is_main,
-                              bool use_realpath,
-                              const char *content,
-                              size_t len);
 
 // Warn: will not dup, use JS_Dup if you want to keep it alive
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);

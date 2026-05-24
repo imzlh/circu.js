@@ -116,10 +116,16 @@ static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *a
         return JS_ThrowInternalError(ctx, "couldn't initialize Signal handle");
     }
 
+    sh->handle.data = sh;
+
     r = uv_signal_start(&sh->handle, uv__signal_cb, sig_num);
     if (r != 0) {
+        /* handle was registered with the loop; we must uv_close it before
+         * freeing the backing memory. The close cb frees sh once both
+         * closed=1 and finalized=1 are set. */
+        sh->finalized = 1;
+        uv_close((uv_handle_t *) &sh->handle, uv__signal_close_cb);
         JS_FreeValue(ctx, obj);
-        tjs__free(sh);
         return tjs_throw_errno(ctx, r);
     }
     uv_unref((uv_handle_t *) &sh->handle);

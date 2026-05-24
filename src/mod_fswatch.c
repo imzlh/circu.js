@@ -121,7 +121,7 @@ static JSValue tjs_fswatch_path_get(JSContext *ctx, JSValue this_val) {
         if (!dbuf) {
             return JS_EXCEPTION;
         }
-        uv_fs_event_getpath(&fw->handle, dbuf, &size);
+        r = uv_fs_event_getpath(&fw->handle, dbuf, &size);
         if (r != 0) {
             js_free(ctx, dbuf);
             return tjs_throw_errno(ctx, r);
@@ -203,11 +203,15 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_ThrowInternalError(ctx, "couldn't initialize handle");
     }
 
+    fw->handle.data = fw;
+
     r = uv_fs_event_start(&fw->handle, uv__fs_event_cb, path, UV_FS_EVENT_RECURSIVE);
     if (r != 0) {
         JS_FreeCString(ctx, path);
+        /* handle is registered with the loop; close before freeing memory. */
+        fw->finalized = 1;
+        uv_close((uv_handle_t *) &fw->handle, uv__fsevent_close_cb);
         JS_FreeValue(ctx, obj);
-        tjs__free(fw);
         return tjs_throw_errno(ctx, r);
     }
 

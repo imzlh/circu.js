@@ -342,6 +342,14 @@ static void uv__fs_req_cb(uv_fs_t *req) {
     switch (req->fs_type) {
         case UV_FS_OPEN:
             arg = tjs_new_file(ctx, fr->req.result, fr->req.path);
+            if (JS_IsException(arg)) {
+                /* fd was opened but the JS wrapper allocation failed: close it
+                 * to avoid leaking the file descriptor. */
+                uv_fs_t close_req;
+                uv_fs_close(NULL, &close_req, fr->req.result, NULL);
+                uv_fs_req_cleanup(&close_req);
+                is_reject = true;
+            }
             break;
         case UV_FS_CLOSE:
             arg = JS_UNDEFINED;
@@ -400,10 +408,22 @@ static void uv__fs_req_cb(uv_fs_t *req) {
 
         case UV_FS_MKSTEMP:
             arg = tjs_new_file(ctx, fr->req.result, fr->req.path);
+            if (JS_IsException(arg)) {
+                uv_fs_t close_req;
+                uv_fs_close(NULL, &close_req, fr->req.result, NULL);
+                uv_fs_req_cleanup(&close_req);
+                is_reject = true;
+            }
             break;
 
         case UV_FS_OPENDIR:
             arg = tjs_new_dir(ctx, fr->req.ptr, fr->req.path);
+            if (JS_IsException(arg)) {
+                uv_fs_t close_req;
+                uv_fs_closedir(NULL, &close_req, fr->req.ptr, NULL);
+                uv_fs_req_cleanup(&close_req);
+                is_reject = true;
+            }
             break;
 
         case UV_FS_CLOSEDIR:

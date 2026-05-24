@@ -162,7 +162,7 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
 			CHECK_NOT_NULL(trt);
 #ifdef DEBUG
 			fprintf(stderr, "[CORE] CALLED: ");
-			tjs_dump_error1(ctx, err);
+			tjs_dump_error(ctx, err);
 #endif
 			TJS_Stop(trt);
 		}
@@ -448,7 +448,7 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
     if (!JS_IsException(ret) && is_main) {
 		JSValue ret = tjs__dispatch_event(ctx, EV_LOAD, JS_UNDEFINED);
 		if (JS_IsException(ret)){
-			tjs_dump_error(ctx);
+			TJS_DumpException(ctx);
 		}
 		JS_FreeValue(ctx, ret);
     }

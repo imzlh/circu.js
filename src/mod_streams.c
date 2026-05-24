@@ -50,6 +50,7 @@ JSValue tjs_new_pipe(JSContext *ctx);  /* exported: used by other modules */
 enum {
     STREAM_CB_READ = 0,    /* onread(data, error) */
     STREAM_CB_CONNECTION,  /* onconnection(error, client) */
+    STREAM_CB_CLOSE,       /* onclose() */
     STREAM_CB_MAX
 };
 
@@ -138,6 +139,13 @@ static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
     s->closed = 1;
+
+    /* Fire onclose callback if set. */
+    JSValue fn = s->callbacks[STREAM_CB_CLOSE];
+    if (JS_IsFunction(s->ctx, fn)) {
+        tjs_call_handler(s->ctx, fn, 0, NULL);
+    }
+
     if (s->finalized)
         tjs__free(s);
 }
@@ -616,12 +624,17 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     JS_FreeValueRT(rt, s->obj);
     for (int i = 0; i < STREAM_CB_MAX; i++)
         JS_FreeValueRT(rt, s->callbacks[i]);
+
+    /* read_buf must be NULL'd: uv_close below will trigger one final
+     * uv__stream_read_cb with UV_ECANCELED, which would double-free it. */
     js_free_rt(rt, s->read_buf);
+    s->read_buf = NULL;
 
     if (s->read_req) {
         TJS_FreePromiseRT(rt, &s->read_req->result);
         JS_FreeValueRT(rt, s->read_req->buf);
         js_free_rt(rt, s->read_req);
+        s->read_req = NULL;
     }
 
     TJS_FreePromiseRT(rt, &s->connect_promise);
@@ -1020,6 +1033,7 @@ static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue
 static const JSCFunctionListEntry tjs_stream_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("onread",       tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_READ),
     JS_CGETSET_MAGIC_DEF("onconnection", tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CONNECTION),
+    JS_CGETSET_MAGIC_DEF("onclose",      tjs_stream_callback_get, tjs_stream_callback_set, STREAM_CB_CLOSE),
     TJS_CFUNC_DEF("listen",      1, tjs_stream_listen),
     TJS_CFUNC_DEF("startRead",   0, tjs_stream_start_read),
     TJS_CFUNC_DEF("stopRead",    0, tjs_stream_stop_read),

@@ -432,7 +432,11 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
     attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrSize);
-    if (!attrList || !InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) ||
+    if (!attrList) {
+        JS_ThrowOutOfMemory(ctx);
+        goto cleanup;
+    }
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) ||
         !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                    hPC, sizeof(HPCON), NULL, NULL)) {
         JS_ThrowInternalError(ctx, "ProcThreadAttribute setup failed");
@@ -442,11 +446,15 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     const char *cmd = (name && *name) ? name : getenv("COMSPEC");
     if (!cmd || !*cmd) cmd = "cmd.exe";
     { int wl = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, NULL, 0);
+      if (wl <= 0) { JS_ThrowInternalError(ctx, "MultiByteToWideChar(cmd) failed"); goto cleanup; }
       wcmd = (WCHAR *)malloc(wl * sizeof(WCHAR));
+      if (!wcmd) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
       MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, wl); }
     if (cwd) {
         int wl = MultiByteToWideChar(CP_UTF8, 0, cwd, -1, NULL, 0);
+        if (wl <= 0) { JS_ThrowInternalError(ctx, "MultiByteToWideChar(cwd) failed"); goto cleanup; }
         wcwd = (WCHAR *)malloc(wl * sizeof(WCHAR));
+        if (!wcwd) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
         MultiByteToWideChar(CP_UTF8, 0, cwd, -1, wcwd, wl);
     }
 

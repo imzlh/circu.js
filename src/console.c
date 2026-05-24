@@ -647,15 +647,23 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
 
 	size_t offset, len, per;
     JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &offset, &len, &per);
+    if (JS_IsException(buffer)) {
+        /* Detached buffer — fall back to generic object display */
+        put_color(buf, opts, ANSI_MAGENTA);
+        dbuf_printf(buf, "%s(%zu) [ <detached> ]", name, len);
+        put_reset(buf, opts);
+        JS_FreeValue(ctx, buffer);
+        return;
+    }
 
     put_color(buf, opts, ANSI_MAGENTA);
     dbuf_printf(buf, "%s(%zu) [ ", name, len);
     put_reset(buf, opts);
     size_t show = MIN(len, opts->max_array_length);
-    for (uint32_t i = 0; i < show; i++) {
+    for (size_t i = 0; i < show; i++) {
         if (i > 0) dbuf_putstr(buf, ", ");
-        JSValue elem = JS_GetPropertyUint32(ctx, val, i + offset);
-        format_number(ctx, elem, buf, opts);
+        JSValue elem = JS_GetPropertyUint32(ctx, val, (uint32_t)i);
+        format_value(ctx, elem, depth + 1, stack, buf, false, opts);
         JS_FreeValue(ctx, elem);
     }
     if (len > show) {
@@ -677,6 +685,29 @@ static void format_array_buffer(JSContext* ctx, JSValue val, DynBuf* buf, const 
 
     put_color(buf, opts, ANSI_MAGENTA);
     dbuf_printf(buf, "ArrayBuffer(%zu) {", size);
+    if (size > 0 && data) {
+        size_t show = size < 32 ? size : 32;
+        for (size_t i = 0; i < show; i++) {
+            if (i > 0) dbuf_putc(buf, ' ');
+            dbuf_printf(buf, "%02x", data[i]);
+        }
+        if (size > show) dbuf_printf(buf, " ... %zu more bytes", size - show);
+    }
+    dbuf_putstr(buf, " }");
+    put_reset(buf, opts);
+}
+
+static void format_dataview(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
+    JSValue buffer = JS_GetPropertyStr(ctx, val, "buffer");
+    size_t size = 0;
+    uint8_t* data = NULL;
+    if (!JS_IsException(buffer) && JS_IsArrayBuffer(buffer)) {
+        data = JS_GetArrayBuffer(ctx, &size, buffer);
+    }
+    JS_FreeValue(ctx, buffer);
+
+    put_color(buf, opts, ANSI_MAGENTA);
+    dbuf_printf(buf, "DataView(%zu) {", size);
     if (size > 0 && data) {
         size_t show = size < 32 ? size : 32;
         for (size_t i = 0; i < show; i++) {
@@ -759,6 +790,8 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 				format_array_buffer(ctx, val, buf, opts);
 			} else if (JS_GetTypedArrayType(val) != -1) {
 				format_typed_array(ctx, val, depth, stack, buf, opts);
+			} else if (JS_IsDataView(val)) {
+				format_dataview(ctx, val, buf, opts);
 			} else if (JS_IsArray(val)) {
 				format_array(ctx, val, depth, stack, buf, opts);
 			} else {
@@ -773,7 +806,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 		case JS_TAG_SYMBOL:
 			format_symbol(ctx, val, buf, opts);
 			break;
-		case JS_TAG_MODULE:
+		case JS_TAG_MODULE: {
 			put_color(buf, opts, ANSI_GRAY);
 			JSAtom module_atom = JS_GetModuleName(ctx, JS_VALUE_GET_PTR(val));
 			const char* module_name = JS_AtomToCString(ctx, module_atom);
@@ -781,6 +814,8 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			JS_FreeCString(ctx, module_name);
 			JS_FreeAtom(ctx, module_atom);
 			put_reset(buf, opts);
+			break;
+		}
 		default:
 			put_color(buf, opts, ANSI_RED);
 			dbuf_printf(buf, "[Unknown:%d]", JS_VALUE_GET_TAG(val));
@@ -973,8 +1008,8 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
 }
 
 // # C apis
-static void tjs_dump_obj(JSContext *ctx, FILE *f, JSValue val) {
-	VisitStack st;
+void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val) {
+	VisitStack st = {0};
 	InspectOptions io = {0};
 	DynBuf buf;
 
@@ -984,13 +1019,13 @@ static void tjs_dump_obj(JSContext *ctx, FILE *f, JSValue val) {
 	dbuf_free(&buf);
 }
 
-void tjs_dump_error(JSContext *ctx) {
+void TJS_DumpException(JSContext *ctx) {
     JSValue exception_val = JS_GetException(ctx);
-    tjs_dump_error1(ctx, exception_val);
+    tjs_dump_error(ctx, exception_val);
     JS_FreeValue(ctx, exception_val);
 }
 
-void tjs_dump_error1(JSContext *ctx, JSValue exception_val) {
-    tjs_dump_obj(ctx, stderr, exception_val);
+void tjs_dump_error(JSContext *ctx, JSValue exception_val) {
+    TJS_DumpValue(ctx, stderr, exception_val);
     fflush(stderr);
 }

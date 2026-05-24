@@ -104,6 +104,7 @@ static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, 
 	const char* name = JS_ToCString(ctx, argv[0]);
     if(!name) return JS_EXCEPTION;
     JSModuleDef* m = JS_NewCModule2(ctx, name);
+    JS_FreeCString(ctx, name);
     if(!m) return JS_EXCEPTION;
     return module_new(ctx, m);
 }
@@ -142,9 +143,14 @@ static JSValue js_module_static_from(JSContext *ctx, JSValueConst new_target, in
 	}
 
 	const char* name = JS_ToCString(ctx, argv[0]);
+	if (!name) return JS_EXCEPTION;
 	JSValue raw_object = JS_DupValue(ctx, argv[1]);
 	JSModuleDef* m = JS_NewCModule(ctx, name, js_module_init_fn);
 	JS_FreeCString(ctx, name);
+	if (!m) {
+		JS_FreeValue(ctx, raw_object);
+		return JS_EXCEPTION;
+	}
 
 	// export all keys
 	JSPropertyEnum* ep;
@@ -154,9 +160,9 @@ static JSValue js_module_static_from(JSContext *ctx, JSValueConst new_target, in
 		return JS_EXCEPTION;
 	}
 	for (int i = 0; i < len; i++) {
-		const char* name = JS_AtomToCString(ctx, ep[i].atom);
-		JS_AddModuleExport(ctx, m, name);
-		JS_FreeCString(ctx, name);
+		const char* ename = JS_AtomToCString(ctx, ep[i].atom);
+		JS_AddModuleExport(ctx, m, ename);
+		JS_FreeCString(ctx, ename);
 	}
 	JS_FreePropertyEnum(ctx, ep, len);
 
@@ -353,16 +359,9 @@ static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
 	js_free_rt(rt, mt);
 }
 
-// static void js_module_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func){
-// 	tjs_module_t* mt = JS_GetOpaque(val, js_module_class_id);
-// 	if (!mt) return;
-// 	JS_MarkValue(rt, JS_MKPTR(JS_TAG_MODULE, mt->def), mark_func);
-// }
-
 static const JSClassDef js_module_class = {
     "Module",
     .finalizer = js_module_finalizer,
-	// .gc_mark = js_module_mark
 };
 
 static const JSCFunctionListEntry js_module_proto_funcs[] = {
@@ -636,7 +635,6 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	if (argc == 0 || !JS_IsPromise(argv[0]))
 		return JS_ThrowTypeError(ctx, "not a Promise.");
 
-	JS_DupValue(ctx, argv[0]);
 	JSValue abort_check = argc >= 2 && JS_IsFunction(ctx, argv[1]) ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
 
 	// call uv_run to make promise sync
@@ -662,7 +660,6 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	trt->jobs.paused = false;
 	tjs__execute_jobs(ctx);
 
-	JS_FreeValue(ctx, argv[0]);
 	JS_FreeValue(ctx, abort_check);
 	return JS_PromiseResult(ctx, argv[0]);
 }

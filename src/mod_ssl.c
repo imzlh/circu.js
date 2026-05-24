@@ -76,6 +76,9 @@ typedef struct {
     char *ciphers;
     int verify_mode;
     bool session_tickets;
+    /* ALPN protocol list (heap-allocated; referenced by SSL_CTX callback for
+     * server mode, which doesn't copy the buffer). Owned by this context. */
+    uint8_t *alpn_list;
 } TJSSSLContext;
 
 static JSClassID tjs_ssl_context_class_id;
@@ -90,6 +93,7 @@ static void tjs_ssl_context_finalizer(JSRuntime *rt, JSValue val) {
         if (ssl_ctx->key_file) js_free_rt(rt, ssl_ctx->key_file);
         if (ssl_ctx->ca_file) js_free_rt(rt, ssl_ctx->ca_file);
         if (ssl_ctx->ciphers) js_free_rt(rt, ssl_ctx->ciphers);
+        if (ssl_ctx->alpn_list) js_free_rt(rt, ssl_ctx->alpn_list);
         js_free_rt(rt, ssl_ctx);
     }
 }
@@ -332,30 +336,37 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         int32_t len;
         JS_ToInt32(ctx, &len, len_val);
         JS_FreeValue(ctx, len_val);
-        
-        /* Build ALPN protocol list */
-        uint8_t alpn_list[256];
+
+        /* Build ALPN protocol list on the heap. SSL_CTX_set_alpn_select_cb
+         * keeps the pointer (no copy), so this must outlive the constructor. */
+        uint8_t *alpn_list = js_malloc(ctx, 256);
         size_t alpn_list_len = 0;
-        
-        for (int32_t i = 0; i < len && alpn_list_len < sizeof(alpn_list) - 1; i++) {
-            JSValue proto_val = JS_GetPropertyUint32(ctx, alpn_val, i);
-            const char *proto = cstr(ctx, proto_val);
-            if (proto) {
-                size_t proto_len = strlen(proto);
-                if (alpn_list_len + proto_len + 1 < sizeof(alpn_list)) {
-                    alpn_list[alpn_list_len++] = proto_len;
-                    memcpy(alpn_list + alpn_list_len, proto, proto_len);
-                    alpn_list_len += proto_len;
+
+        if (alpn_list) {
+            for (int32_t i = 0; i < len && alpn_list_len < 255; i++) {
+                JSValue proto_val = JS_GetPropertyUint32(ctx, alpn_val, i);
+                const char *proto = cstr(ctx, proto_val);
+                if (proto) {
+                    size_t proto_len = strlen(proto);
+                    if (alpn_list_len + proto_len + 1 < 256) {
+                        alpn_list[alpn_list_len++] = proto_len;
+                        memcpy(alpn_list + alpn_list_len, proto, proto_len);
+                        alpn_list_len += proto_len;
+                    }
+                    JS_FreeCString(ctx, proto);
                 }
-                JS_FreeCString(ctx, proto);
+                JS_FreeValue(ctx, proto_val);
             }
-            JS_FreeValue(ctx, proto_val);
-        }
-        
-        if (ssl_ctx->mode == TJS_SSL_MODE_SERVER) {
-            SSL_CTX_set_alpn_select_cb(ssl_ctx->ssl_ctx, alpn_cb, alpn_list);
-        } else {
-            SSL_CTX_set_alpn_protos(ssl_ctx->ssl_ctx, alpn_list, alpn_list_len);
+
+            if (ssl_ctx->mode == TJS_SSL_MODE_SERVER) {
+                /* server: callback retains the pointer — keep on ssl_ctx */
+                ssl_ctx->alpn_list = alpn_list;
+                SSL_CTX_set_alpn_select_cb(ssl_ctx->ssl_ctx, alpn_cb, alpn_list);
+            } else {
+                /* client: SSL_CTX_set_alpn_protos copies the buffer internally */
+                SSL_CTX_set_alpn_protos(ssl_ctx->ssl_ctx, alpn_list, alpn_list_len);
+                js_free(ctx, alpn_list);
+            }
         }
     }
     JS_FreeValue(ctx, alpn_val);
@@ -451,8 +462,9 @@ static void tjs_ssl_pipe_finalizer(JSRuntime *rt, JSValue val) {
         if (pipe->hostname) {
             js_free_rt(rt, pipe->hostname);
         }
+        /* Release ssl_obj BEFORE freeing pipe to avoid UAF. */
+        JS_FreeValueRT(rt, pipe->ssl_obj);
         js_free_rt(rt, pipe);
-		JS_FreeValueRT(rt, pipe->ssl_obj);
     }
 }
 
@@ -495,11 +507,12 @@ static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
     /* Create SSL object */
     pipe->ssl = SSL_new(ssl_context->ssl_ctx);
     if (!pipe->ssl) {
+        JS_FreeValue(ctx, pipe->ssl_obj);
         js_free(ctx, pipe);
         JS_FreeValue(ctx, obj);
         SSL_THROW_ERROR(ctx, "SSL_new");
     }
-    
+
     /* Create BIO pair for memory-based I/O */
     pipe->rbio = BIO_new(BIO_s_mem());
     pipe->wbio = BIO_new(BIO_s_mem());
@@ -507,6 +520,7 @@ static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
         if (pipe->rbio) BIO_free(pipe->rbio);
         if (pipe->wbio) BIO_free(pipe->wbio);
         SSL_free(pipe->ssl);
+        JS_FreeValue(ctx, pipe->ssl_obj);
         js_free(ctx, pipe);
         JS_FreeValue(ctx, obj);
         return JS_ThrowOutOfMemory(ctx);
@@ -972,15 +986,18 @@ static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
 static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this_val,
                                                  int argc, JSValueConst *argv) {
     JSValue options = argc > 0 ? argv[0] : JS_UNDEFINED;
-    
-    /* Parse options */
-    JSValue cn_val = JS_GetPropertyStr(ctx, options, "commonName");
+
+    /* Parse options. cn_val and days_val are always owned references that
+     * must be freed regardless of argc. cn_owned tracks whether cn came from
+     * JS_ToCString (and so requires JS_FreeCString) vs a static fallback. */
+    JSValue cn_val = JS_IsObject(options) ? JS_GetPropertyStr(ctx, options, "commonName") : JS_UNDEFINED;
     const char *cn = cstr(ctx, cn_val);
+    bool cn_owned = (cn != NULL);
     if (!cn) cn = "localhost";
-    
-    JSValue days_val = JS_GetPropertyStr(ctx, options, "days");
+
+    JSValue days_val = JS_IsObject(options) ? JS_GetPropertyStr(ctx, options, "days") : JS_UNDEFINED;
     int32_t days = 365;
-    JS_ToInt32(ctx, &days, days_val);
+    if (!JS_IsUndefined(days_val)) JS_ToInt32(ctx, &days, days_val);
     
     /* Generate RSA key */
     EVP_PKEY *pkey = EVP_PKEY_new();
@@ -1057,12 +1074,10 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
     X509_free(cert);
     EVP_PKEY_free(pkey);
     
-    if (argc > 0) {
-        JS_FreeCString(ctx, cn);
-        JS_FreeValue(ctx, cn_val);
-        JS_FreeValue(ctx, days_val);
-    }
-    
+    if (cn_owned) JS_FreeCString(ctx, cn);
+    JS_FreeValue(ctx, cn_val);
+    JS_FreeValue(ctx, days_val);
+
     return result;
 }
 

@@ -736,9 +736,11 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     
     iconv_t cd = iconv_open(to, from);
     if (cd == (iconv_t)-1) {
+        /* format the error first — from/to are about to be freed */
+        JSValue err = JS_ThrowTypeError(ctx, "Conversion from %s to %s not supported", from, to);
         JS_FreeCString(ctx, from);
         JS_FreeCString(ctx, to);
-        return JS_ThrowTypeError(ctx, "Conversion from %s to %s not supported", from, to);
+        return err;
     }
     
     // Extract input data

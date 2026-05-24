@@ -379,6 +379,8 @@ static void check_multi_info(TJSConnPool *pool) {
                 char *url = NULL;
                 curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &url);
                 if (url) {
+                    /* free previous effective_url to avoid leaking on reuse */
+                    if (curl->effective_url) js_free(curl->ctx, curl->effective_url);
                     curl->effective_url = js_strdup(curl->ctx, url);
                 }
                 
@@ -682,14 +684,14 @@ static JSValue tjs_connpool_process(JSContext *ctx, JSValueConst this_val,
 
 static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv) {
+	if (argc == 0 || !JS_GetOpaque(argv[0], tjs_connpool_class_id)) {
+		return JS_ThrowTypeError(ctx, "Expect first object as ConnPool");
+	}
+
     JSValue obj = JS_NewObjectClass(ctx, tjs_curl_class_id);
     if (JS_IsException(obj)) {
         return obj;
     }
-
-	if (argc == 0 || !JS_GetOpaque(argv[0], tjs_connpool_class_id)) {
-		return JS_ThrowTypeError(ctx, "Expect first object as ConnPool");
-	}
     
     TJSCURL *curl = js_mallocz(ctx, sizeof(TJSCURL));
     if (!curl) {
@@ -808,10 +810,13 @@ static JSValue tjs_curl_set_headers(JSContext *ctx, JSValueConst this_val,
                 const char *val_str = JS_ToCString(ctx, val);
                 
                 if (key_str && val_str) {
-                    char *header = js_malloc(ctx, strlen(key_str) + strlen(val_str) + 3);
-                    sprintf(header, "%s: %s", key_str, val_str);
-                    curl->request_headers = curl_slist_append(curl->request_headers, header);
-                    js_free(ctx, header);
+                    size_t hlen = strlen(key_str) + strlen(val_str) + 3;
+                    char *header = js_malloc(ctx, hlen);
+                    if (header) {
+                        snprintf(header, hlen, "%s: %s", key_str, val_str);
+                        curl->request_headers = curl_slist_append(curl->request_headers, header);
+                        js_free(ctx, header);
+                    }
                 }
                 
                 JS_FreeCString(ctx, key_str);
@@ -837,16 +842,15 @@ static JSValue tjs_curl_set_body(JSContext *ctx, JSValueConst this_val,
         size_t len;
         const char *data = JS_ToCStringLen(ctx, &len, argv[0]);
         if (!data) return JS_EXCEPTION;
-        
-        char *copy = js_malloc(ctx, len);
-        memcpy(copy, data, len);
-        
-        curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDS, copy);
+
+        /* CURLOPT_COPYPOSTFIELDS makes libcurl strdup the buffer internally
+         * and free it on curl_easy_cleanup, so we don't leak. */
         curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDSIZE, (long)len);
-        
+        curl_easy_setopt(curl->handle, CURLOPT_COPYPOSTFIELDS, data);
+
         JS_FreeCString(ctx, data);
     }
-    
+
     return JS_DupValue(ctx, this_val);
 }
 
@@ -977,7 +981,8 @@ static JSValue tjs_curl_perform_sync(JSContext *ctx, JSValueConst this_val,
         
         char *url = NULL;
         curl_easy_getinfo(curl->handle, CURLINFO_EFFECTIVE_URL, &url);
-        if (url && !curl->effective_url) {
+        if (url) {
+            if (curl->effective_url) js_free(ctx, curl->effective_url);
             curl->effective_url = js_strdup(ctx, url);
         }
         

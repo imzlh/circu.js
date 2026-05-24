@@ -189,11 +189,15 @@ static JSValue tjs_xml_parser_constructor(JSContext *ctx, JSValueConst new_targe
     state->current_data = JS_UNDEFINED;
     state->stopped = false;
     
-    /* Parse options */
-    JSValue options = argc > 0 ? argv[0] : JS_UNDEFINED;
-    JSValue ns_val = JS_GetPropertyStr(ctx, options, "namespace");
-    JSValue separator_val = JS_GetPropertyStr(ctx, options, "namespaceSeparator");
-    
+    /* Parse options — only valid on objects, otherwise GetPropertyStr would
+     * leave a TypeError pending in the runtime. */
+    JSValue ns_val = JS_UNDEFINED;
+    JSValue separator_val = JS_UNDEFINED;
+    if (argc > 0 && JS_IsObject(argv[0])) {
+        ns_val = JS_GetPropertyStr(ctx, argv[0], "namespace");
+        separator_val = JS_GetPropertyStr(ctx, argv[0], "namespaceSeparator");
+    }
+
     const char *separator = NULL;
     if (JS_IsString(separator_val)) {
         separator = JS_ToCString(ctx, separator_val);

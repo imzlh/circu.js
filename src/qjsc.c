@@ -385,9 +385,8 @@ static void output_object_code(JSContext *ctx, const char *out_filename,
             // Attach to executable
             FILE *f = fopen(out_filename, "rb+");
             if (!f) {
-                // If file doesn't exist, create it? Or error?
                 // For attach mode, target must exist (it's the runtime)
-                fprintf(stderr, "Error: Cannot open '%s' for attaching. File must exist.\n", out_filename);
+                fprintf(stderr, "Error: Cannot open '%s' for attaching. Maybe under using or not exists?\n", out_filename);
                 exit(1);
             }
             

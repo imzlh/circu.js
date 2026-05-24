@@ -809,12 +809,15 @@ static void udp_timeout_callback(uv_timer_t* handle) {
 	JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
 	JS_FreeValue(ctx->ctx, error);
 
+	/* stop recv before closing — any queued recv callback would otherwise
+	 * see freed resolve_func/reject_func and UAF. */
+	uv_udp_recv_stop(&ctx->udp);
 	uv_timer_stop(&ctx->timeout_timer);
 	uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);
 	uv_close((uv_handle_t*) &ctx->udp, cleanup_callback);
 	JS_FreeValue(ctx->ctx, ctx->resolve_func);
 	JS_FreeValue(ctx->ctx, ctx->reject_func);
-	if (ctx->hostname) free(ctx->hostname);
+	if (ctx->hostname) { free(ctx->hostname); ctx->hostname = NULL; }
 }
 
 // DNS.query(hostname, type, server, [timeout])
@@ -826,26 +829,33 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	if (!hostname) return JS_ThrowTypeError(ctx, "Invalid hostname");
 
 	int32_t qtype = 1;  // Default A record
-	if (argc >= 2 && -1 == JS_ToInt32(ctx, &qtype, argv[1]))
+	if (argc >= 2 && -1 == JS_ToInt32(ctx, &qtype, argv[1])) {
+		JS_FreeCString(ctx, hostname);
 		return JS_ThrowTypeError(ctx, "Invalid query type");
+	}
 
 	const char* server = qtype == DNS_AAAA ? "2001:4860:4860::8888" : "8.8.8.8";  // Default Google DNS
+	bool server_is_js = false;
 	if (argc >= 3 && !JS_IsUndefined(argv[2])) {
 		server = JS_ToCString(ctx, argv[2]);
 		if (!server) {
 			JS_FreeCString(ctx, hostname);
 			return JS_ThrowTypeError(ctx, "Invalid server");
 		}
+		server_is_js = true;
 	}
 
 	int32_t timeout_ms = 5000;  // Default 5s timeout
-	if (argc >= 4 && -1 == JS_ToInt32(ctx, &timeout_ms, argv[3]))
+	if (argc >= 4 && -1 == JS_ToInt32(ctx, &timeout_ms, argv[3])) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
 		return JS_ThrowTypeError(ctx, "Invalid timeout");
+	}
 
 	dns_udp_ctx_t* req_ctx = malloc(sizeof(dns_udp_ctx_t));
 	if (!req_ctx) {
 		JS_FreeCString(ctx, hostname);
-		if (argc >= 3) JS_FreeCString(ctx, server);
+		if (server_is_js) JS_FreeCString(ctx, server);
 		return JS_ThrowOutOfMemory(ctx);
 	}
 	memset(req_ctx, 0, sizeof(dns_udp_ctx_t));
@@ -871,9 +881,10 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	JS_FreeCString(ctx, hostname);
 
 	if (query_len < 0) {
-		if (argc >= 3) JS_FreeCString(ctx, server);
+		if (server_is_js) JS_FreeCString(ctx, server);
 		JS_FreeValue(ctx, req_ctx->resolve_func);
 		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
 		free(req_ctx->hostname);
 		free(req_ctx);
 		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
@@ -881,7 +892,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 
 	// Setup server address
 	uv_ip4_addr(server, 53, &req_ctx->server_addr);
-	if (argc >= 3) JS_FreeCString(ctx, server);
+	if (server_is_js) JS_FreeCString(ctx, server);
 
 	// Initialize UDP socket
 	// Note: TJS is not using libuv's default loop
@@ -898,11 +909,14 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		udp_send_callback);
 
 	if (ret < 0) {
+		uv_udp_recv_stop(&req_ctx->udp);
 		req_ctx->__close_count = 1;  // no timer handle to close
 		uv_close((uv_handle_t*) &req_ctx->udp, cleanup_callback);
 		JS_FreeValue(ctx, req_ctx->resolve_func);
 		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
 		free(req_ctx->hostname);
+		req_ctx->hostname = NULL;
 		return JS_ThrowInternalError(ctx, "Failed to send DNS query");
 	}
 

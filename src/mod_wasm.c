@@ -958,6 +958,43 @@ static JSValue tjs_wasm_moduleimports(JSContext *ctx, JSValue this_val, int argc
     return imports;
 }
 
+/*
+ * moduleCustomSections(module, sectionName)
+ *
+ * Returns an ArrayBuffer for the custom section with the given name.
+ * If multiple sections share the same name, only the first match is returned.
+ * Returns null if not found or if custom sections are not loaded.
+ */
+static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
+    if (!m) {
+        return JS_EXCEPTION;
+    }
+
+    const char *name = JS_ToCString(ctx, argv[1]);
+    if (!name) {
+        return JS_EXCEPTION;
+    }
+
+    WASMModule *wasm_module = (WASMModule *) m->module;
+    JSValue result = JS_NULL;
+
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+    WASMCustomSection *section = wasm_module->custom_section_list;
+    while (section) {
+        if (section->name_len == strlen(name) &&
+            memcmp(section->name_addr, name, section->name_len) == 0) {
+            result = JS_NewArrayBufferCopy(ctx, section->content_addr, section->content_len);
+            break;
+        }
+        section = section->next;
+    }
+#endif
+
+    JS_FreeCString(ctx, name);
+    return result;
+}
+
 static char tjs__wasm_valkind_to_sig(wasm_valkind_t kind) {
     switch (kind) {
         case WASM_I32:
@@ -1659,6 +1696,7 @@ static JSValue tjs_wasm_parsemodule(JSContext *ctx, JSValue this_val, int argc, 
     char error_buf[TJS__WASM_ERROR_BUF_SIZE];
     LoadArgs load_args = { 0 };
     load_args.no_resolve = true;
+    load_args.wasm_binary_freeable = true;
     m->module = wasm_runtime_load_ex(m->data.bytes, (uint32_t) size, &load_args, error_buf, sizeof(error_buf));
     if (!m->module) {
         JS_FreeValue(ctx, obj);
@@ -2074,14 +2112,12 @@ static JSValue tjs_wasm_tableset(JSContext *ctx, JSValue this_val, int argc, JSV
 
 static JSValue tjs_wasm_tablegrow(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmInstance *i = tjs_wasm_instance_get(ctx, argv[0]);
-    if (!i) {
+    if (!i)
         return JS_EXCEPTION;
-    }
 
     const char *name = JS_ToCString(ctx, argv[1]);
-    if (!name) {
+    if (!name)
         return JS_EXCEPTION;
-    }
 
     uint32_t delta;
     if (JS_ToUint32(ctx, &delta, argv[2])) {
@@ -2089,37 +2125,28 @@ static JSValue tjs_wasm_tablegrow(JSContext *ctx, JSValue this_val, int argc, JS
         return JS_EXCEPTION;
     }
 
-    /* Find the table index by name */
     WASMModuleInstance *module_inst = (WASMModuleInstance *) i->module_inst;
-    int32_t export_count = wasm_runtime_get_export_count((wasm_module_t) module_inst->module);
+    WASMModule *wasm_module = module_inst->module;
     uint32_t table_idx = UINT32_MAX;
 
-    for (int32_t j = 0; j < export_count; j++) {
-        wasm_export_t exp;
-        wasm_runtime_get_export_type((wasm_module_t) module_inst->module, j, &exp);
-        if (exp.kind == WASM_IMPORT_EXPORT_KIND_TABLE && strcmp(exp.name, name) == 0) {
-            /* The table index in the export matches the internal table index */
-            WASMExport *exports = module_inst->module->exports;
-            table_idx = exports[j].index;
+    for (uint32_t j = 0; j < wasm_module->export_count; j++) {
+        if (wasm_module->exports[j].kind == EXPORT_KIND_TABLE &&
+            strcmp(wasm_module->exports[j].name, name) == 0) {
+            table_idx = wasm_module->exports[j].index;
             break;
         }
     }
 
     JS_FreeCString(ctx, name);
 
-    if (table_idx == UINT32_MAX) {
+    if (table_idx == UINT32_MAX)
         return tjs_throw_wasm_error(ctx, "RuntimeError", "table not found");
-    }
 
-    /* Get old size before grow */
     WASMTableInstance *tbl_inst = module_inst->tables[table_idx];
     uint32_t old_size = tbl_inst->cur_size;
 
-    table_elem_type_t init_val = NULL_REF;
-
-    if (!wasm_enlarge_table(module_inst, table_idx, delta, init_val)) {
+    if (!wasm_enlarge_table(module_inst, table_idx, delta, (table_elem_type_t) NULL_REF))
         return JS_NewInt32(ctx, -1);
-    }
 
     return JS_NewUint32(ctx, old_size);
 }
@@ -2231,6 +2258,7 @@ static const JSCFunctionListEntry tjs_wasm_funcs[] = {
     TJS_CFUNC_DEF("tableSet", 4, tjs_wasm_tableset),
     TJS_CFUNC_DEF("tableSize", 2, tjs_wasm_tablesize),
     TJS_CFUNC_DEF("validate", 1, tjs_wasm_validate),
+    TJS_CFUNC_DEF("moduleCustomSections", 2, tjs_wasm_modulecustomsections),
 };
 
 static const JSCFunctionListEntry tjs_wasm_instance_funcs[] = {

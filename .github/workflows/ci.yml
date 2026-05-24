@@ -67,6 +67,31 @@ jobs:
           name: cjs-linux-x86_64-test
           path: build/cjs
 
+  build-linux-x86_64-asan:
+    name: Test Build - Linux x86_64 (ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake ninja-build \
+            libcurl4-openssl-dev libltdl-dev libffi-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
+      - name: Build with AddressSanitizer
+        run: |
+          cmake -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_ASAN=ON
+          cmake --build build-asan
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-x86_64-asan
+          path: build-asan/cjs
+
   build-macos-arm64:
     name: Test Build - macOS ARM64
     runs-on: macos-latest
