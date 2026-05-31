@@ -641,7 +641,7 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	uv_loop_t* loop = TJS_GetLoop(trt);
 
-	trt->jobs.paused = true;
+	// trt->jobs.paused = true;
 	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
 		uv_run(loop, UV_RUN_ONCE);
 		if (!JS_IsUndefined(abort_check)) {
@@ -657,8 +657,8 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 			JS_FreeValue(ctx, ret);
 		}
 	}
-	trt->jobs.paused = false;
-	tjs__execute_jobs(ctx);
+	// trt->jobs.paused = false;
+	// tjs__execute_jobs(ctx);
 
 	JS_FreeValue(ctx, abort_check);
 	return JS_PromiseResult(ctx, argv[0]);

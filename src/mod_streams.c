@@ -73,6 +73,9 @@ typedef struct {
     TJSReadReq *read_req;            /* non-NULL while a one-shot read(buf) is in flight */
     TJSPromise connect_promise;
     TJSPromise shutdown_promise;
+
+    // for tty only
+    int tty_mode;
 } TJSStream;
 
 typedef struct {
@@ -550,7 +553,7 @@ static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSVa
 /* readSync(buf) → number of bytes read, or null on EOF */
 static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitIO() instead");
+    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitPromise() instead");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
@@ -572,7 +575,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
 /* writeSync(buf) → number of bytes written */
 static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitIO() instead");
+    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitPromise() instead");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
@@ -745,32 +748,148 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     return TJS_InitPromise(ctx, &t->connect_promise);
 }
 
-/* connectSync: blocking OS connect, hands the fd to libuv. */
+/* connectSync: blocking OS connect with timeout, hands the fd to libuv. */
 static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
 
+    // uv_tcp_open requires the handle to not have a fd yet
+    if (stream_get_fd(t) >= 0)
+        return JS_ThrowInternalError(ctx, "socket already open");
+
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
+
+    // Optional timeout in ms (default 30000)
+    int timeout_ms = 30000;
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
+        if (JS_ToInt32(ctx, &timeout_ms, argv[1])) return JS_EXCEPTION;
+        if (timeout_ms < 0) timeout_ms = 30000;
+    }
 
 #ifndef _WIN32
     int fd = socket(ss.ss_family, SOCK_STREAM, 0);
     if (fd < 0) return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-    if (connect(fd, (struct sockaddr *)&ss, sizeof(ss)) != 0) {
+
+    // Set non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         int e = errno; close(fd);
         return tjs_throw_errno(ctx, uv_translate_sys_error(e));
     }
+
+    // Start connect (returns EINPROGRESS immediately)
+    int conn_ret = connect(fd, (struct sockaddr *)&ss, sizeof(ss));
+    if (conn_ret == 0) {
+        // Connected immediately (rare, e.g. localhost)
+        fcntl(fd, F_SETFL, flags); // Restore blocking
+        int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
+        if (r != 0) { close(fd); return tjs_throw_errno(ctx, r); }
+        return JS_UNDEFINED;
+    }
+
+    if (errno != EINPROGRESS) {
+        int e = errno; close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+
+    // Wait for connect with timeout
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (sel == 0) {
+        close(fd);
+        return JS_ThrowInternalError(ctx, "Connection timeout");
+    }
+    if (sel < 0) {
+        int e = errno; close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+
+    // Check if connect succeeded
+    int so_error = 0;
+    socklen_t len = sizeof(so_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
+        int e = errno; close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+    if (so_error != 0) {
+        close(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(so_error));
+    }
+
+    // Restore blocking mode
+    fcntl(fd, F_SETFL, flags);
     int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
     if (r != 0) { close(fd); return tjs_throw_errno(ctx, r); }
-#else
+#else  // Windows
     SOCKET fd = socket(ss.ss_family, SOCK_STREAM, 0);
     if (fd == INVALID_SOCKET)
         return tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()));
-    if (connect(fd, (struct sockaddr *)&ss, sizeof(ss)) != 0) {
+
+    // Set non-blocking
+    u_long mode = 1;
+    if (ioctlsocket(fd, FIONBIO, &mode) != 0) {
         int e = WSAGetLastError(); closesocket(fd);
         return tjs_throw_errno(ctx, uv_translate_sys_error(e));
     }
+
+    // Start connect (returns WSAEWOULDBLOCK immediately)
+    int conn_ret = connect(fd, (struct sockaddr *)&ss, sizeof(ss));
+    if (conn_ret == 0) {
+        // Connected immediately
+        mode = 0;
+        ioctlsocket(fd, FIONBIO, &mode);
+        int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
+        if (r != 0) { closesocket(fd); return tjs_throw_errno(ctx, r); }
+        return JS_UNDEFINED;
+    }
+
+    int err = WSAGetLastError();
+    if (err != WSAEWOULDBLOCK) {
+        closesocket(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(err));
+    }
+
+    // Wait for connect with timeout
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int sel = select(0, NULL, &wfds, NULL, &tv);
+    if (sel == 0) {
+        closesocket(fd);
+        return JS_ThrowInternalError(ctx, "Connection timeout");
+    }
+    if (sel == SOCKET_ERROR) {
+        int e = WSAGetLastError(); closesocket(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+
+    // Check if connect succeeded
+    int so_error = 0;
+    int len = sizeof(so_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len) != 0) {
+        int e = WSAGetLastError(); closesocket(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(e));
+    }
+    if (so_error != 0) {
+        closesocket(fd);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(so_error));
+    }
+
+    // Restore blocking mode
+    mode = 0;
+    ioctlsocket(fd, FIONBIO, &mode);
     int r = uv_tcp_open(&t->h.tcp, (uv_os_sock_t)fd);
     if (r != 0) { closesocket(fd); return tjs_throw_errno(ctx, r); }
 #endif
@@ -847,6 +966,7 @@ static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc,
         return tjs_throw_errno(ctx, r);
     }
 
+    s->tty_mode = UV_TTY_MODE_NORMAL;
     return tjs_init_stream(ctx, obj, s);
 }
 
@@ -854,14 +974,21 @@ static TJSStream *tjs_tty_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_tty_class_id);
 }
 
-static JSValue tjs_tty_set_mode(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_tty_set_mode(JSContext *ctx, JSValue this_val, JSValue value) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     int mode;
-    if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &mode, value)) return JS_EXCEPTION;
     int r = uv_tty_set_mode(&s->h.tty, mode);
     if (r != 0) return tjs_throw_errno(ctx, r);
+    s->tty_mode = mode;
     return JS_UNDEFINED;
+}
+
+static JSValue tjs_tty_get_mode(JSContext *ctx, JSValue this_val) {
+    TJSStream *s = tjs_tty_get(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    return JS_NewInt32(ctx, s->tty_mode);
 }
 
 static JSValue tjs_tty_get_win_size(JSContext *ctx, JSValue this_val) {
@@ -1060,7 +1187,7 @@ static const JSCFunctionListEntry tjs_tcp_proto_funcs[] = {
 };
 
 static const JSCFunctionListEntry tjs_tty_proto_funcs[] = {
-    TJS_CFUNC_DEF("setMode",    1, tjs_tty_set_mode),
+    JS_CGETSET_DEF("mode",         tjs_tty_get_mode, tjs_tty_set_mode),
     JS_CGETSET_DEF("size",         tjs_tty_get_win_size, NULL)
 };
 

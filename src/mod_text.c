@@ -311,19 +311,14 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
     if (!dec) return JS_EXCEPTION;
     
     // Extract input buffer (ArrayBuffer or TypedArray)
-    size_t inlen;
+    size_t inlen = 0;
     uint8_t *inbuf = NULL;
     JSValue buffer_val = JS_UNDEFINED;
     
     if (argc > 0 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
-        inbuf = JS_GetArrayBuffer(ctx, &inlen, argv[0]);
+        inbuf = JS_GetAnyBuffer(ctx, &inlen, argv[0]);
         if (!inbuf) {
-            // Try TypedArray
-            buffer_val = JS_GetTypedArrayBuffer(ctx, argv[0], NULL, NULL, NULL);
-            if (JS_IsException(buffer_val)) {
-                return JS_ThrowTypeError(ctx, "Argument must be an ArrayBuffer or ArrayBufferView");
-            }
-            inbuf = JS_GetArrayBuffer(ctx, &inlen, buffer_val);
+            return JS_ThrowTypeError(ctx, "Argument must be an ArrayBuffer or ArrayBufferView");
         }
     }
     
@@ -633,16 +628,11 @@ static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_va
     
     // Get destination buffer (TypedArray or ArrayBuffer)
     size_t buf_len;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &buf_len, argv[1]);
+    uint8_t *buf = JS_GetAnyBuffer(ctx, &buf_len, argv[1]);
     JSValue buf_holder = JS_UNDEFINED;
     
     if (!buf) {
-        buf_holder = JS_GetTypedArrayBuffer(ctx, argv[1], NULL, NULL, NULL);
-        if (JS_IsException(buf_holder)) {
-            JS_FreeCString(ctx, str);
-            return JS_ThrowTypeError(ctx, "Second argument must be an ArrayBufferView");
-        }
-        buf = JS_GetArrayBuffer(ctx, &buf_len, buf_holder);
+        return JS_ThrowTypeError(ctx, "Second argument must be an ArrayBufferView");
     }
     
     if (!buf) {
@@ -748,16 +738,9 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     uint8_t *inbuf = NULL;
     JSValue buf_holder = JS_UNDEFINED;
     
-    inbuf = JS_GetArrayBuffer(ctx, &inlen, argv[2]);
+    inbuf = JS_GetAnyBuffer(ctx, &inlen, argv[2]);
     if (!inbuf) {
-        buf_holder = JS_GetTypedArrayBuffer(ctx, argv[2], NULL, NULL, NULL);
-        if (JS_IsException(buf_holder)) {
-            iconv_close(cd);
-            JS_FreeCString(ctx, from);
-            JS_FreeCString(ctx, to);
-            return JS_ThrowTypeError(ctx, "Third argument must be an ArrayBufferView");
-        }
-        inbuf = JS_GetArrayBuffer(ctx, &inlen, buf_holder);
+        return JS_ThrowTypeError(ctx, "Third argument must be an ArrayBufferView");
     }
     
     if (!inbuf) {

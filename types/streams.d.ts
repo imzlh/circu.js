@@ -233,11 +233,11 @@ declare namespace CModuleStreams {
      */
     export interface TTY extends Stream {
         /**
-         * Set TTY mode
+         * Set or Get TTY mode (is a getset)
          * @param mode TTY_MODE_NORMAL, TTY_MODE_RAW or TTY_MODE_RAW_VT
          * @throws Synchronous throw on error
          */
-        setMode(mode: number): void;
+        mode: number;
 
         /**
          * Get terminal window size
