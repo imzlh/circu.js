@@ -46,6 +46,8 @@ static JSClassID tjs_msgpipe_class_id;
 
 typedef struct {
     JSContext *ctx;
+    int closed;
+    int finalized;
     union {
         uv_handle_t handle;
         uv_stream_t stream;
@@ -74,16 +76,37 @@ typedef struct {
 static void uv__close_cb(uv_handle_t *handle) {
     TJSMessagePipe *p = handle->data;
     CHECK_NOT_NULL(p);
-    tjs__free(p);
+    p->closed = 1;
+    if (p->finalized) {
+        for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
+            JS_FreeValue(p->ctx, p->events[i]);
+            p->events[i] = JS_UNDEFINED;
+        }
+        js_free(p->ctx, p->reading.data);
+        p->reading.data = NULL;
+        tjs__free(p);
+    }
 }
 
 static void tjs_msgpipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSMessagePipe *p = JS_GetOpaque(val, tjs_msgpipe_class_id);
     if (p) {
+        p->finalized = 1;
+        if (!uv_is_closing(&p->h.handle)) {
+            uv_read_stop(&p->h.stream);
+            uv_close(&p->h.handle, uv__close_cb);
+            return;
+        }
+        if (!p->closed) {
+            return;
+        }
         for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
             JS_FreeValueRT(rt, p->events[i]);
+            p->events[i] = JS_UNDEFINED;
         }
-        uv_close(&p->h.handle, uv__close_cb);
+        js_free_rt(rt, p->reading.data);
+        p->reading.data = NULL;
+        tjs__free(p);
     }
 }
 

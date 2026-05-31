@@ -153,6 +153,9 @@ typedef struct {
     TJSPromise result;
     struct {
         JSValue tarray;
+        uint8_t *data;
+        size_t len;
+        bool is_write;
     } rw;
 } TJSFsReq;
 
@@ -317,6 +320,9 @@ static JSValue tjs_fsreq_init(JSContext *ctx, TJSFsReq *fr, JSValue obj) {
     fr->req.data = fr;
     fr->obj = JS_DupValue(ctx, obj);
     fr->rw.tarray = JS_UNDEFINED;
+    fr->rw.data = NULL;
+    fr->rw.len = 0;
+    fr->rw.is_write = false;
 
     return TJS_InitPromise(ctx, &fr->result);
 }
@@ -360,6 +366,16 @@ static void uv__fs_req_cb(uv_fs_t *req) {
             f->path = JS_UNDEFINED;
             break;
         case UV_FS_READ:
+            if (fr->req.result > 0) {
+                size_t sz;
+                uint8_t *target = JS_GetUint8Array(ctx, &sz, fr->rw.tarray);
+                if (!target || sz < (size_t)fr->req.result) {
+                    arg = JS_NewInternalError(ctx, "fs read buffer became invalid");
+                    is_reject = true;
+                    break;
+                }
+                memcpy(target, fr->rw.data, (size_t)fr->req.result);
+            }
             arg = fr->req.result == 0 ? JS_NULL : JS_NewInt32(ctx, fr->req.result);
             break;
         case UV_FS_WRITE:
@@ -455,6 +471,7 @@ skip:
 
     JS_FreeValue(ctx, fr->obj);
     JS_FreeValue(ctx, fr->rw.tarray);
+    js_free(ctx, fr->rw.data);
 
     uv_fs_req_cleanup(&fr->req);
     js_free(ctx, fr);
@@ -485,8 +502,20 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (!fr) {
         return JS_EXCEPTION;
     }
+    memset(fr, 0, sizeof(*fr));
 
-    uv_buf_t b = uv_buf_init((char *) buf, size);
+    fr->rw.data = js_malloc(ctx, size);
+    if (!fr->rw.data) {
+        js_free(ctx, fr);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    fr->rw.len = size;
+    fr->rw.is_write = magic != 0;
+    if (magic) {
+        memcpy(fr->rw.data, buf, size);
+    }
+
+    uv_buf_t b = uv_buf_init((char *) fr->rw.data, size);
 
     int r;
     if (magic) {
@@ -495,6 +524,7 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
     }
     if (r != 0) {
+        js_free(ctx, fr->rw.data);
         js_free(ctx, fr);
         return tjs_throw_errno(ctx, r);
     }

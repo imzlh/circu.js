@@ -641,27 +641,85 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	uv_loop_t* loop = TJS_GetLoop(trt);
 
-	// trt->jobs.paused = true;
+	// Save previous paused state to support nested waitIO calls
+	bool prev_paused = trt->jobs.paused;
+	trt->jobs.paused = true;
+
+	bool aborted = false;
+	JSValue abort_exception = JS_UNDEFINED;
+
 	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
-		uv_run(loop, UV_RUN_ONCE);
+		// Run event loop once
+		int uv_result = uv_run(loop, UV_RUN_ONCE);
+
+		// Check if loop has no more active handles - prevent infinite loop
+		if (uv_result == 0 && uv_loop_alive(loop) == 0) {
+			break;
+		}
+
+		// Check abort condition if provided
 		if (!JS_IsUndefined(abort_check)) {
 			JSValue ret = JS_Call(ctx, abort_check, this_val, 0, NULL);
 			if (JS_IsException(ret)) {
-				JS_FreeValue(ctx, ret);
+				// Save exception and break
+				abort_exception = JS_GetException(ctx);
+				aborted = true;
 				break;
 			}
-			if (JS_IsEqual(ctx, ret, JS_TRUE) == 1) {
-				JS_FreeValue(ctx, ret);
-				break;
-			}
+
+			// Check if abort_check returned true
+			int is_true = JS_IsEqual(ctx, ret, JS_TRUE);
 			JS_FreeValue(ctx, ret);
+
+			if (is_true == -1) {
+				// JS_IsEqual threw an exception
+				abort_exception = JS_GetException(ctx);
+				aborted = true;
+				break;
+			}
+
+			if (is_true == 1) {
+				aborted = true;
+				break;
+			}
 		}
 	}
-	// trt->jobs.paused = false;
-	// tjs__execute_jobs(ctx);
+
+	// Restore previous paused state
+	trt->jobs.paused = prev_paused;
+
+	// Execute pending jobs if not paused
+	if (!prev_paused) {
+		tjs__execute_jobs(ctx);
+	}
 
 	JS_FreeValue(ctx, abort_check);
-	return JS_PromiseResult(ctx, argv[0]);
+
+	// Handle abort exception
+	if (!JS_IsUndefined(abort_exception)) {
+		return JS_Throw(ctx, abort_exception);
+	}
+
+	// Get final promise state
+	JSPromiseStateEnum state = JS_PromiseState(ctx, argv[0]);
+
+	switch (state) {
+		case JS_PROMISE_FULFILLED: {
+			JSValue result = JS_PromiseResult(ctx, argv[0]);
+			return JS_DupValue(ctx, result);
+		}
+		case JS_PROMISE_REJECTED: {
+			JSValue error = JS_PromiseResult(ctx, argv[0]);
+			return JS_Throw(ctx, JS_DupValue(ctx, error));
+		}
+		case JS_PROMISE_PENDING:
+			if (aborted) {
+				return JS_ThrowInternalError(ctx, "waitPromise aborted");
+			}
+			return JS_ThrowInternalError(ctx, "IO promise did not settle");
+		default:
+			abort();
+	}
 }
 
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
