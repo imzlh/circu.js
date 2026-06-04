@@ -27,7 +27,9 @@
 #include "private.h"
 #include "utils.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -49,6 +51,7 @@
     #include <sys/types.h>
     #include <sys/wait.h>
     #include <sys/ioctl.h>
+    #include <sys/select.h>
     #include <termios.h>
     #include <errno.h>
     #if defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
@@ -218,6 +221,9 @@ static void free_str_arr(JSContext *ctx, char **arr, int len) {
     for (int i = 0; i < len; i++) js_free(ctx, arr[i]);
     js_free(ctx, arr);
 }
+
+static char **tjs__parse_args(JSContext *ctx, JSValue arg0);
+static void tjs__free_args(JSContext *ctx, char **args);
 
 /* Read { cols, rows } from a JS options object, with defaults. */
 static void parse_winsize(JSContext *ctx, JSValue opts, int *cols, int *rows) {
@@ -596,6 +602,574 @@ static void tjs__free_args(JSContext *ctx, char **args) {
     for (int i = 0; args[i]; i++) js_free(ctx, args[i]);
     js_free(ctx, args);
 }
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} TJSSpawnSyncBuf;
+
+static void spawn_sync_buf_free(TJSSpawnSyncBuf *b) {
+    if (b->data) free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static int spawn_sync_buf_append(TJSSpawnSyncBuf *b, const uint8_t *data, size_t len) {
+    if (len == 0) return 0;
+    if (b->len > SIZE_MAX - len) return -1;
+    size_t need = b->len + len;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < need) {
+            if (cap > SIZE_MAX / 2) { cap = need; break; }
+            cap *= 2;
+        }
+        uint8_t *p = realloc(b->data, cap);
+        if (!p) return -1;
+        b->data = p;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    return 0;
+}
+
+static JSValue spawn_sync_new_buffer(JSContext *ctx, TJSSpawnSyncBuf *b) {
+    return JS_NewArrayBufferCopy(ctx, b->data, b->len);
+}
+
+static const char *spawn_sync_stdio_mode(JSContext *ctx, JSValue opts, const char *name, const char *def) {
+    if (!JS_IsObject(opts)) return def;
+    JSValue v = JS_GetPropertyStr(ctx, opts, name);
+    if (JS_IsUndefined(v) || JS_IsNull(v)) { JS_FreeValue(ctx, v); return def; }
+    if (JS_IsNumber(v)) { JS_FreeValue(ctx, v); return "inherit"; }
+    const char *s = JS_ToCString(ctx, v);
+    JS_FreeValue(ctx, v);
+    if (!s) return def;
+    const char *ret = def;
+    if (!strcmp(s, "ignore")) ret = "ignore";
+    else if (!strcmp(s, "inherit")) ret = "inherit";
+    else if (!strcmp(s, "pipe")) ret = "pipe";
+    JS_FreeCString(ctx, s);
+    return ret;
+}
+
+static JSValue spawn_sync_make_result(JSContext *ctx, int pid, int64_t status, int signal,
+                                      TJSSpawnSyncBuf *out, TJSSpawnSyncBuf *err,
+                                      bool capture_out, bool capture_err) {
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(obj)) return obj;
+
+    JS_DefinePropertyValueStr(ctx, obj, "pid", JS_NewInt32(ctx, pid), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "status", signal ? JS_NULL : JS_NewInt64(ctx, status), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "signal", signal ? JS_NewString(ctx, tjs_getsig(signal)) : JS_NULL, JS_PROP_C_W_E);
+
+    JSValue stdout_val = capture_out ? spawn_sync_new_buffer(ctx, out) : JS_NULL;
+    JSValue stderr_val = capture_err ? spawn_sync_new_buffer(ctx, err) : JS_NULL;
+    JSValue output = JS_NewArray(ctx);
+    if (JS_IsException(stdout_val) || JS_IsException(stderr_val) || JS_IsException(output)) {
+        JS_FreeValue(ctx, stdout_val);
+        JS_FreeValue(ctx, stderr_val);
+        JS_FreeValue(ctx, output);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+
+    JS_SetPropertyUint32(ctx, output, 0, JS_NULL);
+    JS_SetPropertyUint32(ctx, output, 1, JS_DupValue(ctx, stdout_val));
+    JS_SetPropertyUint32(ctx, output, 2, JS_DupValue(ctx, stderr_val));
+    JS_DefinePropertyValueStr(ctx, obj, "stdout", stdout_val, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "stderr", stderr_val, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "output", output, JS_PROP_C_W_E);
+    return obj;
+}
+
+static char **spawn_sync_parse_call_args(JSContext *ctx, int argc, JSValue *argv, JSValue *opts_out) {
+    *opts_out = argc >= 2 ? argv[1] : JS_UNDEFINED;
+    if (argc >= 2 && JS_IsArray(argv[1])) {
+        if (!JS_IsString(argv[0])) {
+            JS_ThrowTypeError(ctx, "spawnSync(command, args?, options?): command must be a string");
+            return NULL;
+        }
+        JSValue full = JS_NewArray(ctx);
+        if (JS_IsException(full)) return NULL;
+        JS_SetPropertyUint32(ctx, full, 0, JS_DupValue(ctx, argv[0]));
+        JSValue lv = JS_GetPropertyStr(ctx, argv[1], "length");
+        uint64_t len = 0;
+        if (JS_ToIndex(ctx, &len, lv)) { JS_FreeValue(ctx, lv); JS_FreeValue(ctx, full); return NULL; }
+        JS_FreeValue(ctx, lv);
+        for (uint64_t i = 0; i < len; i++) {
+            JSValue item = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
+            if (JS_IsException(item)) { JS_FreeValue(ctx, full); return NULL; }
+            JS_SetPropertyUint32(ctx, full, (uint32_t)i + 1, item);
+        }
+        char **args = tjs__parse_args(ctx, full);
+        JS_FreeValue(ctx, full);
+        *opts_out = argc >= 3 ? argv[2] : JS_UNDEFINED;
+        return args;
+    }
+    return tjs__parse_args(ctx, argv[0]);
+}
+
+static int spawn_sync_get_input(JSContext *ctx, JSValue opts, uint8_t **data, size_t *len) {
+    *data = NULL;
+    *len = 0;
+    if (!JS_IsObject(opts)) return 0;
+    JSValue v = JS_GetPropertyStr(ctx, opts, "input");
+    if (JS_IsUndefined(v) || JS_IsNull(v)) { JS_FreeValue(ctx, v); return 0; }
+    const uint8_t *src = NULL;
+    if (JS_IsString(v)) {
+        src = (const uint8_t *)JS_ToCStringLen(ctx, len, v);
+        if (!src) { JS_FreeValue(ctx, v); return -1; }
+        *data = malloc(*len);
+        if (*len && *data) memcpy(*data, src, *len);
+        JS_FreeCString(ctx, (const char *)src);
+        JS_FreeValue(ctx, v);
+        return (*len == 0 || *data) ? 1 : -1;
+    }
+    src = JS_GetAnyBuffer(ctx, len, v);
+    if (src) {
+        *data = malloc(*len);
+        if (*len && *data) memcpy(*data, src, *len);
+    }
+    JS_FreeValue(ctx, v);
+    return (src && (*len == 0 || *data)) ? 1 : -1;
+}
+
+static void spawn_sync_free_input(uint8_t *data) {
+    if (data) free(data);
+}
+
+#ifndef _WIN32
+static void spawn_sync_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags != -1) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static void spawn_sync_set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc == 0) return JS_ThrowTypeError(ctx, "spawnSync: expected command or argv array");
+
+    JSValue opts;
+    char **args = spawn_sync_parse_call_args(ctx, argc, argv, &opts);
+    if (!args) return JS_EXCEPTION;
+    if (!args[0]) { tjs__free_args(ctx, args); return JS_ThrowTypeError(ctx, "spawnSync: empty argv"); }
+
+    uint8_t *input = NULL;
+    size_t input_len = 0, input_off = 0;
+    int input_kind = spawn_sync_get_input(ctx, opts, &input, &input_len);
+    if (input_kind < 0) { tjs__free_args(ctx, args); return JS_ThrowTypeError(ctx, "input must be a string or buffer"); }
+
+    const char *stdin_mode = input_len > 0 ? "pipe" : spawn_sync_stdio_mode(ctx, opts, "stdin", "pipe");
+    const char *stdout_mode = spawn_sync_stdio_mode(ctx, opts, "stdout", "pipe");
+    const char *stderr_mode = spawn_sync_stdio_mode(ctx, opts, "stderr", "pipe");
+    bool cap_out = strcmp(stdout_mode, "pipe") == 0;
+    bool cap_err = strcmp(stderr_mode, "pipe") == 0;
+    bool pipe_in = strcmp(stdin_mode, "pipe") == 0;
+
+    int in_pipe[2] = { -1, -1 }, out_pipe[2] = { -1, -1 }, err_pipe[2] = { -1, -1 };
+    JSValue ret = JS_EXCEPTION;
+    TJSSpawnSyncBuf out = { 0 }, err = { 0 };
+    char **env_arr = NULL;
+    char *cwd = NULL;
+
+    if (pipe_in && pipe(in_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+    if (cap_out && pipe(out_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+    if (cap_err && pipe(err_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+
+    for (int i = 0; i < 2; i++) {
+        if (in_pipe[i] != -1) spawn_sync_set_cloexec(in_pipe[i]);
+        if (out_pipe[i] != -1) spawn_sync_set_cloexec(out_pipe[i]);
+        if (err_pipe[i] != -1) spawn_sync_set_cloexec(err_pipe[i]);
+    }
+
+    if (JS_IsObject(opts)) {
+        JSValue v = JS_GetPropertyStr(ctx, opts, "env");
+        if (JS_IsObject(v)) env_arr = parse_env_obj(ctx, v);
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, opts, "cwd");
+        if (JS_IsString(v)) {
+            const char *s = JS_ToCString(ctx, v);
+            if (!s) { JS_FreeValue(ctx, v); goto cleanup; }
+            cwd = js_strdup(ctx, s);
+            JS_FreeCString(ctx, s);
+        }
+        JS_FreeValue(ctx, v);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+
+    if (pid == 0) {
+        if (pipe_in) dup2(in_pipe[0], STDIN_FILENO);
+        else if (!strcmp(stdin_mode, "ignore")) {
+            int fd = open("/dev/null", O_RDONLY); if (fd >= 0) { dup2(fd, STDIN_FILENO); if (fd > STDERR_FILENO) close(fd); }
+        }
+        if (cap_out) dup2(out_pipe[1], STDOUT_FILENO);
+        else if (!strcmp(stdout_mode, "ignore")) {
+            int fd = open("/dev/null", O_WRONLY); if (fd >= 0) { dup2(fd, STDOUT_FILENO); if (fd > STDERR_FILENO) close(fd); }
+        }
+        if (cap_err) dup2(err_pipe[1], STDERR_FILENO);
+        else if (!strcmp(stderr_mode, "ignore")) {
+            int fd = open("/dev/null", O_WRONLY); if (fd >= 0) { dup2(fd, STDERR_FILENO); if (fd > STDERR_FILENO) close(fd); }
+        }
+        if (in_pipe[0] != -1) close(in_pipe[0]); if (in_pipe[1] != -1) close(in_pipe[1]);
+        if (out_pipe[0] != -1) close(out_pipe[0]); if (out_pipe[1] != -1) close(out_pipe[1]);
+        if (err_pipe[0] != -1) close(err_pipe[0]); if (err_pipe[1] != -1) close(err_pipe[1]);
+        if (cwd && chdir(cwd) < 0) _exit(127);
+        if (env_arr) {
+            for (int i = 0; env_arr[i]; i++) {
+                char *eq = strchr(env_arr[i], '=');
+                if (eq) { *eq = '\0'; setenv(env_arr[i], eq + 1, 1); *eq = '='; }
+            }
+        }
+        execvp(args[0], args);
+        _exit(127);
+    }
+
+    if (in_pipe[0] != -1) { close(in_pipe[0]); in_pipe[0] = -1; }
+    if (out_pipe[1] != -1) { close(out_pipe[1]); out_pipe[1] = -1; }
+    if (err_pipe[1] != -1) { close(err_pipe[1]); err_pipe[1] = -1; }
+    if (in_pipe[1] != -1) spawn_sync_set_nonblock(in_pipe[1]);
+    if (out_pipe[0] != -1) spawn_sync_set_nonblock(out_pipe[0]);
+    if (err_pipe[0] != -1) spawn_sync_set_nonblock(err_pipe[0]);
+
+    bool child_done = false;
+    int wait_status = 0;
+    while (out_pipe[0] != -1 || err_pipe[0] != -1 || in_pipe[1] != -1 || !child_done) {
+        if (!child_done) {
+            pid_t wr = waitpid(pid, &wait_status, WNOHANG);
+            if (wr == pid) child_done = true;
+            else if (wr < 0 && errno != EINTR) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+        }
+
+        if (in_pipe[1] != -1 && input_off >= input_len) { close(in_pipe[1]); in_pipe[1] = -1; }
+        if (child_done && out_pipe[0] == -1 && err_pipe[0] == -1 && in_pipe[1] == -1) break;
+
+        fd_set rfds, wfds;
+        FD_ZERO(&rfds); FD_ZERO(&wfds);
+        int maxfd = -1;
+        if (out_pipe[0] != -1) { FD_SET(out_pipe[0], &rfds); if (out_pipe[0] > maxfd) maxfd = out_pipe[0]; }
+        if (err_pipe[0] != -1) { FD_SET(err_pipe[0], &rfds); if (err_pipe[0] > maxfd) maxfd = err_pipe[0]; }
+        if (in_pipe[1] != -1) { FD_SET(in_pipe[1], &wfds); if (in_pipe[1] > maxfd) maxfd = in_pipe[1]; }
+        if (maxfd < 0) {
+            if (!child_done) {
+                pid_t wr;
+                do { wr = waitpid(pid, &wait_status, 0); } while (wr < 0 && errno == EINTR);
+                if (wr == pid) child_done = true;
+                else { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+            }
+            continue;
+        }
+        int sr;
+        do { sr = select(maxfd + 1, &rfds, &wfds, NULL, NULL); } while (sr < 0 && errno == EINTR);
+        if (sr < 0) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+
+        uint8_t buf[8192];
+        if (out_pipe[0] != -1 && FD_ISSET(out_pipe[0], &rfds)) {
+            ssize_t n = read(out_pipe[0], buf, sizeof(buf));
+            if (n > 0) { if (spawn_sync_buf_append(&out, buf, (size_t)n)) { ret = JS_ThrowOutOfMemory(ctx); goto cleanup; } }
+            else if (n == 0 || errno != EAGAIN) { close(out_pipe[0]); out_pipe[0] = -1; }
+        }
+        if (err_pipe[0] != -1 && FD_ISSET(err_pipe[0], &rfds)) {
+            ssize_t n = read(err_pipe[0], buf, sizeof(buf));
+            if (n > 0) { if (spawn_sync_buf_append(&err, buf, (size_t)n)) { ret = JS_ThrowOutOfMemory(ctx); goto cleanup; } }
+            else if (n == 0 || errno != EAGAIN) { close(err_pipe[0]); err_pipe[0] = -1; }
+        }
+        if (in_pipe[1] != -1 && FD_ISSET(in_pipe[1], &wfds)) {
+            size_t remain = input_len - input_off;
+            ssize_t n = remain ? write(in_pipe[1], input + input_off, remain > 8192 ? 8192 : remain) : 0;
+            if (n > 0) input_off += (size_t)n;
+            else if (n == 0 || (errno != EAGAIN && errno != EPIPE)) { close(in_pipe[1]); in_pipe[1] = -1; }
+            else if (errno == EPIPE) { close(in_pipe[1]); in_pipe[1] = -1; }
+        }
+    }
+
+    int64_t es = 0;
+    int ts = 0;
+    if (WIFEXITED(wait_status)) es = WEXITSTATUS(wait_status);
+    else if (WIFSIGNALED(wait_status)) { ts = WTERMSIG(wait_status); es = 128 + ts; }
+    ret = spawn_sync_make_result(ctx, (int)pid, es, ts, &out, &err, cap_out, cap_err);
+
+cleanup:
+    if (in_pipe[0] != -1) close(in_pipe[0]); if (in_pipe[1] != -1) close(in_pipe[1]);
+    if (out_pipe[0] != -1) close(out_pipe[0]); if (out_pipe[1] != -1) close(out_pipe[1]);
+    if (err_pipe[0] != -1) close(err_pipe[0]); if (err_pipe[1] != -1) close(err_pipe[1]);
+    spawn_sync_buf_free(&out);
+    spawn_sync_buf_free(&err);
+    spawn_sync_free_input(input);
+    free_env(ctx, env_arr);
+    if (cwd) js_free(ctx, cwd);
+    tjs__free_args(ctx, args);
+    return ret;
+}
+#endif /* !_WIN32 */
+
+#ifdef _WIN32
+typedef struct {
+    HANDLE pipe;
+    TJSSpawnSyncBuf *buf;
+} TJSWinReadThread;
+
+typedef struct {
+    HANDLE pipe;
+    const uint8_t *data;
+    size_t len;
+} TJSWinWriteThread;
+
+static DWORD WINAPI spawn_sync_win_read_thread(LPVOID arg) {
+    TJSWinReadThread *r = arg;
+    uint8_t buf[8192];
+    DWORD n;
+    while (ReadFile(r->pipe, buf, sizeof(buf), &n, NULL) && n > 0) {
+        if (spawn_sync_buf_append(r->buf, buf, n)) break;
+    }
+    return 0;
+}
+
+static DWORD WINAPI spawn_sync_win_write_thread(LPVOID arg) {
+    TJSWinWriteThread *w = arg;
+    size_t off = 0;
+    while (off < w->len) {
+        DWORD chunk = (DWORD)((w->len - off) > 8192 ? 8192 : (w->len - off));
+        DWORD n = 0;
+        if (!WriteFile(w->pipe, w->data + off, chunk, &n, NULL) || n == 0) break;
+        off += n;
+    }
+    CloseHandle(w->pipe);
+    w->pipe = INVALID_HANDLE_VALUE;
+    return 0;
+}
+
+static WCHAR *spawn_sync_utf8_to_wide(JSContext *ctx, const char *s) {
+    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (len <= 0) return NULL;
+    WCHAR *w = js_malloc(ctx, sizeof(WCHAR) * len);
+    if (!w) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, w, len)) { js_free(ctx, w); return NULL; }
+    return w;
+}
+
+static char *spawn_sync_quote_win_arg(JSContext *ctx, const char *arg) {
+    bool quote = *arg == '\0';
+    for (const char *p = arg; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '"') { quote = true; break; }
+    }
+    size_t len = quote ? 2 : 0;
+    for (const char *p = arg; *p; p++) len += (*p == '"' || *p == '\\') ? 2 : 1;
+    char *out = js_malloc(ctx, len + 1);
+    if (!out) return NULL;
+    char *q = out;
+    if (quote) *q++ = '"';
+    for (const char *p = arg; *p; p++) {
+        if (*p == '"' || *p == '\\') *q++ = '\\';
+        *q++ = *p;
+    }
+    if (quote) *q++ = '"';
+    *q = '\0';
+    return out;
+}
+
+static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args) {
+    size_t total = 0;
+    char **quoted = NULL;
+    int count = 0;
+    while (args[count]) count++;
+    quoted = js_mallocz(ctx, sizeof(char *) * (count + 1));
+    if (!quoted) return NULL;
+    for (int i = 0; i < count; i++) {
+        quoted[i] = spawn_sync_quote_win_arg(ctx, args[i]);
+        if (!quoted[i]) goto fail;
+        total += strlen(quoted[i]) + (i ? 1 : 0);
+    }
+    char *cmd = js_malloc(ctx, total + 1);
+    if (!cmd) goto fail;
+    cmd[0] = '\0';
+    for (int i = 0; i < count; i++) {
+        if (i) strcat(cmd, " ");
+        strcat(cmd, quoted[i]);
+    }
+    WCHAR *wcmd = spawn_sync_utf8_to_wide(ctx, cmd);
+    js_free(ctx, cmd);
+    for (int i = 0; i < count; i++) js_free(ctx, quoted[i]);
+    js_free(ctx, quoted);
+    return wcmd;
+fail:
+    if (quoted) { for (int i = 0; i < count; i++) js_free(ctx, quoted[i]); js_free(ctx, quoted); }
+    return NULL;
+}
+
+static WCHAR *spawn_sync_build_win_env(JSContext *ctx, char **env) {
+    if (!env) return NULL;
+    int total = 1;
+    for (int i = 0; env[i]; i++) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, env[i], -1, NULL, 0);
+        if (len <= 0) return NULL;
+        if (total > INT_MAX - len) return NULL;
+        total += len;
+    }
+    WCHAR *wenv = js_malloc(ctx, sizeof(WCHAR) * total);
+    if (!wenv) return NULL;
+    WCHAR *p = wenv;
+    for (int i = 0; env[i]; i++) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, env[i], -1, p, total - (int)(p - wenv));
+        if (len <= 0) { js_free(ctx, wenv); return NULL; }
+        p += len;
+    }
+    *p = L'\0';
+    return wenv;
+}
+
+static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc == 0) return JS_ThrowTypeError(ctx, "spawnSync: expected command or argv array");
+
+    JSValue opts;
+    char **args = spawn_sync_parse_call_args(ctx, argc, argv, &opts);
+    if (!args) return JS_EXCEPTION;
+    if (!args[0]) { tjs__free_args(ctx, args); return JS_ThrowTypeError(ctx, "spawnSync: empty argv"); }
+
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    int input_kind = spawn_sync_get_input(ctx, opts, &input, &input_len);
+    if (input_kind < 0) { tjs__free_args(ctx, args); return JS_ThrowTypeError(ctx, "input must be a string or buffer"); }
+
+    const char *stdin_mode = input_len > 0 ? "pipe" : spawn_sync_stdio_mode(ctx, opts, "stdin", "pipe");
+    const char *stdout_mode = spawn_sync_stdio_mode(ctx, opts, "stdout", "pipe");
+    const char *stderr_mode = spawn_sync_stdio_mode(ctx, opts, "stderr", "pipe");
+    bool pipe_in = strcmp(stdin_mode, "pipe") == 0;
+    bool cap_out = strcmp(stdout_mode, "pipe") == 0;
+    bool cap_err = strcmp(stderr_mode, "pipe") == 0;
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE in_r = INVALID_HANDLE_VALUE, in_w = INVALID_HANDLE_VALUE;
+    HANDLE out_r = INVALID_HANDLE_VALUE, out_w = INVALID_HANDLE_VALUE;
+    HANDLE err_r = INVALID_HANDLE_VALUE, err_w = INVALID_HANDLE_VALUE;
+    HANDLE out_thread = NULL, err_thread = NULL, in_thread = NULL;
+    PROCESS_INFORMATION pi = { 0 };
+    STARTUPINFOW si = { 0 };
+    TJSSpawnSyncBuf out = { 0 }, err = { 0 };
+    TJSWinReadThread out_arg = { 0 }, err_arg = { 0 };
+    TJSWinWriteThread in_arg = { 0 };
+    WCHAR *wcmd = NULL, *wcwd = NULL, *wenv = NULL;
+    char **env_arr = NULL;
+    JSValue ret = JS_EXCEPTION;
+    bool spawned = false;
+
+    if (pipe_in && !CreatePipe(&in_r, &in_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdin) failed: %lu", GetLastError()); goto cleanup; }
+    if (cap_out && !CreatePipe(&out_r, &out_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdout) failed: %lu", GetLastError()); goto cleanup; }
+    if (cap_err && !CreatePipe(&err_r, &err_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stderr) failed: %lu", GetLastError()); goto cleanup; }
+    if (in_w != INVALID_HANDLE_VALUE) SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
+    if (out_r != INVALID_HANDLE_VALUE) SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+    if (err_r != INVALID_HANDLE_VALUE) SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+
+    wcmd = spawn_sync_build_win_cmdline(ctx, args);
+    if (!wcmd) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
+
+    if (JS_IsObject(opts)) {
+        JSValue v = JS_GetPropertyStr(ctx, opts, "cwd");
+        if (JS_IsString(v)) {
+            const char *s = JS_ToCString(ctx, v);
+            if (!s) { JS_FreeValue(ctx, v); goto cleanup; }
+            wcwd = spawn_sync_utf8_to_wide(ctx, s);
+            JS_FreeCString(ctx, s);
+            if (!wcwd) { JS_FreeValue(ctx, v); JS_ThrowOutOfMemory(ctx); goto cleanup; }
+        }
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, opts, "env");
+        if (JS_IsObject(v)) {
+            env_arr = parse_env_obj(ctx, v);
+            wenv = spawn_sync_build_win_env(ctx, env_arr);
+            if (env_arr && !wenv) { JS_FreeValue(ctx, v); JS_ThrowOutOfMemory(ctx); goto cleanup; }
+        }
+        JS_FreeValue(ctx, v);
+    }
+
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = pipe_in ? in_r : (!strcmp(stdin_mode, "ignore") ? INVALID_HANDLE_VALUE : GetStdHandle(STD_INPUT_HANDLE));
+    si.hStdOutput = cap_out ? out_w : (!strcmp(stdout_mode, "ignore") ? INVALID_HANDLE_VALUE : GetStdHandle(STD_OUTPUT_HANDLE));
+    si.hStdError = cap_err ? err_w : (!strcmp(stderr_mode, "ignore") ? INVALID_HANDLE_VALUE : GetStdHandle(STD_ERROR_HANDLE));
+
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT;
+    if (JS_IsObject(opts)) {
+        JSValue bg = JS_GetPropertyStr(ctx, opts, "background");
+        if (JS_IsEqual(ctx, bg, JS_TRUE)) flags |= CREATE_NO_WINDOW;
+        JS_FreeValue(ctx, bg);
+    }
+
+    if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, flags, wenv, wcwd, &si, &pi)) {
+        JS_ThrowInternalError(ctx, "CreateProcess failed: %lu", GetLastError());
+        goto cleanup;
+    }
+    spawned = true;
+    CloseHandle(pi.hThread); pi.hThread = NULL;
+
+    if (in_r != INVALID_HANDLE_VALUE) { CloseHandle(in_r); in_r = INVALID_HANDLE_VALUE; }
+    if (out_w != INVALID_HANDLE_VALUE) { CloseHandle(out_w); out_w = INVALID_HANDLE_VALUE; }
+    if (err_w != INVALID_HANDLE_VALUE) { CloseHandle(err_w); err_w = INVALID_HANDLE_VALUE; }
+
+    if (cap_out) {
+        out_arg.pipe = out_r; out_arg.buf = &out;
+        out_thread = CreateThread(NULL, 0, spawn_sync_win_read_thread, &out_arg, 0, NULL);
+        if (!out_thread) { JS_ThrowInternalError(ctx, "CreateThread(stdout) failed: %lu", GetLastError()); goto cleanup; }
+    }
+    if (cap_err) {
+        err_arg.pipe = err_r; err_arg.buf = &err;
+        err_thread = CreateThread(NULL, 0, spawn_sync_win_read_thread, &err_arg, 0, NULL);
+        if (!err_thread) { JS_ThrowInternalError(ctx, "CreateThread(stderr) failed: %lu", GetLastError()); goto cleanup; }
+    }
+    if (pipe_in) {
+        in_arg.pipe = in_w; in_arg.data = input; in_arg.len = input_len;
+        in_thread = CreateThread(NULL, 0, spawn_sync_win_write_thread, &in_arg, 0, NULL);
+        if (!in_thread) { JS_ThrowInternalError(ctx, "CreateThread(stdin) failed: %lu", GetLastError()); goto cleanup; }
+        in_w = INVALID_HANDLE_VALUE;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (in_thread) WaitForSingleObject(in_thread, INFINITE);
+    if (out_thread) WaitForSingleObject(out_thread, INFINITE);
+    if (err_thread) WaitForSingleObject(err_thread, INFINITE);
+
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    ret = spawn_sync_make_result(ctx, (int)pi.dwProcessId, (int64_t)code, 0, &out, &err, cap_out, cap_err);
+
+cleanup:
+    if (spawned && JS_IsException(ret) && pi.hProcess) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+    if (in_thread) WaitForSingleObject(in_thread, INFINITE);
+    if (out_thread) WaitForSingleObject(out_thread, INFINITE);
+    if (err_thread) WaitForSingleObject(err_thread, INFINITE);
+    if (in_r != INVALID_HANDLE_VALUE) CloseHandle(in_r);
+    if (in_w != INVALID_HANDLE_VALUE) CloseHandle(in_w);
+    if (out_r != INVALID_HANDLE_VALUE) CloseHandle(out_r);
+    if (out_w != INVALID_HANDLE_VALUE) CloseHandle(out_w);
+    if (err_r != INVALID_HANDLE_VALUE) CloseHandle(err_r);
+    if (err_w != INVALID_HANDLE_VALUE) CloseHandle(err_w);
+    if (out_thread) CloseHandle(out_thread);
+    if (err_thread) CloseHandle(err_thread);
+    if (in_thread) CloseHandle(in_thread);
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (wcmd) js_free(ctx, wcmd);
+    if (wcwd) js_free(ctx, wcwd);
+    if (wenv) js_free(ctx, wenv);
+    free_env(ctx, env_arr);
+    spawn_sync_buf_free(&out);
+    spawn_sync_buf_free(&err);
+    spawn_sync_free_input(input);
+    tjs__free_args(ctx, args);
+    return ret;
+}
+#endif /* _WIN32 */
 
 static void uv__exit_cb(uv_process_t *handle, int64_t exit_status, int term_signal) {
     TJSProcess *p = handle->data;
@@ -1025,9 +1599,10 @@ static const JSCFunctionListEntry tjs_process_proto_funcs[] = {
 };
 
 static const JSCFunctionListEntry tjs_process_funcs[] = {
-    TJS_CFUNC_DEF("spawn", 2, tjs_spawn),
-    TJS_CFUNC_DEF("kill",  2, tjs_kill),
-    TJS_CFUNC_DEF("exec",  1, tjs_exec),
+    TJS_CFUNC_DEF("spawn",     2, tjs_spawn),
+    TJS_CFUNC_DEF("spawnSync", 3, tjs_spawn_sync),
+    TJS_CFUNC_DEF("kill",      2, tjs_kill),
+    TJS_CFUNC_DEF("exec",      1, tjs_exec),
 };
 /* clang-format on */
 

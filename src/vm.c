@@ -274,6 +274,10 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     CHECK_EQ(uv_check_init(&qrt->loop, &qrt->jobs.check), 0);
     qrt->jobs.check.data = qrt;
 
+    /* Initialize job control state */
+    qrt->jobs.paused = false;
+    qrt->jobs.waitio_depth = 0;
+
     /* handle for stopping this runtime (also works from another thread) */
     CHECK_EQ(uv_async_init(&qrt->loop, &qrt->stop, uv__stop), 0);
     qrt->stop.data = qrt;
@@ -543,7 +547,10 @@ static void uv__check_cb(uv_check_t *handle) {
     TJSRuntime *qrt = handle->data;
     CHECK_NOT_NULL(qrt);
 
-    tjs__execute_jobs(qrt->ctx);
+    /* Don't execute jobs here if we're inside waitIO - it handles jobs itself */
+    if (qrt->jobs.waitio_depth == 0) {
+        tjs__execute_jobs(qrt->ctx);
+    }
 
     uv__maybe_idle(qrt);
 }

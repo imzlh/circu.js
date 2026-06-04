@@ -153,6 +153,30 @@ await test('proc.waitSync - synchronous wait', () => {
     assertEquals(status.exit_status, 0, 'Should exit with 0');
 });
 
+await test('proc.spawnSync - capture stdout', () => {
+    const result = proc.spawnSync(['echo', 'sync stdout']);
+    const stdout = engine.decodeString(result.stdout);
+
+    assertEquals(result.status, 0, 'Should exit with 0');
+    assert(stdout.includes('sync stdout'), 'Should capture stdout');
+});
+
+await test('proc.spawnSync - capture stderr and status', () => {
+    const result = proc.spawnSync(['sh', '-c', 'echo sync error >&2; exit 7']);
+    const stderr = engine.decodeString(result.stderr);
+
+    assertEquals(result.status, 7, 'Should report exit status');
+    assert(stderr.includes('sync error'), 'Should capture stderr');
+});
+
+await test('proc.spawnSync - input', () => {
+    const result = proc.spawnSync(['cat'], { input: engine.encodeString('sync input') });
+    const stdout = engine.decodeString(result.stdout);
+
+    assertEquals(result.status, 0, 'Should exit with 0');
+    assertEquals(stdout, 'sync input', 'Should write input to stdin');
+});
+
 // ========== Process Kill ==========
 await test('proc.kill - kill process with signal', async () => {
     const child = proc.spawn(['sleep', '10']);

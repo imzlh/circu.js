@@ -16,8 +16,10 @@ declare namespace CModuleCURL {
      * HTTP response object
      */
     export interface Response {
-        /** Response body content */
-        body?: string;
+        /** Raw response body bytes. Omitted in streaming mode. */
+        body?: ArrayBuffer;
+        /** UTF-8 decoded body text. Empty in streaming mode. */
+        readonly text: string;
         /** Raw response headers */
         headers: string;
         /** HTTP status code */
@@ -91,7 +93,21 @@ declare namespace CModuleCURL {
         downloadSize: number;
         /** Uploaded data size (bytes) */
         uploadSize: number;
+        /** Download speed (bytes/second) */
+        downloadSpeed: number;
+        /** HTTP version reported by libcurl */
+        httpVersion: number;
     }
+
+    export interface MimePart {
+        name: string;
+        data?: string | ArrayBuffer | ArrayBufferView;
+        file?: string;
+        filename?: string;
+        type?: string;
+    }
+
+    export type CurlOptionValue = string | number | boolean | null | undefined | string[] | ArrayBuffer | ArrayBufferView;
 
     /**
      * Connection pool - Manages multiple CURL connections for reuse
@@ -140,6 +156,12 @@ declare namespace CModuleCURL {
          * @param streams Maximum concurrent streams
          */
         setMaxConcurrentStreams(streams: number): void;
+
+        onerror: ((error: Error) => void) | undefined;
+    }
+
+    export class Share {
+        constructor();
     }
 
     /**
@@ -196,7 +218,7 @@ declare namespace CModuleCURL {
          * @param body Request body string
          * @returns Current CURL instance (supports chaining)
          */
-        setBody(body: string): this;
+        setBody(body: string | ArrayBuffer | ArrayBufferView): this;
 
         /**
          * Set timeout (milliseconds)
@@ -233,7 +255,7 @@ declare namespace CModuleCURL {
          * @param type Proxy type (http, https, socks4, socks5)
          * @returns Current CURL instance (supports chaining)
          */
-        setProxy(proxy: string, type?: 'http' | 'https' | 'socks4' | 'socks5'): this;
+        setProxy(proxy: string, type?: 'http' | 'https' | 'socks4' | 'socks4a' | 'socks5' | 'socks5h'): this;
 
         /**
          * Set user agent string
@@ -255,6 +277,11 @@ declare namespace CModuleCURL {
          * @returns Current CURL instance (supports chaining)
          */
         setCookieFile(path: string): this;
+
+        /**
+         * Set cookie jar output path.
+         */
+        setCookieJar(path: string): this;
 
         /**
          * Set referer header
@@ -300,6 +327,21 @@ declare namespace CModuleCURL {
         setRange(start: number, end?: number): this;
 
         /**
+         * Enable or set accepted compressed response encodings.
+         */
+        setAcceptEncoding(encoding?: string): this;
+
+        /**
+         * Set HTTP Basic authentication credentials.
+         */
+        setBasicAuth(username: string, password?: string): this;
+
+        /**
+         * Set bearer token authentication.
+         */
+        setBearerToken(token: string): this;
+
+        /**
          * Set DNS server list (comma-separated)
          * @param servers DNS server list (e.g., "8.8.8.8,1.1.1.1")
          * @returns Current CURL instance (supports chaining)
@@ -312,6 +354,26 @@ declare namespace CModuleCURL {
          * @returns Current CURL instance (supports chaining)
          */
         setInterface(interfaceName: string): this;
+
+        /**
+         * Enable TCP keepalive, optionally setting idle and interval seconds.
+         */
+        setKeepAlive(enabled: boolean, idle?: number, interval?: number): this;
+
+        /**
+         * Abort transfers slower than limit bytes/sec for time seconds.
+         */
+        setLowSpeedLimit(limit: number, time?: number): this;
+
+        /**
+         * Set a libcurl easy option by numeric id. Unsafe pointer options are rejected.
+         */
+        setOpt(option: number, value: CurlOptionValue): this;
+
+        /**
+         * Set a libcurl easy option by runtime option name, for example "URL".
+         */
+        setOptByName(name: string, value: CurlOptionValue): this;
 
         /**
          * Set progress callback function
@@ -346,6 +408,12 @@ declare namespace CModuleCURL {
          * @returns RequestInfo Request statistics
          */
         getInfo(): RequestInfo;
+        getInfo(info: number): string | number | string[] | null;
+
+        /**
+         * Abort an in-flight asynchronous request.
+         */
+        abort(): void;
 
         /**
          * Reset CURL instance to initial state
@@ -362,10 +430,38 @@ declare namespace CModuleCURL {
          * Stream callback. Return `true` to abort reading.
          */
         onData(cb: (buf: ArrayBuffer) => boolean): void;
+
+        /**
+         * Upload raw data using libcurl's read callback.
+         */
+        setUploadData(data: string | ArrayBuffer | ArrayBufferView): this;
+
+        /**
+         * Upload a file path using libcurl's file reader.
+         */
+        setUploadFile(path: string): this;
+
+        /**
+         * Configure multipart/form-data POST parts.
+         */
+        setMimePost(parts: MimePart[]): this;
+
+        /**
+         * Attach a libcurl share handle for cookies, DNS, SSL sessions, and connections.
+         */
+        setShare(share: Share): this;
     }
     
     /**
      * Get module version information
      */
     export const version: VersionInfo;
+
+    export const CURLOPT: Record<string, number>;
+    export const CURLINFO: Record<string, number>;
+    export const constants: Record<string, number>;
+
+    export function strerror(code: number): string;
+    export function escape(value: string): string | null;
+    export function unescape(value: string): string | null;
 }

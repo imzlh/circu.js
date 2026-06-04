@@ -51,6 +51,21 @@ declare namespace CModuleProcess {
         cols?: number;
         /** PTY rows (default 24) */
         rows?: number;
+        /** Data written to stdin then closed (spawnSync only) */
+        input?: string | ArrayBuffer | Uint8Array;
+    }
+
+    /**
+     * Synchronous spawn result. stdout/stderr are ArrayBuffers when captured.
+     */
+    export interface SpawnSyncResult {
+        pid: number;
+        output: [null, ArrayBuffer | null, ArrayBuffer | null];
+        stdout: ArrayBuffer | null;
+        stderr: ArrayBuffer | null;
+        status: number | null;
+        signal: string | null;
+        error?: Error;
     }
 
     /**
@@ -133,6 +148,18 @@ declare namespace CModuleProcess {
      * @param options Optional configuration
      */
     export function spawn<T>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
+
+    /**
+     * Synchronously spawn a child process using platform-native process APIs.
+     * @param args Command string or argument array (first element is command to execute)
+     * @param options Optional configuration
+     */
+    export function spawnSync(args: string | string[], options?: SpawnOptions<false>): SpawnSyncResult;
+
+    /**
+     * Node-style overload: command plus argument array.
+     */
+    export function spawnSync(command: string, args?: string[], options?: SpawnOptions<false>): SpawnSyncResult;
 
     /**
      * Execute command (shorthand for spawn + wait)

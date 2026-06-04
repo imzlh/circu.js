@@ -58,6 +58,7 @@ struct TJSRuntime {
         uv_idle_t idle;
         uv_prepare_t prepare;
 		bool paused;
+		int waitio_depth;  /* Track nested waitIO calls */
     } jobs;
     uv_async_t stop;
 

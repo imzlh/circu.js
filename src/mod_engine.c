@@ -637,23 +637,57 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 
 	JSValue abort_check = argc >= 2 && JS_IsFunction(ctx, argv[1]) ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
 
-	// call uv_run to make promise sync
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	uv_loop_t* loop = TJS_GetLoop(trt);
 
-	// Save previous paused state to support nested waitIO calls
-	bool prev_paused = trt->jobs.paused;
-	trt->jobs.paused = true;
+	// Track nested waitIO depth
+	int prev_depth = trt->jobs.waitio_depth++;
 
 	bool aborted = false;
 	JSValue abort_exception = JS_UNDEFINED;
+	int loop_iterations = 0;
+	const int MAX_ITERATIONS = 100000;
 
 	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
-		// Run event loop once
+		// Safety: prevent infinite loops
+		if (++loop_iterations > MAX_ITERATIONS) {
+			abort_exception = JS_ThrowInternalError(ctx, "waitPromise: too many iterations");
+			aborted = true;
+			break;
+		}
+
+		// Execute pending jobs BEFORE uv_run
+		// This is critical: jobs may create/start uv handles needed for I/O
+		JSContext *ctx1;
+		int err;
+		while (1) {
+			err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
+			if (err <= 0) {
+				if (err < 0) {
+					// Job threw an exception
+					JSValue js_err = JS_GetException(ctx1);
+					JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
+					bool should_stop = (JS_IsEqual(ctx1, retv, JS_FALSE) == 1);
+					JS_FreeValue(ctx1, js_err);
+					JS_FreeValue(ctx1, retv);
+
+					if (should_stop) {
+						abort_exception = JS_ThrowInternalError(ctx, "Job exception caused runtime stop");
+						aborted = true;
+						break;
+					}
+				}
+				break;  // No more jobs
+			}
+		}
+
+		if (aborted) break;
+
+		// Run event loop to process I/O
 		int uv_result = uv_run(loop, UV_RUN_ONCE);
 
-		// Check if loop has no more active handles - prevent infinite loop
-		if (uv_result == 0 && uv_loop_alive(loop) == 0) {
+		// Check if loop is dead and no pending jobs
+		if (uv_result == 0 && uv_loop_alive(loop) == 0 && !JS_IsJobPending(JS_GetRuntime(ctx))) {
 			break;
 		}
 
@@ -661,18 +695,15 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 		if (!JS_IsUndefined(abort_check)) {
 			JSValue ret = JS_Call(ctx, abort_check, this_val, 0, NULL);
 			if (JS_IsException(ret)) {
-				// Save exception and break
 				abort_exception = JS_GetException(ctx);
 				aborted = true;
 				break;
 			}
 
-			// Check if abort_check returned true
 			int is_true = JS_IsEqual(ctx, ret, JS_TRUE);
 			JS_FreeValue(ctx, ret);
 
 			if (is_true == -1) {
-				// JS_IsEqual threw an exception
 				abort_exception = JS_GetException(ctx);
 				aborted = true;
 				break;
@@ -685,19 +716,14 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 		}
 	}
 
-	// Restore previous paused state
-	trt->jobs.paused = prev_paused;
-
-	// Execute pending jobs if not paused
-	if (!prev_paused) {
-		tjs__execute_jobs(ctx);
-	}
+	// Restore state
+	trt->jobs.waitio_depth = prev_depth;
 
 	JS_FreeValue(ctx, abort_check);
 
 	// Handle abort exception
 	if (!JS_IsUndefined(abort_exception)) {
-		return JS_Throw(ctx, abort_exception);
+		return abort_exception;
 	}
 
 	// Get final promise state
@@ -716,7 +742,7 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 			if (aborted) {
 				return JS_ThrowInternalError(ctx, "waitPromise aborted");
 			}
-			return JS_ThrowInternalError(ctx, "IO promise did not settle");
+			return JS_ThrowInternalError(ctx, "waitPromise: promise did not settle");
 		default:
 			abort();
 	}
