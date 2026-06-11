@@ -422,12 +422,12 @@ class CJSRepl {
         } else {
             const pipe = new streams.Pipe();
             pipe.open(os.STDOUT_FILENO);
-            this.#stdout = pipe as unknown as CModuleStreams.Stream;
+            this.#stdout = pipe as CModuleStreams.Stream;
         }
 
         if (os.guessHandle(os.STDIN_FILENO) === 'tty') {
             const stdin = this.#stdin = new streams.TTY(os.STDIN_FILENO, true);
-            stdin.setMode(streams.TTY_MODE_RAW_VT);
+            stdin.mode = (streams.TTY_MODE_RAW_VT);
             this.#isatty = true;
         } else {
             const pipe = new streams.Pipe();
@@ -441,7 +441,7 @@ class CJSRepl {
         // Disable bracketed paste mode before exiting
             if (this.#isatty) {
                 this.#stdin.write(engine.encodeString('\x1b[?2004l'));
-                (this.#stdin as CModuleStreams.TTY).setMode(streams.TTY_MODE_NORMAL);
+                (this.#stdin as CModuleStreams.TTY).mode = (streams.TTY_MODE_NORMAL);
             }
         });
     }

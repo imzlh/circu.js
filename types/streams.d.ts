@@ -56,10 +56,9 @@ declare namespace CModuleStreams {
         listen(backlog?: number): void;
 
         /**
-         * Shutdown write/read direction
-         * @returns Promise resolves when shutdown complete
+         * Shutdown write/read direction (synchronous, wraps uv_shutdown)
          */
-        shutdown(): Promise<void>;
+        shutdown(): void;
 
         /**
          * Set stream to blocking or non-blocking mode

@@ -1243,7 +1243,7 @@ static JSValue tjs_curl_set_opt_by_name(JSContext *ctx, JSValueConst this_val, i
 static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
     switch (info & CURLINFO_TYPEMASK) {
         case CURLINFO_STRING: {
-            char *s = NULL;m
+            char *s = NULL;
             if (curl_easy_getinfo(handle, info, &s) != CURLE_OK || !s) return JS_NULL;
             return JS_NewString(ctx, s);
         }

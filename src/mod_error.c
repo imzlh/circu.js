@@ -47,6 +47,20 @@ JSValue tjs_new_error(JSContext *ctx, int err) {
     return obj;
 }
 
+JSValue tjs_new_error_path(JSContext *ctx, int err, const char *path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s: %s, path '%s'", uv_err_name(err), uv_strerror(err), path ? path : "(null)");
+
+    JSValue obj = JS_NewError(ctx);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, JS_NewString(ctx, buf), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx, obj, "code", JS_NewInt32(ctx, err), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    if (JS_IsException(obj)) {
+        obj = JS_NULL;
+    }
+    return obj;
+}
+
 static JSValue tjs_error_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
     int err;
     if (JS_ToInt32(ctx, &err, argv[0])) {
@@ -58,6 +72,25 @@ static JSValue tjs_error_constructor(JSContext *ctx, JSValue new_target, int arg
 JSValue tjs_throw_errno(JSContext *ctx, int err) {
     JSValue obj;
     obj = tjs_new_error(ctx, err);
+    if (JS_IsException(obj)) {
+        obj = JS_NULL;
+    }
+    return JS_Throw(ctx, obj);
+}
+
+JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s: %s, path '%s'", uv_err_name(err), uv_strerror(err), path ? path : "(null)");
+
+    JSValue obj;
+    obj = JS_NewError(ctx);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, JS_NewString(ctx, buf), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx,
+                              obj,
+                              "code",
+                              JS_NewInt32(ctx, err),
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     if (JS_IsException(obj)) {
         obj = JS_NULL;
     }

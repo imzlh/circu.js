@@ -188,15 +188,17 @@ declare namespace CModuleDNS {
     }
 
     /** DNS answer record union type */
-    type DNSAnswer = 
-        | AddressAnswer 
-        | CNameAnswer 
-        | NsAnswer 
-        | PtrAnswer 
-        | MxAnswer 
-        | SoaAnswer 
-        | TxtAnswer 
-        | SrvAnswer 
+    type DNSAnswer =
+        | AddressAnswer
+        | CNameAnswer
+        | NsAnswer
+        | PtrAnswer
+        | MxAnswer
+        | SoaAnswer
+        | TxtAnswer
+        | SrvAnswer
+        | NaptrAnswer
+        | CaaAnswer
         | RawAnswer;
 
     /**

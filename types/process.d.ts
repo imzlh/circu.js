@@ -92,23 +92,23 @@ declare namespace CModuleProcess {
     export interface ChildProcess<PTY = false> {
         /** Process ID */
         readonly pid: number;
-        /** Stdin stream (if configured as pipe) */
+        /** Stdin stream (non-PTY mode only, undefined in PTY mode) */
         readonly stdin: PTY extends true ? undefined : Pipe;
-        /** Stdout stream (if configured as pipe) */
-        readonly stdout?: PTY extends true ? undefined : Pipe;
-        /** Stderr stream (if configured as pipe) */
-        readonly stderr?: PTY extends true ? undefined : Pipe;
+        /** Stdout stream (non-PTY mode only, undefined in PTY mode) */
+        readonly stdout: PTY extends true ? undefined : Pipe;
+        /** Stderr stream (non-PTY mode only, undefined in PTY mode) */
+        readonly stderr: PTY extends true ? undefined : Pipe;
 
         /**
-         * PTY readable stream (PTY mode only)
+         * PTY readable stream (PTY mode only, undefined in non-PTY mode)
          * On Linux, same object as writable
          */
-        readonly readable?: PTY extends true ? Pipe : undefined;
+        readonly readable: PTY extends true ? Pipe : undefined;
         /**
-         * PTY writable stream (PTY mode only)
+         * PTY writable stream (PTY mode only, undefined in non-PTY mode)
          * On Linux, same object as readable
          */
-        readonly writable?: PTY extends true ? Pipe : undefined;
+        readonly writable: PTY extends true ? Pipe : undefined;
 
         /**
          * Wait for process exit

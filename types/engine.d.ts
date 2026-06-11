@@ -343,6 +343,14 @@ declare namespace CModuleEngine {
     /**
      * **DANGEROUS** Pseudo-sync wait for Promise. Converts async IO to sync IO, may have mutex issues
      * @param prom Promise with any IO behavior
+     * @param abortCheck Optional function called each iteration; return true to abort
      */
-    export function waitPromise<T>(prom: globalThis.Promise<T>): T;
+    export function waitIO<T>(prom: globalThis.Promise<T>, abortCheck?: () => boolean): T;
+
+    /**
+     * Make an ArrayBuffer immutable (neutered/transfer semantics)
+     * @param buffer ArrayBuffer to make immutable
+     * @param immutable Whether to make it immutable
+     */
+    export function setImmutableArrayBuffer(buffer: ArrayBuffer, immutable: boolean): void;
 }

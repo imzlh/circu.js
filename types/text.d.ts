@@ -368,7 +368,7 @@ declare namespace CModuleText {
         from: string,
         to: string,
         data: ArrayBuffer | ArrayBufferView
-    ): string | Uint8Array;
+    ): string | ArrayBuffer;
 
     /**
      * List supported encodings

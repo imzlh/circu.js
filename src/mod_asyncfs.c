@@ -340,7 +340,11 @@ static void uv__fs_req_cb(uv_fs_t *req) {
     bool is_reject = false;
 
     if (req->result < 0) {
-        arg = tjs_new_error(ctx, fr->req.result);
+        if (fr->req.path) {
+            arg = tjs_new_error_path(ctx, fr->req.result, fr->req.path);
+        } else {
+            arg = tjs_new_error(ctx, fr->req.result);
+        }
         is_reject = true;
         goto skip;
     }
@@ -526,7 +530,10 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (r != 0) {
         js_free(ctx, fr->rw.data);
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     /* tjs_fsreq_init returns a dup'd promise reference for the caller to own.
@@ -551,7 +558,10 @@ static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValu
     int r = uv_fs_close(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -571,7 +581,10 @@ static JSValue tjs_file_stat(JSContext *ctx, JSValue this_val, int argc, JSValue
     int r = uv_fs_fstat(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -596,7 +609,10 @@ static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSV
     int r = uv_fs_ftruncate(tjs_get_loop(ctx), &fr->req, f->fd, offset, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -616,7 +632,10 @@ static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue
     int r = uv_fs_fsync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -636,7 +655,10 @@ static JSValue tjs_file_datasync(JSContext *ctx, JSValue this_val, int argc, JSV
     int r = uv_fs_fdatasync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -661,7 +683,10 @@ static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValu
     int r = uv_fs_fchmod(tjs_get_loop(ctx), &fr->req, f->fd, mode, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -691,7 +716,10 @@ static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValu
     int r = uv_fs_fchown(tjs_get_loop(ctx), &fr->req, f->fd, uid, gid, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -722,7 +750,10 @@ static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValu
     int r = uv_fs_futime(tjs_get_loop(ctx), &fr->req, f->fd, atime / 1000, mtime / 1000, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, f->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -761,7 +792,10 @@ static JSValue tjs_dir_close(JSContext *ctx, JSValue this_val, int argc, JSValue
     int r = uv_fs_closedir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, d->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -796,7 +830,10 @@ static JSValue tjs_dir_next(JSContext *ctx, JSValue this_val, int argc, JSValue 
     int r = uv_fs_readdir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        const char *path = JS_ToCString(ctx, d->path);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     return tjs_fsreq_init(ctx, fr, this_val);
@@ -985,11 +1022,13 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
 
     int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1033,11 +1072,13 @@ static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *
     } else {
         r = uv_fs_stat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     }
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1050,12 +1091,14 @@ static JSValue tjs_fs_stat_sync(JSContext *ctx, JSValue this_val, int argc, JSVa
 
     uv_fs_t req;
     int r = uv_fs_stat(NULL, &req, path, NULL);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         uv_fs_req_cleanup(&req);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
+    JS_FreeCString(ctx, path);
     JSValue ret = tjs_new_stat(ctx, &req.statbuf);
     uv_fs_req_cleanup(&req);
 
@@ -1075,11 +1118,13 @@ static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     int r = uv_fs_realpath(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1097,11 +1142,13 @@ static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue
     }
 
     int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1126,12 +1173,15 @@ static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue
     }
 
     int r = uv_fs_rename(tjs_get_loop(ctx), &fr->req, path, new_path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, new_path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, new_path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
+    JS_FreeCString(ctx, new_path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1149,11 +1199,13 @@ static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int r = uv_fs_mkdtemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
-    JS_FreeCString(ctx, tpl);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, tpl);
+        JS_FreeCString(ctx, tpl);
+        return err;
     }
+    JS_FreeCString(ctx, tpl);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1171,11 +1223,13 @@ static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int r = uv_fs_mkstemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
-    JS_FreeCString(ctx, tpl);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, tpl);
+        JS_FreeCString(ctx, tpl);
+        return err;
     }
+    JS_FreeCString(ctx, tpl);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1193,11 +1247,13 @@ static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     int r = uv_fs_rmdir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1223,11 +1279,13 @@ static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     int r = uv_fs_mkdir(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1248,11 +1306,13 @@ static JSValue tjs_fs_mkdir_sync(JSContext *ctx, JSValue this_val, int argc, JSV
 
     uv_fs_t req;
     int r = uv_fs_mkdir(NULL, &req, path, mode, NULL);
-    JS_FreeCString(ctx, path);
     uv_fs_req_cleanup(&req);
     if (r != 0) {
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -1277,12 +1337,15 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     int r = uv_fs_copyfile(tjs_get_loop(ctx), &fr->req, path, new_path, 0, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, new_path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, new_path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
+    JS_FreeCString(ctx, new_path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1300,11 +1363,13 @@ static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int r = uv_fs_opendir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1325,11 +1390,11 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
     bool is_reject = false;
 
     if (status != 0) {
-        arg = tjs_new_error(ctx, status);
+        arg = tjs_new_error_path(ctx, status, fr->filename);
         is_reject = true;
         dbuf_free(&fr->dbuf);
     } else if (fr->r < 0) {
-        arg = tjs_new_error(ctx, fr->r);
+        arg = tjs_new_error_path(ctx, fr->r, fr->filename);
         is_reject = true;
         dbuf_free(&fr->dbuf);
     } else {
@@ -1366,10 +1431,11 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int r = uv_queue_work(tjs_get_loop(ctx), &fr->req, tjs__readfile_work_cb, tjs__readfile_after_work_cb);
     if (r != 0) {
+        JSValue err = tjs_throw_errno_path(ctx, r, fr->filename);
         js_free(ctx, fr->filename);
-		dbuf_free(&fr->dbuf);
+        dbuf_free(&fr->dbuf);
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        return err;
     }
 
     return TJS_InitPromise(ctx, &fr->result);
@@ -1402,11 +1468,13 @@ static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue
     }
 
     int r = (magic == 1 ? uv_fs_lchown : uv_fs_chown)(tjs_get_loop(ctx), &fr->req, path, uid, gid, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1433,11 +1501,13 @@ static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     int r = uv_fs_chmod(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1471,11 +1541,13 @@ static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue
     /* Date.getTime is in ms, convert to seconds. */
     int r = (magic == 1 ? uv_fs_lutime
                         : uv_fs_utime)(tjs_get_loop(ctx), &fr->req, path, atime / 1000, mtime / 1000, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1497,11 +1569,13 @@ static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     int r = uv_fs_readlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1533,12 +1607,15 @@ static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
 
     int r = uv_fs_link(tjs_get_loop(ctx), &fr->req, path, path2, uv__fs_req_cb);
+    if (r != 0) {
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, path2);
+        js_free(ctx, fr);
+        return err;
+    }
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, path2);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1577,12 +1654,15 @@ static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int r = uv_fs_symlink(tjs_get_loop(ctx), &fr->req, path, path2, flags, uv__fs_req_cb);
+    if (r != 0) {
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, path2);
+        js_free(ctx, fr);
+        return err;
+    }
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, path2);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
@@ -1604,11 +1684,13 @@ static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue
     }
 
     int r = uv_fs_statfs(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
-    JS_FreeCString(ctx, path);
     if (r != 0) {
+        JSValue err = tjs_throw_errno_path(ctx, r, path);
+        JS_FreeCString(ctx, path);
         js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }

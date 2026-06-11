@@ -5,7 +5,7 @@
  * const udp = import.meta.use('udp');
  * 
  * const sock = await udp.create();
- * await sock.bind({ ip: '0.0.0.0', port: 12345 });
+ * sock.bind({ ip: '0.0.0.0', port: 12345 });
  * 
  * const buffer = new Uint8Array(1024);
  * const { nread, addr } = await sock.recv(buffer);
@@ -16,12 +16,12 @@ declare namespace CModuleUDP {
      */
     export interface UDP {
         /**
-         * Close UDP connection
+         * Close UDP connection (synchronous)
          */
-        close(): Promise<void>;
+        close(): void;
 
         /**
-         * Receive data
+         * Receive data (async, returns Promise)
          * @param buffer Uint8Array to store received data
          * @returns Receive info object
          */
@@ -35,7 +35,7 @@ declare namespace CModuleUDP {
         }>;
 
         /**
-         * Send data
+         * Send data (async, returns Promise)
          * @param buffer Uint8Array containing data to send
          * @param addr Target address object
          * @returns Sent data length
@@ -43,35 +43,35 @@ declare namespace CModuleUDP {
         send(buffer: Uint8Array, addr?: Record<string, any>): Promise<number>;
 
         /**
-         * Get file descriptor
+         * Get file descriptor (synchronous)
          * @returns File descriptor
          */
-        fileno(): Promise<number>;
+        fileno(): number;
 
         /**
-         * Get socket name
+         * Get socket name (synchronous, wraps uv_udp_getsockname)
          * @returns Socket name object
          */
-        getsockname(): Promise<Record<string, any>>;
+        getsockname(): Record<string, any>;
 
         /**
-         * Get peer name
+         * Get peer name (synchronous, wraps uv_udp_getpeername)
          * @returns Peer name object
          */
-        getpeername(): Promise<Record<string, any>>;
+        getpeername(): Record<string, any>;
 
         /**
-         * Connect to address
+         * Connect to address (synchronous, wraps uv_udp_connect)
          * @param addr Address object
          */
-        connect(addr: Record<string, any>): Promise<void>;
+        connect(addr: Record<string, any>): void;
 
         /**
-         * Bind to address
+         * Bind to address (synchronous, wraps uv_udp_bind)
          * @param addr Address object
          * @param flags Bind flags (optional)
          */
-        bind(addr: Record<string, any>, flags?: number): Promise<void>;
+        bind(addr: Record<string, any>, flags?: number): void;
 
         readonly [Symbol.toStringTag]: 'UDP';
     }

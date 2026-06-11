@@ -509,18 +509,19 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     int ret = _wstat64(wpath, &st);
     free(wpath);
 #else
     int ret = stat(path, &st);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (ret < 0) {
-        THROW("stat");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return build_stat_obj(ctx, &st);
 }
@@ -542,18 +543,19 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
 #ifdef _WIN32
     /* Windows doesn't have lstat, use stat */
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     int ret = _wstat64(wpath, &st);
     free(wpath);
 #else
     int ret = lstat(path, &st);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (ret < 0) {
-        THROW("lstat");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return build_stat_obj(ctx, &st);
 }
@@ -617,18 +619,19 @@ static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, 
     int fd;
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     fd = _wopen(wpath, flags, mode);
     free(wpath);
 #else
     fd = open(path, flags, mode);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (fd < 0) {
-        THROW("open");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_NewInt32(ctx, fd);
 }
@@ -874,21 +877,23 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     int fd;
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     fd = _wopen(wpath, O_RDONLY | O_BINARY);
     free(wpath);
 #else
     fd = open(path, O_RDONLY);
-    JS_FreeCString(ctx, path);
 #endif
     if (fd < 0) {
-        THROW("open");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     if (fstat(fd, &st) < 0) {
         close(fd);
-        THROW("fstat");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     size_t size = st.st_size;
@@ -901,6 +906,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         uint8_t* buf = js_malloc(ctx, capacity);
         if (!buf) {
             close(fd);
+            JS_FreeCString(ctx, path);
             return JS_EXCEPTION;
         }
 
@@ -910,7 +916,9 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
                 if (errno == EINTR) continue;
                 js_free(ctx, buf);
                 close(fd);
-                THROW("read");
+                JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+                JS_FreeCString(ctx, path);
+                return err;
             }
             total_read += n;
             if (total_read >= capacity) {
@@ -920,6 +928,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
                 if (!new_buf) {
                     js_free(ctx, buf);
                     close(fd);
+                    JS_FreeCString(ctx, path);
                     return JS_EXCEPTION;
                 }
                 buf = new_buf;
@@ -928,6 +937,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         }
 
         close(fd);
+        JS_FreeCString(ctx, path);
 
         JSValue result = JS_NewArrayBufferCopy(ctx, buf, total_read);
         js_free(ctx, buf);
@@ -937,6 +947,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     uint8_t* buf = js_malloc(ctx, size);
     if (!buf) {
         close(fd);
+        JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
 
@@ -946,13 +957,16 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
             if (errno == EINTR) continue;
             js_free(ctx, buf);
             close(fd);
-            THROW("read");
+            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+            JS_FreeCString(ctx, path);
+            return err;
         }
         total_read += n;
         if (total_read == size) break;
     }
 
     close(fd);
+    JS_FreeCString(ctx, path);
 
     JSValue result = JS_NewArrayBufferCopy(ctx, buf, total_read);
     js_free(ctx, buf);
@@ -992,17 +1006,17 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
     int fd;
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     fd = _wopen(wpath, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
     free(wpath);
 #else
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (fd < 0) {
-        THROW("open");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     ssize_t total_written = 0;
@@ -1011,12 +1025,15 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
         if (n < 0) {
             if (errno == EINTR) continue;
             close(fd);
-            THROW("write");
+            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+            JS_FreeCString(ctx, path);
+            return err;
         }
         total_written += n;
     }
 
     close(fd);
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -1044,18 +1061,19 @@ static JSValue tjs_syncfs_mkdir(JSContext* ctx, JSValueConst this_val, int argc,
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     int ret = _wmkdir(wpath);
     free(wpath);
 #else
     int ret = mkdir(path, mode);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (ret < 0) {
-        THROW("mkdir");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -1075,18 +1093,19 @@ static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc,
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     int ret = _wrmdir(wpath);
     free(wpath);
 #else
     int ret = rmdir(path);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (ret < 0) {
-        THROW("rmdir");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -1106,18 +1125,19 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     int ret = _wunlink(wpath);
     free(wpath);
 #else
     int ret = unlink(path);
-    JS_FreeCString(ctx, path);
 #endif
 
     if (ret < 0) {
-        THROW("unlink");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -1153,31 +1173,21 @@ static JSValue tjs_syncfs_link(JSContext* ctx, JSValueConst this_val,
     BOOL result = CreateHardLinkA(new_path, existing_path, NULL);
     (void) result;  // Silence unused variable warning in case of macro weirdness
     if (!result) {
-        DWORD error_code = GetLastError();
-        LPSTR messageBuffer = NULL;
-        JSValue error;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) &messageBuffer, 0, NULL);
-        if (messageBuffer) {
-            error = JS_ThrowTypeError(ctx, "Failed to create hard link: %s", messageBuffer);
-            LocalFree(messageBuffer);
-        }
-        else {
-            error = JS_ThrowTypeError(ctx, "Failed to create hard link. Error code: %lu", error_code);
-        }
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), new_path);
         JS_FreeCString(ctx, existing_path);
         JS_FreeCString(ctx, new_path);
-        return error;
+        return err;
     }
 #else
     // Unix-like implementation using link()
     int result = link(existing_path, new_path);
     (void) result;  // Silence unused variable warning in case of macro weirdness
     if (result != 0) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, new_path);
         JS_FreeCString(ctx, existing_path);
         JS_FreeCString(ctx, new_path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
 #endif
 
@@ -1350,10 +1360,11 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
     int symlink_result = symlink(target, path);
 
     if (symlink_result != 0) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, path);
         JS_FreeCString(ctx, target);
         JS_FreeCString(ctx, path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
 #endif
 
@@ -1529,10 +1540,11 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
     }
 
     if (link_size == -1) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, path);
         js_free(ctx, link_path);
         JS_FreeCString(ctx, path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
 
     // Null-terminate the string
@@ -1637,19 +1649,21 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     // Open source file (read-only)
     src_fd = open(src_path, O_RDONLY);
     if (src_fd == -1) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, src_path);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
 
     // Check if source is a regular file (don't copy directories or special files)
     if (fstat(src_fd, &src_stat) == -1) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
         close(src_fd);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, src_path);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
     if (!S_ISREG(src_stat.st_mode)) {
         close(src_fd);
@@ -1661,11 +1675,12 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     // Open destination file (create, write-only, with same permissions as source)
     dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
     if (dest_fd == -1) {
-        int saved_errno = errno;
+        int uv_err = uv_translate_sys_error(errno);
         close(src_fd);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+        return err;
     }
 
     // Use sendfile for efficient zero-copy file transfer (where available)
@@ -1735,14 +1750,20 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
         int saved_errno2 = errno;
         unlink(dest_path);
 
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
         if (saved_errno != 0) {
-            return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno));
+            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(saved_errno), src_path);
+            JS_FreeCString(ctx, src_path);
+            JS_FreeCString(ctx, dest_path);
+            return err;
         }
         if (saved_errno2 != 0 && saved_errno2 != ENOENT) {
-            return tjs_throw_errno(ctx, uv_translate_sys_error(saved_errno2));
+            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(saved_errno2), src_path);
+            JS_FreeCString(ctx, src_path);
+            JS_FreeCString(ctx, dest_path);
+            return err;
         }
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
         return JS_ThrowTypeError(ctx, "Failed to copy file data (file may have been modified during copy)");
     }
 #endif
@@ -1776,10 +1797,10 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
 #ifdef _WIN32
     WCHAR *wold = utf8_to_wcs(oldpath);
     WCHAR *wnew = utf8_to_wcs(newpath);
-    JS_FreeCString(ctx, oldpath);
-    JS_FreeCString(ctx, newpath);
     if (!wold || !wnew) {
         free(wold); free(wnew);
+        JS_FreeCString(ctx, oldpath);
+        JS_FreeCString(ctx, newpath);
         return JS_ThrowOutOfMemory(ctx);
     }
     int ret = _wrename(wold, wnew);
@@ -1787,13 +1808,16 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
     free(wnew);
 #else
     int ret = rename(oldpath, newpath);
-    JS_FreeCString(ctx, oldpath);
-    JS_FreeCString(ctx, newpath);
 #endif
 
     if (ret < 0) {
-        THROW("rename");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), oldpath);
+        JS_FreeCString(ctx, oldpath);
+        JS_FreeCString(ctx, newpath);
+        return err;
     }
+    JS_FreeCString(ctx, oldpath);
+    JS_FreeCString(ctx, newpath);
 
     return JS_UNDEFINED;
 }
@@ -1813,13 +1837,12 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
     /* Build wide-char search path: path\\* */
     size_t wlen = wcslen(wpath);
     WCHAR *wsearch = (WCHAR *)malloc((wlen + 3) * sizeof(WCHAR));
-    if (!wsearch) { free(wpath); return JS_ThrowOutOfMemory(ctx); }
+    if (!wsearch) { free(wpath); JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
     wcscpy(wsearch, wpath);
     wsearch[wlen] = L'\\';
     wsearch[wlen + 1] = L'*';
@@ -1831,8 +1854,11 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     free(wsearch);
 
     if (handle == INVALID_HANDLE_VALUE) {
-        THROW2("opendir")
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     JSValue arr = JS_NewArray(ctx);
     uint32_t idx = 0;
@@ -1851,11 +1877,13 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     FindClose(handle);
 #else
     DIR* dir = opendir(path);
-    JS_FreeCString(ctx, path);
 
     if (!dir) {
-        THROW("opendir");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     JSValue arr = JS_NewArray(ctx);
     uint32_t idx = 0;
@@ -1889,8 +1917,7 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
     HANDLE hFile = CreateFileW(wpath,
         0,    // query only
@@ -1901,7 +1928,9 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
         NULL);
     free(wpath);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("realpath");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     /* 2. get final path (resolved symlinks, ., and ..) */
@@ -1910,8 +1939,10 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
         VOLUME_NAME_DOS);
     CloseHandle(hFile);
     if (len == 0 || len >= sizeof(wbuf) / sizeof(WCHAR)) {
-        SetLastError(len == 0 ? ERROR_GEN_FAILURE : ERROR_INSUFFICIENT_BUFFER);
-        THROW2("realpath");
+        DWORD err = (len == 0) ? ERROR_GEN_FAILURE : ERROR_INSUFFICIENT_BUFFER;
+        JSValue err_val = tjs_throw_errno_path(ctx, uv_translate_sys_error(err), path);
+        JS_FreeCString(ctx, path);
+        return err_val;
     }
 
     const WCHAR* out = wbuf;
@@ -1928,17 +1959,24 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
         }
     }
     char *utf8_out = wcs_to_utf8(out, -1);
-    if (!utf8_out) THROW2("realpath");
+    if (!utf8_out) {
+        JSValue err_val = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err_val;
+    }
     JSValue result = JS_NewString(ctx, utf8_out);
     free(utf8_out);
+    JS_FreeCString(ctx, path);
     return result;
 #else
     char resolved[PATH_MAX];
     char* ret = realpath(path, resolved);
-    JS_FreeCString(ctx, path);
     if (!ret) {
-        THROW("realpath");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
     return JS_NewString(ctx, resolved);
 #endif
 }
@@ -2088,15 +2126,16 @@ static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int ar
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
     HANDLE hFile = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, NULL);
     free(wpath);
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("truncate")
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     LARGE_INTEGER li;
@@ -2104,17 +2143,21 @@ static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int ar
 
     if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) || !SetEndOfFile(hFile)) {
         CloseHandle(hFile);
-        THROW2("truncate")
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     CloseHandle(hFile);
+    JS_FreeCString(ctx, path);
 #else
     int ret = truncate(path, length);
-    JS_FreeCString(ctx, path);
-
     if (ret < 0) {
-        THROW("truncate");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 #endif
 
     return JS_UNDEFINED;
@@ -2182,11 +2225,13 @@ static JSValue tjs_syncfs_chmod(JSContext* ctx, JSValueConst this_val, int argc,
 #else
     int ret = chmod(path, mode);
 #endif
-    JS_FreeCString(ctx, path);
 
     if (ret < 0) {
-        THROW("chmod");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }
@@ -2249,11 +2294,13 @@ static JSValue tjs_syncfs_chown(JSContext* ctx, JSValueConst this_val, int argc,
     return JS_ThrowInternalError(ctx, "chown not supported on Windows");
 #else
     int ret = chown(path, uid, gid);
-    JS_FreeCString(ctx, path);
 
     if (ret < 0) {
-        THROW("chown");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 #endif
 
     return JS_UNDEFINED;
@@ -2316,8 +2363,7 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
-    JS_FreeCString(ctx, path);
-    if (!wpath) return JS_ThrowOutOfMemory(ctx);
+    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
     HANDLE hFile = CreateFileW(wpath, FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -2325,7 +2371,9 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
     free(wpath);
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("utimes failed: cannot open file");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     FILETIME ft_atime, ft_mtime;
@@ -2342,10 +2390,13 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
 
     if (!SetFileTime(hFile, NULL, &ft_atime, &ft_mtime)) {
         CloseHandle(hFile);
-        THROW2("utimes")
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
 
     CloseHandle(hFile);
+    JS_FreeCString(ctx, path);
 #else
     struct timeval times[2];
     times[0].tv_sec = (time_t) atime;
@@ -2354,11 +2405,13 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
     times[1].tv_usec = (suseconds_t) ((mtime - times[1].tv_sec) * 1000000);
 
     int ret = utimes(path, times);
-    JS_FreeCString(ctx, path);
 
     if (ret < 0) {
-        THROW("utimes");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 #endif
 
     return JS_UNDEFINED;
@@ -2390,11 +2443,13 @@ static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc
 #else
     int ret = access(path, mode);
 #endif
-    JS_FreeCString(ctx, path);
 
     if (ret < 0) {
-        THROW("access");
+        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
+        JS_FreeCString(ctx, path);
+        return err;
     }
+    JS_FreeCString(ctx, path);
 
     return JS_UNDEFINED;
 }

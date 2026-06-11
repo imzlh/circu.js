@@ -159,7 +159,9 @@ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);
+JSValue tjs_new_error_path(JSContext *ctx, int err, const char *path);
 JSValue tjs_throw_errno(JSContext *ctx, int err);
+JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path);
 
 JSValue tjs_new_pipe(JSContext *ctx);
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);

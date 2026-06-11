@@ -138,5 +138,5 @@ declare namespace CModuleWin32 {
      * // pass caBundle to whatever TLS library you use
      * ```
      */
-    export function exportCerts(storeName ?: 'ROOT' | 'CA' | 'MY' | string): string[];
+    export function exportCerts(storeName?: 'ROOT' | 'CA' | 'MY' | string): string[];
 }

@@ -56,7 +56,7 @@ if(ENABLE_ASAN)
 endif()
 
 set(CJS__VERSION_MAJOR 1)
-set(CJS__VERSION_MINOR 1)
+set(CJS__VERSION_MINOR 2)
 set(CJS__VERSION_PATCH 0)
 set(CJS__VERSION_SUFFIX "")
 configure_file(

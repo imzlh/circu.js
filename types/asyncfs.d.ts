@@ -26,7 +26,7 @@ declare namespace CModuleAsyncFS {
      * Symlink type (bit flags)
      * @internal Mainly used on Windows platform
      */
-    const enum SymlinkType {
+    enum SymlinkType {
         /** Directory symlink */
         DIR = 1,
         /** Junction point (Windows) */

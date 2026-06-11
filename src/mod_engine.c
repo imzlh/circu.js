@@ -764,7 +764,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
 	TJS_CFUNC_DEF("setImmutableArrayBuffer", 2, tjs_immutArrayBuffer),
-	TJS_CFUNC_DEF("waitPromise", 2, tjs_waitIO),
+	TJS_CFUNC_DEF("waitIO", 2, tjs_waitIO),
 
 	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),
 	TJS_CONST2("DUMP_NODEBUG", JS_WRITE_OBJ_STRIP_DEBUG),

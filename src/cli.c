@@ -24,8 +24,23 @@
 
 #include "tjs.h"
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
+
+
+int exit_hook(int reportType, char* message, int* returnValue) {
+    if (reportType == _CRT_WARN && strstr(message, "calling exit")) {
+        __debugbreak();
+    }
+    return 0;
+}
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    _CrtSetReportHook(exit_hook);
+#endif
+
     TJS_Initialize(argc, argv);
 
     TJSRuntime *qrt = TJS_NewRuntime();
