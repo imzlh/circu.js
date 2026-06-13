@@ -318,6 +318,9 @@ static int decode_dns_name(const uint8_t* packet, size_t packet_len,
 	int jumped = 0;
 	size_t jump_offset = 0;
 	int label_count = 0;
+	int jumps = 0;
+
+	if (name_len == 0) return -1;
 
 	while (pos < packet_len && label_count < 127) {
 		uint8_t len = packet[pos];
@@ -329,6 +332,11 @@ static int decode_dns_name(const uint8_t* packet, size_t packet_len,
 				jump_offset = pos + 2;
 				jumped = 1;
 			}
+			// Bound the number of compression-pointer jumps to defeat
+			// malicious packets whose pointers reference each other (a
+			// loop that never consumes a label would otherwise spin
+			// forever, since pointer follows do not advance label_count).
+			if (++jumps > 128) return -1;
 			pos = ((len & 0x3F) << 8) | packet[pos + 1];
 			if (pos >= packet_len) return -1;
 			continue;
@@ -338,6 +346,9 @@ static int decode_dns_name(const uint8_t* packet, size_t packet_len,
 		if (len == 0) {
 			if (!jumped) *offset = pos + 1;
 			else *offset = jump_offset;
+			// Always NUL-terminate; callers pass uninitialized buffers
+			// (cname/ns/mx/target/...) straight to JS_NewString.
+			name[name_pos] = '\0';
 			return 0;
 		}
 
@@ -689,9 +700,6 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 			uint8_t* data = js_malloc(ctx, ans->rdlength);
 			if (data) {
 				memcpy(data, ans->rdata, ans->rdlength);
-				/* fix: use TJS_NewUint8Array so the buffer is freed via js_free_rt
-				 * when GC'd. The old JS_NewArrayBuffer(..., NULL, NULL, 1) (external,
-				 * no freer) would silently leak the js_malloc'd block. */
 				JS_SetPropertyStr(ctx, obj, "data",
 					TJS_NewUint8Array(ctx, data, ans->rdlength));
 			}
@@ -786,9 +794,7 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 		JSValue args[] = { error };
 		JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
 		JS_FreeValue(ctx->ctx, error);
-
-		/* fix: stop recv before closing; otherwise udp_recv_callback may fire
-		 * after resolve/reject funcs are freed, causing UAF. */
+		
 		uv_udp_recv_stop(&ctx->udp);
 		uv_timer_stop(&ctx->timeout_timer);
 		uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);

@@ -2,6 +2,7 @@
  * circu.js
  *
  * Copyright (c) 2019-present Saúl Ibarra Corretgé <s@saghul.net>
+ * Copyright (c) 2026-present iz <himzlh@163.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -135,6 +136,8 @@ typedef struct {
     JSValue *externrefs;
     uint32_t externref_count;
     uint32_t externref_capacity;
+    /* Live ArrayBuffer view over linear memory; detached when memory grows. */
+    JSValue mem_buffer;
 } TJSWasmInstance;
 
 static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
@@ -167,6 +170,7 @@ static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
             JS_FreeValueRT(rt, i->externrefs[j]);
         }
         js_free_rt(rt, i->externrefs);
+        JS_FreeValueRT(rt, i->mem_buffer);
         js_free_rt(rt, i);
     }
 }
@@ -187,6 +191,7 @@ static void tjs_wasm_instance_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark
         for (uint32_t j = 0; j < i->externref_count; j++) {
             JS_MarkValue(rt, i->externrefs[j], mark_func);
         }
+        JS_MarkValue(rt, i->mem_buffer, mark_func);
     }
 }
 
@@ -234,6 +239,7 @@ static JSValue tjs_new_wasm_instance(JSContext *ctx) {
         return JS_EXCEPTION;
     }
 
+    i->mem_buffer = JS_UNDEFINED;
     JS_SetOpaque(obj, i);
     return obj;
 }
@@ -385,10 +391,8 @@ static JSValue tjs__externref_unbox(TJSWasmInstance *inst, uint32_t externref_id
 /* Raw native trampoline: called by WAMR, forwards to a JS function.
  *
  * NOTE: externref params/returns are not supported in import trampolines due to:
- * 1. WAMR 2.4.4 bug: wasm_func_type_get_param_valkind asserts for externref
- *    (fixed on WAMR master, not yet in our pinned version)
- * 2. WAMR bug: invoke_native_raw passes garbage for externref params
- *    (still unfixed upstream as of 2026-03)
+ * WAMR bug: invoke_native_raw passes garbage for externref params
+ *    (still unfixed upstream as of 2026-06)
  * Externref works fine for exported functions, globals, and tables.
  */
 static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args) {
@@ -698,6 +702,19 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* Detach and release the cached linear-memory ArrayBuffer (if any).
+ * WAMR may move the linear-memory base when it grows (explicit growMemory or
+ * an internal memory.grow during a call), leaving any previously exposed
+ * ArrayBuffer pointing at freed/moved memory. Detaching makes stale access
+ * throw a clean "detached ArrayBuffer" error instead of corrupting memory. */
+static void tjs__wasm_invalidate_membuf(JSContext *ctx, TJSWasmInstance *inst) {
+    if (!JS_IsUndefined(inst->mem_buffer)) {
+        JS_DetachArrayBuffer(ctx, inst->mem_buffer);
+        JS_FreeValue(ctx, inst->mem_buffer);
+        inst->mem_buffer = JS_UNDEFINED;
+    }
+}
+
 static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
                                         TJSWasmInstance *inst,
                                         wasm_function_inst_t func,
@@ -743,6 +760,14 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
 
     wasm_val_t results[TJS__WASM_MAX_ARGS];
 
+    /* Record linear-memory base to detect a move from an internal memory.grow. */
+    void *tjs__mem_base_before = NULL;
+    {
+        wasm_memory_inst_t tjs__mem = wasm_runtime_get_default_memory(inst->module_inst);
+        if (tjs__mem)
+            tjs__mem_base_before = wasm_memory_get_base_address(tjs__mem);
+    }
+
     if (!wasm_runtime_call_wasm_a(inst->exec_env, func, result_count, results, param_count, params)) {
         /* If an imported JS function threw, re-throw the original JS exception */
         if (inst->has_pending_exception) {
@@ -757,6 +782,14 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         JSValue err = tjs_throw_wasm_error(ctx, "RuntimeError", exception ? exception : "call failed");
         wasm_runtime_clear_exception(inst->module_inst);
         return err;
+    }
+
+    /* If linear memory moved during the call, any exposed ArrayBuffer dangles. */
+    {
+        wasm_memory_inst_t tjs__mem = wasm_runtime_get_default_memory(inst->module_inst);
+        void *tjs__mem_base_after = tjs__mem ? wasm_memory_get_base_address(tjs__mem) : NULL;
+        if (tjs__mem_base_after != tjs__mem_base_before)
+            tjs__wasm_invalidate_membuf(ctx, inst);
     }
 
     wasm_valkind_t result_types[TJS__WASM_MAX_ARGS];
@@ -1722,12 +1755,22 @@ static JSValue tjs_wasm_getmemorybuffer(JSContext *ctx, JSValue this_val, int ar
         return tjs_throw_wasm_error(ctx, "RuntimeError", "no memory instance");
     }
 
+    /* Reuse the cached buffer while it is still live (WebAssembly.Memory
+     * semantics: memory.buffer is stable until the memory grows). */
+    if (!JS_IsUndefined(i->mem_buffer))
+        return JS_DupValue(ctx, i->mem_buffer);
+
     void *base = wasm_memory_get_base_address(mem);
     uint64_t page_count = wasm_memory_get_cur_page_count(mem);
     uint64_t bytes_per_page = wasm_memory_get_bytes_per_page(mem);
     size_t byte_length = (size_t) (page_count * bytes_per_page);
 
-    return JS_NewArrayBuffer(ctx, (uint8_t *) base, byte_length, tjs__wasm_memory_free, NULL, false);
+    JSValue buf = JS_NewArrayBuffer(ctx, (uint8_t *) base, byte_length, tjs__wasm_memory_free, NULL, false);
+    if (JS_IsException(buf))
+        return buf;
+    /* Keep our own tracking reference so we can detach it on grow. */
+    i->mem_buffer = JS_DupValue(ctx, buf);
+    return buf;
 }
 
 static JSValue tjs_wasm_growmemory(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1755,6 +1798,9 @@ static JSValue tjs_wasm_growmemory(JSContext *ctx, JSValue this_val, int argc, J
     if (!wasm_memory_enlarge(mem, delta)) {
         return JS_ThrowRangeError(ctx, "failed to grow memory");
     }
+
+    /* Base may have moved; invalidate any previously exposed buffer. */
+    tjs__wasm_invalidate_membuf(ctx, i);
 
     return JS_NewUint32(ctx, (uint32_t) old_pages);
 }
@@ -1806,6 +1852,17 @@ static JSValue tjs_wasm_getglobal(JSContext *ctx, JSValue this_val, int argc, JS
             uint32_t idx = *(uint32_t *) global_inst.global_data;
             return JS_DupValue(ctx, tjs__externref_unbox(i, idx));
         }
+        case WASM_FUNCREF: {
+            /* funcref globals hold a function index (NULL_REF == null). */
+            uint32_t fidx;
+            memcpy(&fidx, global_inst.global_data, sizeof(fidx));
+            if (fidx == (uint32_t) NULL_REF)
+                return JS_NULL;
+            return JS_NewUint32(ctx, fidx);
+        }
+        case WASM_V128:
+            /* 128-bit SIMD value exposed as a copied 16-byte Uint8Array. */
+            return JS_NewUint8ArrayCopy(ctx, (const uint8_t *) global_inst.global_data, 16);
         default:
             return JS_UNDEFINED;
     }
@@ -1880,6 +1937,33 @@ static JSValue tjs_wasm_setglobal(JSContext *ctx, JSValue this_val, int argc, JS
                 return JS_ThrowInternalError(ctx, "failed to register externref");
             }
             memcpy(global_inst.global_data, &idx, sizeof(idx));
+            break;
+        }
+        case WASM_FUNCREF: {
+            /* funcref globals hold a function index; null clears to NULL_REF. */
+            if (JS_IsNull(argv[2]) || JS_IsUndefined(argv[2])) {
+                uint32_t nullref = (uint32_t) NULL_REF;
+                memcpy(global_inst.global_data, &nullref, sizeof(nullref));
+            } else {
+                uint32_t fidx;
+                if (JS_ToUint32(ctx, &fidx, argv[2])) {
+                    return JS_EXCEPTION;
+                }
+                memcpy(global_inst.global_data, &fidx, sizeof(fidx));
+            }
+            break;
+        }
+        case WASM_V128: {
+            /* Accept any 16-byte view/buffer for the 128-bit SIMD value. */
+            size_t len = 0;
+            uint8_t *data = JS_GetAnyBuffer(ctx, &len, argv[2]);
+            if (!data) {
+                return JS_ThrowTypeError(ctx, "v128 global requires a byte buffer");
+            }
+            if (len < 16) {
+                return JS_ThrowTypeError(ctx, "v128 global requires a 16-byte buffer");
+            }
+            memcpy(global_inst.global_data, data, 16);
             break;
         }
         default:

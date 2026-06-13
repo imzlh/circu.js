@@ -194,33 +194,25 @@ int tjs__build_binary(FILE* file, uint8_t *binary, uint32_t size, int create) {
 }
 
 uint8_t* tjs__read_self_attached(uint32_t *binary_length){
-#if defined(CJS_BLOB_INCBIN)
-    /* GCC/Clang: blob linked in via .incbin in binary_blob.S */
-    extern const uint8_t  _cjs_blob_start[];
-    extern const uint8_t  _cjs_blob_end[];
-    *binary_length = (uint32_t)(_cjs_blob_end - _cjs_blob_start);
-    return (uint8_t *)_cjs_blob_start;
-#elif defined(CJS_BLOB_RCDATA)
-    /* MSVC: blob embedded as a Windows RCDATA resource */
-    HRSRC   hRes  = FindResource(NULL, "CJS_CORE", RT_RCDATA);
-    HGLOBAL hData = LoadResource(NULL, hRes);
-    *binary_length = SizeofResource(NULL, hRes);
-    return (uint8_t *)LockResource(hData);
+#if defined(CJS_BLOB_EMBEDDED)
+    extern const uint32_t cjs_blob_size;
+    extern const uint8_t  cjs_blob[];
+    *binary_length = cjs_blob_size;
+    return (uint8_t *)cjs_blob;
 #else
-    /* Default: read blob appended to the end of this executable */
-	static uint8_t* js = NULL;
-	static uint32_t size = 0;
-	static char* self_exe_path = NULL;
-	if(size == 0){
-		self_exe_path = tjs__get_self();
-		assert(self_exe_path != NULL);
-		FILE* fp = fopen(self_exe_path, "rb");
-		assert(fp != NULL);
-		js = tjs__read_attached(fp, &size);
-		fclose(fp);
-	}
-	*binary_length = size;
-	return js;
+    static uint8_t* js = NULL;
+    static uint32_t size = 0;
+    static char* self_exe_path = NULL;
+    if(size == 0){
+        self_exe_path = tjs__get_self();
+        assert(self_exe_path != NULL);
+        FILE* fp = fopen(self_exe_path, "rb");
+        assert(fp != NULL);
+        js = tjs__read_attached(fp, &size);
+        fclose(fp);
+    }
+    *binary_length = size;
+    return js;
 #endif
 }
 

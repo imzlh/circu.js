@@ -99,7 +99,11 @@ JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path) {
 
 JSValue tjs__error_strerr(JSContext *ctx, JSValueConst this_val, int argc, JSValue *argv){
 	uint32_t err;
-	if (argc == 0 || -1 == JS_ToUint32(ctx, &err, argv[0])) {
+	if (argc == 0) {
+		err = errno;
+	} else if (JS_ToUint32(ctx, &err, argv[0])) {
+		/* Clear the pending exception; falling back to errno. */
+		JS_FreeValue(ctx, JS_GetException(ctx));
 		err = errno;
 	}
 

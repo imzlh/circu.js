@@ -78,12 +78,6 @@ static void uv__close_cb(uv_handle_t *handle) {
     CHECK_NOT_NULL(p);
     p->closed = 1;
     if (p->finalized) {
-        for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-            JS_FreeValue(p->ctx, p->events[i]);
-            p->events[i] = JS_UNDEFINED;
-        }
-        js_free(p->ctx, p->reading.data);
-        p->reading.data = NULL;
         tjs__free(p);
     }
 }
@@ -91,6 +85,14 @@ static void uv__close_cb(uv_handle_t *handle) {
 static void tjs_msgpipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSMessagePipe *p = JS_GetOpaque(val, tjs_msgpipe_class_id);
     if (p) {
+        /* Free JS resources now while rt is still alive. */
+        for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
+            JS_FreeValueRT(rt, p->events[i]);
+            p->events[i] = JS_UNDEFINED;
+        }
+        js_free_rt(rt, p->reading.data);
+        p->reading.data = NULL;
+
         p->finalized = 1;
         if (!uv_is_closing(&p->h.handle)) {
             uv_read_stop(&p->h.stream);
@@ -98,14 +100,9 @@ static void tjs_msgpipe_finalizer(JSRuntime *rt, JSValue val) {
             return;
         }
         if (!p->closed) {
+            /* uv_close already in flight, close_cb will free p */
             return;
         }
-        for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-            JS_FreeValueRT(rt, p->events[i]);
-            p->events[i] = JS_UNDEFINED;
-        }
-        js_free_rt(rt, p->reading.data);
-        p->reading.data = NULL;
         tjs__free(p);
     }
 }
@@ -165,8 +162,8 @@ static void uv__alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *b
         uint64_t remaining = p->reading.total_size.u64 - p->reading.nread;
         buf->len = remaining > suggested_size ? suggested_size : remaining;
     } else {
-        buf->base = (char *) p->reading.total_size.u8;
-        buf->len = sizeof(p->reading.total_size.u8);
+        buf->base = (char *) p->reading.total_size.u8 + p->reading.nread;
+        buf->len = sizeof(p->reading.total_size.u8) - p->reading.nread;
     }
 }
 
@@ -193,18 +190,15 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     if (!p->reading.data) {
         size_t len_size = sizeof(p->reading.total_size.u8);
 
-        /* This is a bogus read, likely a zero-read. Just return the buffer. */
-        if (nread != (ssize_t)len_size) {
+        p->reading.nread += (uint64_t) nread;
+        if (p->reading.nread < len_size) {
             return;
         }
 
         uint64_t total_size = p->reading.total_size.u64;
+        p->reading.nread = 0;
         CHECK_GE(total_size, 0);
 
-        /* fix: a zero-byte payload is technically valid (though unusual).
-         * Handle it immediately rather than calling js_malloc(0) which may
-         * return NULL and then stall the reader forever waiting for more data
-         * that will never arrive. */
         if (total_size == 0) {
             JSSABTab sab_tab = { .tab = NULL, .len = 0 };
             JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) "", 0,
@@ -223,7 +217,6 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
         }
 
         p->reading.data = js_malloc(ctx, total_size);
-        /* fix: malloc failure — reset state and report error instead of stalling */
         if (!p->reading.data) {
             memset(&p->reading, 0, sizeof(p->reading));
             JSValue err = tjs_new_error(ctx, UV_ENOMEM);
@@ -251,7 +244,6 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE;
     JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) p->reading.data, total_size, flags, &sab_tab);
     if (JS_IsException(obj)) {
-        /* fix: JS_GetException transfers ownership; must free after emitting */
         JSValue exc = JS_GetException(ctx);
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, exc);
         JS_FreeValue(ctx, exc);
@@ -302,16 +294,17 @@ static void uv__write_cb(uv_write_t *req, int status) {
     TJSMessagePipe *p = req->handle->data;
     CHECK_NOT_NULL(p);
 
-    JSContext *ctx = p->ctx;
-
-    if (status < 0) {
+    if (status < 0 && !p->finalized) {
+        JSContext *ctx = p->ctx;
         JSValue error = tjs_new_error(ctx, status);
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, error);
         JS_FreeValue(ctx, error);
     }
 
-    js_free(ctx, wr->data);
-    js_free(ctx, wr);
+    /* js_malloc/js_free use the same allocator as tjs__malloc/tjs__free,
+     * so tjs__free is safe here even after ctx/rt have been freed. */
+    tjs__free(wr->data);
+    tjs__free(wr);
 }
 
 static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -353,6 +346,8 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     for (int i = 0; i < sab_tab.len; i++) {
         tjs__sab_dup(NULL, sab_tab.tab[i]);
     }
+
+    js_free(ctx, sab_tab.tab);
 
     return JS_UNDEFINED;
 }
@@ -506,9 +501,6 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
 
 static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
 	TJSRuntime *qrt = TJS_GetRuntime(ctx);
-	if (qrt->is_worker) {
-		return JS_ThrowTypeError(ctx, "Nested workers are not supported.");
-	}
 
 	/* serialize user_data */
     JSValue user_data = argc >= 1 ? argv[0] : JS_UNDEFINED;

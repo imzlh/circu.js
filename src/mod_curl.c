@@ -32,6 +32,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 /*
  * Design notes
  * ------------
@@ -106,6 +110,7 @@ typedef struct {
     /* Callbacks */
     JSValue on_progress;
     JSValue on_header;
+    JSValue on_headers_complete;  /* fired once with (status, headersString) when headers end */
 
     /* Status / scratch */
     long response_code;
@@ -257,6 +262,28 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
             return 0;
         }
         JS_FreeValue(curl->ctx, ret);
+    }
+
+    /* Blank line signals end of headers (also handles HTTP/2 where status line
+     * may repeat on redirects — fire only when we have a final 2xx/3xx/4xx/5xx). */
+    if (!JS_IsUndefined(curl->on_headers_complete) &&
+            (realsize == 2 && ptr[0] == '\r' && ptr[1] == '\n')) {
+        long status = 0;
+        curl_easy_getinfo(curl->handle, CURLINFO_RESPONSE_CODE, &status);
+        /* Skip informational 1xx responses — headers aren't final yet. */
+        if (status >= 200) {
+            JSValue args[2] = {
+                JS_NewInt32(curl->ctx, (int32_t) status),
+                curl->response_headers.size > 0
+                    ? JS_NewStringLen(curl->ctx, (char *) curl->response_headers.buf,
+                                      curl->response_headers.size)
+                    : JS_NewString(curl->ctx, ""),
+            };
+            JSValue ret = JS_Call(curl->ctx, curl->on_headers_complete, JS_UNDEFINED, 2, args);
+            JS_FreeValue(curl->ctx, args[0]);
+            JS_FreeValue(curl->ctx, args[1]);
+            JS_FreeValue(curl->ctx, ret);
+        }
     }
     return realsize;
 }
@@ -515,11 +542,42 @@ static JSValue build_response(JSContext *ctx, TJSCURL *curl) {
     return response;
 }
 
+static JSValue tjs__curl_new_os_string(JSContext *ctx, const char *s) {
+    if (!s)
+        return JS_NewString(ctx, "");
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+    if (wlen <= 0)
+        return JS_NewString(ctx, s);
+    WCHAR *w = js_malloc(ctx, (size_t) wlen * sizeof(WCHAR));
+    if (!w)
+        return JS_NewString(ctx, s);
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w, wlen);
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (ulen <= 0) {
+        js_free(ctx, w);
+        return JS_NewString(ctx, s);
+    }
+    char *u = js_malloc(ctx, (size_t) ulen);
+    if (!u) {
+        js_free(ctx, w);
+        return JS_NewString(ctx, s);
+    }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, u, ulen, NULL, NULL);
+    js_free(ctx, w);
+    JSValue v = JS_NewString(ctx, u);
+    js_free(ctx, u);
+    return v;
+#else
+    return JS_NewString(ctx, s);
+#endif
+}
+
 static JSValue build_error(JSContext *ctx, const char *error_buffer, CURLcode code) {
     JSValue error = JS_NewError(ctx);
     const char *msg = (error_buffer && error_buffer[0]) ? error_buffer : curl_easy_strerror(code);
     JS_DefinePropertyValueStr(ctx, error, "message",
-        JS_NewString(ctx, msg), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        tjs__curl_new_os_string(ctx, msg), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValueStr(ctx, error, "code",
         JS_NewInt32(ctx, code), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     return error;
@@ -916,6 +974,7 @@ static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
 
     curl->on_progress = JS_UNDEFINED;
     curl->on_header = JS_UNDEFINED;
+    curl->on_headers_complete = JS_UNDEFINED;
     curl->on_data = JS_UNDEFINED;
     curl->self_obj = JS_UNDEFINED;
     curl->share_obj = JS_UNDEFINED;
@@ -1087,6 +1146,13 @@ static JSValue tjs_curl_on_data(JSContext *ctx, JSValueConst this_val, int argc,
     } else {
         curl->on_data = JS_UNDEFINED;
     }
+    return JS_DupValue(ctx, this_val);
+}
+
+static JSValue tjs_curl_on_headers_complete(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CURL_THIS(ctx, this_val);
+    JS_FreeValue(ctx, curl->on_headers_complete);
+    curl->on_headers_complete = JS_IsFunction(ctx, argv[0]) ? JS_DupValue(ctx, argv[0]) : JS_UNDEFINED;
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1670,9 +1736,8 @@ static JSValue tjs_curl_perform(JSContext *ctx, JSValueConst this_val, int argc,
 
     int running;
     MSACT(pool, pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
-    check_multi_info(pool);
     if (pool->multi_handle) {
-        kick_prep_once(pool); /* drain synchronous completions on next loop tick */
+        kick_prep_once(pool);
     }
 
     return promise;
@@ -1748,6 +1813,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_FreeValue(ctx, curl->on_data); curl->on_data = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_progress); curl->on_progress = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_header); curl->on_header = JS_UNDEFINED;
+    JS_FreeValue(ctx, curl->on_headers_complete); curl->on_headers_complete = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->share_obj); curl->share_obj = JS_UNDEFINED;
 
     return JS_UNDEFINED;
@@ -1831,6 +1897,7 @@ static const JSCFunctionListEntry tjs_curl_proto_funcs[] = {
     /* callbacks */
     TJS_CFUNC_DEF("onProgress", 1, tjs_curl_on_progress),
     TJS_CFUNC_DEF("onHeader", 1, tjs_curl_on_header),
+    TJS_CFUNC_DEF("onHeadersComplete", 1, tjs_curl_on_headers_complete),
     TJS_CFUNC_DEF("setStreamMode", 1, tjs_curl_set_stream_mode),
     TJS_CFUNC_DEF("onData", 1, tjs_curl_on_data),
 

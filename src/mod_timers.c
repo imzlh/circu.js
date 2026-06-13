@@ -120,6 +120,11 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    /* Negative delays would wrap to a huge uint64 timeout in libuv. */
+    if (delay < 0) {
+        delay = 0;
+    }
+
     int nargs = argc - 2;
     if (nargs < 0) {
         nargs = 0;

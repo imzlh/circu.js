@@ -26,15 +26,18 @@
 
 #ifdef _WIN32
 #include <crtdbg.h>
-#endif
+#include <string.h>
 
-
+/* MSVC-only debug hook: _CRT_WARN / __debugbreak() do not exist on other
+ * toolchains, so this must stay inside the _WIN32 guard or non-Windows builds
+ * fail to compile. */
 int exit_hook(int reportType, char* message, int* returnValue) {
     if (reportType == _CRT_WARN && strstr(message, "calling exit")) {
         __debugbreak();
     }
     return 0;
 }
+#endif
 
 int main(int argc, char **argv) {
 #if defined(_WIN32)

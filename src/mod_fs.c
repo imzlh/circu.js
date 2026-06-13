@@ -51,6 +51,25 @@
 /* Use wide-char file open on Windows for Unicode path support */
 #ifdef _WIN32
 #define open _wopen
+
+/* Format a Win32 error code as a UTF-8 string into buf (size bytes).
+ * Always NUL-terminates. Returns buf. */
+static char *win32_strerror_utf8(DWORD code, char *buf, int size) {
+    WCHAR wbuf[512];
+    if (FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            wbuf, (DWORD)(sizeof(wbuf)/sizeof(wbuf[0])), NULL)) {
+        /* strip trailing whitespace / CR LF */
+        int len = (int)wcslen(wbuf);
+        while (len > 0 && (wbuf[len-1] == L'\r' || wbuf[len-1] == L'\n' || wbuf[len-1] == L' '))
+            wbuf[--len] = L'\0';
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, size, NULL, NULL);
+    } else {
+        snprintf(buf, size, "error code %lu", (unsigned long)code);
+    }
+    buf[size-1] = '\0';
+    return buf;
+}
 #endif
  /* flock constants - not defined in Windows headers */
 #ifndef LOCK_SH
@@ -1339,17 +1358,9 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
 
     if (!success) {
         DWORD error_code = GetLastError();
-        LPSTR messageBuffer = NULL;
-        JSValue error;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) &messageBuffer, 0, NULL);
-        if (messageBuffer) {
-            error = JS_ThrowTypeError(ctx, "Failed to create symbolic link: %s", messageBuffer);
-            LocalFree(messageBuffer);
-        }
-        else {
-            error = JS_ThrowTypeError(ctx, "Failed to create symbolic link. Error code: %lu", error_code);
-        }
+        char errbuf[512];
+        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
+        JSValue error = JS_ThrowTypeError(ctx, "Failed to create symbolic link: %s", errbuf);
         JS_FreeCString(ctx, target);
         JS_FreeCString(ctx, path);
         return error;
@@ -1426,17 +1437,9 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
 
     if (hFile == INVALID_HANDLE_VALUE) {
         DWORD error_code = GetLastError();
-        LPSTR messageBuffer = NULL;
-        JSValue error;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) &messageBuffer, 0, NULL);
-        if (messageBuffer) {
-            error = JS_ThrowTypeError(ctx, "Cannot open symbolic link: %s", messageBuffer);
-            LocalFree(messageBuffer);
-        }
-        else {
-            error = JS_ThrowTypeError(ctx, "Cannot open symbolic link. Error code: %lu", error_code);
-        }
+        char errbuf[512];
+        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
+        JSValue error = JS_ThrowTypeError(ctx, "Cannot open symbolic link: %s", errbuf);
         JS_FreeCString(ctx, path);
         return error;
     }
@@ -1496,17 +1499,9 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
 
     if (!success || !link_path) {
         DWORD error_code = GetLastError();
-        LPSTR messageBuffer = NULL;
-        JSValue error;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) &messageBuffer, 0, NULL);
-        if (messageBuffer) {
-            error = JS_ThrowTypeError(ctx, "Failed to read symbolic link: %s", messageBuffer);
-            LocalFree(messageBuffer);
-        }
-        else {
-            error = JS_ThrowTypeError(ctx, "Failed to read symbolic link. Error code: %lu", error_code);
-        }
+        char errbuf[512];
+        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
+        JSValue error = JS_ThrowTypeError(ctx, "Failed to read symbolic link: %s", errbuf);
         JS_FreeCString(ctx, path);
         if (link_path) js_free(ctx, link_path);
         return error;
@@ -1517,7 +1512,7 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
     ssize_t link_size;
 
     // Allocate buffer for the link path
-    link_path = (char*) js_malloc(ctx, buffer_size);
+    link_path = (char*) js_malloc(ctx, buffer_size + 1);
     if (!link_path) {
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, "Memory allocation failed");
@@ -1531,7 +1526,7 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
         // Buffer might be too small (content was truncated), try with larger buffer
         js_free(ctx, link_path);
         buffer_size = 65536; // 64KB should be sufficient for most paths
-        link_path = (char*) js_malloc(ctx, buffer_size);
+        link_path = (char*) js_malloc(ctx, buffer_size + 1);
         if (!link_path) {
             JS_FreeCString(ctx, path);
             return JS_ThrowTypeError(ctx, "Memory allocation failed");
@@ -1623,18 +1618,10 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     free(wdest_copy);
     if (!result) {
         DWORD error_code = GetLastError();
-        char error_msg[256];
-
-        LPSTR messageBuffer = NULL;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) &messageBuffer, 0, NULL);
-        if (messageBuffer) {
-            snprintf(error_msg, sizeof(error_msg), "Failed to copy file: %s", messageBuffer);
-            LocalFree(messageBuffer);
-        }
-        else {
-            snprintf(error_msg, sizeof(error_msg), "Failed to copy file. Error code: %lu", error_code);
-        }
+        char error_msg[512];
+        char errbuf[400];
+        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
+        snprintf(error_msg, sizeof(error_msg), "Failed to copy file: %s", errbuf);
 
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);

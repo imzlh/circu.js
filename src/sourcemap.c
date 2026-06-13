@@ -129,17 +129,23 @@ static inline int base64_decode_char(char c) {
 }
 
 static int decode_vlq(const char **input, int *value) {
-    int result = 0, shift = 0, digit;
+    uint32_t result = 0;
+    int shift = 0, digit;
     while (**input) {
         digit = base64_decode_char(**input);
         if (digit == -1) return 0;
         (*input)++;
-        result |= (digit & 31) << shift;
+        result |= (uint32_t)(digit & 31) << shift;
         if (!(digit & 32)) break;
         shift += 5;
         if (shift > 30) return 0;  /* guard malformed input */
     }
-    *value = (result & 1) ? -(result >> 1) : (result >> 1);
+    /* Lowest bit is the sign; remaining bits are the magnitude. */
+    if (result & 1) {
+        *value = -(int)(result >> 1);
+    } else {
+        *value = (int)(result >> 1);
+    }
     return 1;
 }
 
@@ -155,7 +161,8 @@ static char **parse_json_array(JSContext *ctx, JSValue array, int *count) {
     }
     JS_FreeValue(ctx, len_val);
 
-    char **result = malloc(len * sizeof(char *));
+    if ((size_t) len > SIZE_MAX / sizeof(char *)) return NULL;
+    char **result = malloc((size_t) len * sizeof(char *));
     if (!result) return NULL;
 
     int actual = 0;

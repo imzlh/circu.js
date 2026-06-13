@@ -363,31 +363,38 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
     
     EC_KEY* eckey = EC_KEY_new();
     if (!eckey) {
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(eckey, group) != 1) {
         EC_KEY_free(eckey);
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
     }
     
     EC_POINT* pub_point = EC_POINT_new(group);
     if (!pub_point) {
         EC_KEY_free(eckey);
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_POINT allocation failed");
     }
     
     if (EC_POINT_oct2point(group, pub_point, pub_data, pub_len, NULL) != 1) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "Failed to parse public key");
     }
     
     if (EC_KEY_set_public_key(eckey, pub_point) != 1) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "Failed to set public key");
     }
+    
+    EC_GROUP_free((EC_GROUP*)group);
     
     // Hash the data
     uint8_t hash[EVP_MAX_MD_SIZE];
@@ -450,13 +457,20 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     
     EC_KEY* priv_key = EC_KEY_new();
     if (!priv_key) {
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(priv_key, group) != 1) {
         EC_KEY_free(priv_key);
+        EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
     }
+    /* priv_key now owns a copy of the group. Release our standalone copy and
+     * borrow priv_key's group for the remaining operations so we don't leak
+     * the EC_GROUP on the many return paths below. */
+    EC_GROUP_free((EC_GROUP*)group);
+    group = EC_KEY_get0_group(priv_key);
     
     // Import private key
     BIGNUM* priv_bn = BN_bin2bn(priv_data, priv_len, NULL);
@@ -2344,7 +2358,6 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     
     int decoded = EVP_DecodeBlock(out, (const uint8_t*)str, str_len);
 
-    /* fix: check padding BEFORE freeing str — was UAF */
     int padding = 0;
     if (str_len >= 2 && str[str_len - 1] == '=') {
         padding++;
@@ -2489,10 +2502,16 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("hmacSha512", 2, tjs_crypto_hmac, HASH_SHA512),
     
     /* Streaming hash */
-    JS_CFUNC_MAGIC_DEF("createMd5", 0, tjs_crypto_create_hash, HASH_MD5),
-    JS_CFUNC_MAGIC_DEF("createSha1", 0, tjs_crypto_create_hash, HASH_SHA1),
+    JS_CFUNC_MAGIC_DEF("createMd5",    0, tjs_crypto_create_hash, HASH_MD5),
+    JS_CFUNC_MAGIC_DEF("createSha1",   0, tjs_crypto_create_hash, HASH_SHA1),
+    JS_CFUNC_MAGIC_DEF("createSha224", 0, tjs_crypto_create_hash, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("createSha256", 0, tjs_crypto_create_hash, HASH_SHA256),
+    JS_CFUNC_MAGIC_DEF("createSha384", 0, tjs_crypto_create_hash, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("createSha512", 0, tjs_crypto_create_hash, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("createSha3_224", 0, tjs_crypto_create_hash, HASH_SHA3_224),
+    JS_CFUNC_MAGIC_DEF("createSha3_256", 0, tjs_crypto_create_hash, HASH_SHA3_256),
+    JS_CFUNC_MAGIC_DEF("createSha3_384", 0, tjs_crypto_create_hash, HASH_SHA3_384),
+    JS_CFUNC_MAGIC_DEF("createSha3_512", 0, tjs_crypto_create_hash, HASH_SHA3_512),
     
     /* Streaming HMAC */
     JS_CFUNC_MAGIC_DEF("createHmacSha256", 1, tjs_crypto_create_hmac, HASH_SHA256),

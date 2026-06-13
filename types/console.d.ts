@@ -13,7 +13,7 @@ declare namespace CModuleConsole {
     /**
      * non-standard console.inspect() method, returns a string representation of the objects.
      */
-    export function inspect(data: string, options?: InspectOption): string;
+    export function inspect(data: any, options?: InspectOption): string;
 
     /**
      * The **`console.assert()`** static method writes an error message to the console if the assertion is false.

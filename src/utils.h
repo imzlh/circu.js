@@ -146,21 +146,30 @@ int tjs_getsignum(const char *sig_str);
 void tjs_dbuf_init(JSContext *ctx, DynBuf *s);
 
 static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueConst obj){
+	*psize = 0;
 	if (JS_GetTypedArrayType(obj) == JS_TYPED_ARRAY_UINT8)
 		return JS_GetUint8Array(ctx, psize, obj);
 	else if (JS_IsArrayBuffer(obj))
 		return JS_GetArrayBuffer(ctx, psize, obj);
 
-	size_t poffset, plen, pbytes_per_element;
+	size_t poffset = 0, plen = 0, pbytes_per_element = 0;
 	JSValue arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
 	if (JS_IsException(arrbuf)){
 		return NULL;
 	}
-	*psize = plen * pbytes_per_element;
-	size_t __psize;
-	void* ret = JS_GetArrayBuffer(ctx, &__psize, arrbuf);
+	size_t bufsz = 0;
+	uint8_t* ret = JS_GetArrayBuffer(ctx, &bufsz, arrbuf);
 	JS_FreeValue(ctx, arrbuf);
-	return (uint8_t*)ret + poffset;
+	if (!ret){
+		/* backing buffer detached or unavailable */
+		return NULL;
+	}
+	/* plen is the view byte length; guard against an out-of-range view */
+	if (poffset > bufsz || plen > bufsz - poffset){
+		return NULL;
+	}
+	*psize = plen;
+	return ret + poffset;
 }
 
 static inline int TJS_ParseOpenFlags(const char *strflags, int len) {

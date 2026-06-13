@@ -53,6 +53,8 @@ declare namespace CModuleProcess {
         rows?: number;
         /** Data written to stdin then closed (spawnSync only) */
         input?: string | ArrayBuffer | Uint8Array;
+        /** Enable IPC channel */
+        ipc?: boolean;
     }
 
     /**
@@ -109,6 +111,12 @@ declare namespace CModuleProcess {
          * On Linux, same object as readable
          */
         readonly writable: PTY extends true ? Pipe : undefined;
+
+        /**
+         * IPC pipe (non-PTY mode only, undefined in PTY mode)
+         * Used for inter-process communication
+         */
+        readonly ipc: Pipe | null;
 
         /**
          * Wait for process exit

@@ -57,7 +57,7 @@ endif()
 
 set(CJS__VERSION_MAJOR 1)
 set(CJS__VERSION_MINOR 2)
-set(CJS__VERSION_PATCH 0)
+set(CJS__VERSION_PATCH 1)
 set(CJS__VERSION_SUFFIX "")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
@@ -79,15 +79,14 @@ endmacro()
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
-cpr_option(BUILD_WITH_CURL "Enable cURL support" ON)
 # we recommend to enable to make attached binary smaller
 cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
 # ASan is enabled by default in Debug builds, disabled in Release
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
-    set(_asan_default ON)
-else()
+# if(CMAKE_BUILD_TYPE MATCHES "Debug")
+#     set(_asan_default ON)
+# else()
     set(_asan_default OFF)
-endif()
+# endif()
 cpr_option(ENABLE_ASAN "Enable AddressSanitizer (ASan)" ${_asan_default})
 
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
@@ -138,6 +137,7 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv REQUIRED)
+find_package(CURL REQUIRED)
 find_package(llhttp) # optional
 
 # Check expat version for XML_ExpatVersion function availability
@@ -159,10 +159,6 @@ if(EXPAT_FOUND)
         message(STATUS "Old expat detected - using version macros instead of XML_ExpatVersion()")
         add_compile_definitions(HAVE_XML_EXPAT_VERSION)
     endif()
-endif()
-
-if (BUILD_WITH_CURL)
-    find_package(CURL REQUIRED)
 endif()
 
 option(libuv_buildtests "" OFF)
@@ -190,7 +186,6 @@ add_library(libcjs
     src/mod_fswatch.c
     src/mod_os.c
     src/mod_process.c
-
     src/mod_sqlite3.c
     src/mod_streams.c
     src/mod_sys.c
@@ -201,6 +196,7 @@ add_library(libcjs
     src/mod_crypto.c
     src/mod_http.c
     src/mod_socket.c
+    src/mod_curl.c
 )
 
 if (WIN32)
@@ -230,12 +226,6 @@ if (Iconv_FOUND)
     target_link_libraries(libcjs Iconv::Iconv)
 else()
     message(NOTICE "build without iconv")
-endif()
-
-if (BUILD_WITH_CURL AND CURL_FOUND)
-    add_compile_definitions(CJS__HAS_CURL)
-    target_sources(libcjs PUBLIC src/mod_curl.c)
-    target_link_libraries(libcjs CURL::libcurl)
 endif()
 
 if (BUILD_WITH_WASM)
@@ -353,7 +343,7 @@ target_link_options(libcjs PRIVATE ${cjs_ldflags})
 target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(libcjs PUBLIC src)
 # libutil is required for openpty
-target_link_libraries(libcjs qjs uv_a OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB EXPAT::EXPAT)
+target_link_libraries(libcjs qjs uv_a OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB EXPAT::EXPAT)
 if(TARGET SQLite3::SQLite3)
     target_link_libraries(libcjs SQLite3::SQLite3)
 elseif(TARGET SQLite::SQLite3)
@@ -371,10 +361,20 @@ set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
 )
 
-# Increase stack size for MSVC (default 1MB is too small for deep recursion
-# in the TypeScript compiler when parsing large files like repl.ts)
 if(MSVC)
     target_link_options(cjs-cli PRIVATE "/STACK:8388608")
+endif()
+
+# ─── Embed bytecode blob into cjs-cli ────────────────────────────────────────
+# When CJS_BLOB_C is set (by the parent project), it points to a generated .c
+# file containing the bytecode as a const uint8_t array (cjs_blob[] / cjs_blob_size).
+# This is produced by cjsc -o blob.h and compiled directly into libcjs.
+if(CJS_BLOB_C)
+    target_compile_definitions(libcjs PRIVATE CJS_BLOB_EMBEDDED)
+    target_include_directories(libcjs PRIVATE "${CMAKE_BINARY_DIR}")
+    target_sources(libcjs PRIVATE "${CJS_BLOB_C}")
+    set_source_files_properties("${CJS_BLOB_C}" PROPERTIES GENERATED TRUE)
+    message(STATUS "Embedding blob: ${CJS_BLOB_C}")
 endif()
 
 if(WIN32)

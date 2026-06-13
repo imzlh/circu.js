@@ -200,6 +200,11 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
         if (strm.avail_out == 0) {
             /* Need more output space */
             size_t new_size = out_size * 2;
+            if (new_size < out_size) {  /* size_t overflow guard */
+                inflateEnd(&strm);
+                js_free(ctx, out);
+                return JS_ThrowInternalError(ctx, "Decompressed output too large");
+            }
             uint8_t* new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {
                 inflateEnd(&strm);
@@ -210,6 +215,11 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
             strm.next_out = out + out_size;
             strm.avail_out = out_size;
             out_size = new_size;
+        } else {
+            /* Output space remains but inflate made no further progress
+             * (input exhausted without Z_STREAM_END, i.e. a truncated
+             * stream).  Break instead of spinning forever on Z_BUF_ERROR. */
+            break;
         }
     }
     

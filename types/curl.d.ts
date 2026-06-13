@@ -390,6 +390,13 @@ declare namespace CModuleCURL {
         onHeader(callback: HeaderCallback): this;
 
         /**
+         * Set callback fired once when response headers are complete.
+         * Receives (status: number, headersRaw: string).
+         * Enables streaming: set this + onData to get body chunks before perform() resolves.
+         */
+        onHeadersComplete(callback: (status: number, headers: string) => void): this;
+
+        /**
          * Execute HTTP request asynchronously
          * @returns Promise<Response> HTTP response
          * @throws CURLException Throws on request failure

@@ -346,4 +346,36 @@ declare namespace CModuleOS {
 
     /** Current command line arguments array */
     const args: string[];
+
+    // ==================== IPC Helpers ====================
+
+    /**
+     * Create a pipe pair for IPC communication.
+     * Returns [readable_fd, writable_fd].
+     *
+     * @example
+     * const [readFd, writeFd] = os.ipcPipe();
+     */
+    function ipcPipe(): [number, number];
+
+    /**
+     * Send a file descriptor over a Unix domain socket.
+     * Uses sendmsg with SCM_RIGHTS ancillary data.
+     * (POSIX only, throws on Windows)
+     *
+     * @param socketFd - Unix domain socket file descriptor
+     * @param fdToSend - File descriptor to send
+     * @returns bytes sent (>= 0) on success
+     */
+    function sendfd(socketFd: number, fdToSend: number): number;
+
+    /**
+     * Receive a file descriptor from a Unix domain socket.
+     * Uses recvmsg with SCM_RIGHTS ancillary data.
+     * (POSIX only, throws on Windows)
+     *
+     * @param socketFd - Unix domain socket file descriptor
+     * @returns received file descriptor (>= 0) on success
+     */
+    function recvfd(socketFd: number): number;
 }

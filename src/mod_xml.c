@@ -26,6 +26,7 @@
 #include "tjs.h"
 #include <expat.h>
 #include <string.h>
+#include <limits.h>
 
 /* Parser state structure */
 typedef struct {
@@ -34,6 +35,7 @@ typedef struct {
     JSValue handlers;
     JSValue current_data;
     bool stopped;
+    bool exception;
 } TJSXMLParser;
 
 /* Macro for creating callback wrapper */
@@ -48,6 +50,8 @@ typedef struct {
         JSValue ret = JS_Call((state)->ctx, handler, JS_UNDEFINED, argc, args); \
         if (JS_IsException(ret)) { \
             (state)->stopped = true; \
+            (state)->exception = true; \
+            if ((state)->parser) XML_StopParser((state)->parser, XML_FALSE); \
         } \
         JS_FreeValue((state)->ctx, ret); \
         for (int i = 0; i < argc; i++) JS_FreeValue((state)->ctx, args[i]); \
@@ -259,11 +263,24 @@ static JSValue tjs_xml_parser_parse(JSContext *ctx, JSValueConst this_val,
     const char *data = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!data) return JS_EXCEPTION;
     
+    /* XML_Parse takes an int length; reject oversized inputs instead of
+     * silently truncating (which would corrupt parsing). */
+    if (len > INT_MAX) {
+        JS_FreeCString(ctx, data);
+        return JS_ThrowRangeError(ctx, "XML chunk too large");
+    }
+
     int is_final = argc > 1 ? JS_ToBool(ctx, argv[1]) : 1;
     
     state->stopped = false;
-    int status = XML_Parse(state->parser, data, len, is_final);
+    state->exception = false;
+    int status = XML_Parse(state->parser, data, (int) len, is_final);
     JS_FreeCString(ctx, data);
+    
+    /* A handler threw: propagate the pending JS exception. */
+    if (state->exception) {
+        return JS_EXCEPTION;
+    }
     
     if (!status && !state->stopped) {
         enum XML_Error error = XML_GetErrorCode(state->parser);

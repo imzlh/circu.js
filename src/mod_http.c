@@ -168,6 +168,9 @@ static int tjs_llhttp_emit(TJSLlhttpParser* p, TJSLlhttpEvent ev, const char* at
 			tjs_llhttp_set_ref(ctx, &p->pending_exc, exc);
 			return HPE_USER;
 		}
+		/* Non-critical event: swallow the error, but clear the pending
+		 * exception so it cannot leak into later parsing or unrelated JS. */
+		JS_FreeValue(ctx, JS_GetException(ctx));
 		return 0;
 	}
 

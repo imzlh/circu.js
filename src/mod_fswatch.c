@@ -160,8 +160,10 @@ static void uv__fs_event_cb(uv_fs_event_t *handle, const char *filename, int eve
         return;
     }
 
+    /* libuv may pass filename == NULL (e.g. for some events); JS_NewString
+     * would strlen(NULL) and crash, so guard it. */
     JSValue args[2] = {
-        JS_NewString(ctx, filename),
+        filename ? JS_NewString(ctx, filename) : JS_NULL,
         event,
     };
 

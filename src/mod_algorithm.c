@@ -39,10 +39,6 @@ static inline bool JS_IsUint8Array(JSValueConst val){
 	return JS_GetTypedArrayType(val) == JS_TYPED_ARRAY_UINT8;
 }
 
-void tjs__free_ab(JSRuntime *rt, void *opaque, void *ptr){
-	js_free_rt(rt, ptr);
-}
-
 static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* argv){
 	if(argc < 2 || !JS_IsUint8Array(argv[0]) || !JS_IsUint8Array(argv[1])){
 		return JS_ThrowTypeError(ctx, "Invalid arguments. expected: (Uint8Array, Uint8Array)");
@@ -65,7 +61,7 @@ static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* 
 		outbuf[i] = inbuf[i] ^ keybuf[i % 4];
 	}
 
-	return JS_NewUint8Array(ctx, outbuf, inbuflen, tjs__free_ab, NULL, false);
+	return TJS_NewUint8Array(ctx, outbuf, inbuflen);
 }
 
 typedef struct {
@@ -462,7 +458,11 @@ static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
     uint32_t hash = seed;
 
     const int nblocks = len / 4;
-    const uint32_t *blocks = (const uint32_t *)key;
+    /* MurmurHash3 walks the body with NEGATIVE indices, so blocks must point at
+     * the END of the block region (key + nblocks*4). Pointing it at the start
+     * caused blocks[-nblocks..-1] to read nblocks*4 bytes BEFORE the buffer
+     * (heap underflow / OOB read) and produced an incorrect hash. */
+    const uint32_t *blocks = (const uint32_t *)(key + nblocks * 4);
 
     for (int i = -nblocks; i; i++) {
         uint32_t k = blocks[i];

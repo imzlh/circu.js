@@ -508,18 +508,20 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
     memset(fr, 0, sizeof(*fr));
 
-    fr->rw.data = js_malloc(ctx, size);
-    if (!fr->rw.data) {
+    /* Own the I/O buffer in a local until after tjs_fsreq_init(); that helper
+     * resets the fr->rw.* fields, so assigning them earlier gets clobbered
+     * (leaving rw.data == NULL -> NULL-deref on the read copy-back, and a leak
+     * of the I/O buffer on write). */
+    uint8_t *data = js_malloc(ctx, size);
+    if (!data) {
         js_free(ctx, fr);
         return JS_ThrowOutOfMemory(ctx);
     }
-    fr->rw.len = size;
-    fr->rw.is_write = magic != 0;
     if (magic) {
-        memcpy(fr->rw.data, buf, size);
+        memcpy(data, buf, size);
     }
 
-    uv_buf_t b = uv_buf_init((char *) fr->rw.data, size);
+    uv_buf_t b = uv_buf_init((char *) data, size);
 
     int r;
     if (magic) {
@@ -528,7 +530,7 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
     }
     if (r != 0) {
-        js_free(ctx, fr->rw.data);
+        js_free(ctx, data);
         js_free(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
@@ -538,8 +540,12 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     /* tjs_fsreq_init returns a dup'd promise reference for the caller to own.
      * Do NOT discard it and return fr->result.p directly — that would leak
-     * one reference and break ref-counting on promise settlement. */
+     * one reference and break ref-counting on promise settlement.
+     * Assign rw.* AFTER init: tjs_fsreq_init() zeroes them. */
     JSValue promise = tjs_fsreq_init(ctx, fr, this_val);
+    fr->rw.data = data;
+    fr->rw.len = size;
+    fr->rw.is_write = magic != 0;
     fr->rw.tarray = JS_DupValue(ctx, argv[0]);
     return promise;
 }

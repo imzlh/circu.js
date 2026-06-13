@@ -93,6 +93,10 @@ end:
 void tjs_addr2obj(JSContext *ctx, JSValue obj, const struct sockaddr *sa, bool skip_port) {
     char buf[INET6_ADDRSTRLEN + 1];
 
+    if (!sa) {
+        return;
+    }
+
     switch (sa->sa_family) {
         case AF_INET: {
             struct sockaddr_in *addr4 = (struct sockaddr_in *) sa;

@@ -183,11 +183,15 @@ static void uv__close_cb(uv_handle_t *handle) {
         tjs_call_handler(s->ctx, fn, 0, NULL);
     }
 
-    /* Keep the JS wrapper pinned until libuv has fully finished closing.
-     * Close can still trigger read cancellation callbacks before this point. */
+    /* Save finalized flag BEFORE stream_unpin: if stream_unpin drops the JS
+     * object refcount to zero, the finalizer runs synchronously inside
+     * JS_FreeValue, sees closed==1, and calls tjs__free(s) immediately.
+     * Accessing s->finalized after that point is a use-after-free. */
+    int finalized = s->finalized;
     stream_unpin(s);
-
-    if (s->finalized)
+    /* Do NOT touch s after this point — it may have been freed by the finalizer
+     * triggered inside stream_unpin above. */
+    if (finalized)
         tjs__free(s);
 }
 
@@ -239,6 +243,10 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
         }
     }
 
+    /* Pin the JS wrapper so the GC finalizer cannot run before uv__close_cb.
+     * Without this, callbacks are freed by the finalizer while the pending
+     * close callback still holds a pointer to them. */
+    stream_pin(ctx, s, this_val);
     maybe_close(s);
     return JS_UNDEFINED;
 }

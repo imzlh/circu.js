@@ -93,6 +93,11 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
         return obj;
 
     tjs_sock_t *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) {
+        JS_FreeValue(ctx, obj);
+        sock_close(fd);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     s->sock      = fd;
     s->callback  = JS_UNDEFINED;
     s->this_obj  = JS_DupValue(ctx, obj);
@@ -220,6 +225,8 @@ static JSValue tjs_sock_accept(JSContext *ctx, JSValue this_val, int argc, JSVal
     GET_SOCK(ctx, this_val, s);
     socklen_t sz = sizeof(struct sockaddr_storage);
     struct sockaddr *addr = js_malloc(ctx, sz);
+    if (!addr)
+        return JS_ThrowOutOfMemory(ctx);
     sock_fd_t fd = accept(s->sock, addr, &sz);
     if (!sock_valid(fd)) {
         js_free(ctx, addr);
@@ -247,6 +254,8 @@ static JSValue tjs_sock_recv(JSContext *ctx, JSValue this_val, int argc, JSValue
         JS_ToUint32(ctx, &flags, argv[1]);
 
     uint8_t *buf = js_malloc(ctx, count);
+    if (!buf && count != 0)
+        return JS_ThrowOutOfMemory(ctx);
     int ret = recv(s->sock, (char *) buf, count, (int) flags);
     if (ret < 0)  { js_free(ctx, buf); return THROW_STRERROR(); }
     if (ret == 0) { js_free(ctx, buf); return JS_NULL; }
@@ -286,6 +295,8 @@ static JSValue tjs_sock_getsockopt(JSContext *ctx, JSValue this_val, int argc, J
         JS_ToUint32(ctx, &optlen, argv[2]);
 
     void *optval = js_malloc(ctx, optlen);
+    if (!optval && optlen != 0)
+        return JS_ThrowOutOfMemory(ctx);
     int ret = getsockopt(s->sock, level, optname, (char *) optval, &optlen);
     if (ret < 0) { js_free(ctx, optval); return THROW_STRERROR(); }
     return TJS_NewUint8Array(ctx, optval, optlen);
@@ -480,12 +491,18 @@ static JSValue tjs_uv_strerror(JSContext *ctx, JSValue this_val, int argc, JSVal
 
 static JSValue tjs_sock_sockaddr_inet(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     struct sockaddr_storage *ss = js_malloc(ctx, sizeof(*ss));
-    if (tjs_obj2addr(ctx, argv[0], ss) < -1) {
+    if (!ss)
+        return JS_ThrowOutOfMemory(ctx);
+    if (tjs_obj2addr(ctx, argv[0], ss) != 0) {
         js_free(ctx, ss);
-        return JS_ThrowTypeError(ctx, "invalid address object");
+        return JS_EXCEPTION;
     }
     struct sockaddr *addr = js_realloc(ctx, ss, sizeof(struct sockaddr));
-    return TJS_NewUint8Array(ctx, (uint8_t *) addr, sizeof(*addr));
+    if (!addr) {
+        js_free(ctx, ss);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    return TJS_NewUint8Array(ctx, (uint8_t *) addr, sizeof(struct sockaddr));
 }
 
 static JSValue tjs_posix_if_nametoindex(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

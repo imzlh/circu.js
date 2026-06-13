@@ -32,8 +32,12 @@
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
+#include <io.h>
+#include <fcntl.h>
 #else
 #include <unistd.h>
+#include <sys/socket.h>
+#include <errno.h>
 #endif
 
 
@@ -598,6 +602,132 @@ static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     return JS_UNDEFINED;
 }
 
+/* ── IPC helpers ───────────────────────────────────────────────────── */
+
+/**
+ * Create a pipe pair for IPC.
+ * Returns [readable_fd, writable_fd].
+ * On Windows, uses _pipe(); on POSIX, uses pipe().
+ */
+static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    int fds[2];
+    int r;
+
+#ifdef _WIN32
+    r = _pipe(fds, 65536, _O_BINARY);
+#else
+    r = pipe(fds);
+#endif
+
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyInt64(ctx, arr, 0, JS_NewInt32(ctx, fds[0]));
+    JS_SetPropertyInt64(ctx, arr, 1, JS_NewInt32(ctx, fds[1]));
+    return arr;
+}
+
+/**
+ * Send a file descriptor over a Unix domain socket.
+ * Uses sendmsg with SCM_RIGHTS ancillary data.
+ * (POSIX only, throws on Windows)
+ *
+ * @param socket_fd - Unix domain socket file descriptor
+ * @param fd_to_send - File descriptor to send
+ * @returns bytes sent (>= 0) on success
+ */
+static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef _WIN32
+    return JS_ThrowInternalError(ctx, "sendfd is not supported on Windows");
+#else
+    int sock_fd, fd_to_send;
+    if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &fd_to_send, argv[1])) return JS_EXCEPTION;
+
+    // Prepare control message buffer
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char dummy = 'F'; // Dummy data
+
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // Control message buffer for SCM_RIGHTS
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    // Fill control message
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    *((int *)CMSG_DATA(cmsg)) = fd_to_send;
+
+    ssize_t ret = sendmsg(sock_fd, &msg, 0);
+    if (ret < 0) {
+        return tjs_throw_errno(ctx, errno);
+    }
+
+    return JS_NewInt32(ctx, (int)ret);
+#endif
+}
+
+/**
+ * Receive a file descriptor from a Unix domain socket.
+ * Uses recvmsg with SCM_RIGHTS ancillary data.
+ * (POSIX only, throws on Windows)
+ *
+ * @param socket_fd - Unix domain socket file descriptor
+ * @returns received file descriptor (>= 0) on success
+ */
+static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef _WIN32
+    return JS_ThrowInternalError(ctx, "recvfd is not supported on Windows");
+#else
+    int sock_fd;
+    if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
+
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char dummy;
+    ssize_t ret;
+
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // Control message buffer
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    ret = recvmsg(sock_fd, &msg, 0);
+    if (ret < 0) {
+        return tjs_throw_errno(ctx, errno);
+    }
+
+    // Extract received fd from control message
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == NULL ||
+        cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+        return JS_ThrowInternalError(ctx, "invalid control message");
+    }
+
+    int received_fd = *((int *)CMSG_DATA(cmsg));
+    return JS_NewInt32(ctx, received_fd);
+#endif
+}
+
 static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CONST(AF_INET),
     TJS_CONST(AF_INET6),
@@ -622,6 +752,10 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CFUNC_DEF("availableParallelism", 0, tjs_availableParallelism),
 	TJS_CFUNC_DEF("memoryUsage", 0, tjs_memory),
     TJS_CFUNC_DEF("sleep", 0, tjs_sleep),
+    // IPC helpers
+    TJS_CFUNC_DEF("ipcPipe", 0, tjs_ipc_pipe),
+    TJS_CFUNC_DEF("sendfd", 2, tjs_send_fd),
+    TJS_CFUNC_DEF("recvfd", 1, tjs_recv_fd),
     TJS_CGETSET_DEF("cwd", tjs_cwd, NULL),
     TJS_CGETSET_DEF("homeDir", tjs_homedir, NULL),
     TJS_CGETSET_DEF("hostName", tjs_gethostname, NULL),

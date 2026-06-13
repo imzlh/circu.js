@@ -49,9 +49,7 @@ static const struct TJSModule tjs_modules[] = {
 	// name init_fn allow_in_worker
 	{ "algorithm", tjs__mod_algorithm_init, true },
 	{ "asyncfs", tjs__mod_asyncfs_init, true },
-#ifdef CJS__HAS_CURL
-	{ "curl", tjs__mod_curl_init, false }, // not thread-safe currently
-#endif
+	{ "curl", tjs__mod_curl_init, true },
 	{ "crypto", tjs__mod_crypto_init, true },
 	{ "console", tjs__mod_console_init, true },
 	{ "dns", tjs__mod_dns_init, true },
@@ -416,8 +414,8 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 		JSValue ret = JS_Call(ctx, trt->module.metaloader, JS_UNDEFINED, 2, args);
 		JS_FreeValue(ctx, args[0]);
 		JS_FreeValue(ctx, meta_obj);
-		JS_FreeCString(ctx, module_name);  /* fix: was leaked on this path */
-		if (JS_IsException(ret)) {         /* fix: propagate exception instead of swallowing */
+		JS_FreeCString(ctx, module_name);
+		if (JS_IsException(ret)) {
 			JS_FreeValue(ctx, ret);
 			return -1;
 		}
@@ -447,8 +445,17 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
         // all we need to do is split on the last path separator.
         const char *start = buf + 7; /* skip file:// */
         char *p = strrchr(start, TJS__PATHSEP);
-        strncpy(module_dirname, start, p - start);
-        strcpy(module_basename, p + 1);
+        if (p) {
+            size_t dlen = (size_t) (p - start);
+            if (dlen >= sizeof(module_dirname))
+                dlen = sizeof(module_dirname) - 1;
+            memcpy(module_dirname, start, dlen);
+            module_dirname[dlen] = '\0';
+            js__pstrcpy(module_basename, sizeof(module_basename), p + 1);
+        } else {
+            module_dirname[0] = '\0';
+            js__pstrcpy(module_basename, sizeof(module_basename), start);
+        }
     } else {
         js__pstrcat(buf, sizeof(buf), module_name);
     }

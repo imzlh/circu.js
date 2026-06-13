@@ -44,7 +44,7 @@ static JSValue tjs_loadModule(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
     ret = TJS_EvalModule(ctx, filename, true);
-    JS_FreeCString(ctx, filename);  /* fix: was commented out, causing CString leak */
+    JS_FreeCString(ctx, filename);
     return ret;
 }
 

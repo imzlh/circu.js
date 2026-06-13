@@ -241,7 +241,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
             JS_FreeValue(ctx, cert_val);
             JS_FreeValue(ctx, key_val);
             if (key) JS_FreeCString(ctx, key);
-            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);  /* fix: leaked */
+            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
@@ -256,8 +256,8 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         JS_FreeCString(ctx, key);
         if (ret != 1) {
             JS_FreeValue(ctx, key_val);
-            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);  /* fix: leaked */
-            if (ssl_ctx->key_file) js_free(ctx, ssl_ctx->key_file);    /* fix: leaked */
+            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
+            if (ssl_ctx->key_file) js_free(ctx, ssl_ctx->key_file);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
@@ -275,7 +275,6 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         JS_FreeCString(ctx, ca);
         if (ret != 1) {
             JS_FreeValue(ctx, ca_val);
-            /* fix: all previously strdup'd fields leaked before */
             if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
             if (ssl_ctx->key_file)  js_free(ctx, ssl_ctx->key_file);
             if (ssl_ctx->ca_file)   js_free(ctx, ssl_ctx->ca_file);
@@ -999,8 +998,9 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
     int32_t days = 365;
     if (!JS_IsUndefined(days_val)) JS_ToInt32(ctx, &days, days_val);
     
-    /* Generate RSA key */
-    EVP_PKEY *pkey = EVP_PKEY_new();
+    /* Generate RSA key. Keep pkey NULL so EVP_PKEY_generate allocates it (passing
+     * a pre-allocated EVP_PKEY leaks the original). */
+    EVP_PKEY *pkey = NULL;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
@@ -1017,29 +1017,45 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
         pkey = NULL;
     }
 #else
-	RSA *rsa = RSA_new();
+    pkey = EVP_PKEY_new();
+    RSA *rsa = RSA_new();
     BIGNUM *bne = BN_new();
-    
-    if (rsa && bne) {
+
+    if (pkey && rsa && bne) {
         BN_set_word(bne, RSA_F4);
         if (RSA_generate_key_ex(rsa, 2048, bne, NULL) > 0) {
             EVP_PKEY_assign_RSA(pkey, rsa);
+            rsa = NULL; /* ownership transferred to pkey */
         } else {
-            RSA_free(rsa);
             EVP_PKEY_free(pkey);
             pkey = NULL;
         }
     } else {
-        if (rsa) RSA_free(rsa);
-        if (bne) BN_free(bne);
         EVP_PKEY_free(pkey);
         pkey = NULL;
     }
+    if (rsa) RSA_free(rsa);
     if (bne) BN_free(bne);
 #endif
     
+    /* Bail out if key generation failed (otherwise the X509_* calls below
+     * dereference a NULL pkey and crash). */
+    if (!pkey) {
+        if (cn_owned) JS_FreeCString(ctx, cn);
+        JS_FreeValue(ctx, cn_val);
+        JS_FreeValue(ctx, days_val);
+        return JS_ThrowInternalError(ctx, "failed to generate RSA key for self-signed certificate");
+    }
+
     /* Create certificate */
     X509 *cert = X509_new();
+    if (!cert) {
+        EVP_PKEY_free(pkey);
+        if (cn_owned) JS_FreeCString(ctx, cn);
+        JS_FreeValue(ctx, cn_val);
+        JS_FreeValue(ctx, days_val);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
     X509_gmtime_adj(X509_get_notBefore(cert), 0);
     X509_gmtime_adj(X509_get_notAfter(cert), 60L * 60L * 24L * days);

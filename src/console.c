@@ -192,7 +192,7 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
         JS_FreeValue(ctx, tag);
         if (str && str[0]) {
             char* dup = js_strdup(ctx, str);
-            JS_FreeCString(ctx, str);  /* fix: str leaked before return */
+            JS_FreeCString(ctx, str);
             return dup;
         }
         if (str) JS_FreeCString(ctx, str);
@@ -219,7 +219,7 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
     
     if (str && str[0] && strcmp(str, "Object") != 0) {
         char* dup = js_strdup(ctx, str);
-        JS_FreeCString(ctx, str);  /* fix: str leaked before return */
+        JS_FreeCString(ctx, str);
         return dup;
     }
     if (str) JS_FreeCString(ctx, str);
@@ -958,9 +958,15 @@ static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc
         fprintf2(stderr, ANSI_RED "Assertion failed " ANSI_RESET);
         if (argc > 1) {
             fprintf2(stderr, ": ");
-            InspectOptions opts = {0};
-            opts.depth = 2;
-            opts.colors = isatty(STDERR_FILENO);
+            InspectOptions opts = {
+                .depth = 2,
+                .break_length = DEFAULT_BREAK_LENGTH,
+                .colors = isatty(STDERR_FILENO),
+                .show_hidden = false,
+                .max_array_length = MAX_ARRAY_LENGTH,
+                .max_string_length = MAX_STRING_LENGTH,
+                .compact = true,
+            };
             VisitStack stack = {0};
             DynBuf buf;
             dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
@@ -1010,7 +1016,15 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
 // # C apis
 void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val) {
 	VisitStack st = {0};
-	InspectOptions io = {0};
+	InspectOptions io = {
+		.depth = 2,
+		.break_length = DEFAULT_BREAK_LENGTH,
+		.colors = isatty(fileno(f)),
+		.show_hidden = false,
+		.max_array_length = MAX_ARRAY_LENGTH,
+		.max_string_length = MAX_STRING_LENGTH,
+		.compact = true,
+	};
 	DynBuf buf;
 
 	dbuf_init(&buf);

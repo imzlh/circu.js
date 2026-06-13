@@ -170,6 +170,14 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
     TJSUdp *u = handle->data;
     CHECK_NOT_NULL(u);
 
+    /* libuv signals "no data available right now" with nread==0 && addr==NULL.
+     * This is NOT a datagram (an empty datagram has addr != NULL), so keep the
+     * recv armed and wait for a real packet instead of stopping and then
+     * dereferencing a NULL addr in tjs_addr2obj. */
+    if (nread == 0 && addr == NULL) {
+        return;
+    }
+
     uv_udp_recv_stop(handle);
 
     JSContext *ctx = u->ctx;

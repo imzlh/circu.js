@@ -502,7 +502,7 @@ static JSValue tjs__set_event_receiver(JSContext *ctx, JSValue this_val, int arg
 	}
 
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
-	JS_FreeValue(ctx, trt->builtins.dispatch_event_func);  /* fix: free old value */
+	JS_FreeValue(ctx, trt->builtins.dispatch_event_func);
 	trt->builtins.dispatch_event_func = JS_DupValue(ctx, argv[0]);
 	return JS_UNDEFINED;
 }
@@ -614,8 +614,8 @@ static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-	if(argc == 0 && !JS_IsArrayBuffer(argv[0]))
-		return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
+	if(argc == 0 || !JS_IsArrayBuffer(argv[0]))
+		return JS_ThrowTypeError(ctx, "first argument is not an ArrayBuffer");
     JS_DetachArrayBuffer(ctx, argv[0]);
 
     return JS_UNDEFINED;
@@ -623,8 +623,8 @@ static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc,
 
 
 static JSValue tjs_immutArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-	if(argc == 0 && !JS_IsArrayBuffer(argv[0]))
-		return JS_ThrowTypeError(ctx, "not an ArrayBuffer");
+	if(argc == 0 || !JS_IsArrayBuffer(argv[0]))
+		return JS_ThrowTypeError(ctx, "first argument is not an ArrayBuffer");
 	bool immut = argc >= 2 ? JS_ToBool(ctx, argv[1]) : true;
     int ret = JS_SetImmutableArrayBuffer(argv[0], immut);
 
