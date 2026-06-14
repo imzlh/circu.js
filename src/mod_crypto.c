@@ -753,21 +753,24 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
 static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t key_len, data_len;
     const uint8_t *key_data, *data;
-    int32_t salt_len = -1; // auto
-    
+    int32_t salt_len = -1;
+
     if (argc < 2) {
         return JS_ThrowTypeError(ctx, "rsaPssSign() requires 2 arguments: privateKey and data");
     }
-    
+
+    /* Convert scalar parameters BEFORE buffer acquisition */
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &salt_len, argv[2]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
     data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
-    
+
     if (!key_data || !data) {
         return JS_EXCEPTION;
-    }
-    
-    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
-        JS_ToInt32(ctx, &salt_len, argv[2]);
     }
     
     const EVP_MD* md = get_md_from_magic(magic);
@@ -824,21 +827,24 @@ static JSValue tjs_crypto_rsa_pss_verify(JSContext* ctx, JSValueConst this_val, 
     size_t key_len, data_len, sig_len;
     const uint8_t *key_data, *data, *sig;
     int32_t salt_len = -1;
-    
+
     if (argc < 3) {
         return JS_ThrowTypeError(ctx, "rsaPssVerify() requires 3 arguments: publicKey, data, signature");
     }
-    
+
+    /* Convert scalar parameters BEFORE buffer acquisition */
+    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
+        if (JS_ToInt32(ctx, &salt_len, argv[3]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
     data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
     sig = JS_GetAnyBuffer(ctx, &sig_len, argv[2]);
-    
+
     if (!key_data || !data || !sig) {
         return JS_EXCEPTION;
-    }
-    
-    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
-        JS_ToInt32(ctx, &salt_len, argv[3]);
     }
     
     const EVP_MD* md = get_md_from_magic(magic);
@@ -946,24 +952,25 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
     size_t ikm_len, salt_len = 0, info_len = 0;
     const uint8_t *ikm, *salt = NULL, *info = NULL;
     int32_t keylen;
-    
+
     if (argc < 2) {
         return JS_ThrowTypeError(ctx, "hkdf() requires 2 arguments: ikm and keylen");
     }
-    
+
+    /* Convert scalar parameters BEFORE buffer acquisition */
+    if (JS_ToInt32(ctx, &keylen, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (keylen < 1 || keylen > 65536) {
+        return JS_ThrowRangeError(ctx, "Invalid keylen");
+    }
+
     ikm = JS_GetAnyBuffer(ctx, &ikm_len, argv[0]);
     if (!ikm) {
         return JS_EXCEPTION;
     }
-    
-    if (JS_ToInt32(ctx, &keylen, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
-    
-    if (keylen < 1 || keylen > 65536) {
-        return JS_ThrowRangeError(ctx, "Invalid keylen");
-    }
-    
+
     // Optional salt and info
     if (argc >= 3 && !JS_IsUndefined(argv[2])) {
         salt = JS_GetAnyBuffer(ctx, &salt_len, argv[2]);
@@ -1148,50 +1155,65 @@ static JSValue tjs_crypto_random_bytes(JSContext* ctx, JSValueConst this_val, in
 static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t key_len, iv_len = 0, data_len;
     const uint8_t *key, *iv = NULL, *data;
-    int encrypt = (magic >> 8) & 1;  // High bit indicates encrypt/decrypt
+    int encrypt = (magic >> 8) & 1;
     int cipher_magic = magic & 0xFF;
-    
+
     if (argc < 2) {
         return JS_ThrowTypeError(ctx, "cipher() requires at least 2 arguments: key and data");
     }
-    
+
     const EVP_CIPHER* cipher = get_cipher_from_magic(cipher_magic);
     if (!cipher) {
         return JS_ThrowInternalError(ctx, "Invalid cipher algorithm");
     }
-    
+
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
     if (!key) {
         return JS_EXCEPTION;
     }
-    
+
+    /* Validate key length */
+    if (key_len != (size_t)EVP_CIPHER_key_length(cipher)) {
+        return JS_ThrowTypeError(ctx, "Invalid key length");
+    }
+
     // IV is optional for some modes
     if (argc >= 3 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
         iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
         if (!iv) {
             return JS_EXCEPTION;
         }
+        /* Validate IV length */
+        if (iv_len != (size_t)EVP_CIPHER_iv_length(cipher)) {
+            return JS_ThrowTypeError(ctx, "Invalid IV length");
+        }
         data = JS_GetAnyBuffer(ctx, &data_len, argv[2]);
     } else {
         data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
     }
-    
+
     if (!data) {
         return JS_EXCEPTION;
     }
-    
+
     EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
     if (!cctx) {
         return JS_ThrowInternalError(ctx, "Failed to create cipher context");
     }
-    
-    int out_len = data_len + EVP_CIPHER_block_size(cipher);
+
+    /* Prevent integer overflow: data_len + block_size */
+    int block_size = EVP_CIPHER_block_size(cipher);
+    if (data_len > (size_t)(INT_MAX - block_size)) {
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowRangeError(ctx, "Data too large");
+    }
+    int out_len = (int)data_len + block_size;
     uint8_t* out = js_malloc(ctx, out_len);
     if (!out) {
         EVP_CIPHER_CTX_free(cctx);
         return JS_EXCEPTION;
     }
-    
+
     int len, final_len;
     
     if (EVP_CipherInit_ex(cctx, cipher, NULL, key, iv, encrypt) != 1 ||
@@ -1215,29 +1237,13 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
 static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     size_t key_len, iv_len, plaintext_len, aad_len = 0;
     const uint8_t *key, *iv, *plaintext, *aad = NULL;
-    
+    int tag_len = 16;
+
     if (argc < 3) {
         return JS_ThrowTypeError(ctx, "gcmEncrypt requires at least 3 arguments: key, iv, plaintext");
     }
-    
-    key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
-    iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
-    plaintext = JS_GetAnyBuffer(ctx, &plaintext_len, argv[2]);
-    
-    if (!key || !iv || !plaintext) {
-        return JS_EXCEPTION;
-    }
-    
-    // Optional AAD (4th argument)
-    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
-        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[3]);
-        if (!aad && aad_len > 0) {
-            return JS_EXCEPTION;
-        }
-    }
-    
-    // Optional tag length (5th argument, default 16)
-    int tag_len = 16;
+
+    /* Convert scalar parameters BEFORE buffer acquisition */
     if (argc >= 5 && !JS_IsUndefined(argv[4])) {
         int32_t tl;
         if (JS_ToInt32(ctx, &tl, argv[4]) < 0) {
@@ -1247,6 +1253,22 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
             return JS_ThrowRangeError(ctx, "tagLength must be between 4 and 16");
         }
         tag_len = tl;
+    }
+
+    key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
+    iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
+    plaintext = JS_GetAnyBuffer(ctx, &plaintext_len, argv[2]);
+
+    if (!key || !iv || !plaintext) {
+        return JS_EXCEPTION;
+    }
+
+    // Optional AAD (4th argument)
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        aad = JS_GetAnyBuffer(ctx, &aad_len, argv[3]);
+        if (!aad && aad_len > 0) {
+            return JS_EXCEPTION;
+        }
     }
     
     // Determine cipher based on key length
@@ -1331,20 +1353,21 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
 static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     size_t key_len, iv_len, ciphertext_len, tag_len, aad_len = 0;
     const uint8_t *key, *iv, *ciphertext, *tag, *aad = NULL;
-    
+
     if (argc < 4) {
         return JS_ThrowTypeError(ctx, "gcmDecrypt requires at least 4 arguments: key, iv, ciphertext, tag");
     }
-    
+
+    /* No scalar parameters to convert before buffers in decrypt */
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
     iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
     ciphertext = JS_GetAnyBuffer(ctx, &ciphertext_len, argv[2]);
     tag = JS_GetAnyBuffer(ctx, &tag_len, argv[3]);
-    
+
     if (!key || !iv || !ciphertext || !tag) {
         return JS_EXCEPTION;
     }
-    
+
     // Optional AAD (5th argument)
     if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
         aad = JS_GetAnyBuffer(ctx, &aad_len, argv[4]);
@@ -1435,31 +1458,32 @@ static JSValue tjs_crypto_pbkdf2(JSContext* ctx, JSValueConst this_val, int argc
     size_t password_len, salt_len;
     const uint8_t *password, *salt;
     int32_t iterations, keylen;
-    
+
     if (argc < 4) {
         return JS_ThrowTypeError(ctx, "pbkdf2() requires 4 arguments: password, salt, iterations, keylen");
     }
-    
+
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
         return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
     }
-    
+
+    /* Convert scalar parameters BEFORE buffer acquisition to prevent detach-UAF */
+    if (JS_ToInt32(ctx, &iterations, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt32(ctx, &keylen, argv[3]) < 0) {
+        return JS_EXCEPTION;
+    }
+
     password = JS_GetAnyBuffer(ctx, &password_len, argv[0]);
     if (!password) {
         return JS_EXCEPTION;
     }
-    
+
     salt = JS_GetAnyBuffer(ctx, &salt_len, argv[1]);
     if (!salt) {
-        return JS_EXCEPTION;
-    }
-    
-    if (JS_ToInt32(ctx, &iterations, argv[2]) < 0) {
-        return JS_EXCEPTION;
-    }
-    
-    if (JS_ToInt32(ctx, &keylen, argv[3]) < 0) {
         return JS_EXCEPTION;
     }
     
@@ -2339,25 +2363,30 @@ static JSValue tjs_crypto_base64_encode(JSContext* ctx, JSValueConst this_val, i
 
 static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* str;
-    
+
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "base64Decode() requires 1 argument: string");
     }
-    
+
     str = JS_ToCString(ctx, argv[0]);
     if (!str) {
         return JS_EXCEPTION;
     }
-    
+
     size_t str_len = strlen(str);
-    int out_len = (str_len / 4) * 3;
-    uint8_t* out = js_malloc(ctx, out_len +1);
+    /* Prevent integer overflow and signed/unsigned confusion */
+    if (str_len > (size_t)INT_MAX) {
+        JS_FreeCString(ctx, str);
+        return JS_ThrowRangeError(ctx, "Input string too large");
+    }
+    int out_len = ((int)str_len / 4) * 3;
+    uint8_t* out = js_malloc(ctx, out_len + 1);
     if (!out) {
         JS_FreeCString(ctx, str);
         return JS_EXCEPTION;
     }
-    
-    int decoded = EVP_DecodeBlock(out, (const uint8_t*)str, str_len);
+
+    int decoded = EVP_DecodeBlock(out, (const uint8_t*)str, (int)str_len);
 
     int padding = 0;
     if (str_len >= 2 && str[str_len - 1] == '=') {
@@ -2372,6 +2401,10 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     }
 
     decoded -= padding;
+    if (decoded < 0) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "Base64 decode failed: invalid padding");
+    }
 
     JSValue result = js_fastab(ctx, out, decoded);
     return result;

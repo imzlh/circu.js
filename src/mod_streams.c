@@ -68,6 +68,7 @@ typedef struct {
         uv_pipe_t   pipe;
     } h;
     JSValue obj;                     /* GC pin — not in gc_mark to prevent false cycle detection */
+    int pin_count;
     JSValue callbacks[STREAM_CB_MAX];
     uint8_t *read_buf;               /* dynamically allocated for the streaming onread path */
     TJSReadReq *read_req;            /* non-NULL while a one-shot read(buf) is in flight */
@@ -142,13 +143,13 @@ static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
 
 /* Pin the JS object to prevent GC while async work is in flight. Idempotent. */
 static inline void stream_pin(JSContext *ctx, TJSStream *s, JSValue obj) {
-    if (JS_IsUndefined(s->obj))
+    if (s->pin_count++ == 0)
         s->obj = JS_DupValue(ctx, obj);
 }
 
 /* Release the GC pin. */
 static inline void stream_unpin(TJSStream *s) {
-    if (!JS_IsUndefined(s->obj)) {
+    if (s->pin_count > 0 && --s->pin_count == 0 && !JS_IsUndefined(s->obj)) {
         JS_FreeValue(s->ctx, s->obj);
         s->obj = JS_UNDEFINED;
     }
@@ -166,11 +167,16 @@ static inline int stream_get_fd(TJSStream *s) {
 }
 
 #pragma endregion
-#pragma callbacks
+#pragma region callbacks
 static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
     s->closed = 1;
+
+    if (s->finalized) {
+        tjs__free(s);
+        return;
+    }
 
     if (s->read_req && (s->read_req->canceled || s->read_req->settled)) {
         tjs_read_req_free(s->ctx, s->read_req);
@@ -301,6 +307,10 @@ static JSValue tjs_stream_start_read(JSContext *ctx, JSValue this_val, int argc,
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    if (s->read_req)
+        return JS_ThrowInternalError(ctx, "read already in progress");
+    if (s->read_buf)
+        return JS_ThrowInternalError(ctx, "startRead already in progress");
 
     int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
     if (r != 0) return tjs_throw_errno(ctx, r);
@@ -452,6 +462,8 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->read_req)
         return JS_ThrowInternalError(ctx, "read already in progress");
+    if (s->read_buf)
+        return JS_ThrowInternalError(ctx, "startRead already in progress");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
@@ -486,7 +498,18 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
 static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
+    if (s->finalized) {
+        tjs__free(req);
+        return;
+    }
     JSContext *ctx = s->ctx;
+
+    // Guard against runtime freeing
+    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    if (!qrt || qrt->freeing) {
+        tjs__free(req);
+        return;
+    }
 
     if (status == 0) {
         TJS_ResolvePromise(ctx, &s->shutdown_promise, 0, NULL);
@@ -495,6 +518,7 @@ static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
         TJS_RejectPromise(ctx, &s->shutdown_promise, 1, &arg);
     }
 
+    stream_unpin(s);
     js_free(ctx, req);
 }
 
@@ -515,6 +539,7 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
         return tjs_throw_errno(ctx, r);
     }
 
+    stream_pin(ctx, s, this_val);
     return TJS_InitPromise(ctx, &s->shutdown_promise);
 }
 
@@ -692,6 +717,7 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
     s->ctx           = ctx;
     s->h.handle.data = s;
     s->obj           = JS_UNDEFINED;
+    s->pin_count     = 0;
     s->read_buf      = NULL;
     s->read_req      = NULL;
 
@@ -715,6 +741,8 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     if (!s) return;
 
     JS_FreeValueRT(rt, s->obj);
+    s->obj = JS_UNDEFINED;
+    s->pin_count = 0;
     for (int i = 0; i < STREAM_CB_MAX; i++)
         JS_FreeValueRT(rt, s->callbacks[i]);
 

@@ -39,6 +39,7 @@
 
 typedef struct {
 	JSContext* ctx;
+	JSRuntime* rt;
 	uv_getaddrinfo_t req;
 	TJSPromise result;
 	struct addrinfo* res;  // For sync operations
@@ -52,7 +53,8 @@ static JSValue tjs_addrinfo2obj(JSContext* ctx, struct addrinfo* ai) {
 	struct addrinfo* ptr;
 	int i = 0;
 	for (ptr = ai; ptr; ptr = ptr->ai_next) {
-		CHECK_EQ(ptr->ai_socktype, SOCK_STREAM);
+		// Skip non-SOCK_STREAM entries instead of aborting
+		if (ptr->ai_socktype != SOCK_STREAM) continue;
 		JSValue item = JS_NewObjectProto(ctx, JS_NULL);
 		tjs_addr2obj(ctx, item, ptr->ai_addr, true);
 		JS_DefinePropertyValueUint32(ctx, obj, i, item, JS_PROP_C_W_E);
@@ -67,6 +69,17 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 	CHECK_NOT_NULL(gr);
 
 	JSContext* ctx = gr->ctx;
+	JSRuntime* rt = gr->rt;
+	TJSRuntime* qrt = JS_GetRuntimeOpaque(rt);
+
+	// Safeguard: if runtime is being freed, don't call JS functions
+	if (!qrt || qrt->freeing) {
+		if (res) uv_freeaddrinfo(res);
+		TJS_FreePromiseRT(rt, &gr->result);
+		js_free_rt(rt, gr);
+		return;
+	}
+
 	JSValue arg;
 	bool is_reject = status != 0;
 
@@ -79,7 +92,7 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 
 	TJS_SettlePromise(ctx, &gr->result, is_reject, 1, &arg);
 
-	uv_freeaddrinfo(res);
+	if (res) uv_freeaddrinfo(res);
 	js_free(ctx, gr);
 }
 
@@ -119,6 +132,7 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 
 	gr->ctx = ctx;
+	gr->rt = JS_GetRuntime(ctx);
 	gr->req.data = gr;
 
 	struct addrinfo hints;
@@ -440,16 +454,18 @@ static int parse_dns_response(const uint8_t* packet, size_t packet_len,
 		}
 		ans->name = strdup(name);
 
-		// Parse type, class, TTL, rdlength
+		// Parse type, class, TTL, rdlength (use memcpy for alignment safety)
 		if (pos + 10 > packet_len) goto parse_error;
-		ans->type = ntohs(*(uint16_t*) (packet + pos));
-		pos += 2;
-		ans->class = ntohs(*(uint16_t*) (packet + pos));
-		pos += 2;
-		ans->ttl = ntohl(*(uint32_t*) (packet + pos));
-		pos += 4;
-		ans->rdlength = ntohs(*(uint16_t*) (packet + pos));
-		pos += 2;
+		uint16_t type_val, class_val, rdlength_val;
+		uint32_t ttl_val;
+		memcpy(&type_val, packet + pos, 2); pos += 2;
+		ans->type = ntohs(type_val);
+		memcpy(&class_val, packet + pos, 2); pos += 2;
+		ans->class = ntohs(class_val);
+		memcpy(&ttl_val, packet + pos, 4); pos += 4;
+		ans->ttl = ntohl(ttl_val);
+		memcpy(&rdlength_val, packet + pos, 2); pos += 2;
+		ans->rdlength = ntohs(rdlength_val);
 
 		// Parse rdata
 		if (pos + ans->rdlength > packet_len) goto parse_error;
@@ -589,11 +605,18 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 			size_t param_offset = (ans->rdata) ? (offset - ans->rdata_offset) : offset;
 			const uint8_t* params = ans->rdata ? (ans->rdata + param_offset) : (ans->packet + offset);
 
-			uint32_t serial = ntohl(*(uint32_t*) params);
-			uint32_t refresh = ntohl(*(uint32_t*) (params + 4));
-			uint32_t retry = ntohl(*(uint32_t*) (params + 8));
-			uint32_t expire = ntohl(*(uint32_t*) (params + 12));
-			uint32_t minimum = ntohl(*(uint32_t*) (params + 16));
+			// Use memcpy for alignment safety
+			uint32_t serial, refresh, retry, expire, minimum;
+			memcpy(&serial, params, 4);
+			memcpy(&refresh, params + 4, 4);
+			memcpy(&retry, params + 8, 4);
+			memcpy(&expire, params + 12, 4);
+			memcpy(&minimum, params + 16, 4);
+			serial = ntohl(serial);
+			refresh = ntohl(refresh);
+			retry = ntohl(retry);
+			expire = ntohl(expire);
+			minimum = ntohl(minimum);
 
 			JS_SetPropertyStr(ctx, obj, "serial", JS_NewInt32(ctx, serial));
 			JS_SetPropertyStr(ctx, obj, "refresh", JS_NewInt32(ctx, refresh));
@@ -603,9 +626,14 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 		}
 	}
 	else if (ans->type == DNS_SRV && ans->rdlength > 6) {
-		uint16_t priority = ntohs(*(uint16_t*) ans->rdata);
-		uint16_t weight = ntohs(*(uint16_t*) (ans->rdata + 2));
-		uint16_t port = ntohs(*(uint16_t*) (ans->rdata + 4));
+		// Use memcpy for alignment safety
+		uint16_t priority, weight, port;
+		memcpy(&priority, ans->rdata, 2);
+		memcpy(&weight, ans->rdata + 2, 2);
+		memcpy(&port, ans->rdata + 4, 2);
+		priority = ntohs(priority);
+		weight = ntohs(weight);
+		port = ntohs(port);
 		char target[256];
 		size_t offset = ans->rdata_offset + 6;  // 6 byte offset
 
@@ -722,6 +750,18 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 	unsigned flags) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) handle->data;
 	JSContext* js_ctx = ctx->ctx;
+	TJSRuntime* qrt = JS_GetContextOpaque(js_ctx);
+
+	// If runtime is being freed, just cleanup without touching JSContext
+	if (!qrt || qrt->freeing) {
+		uv_udp_recv_stop(handle);
+		uv_timer_stop(&ctx->timeout_timer);
+		uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);
+		uv_close((uv_handle_t*) &ctx->udp, cleanup_callback);
+		if (buf->base) free(buf->base);
+		if (ctx->hostname) free(ctx->hostname);
+		return;
+	}
 
 	if (nread < 0) {
 		JSValue error = JS_NewError(js_ctx);
@@ -761,12 +801,7 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 			JS_Call(js_ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
 			JS_FreeValue(js_ctx, error);
 		}
-
-		goto cleanup;
 	}
-
-	if (buf->base) free(buf->base);
-	return;
 
 cleanup:
 	uv_timer_stop(&ctx->timeout_timer);
@@ -786,14 +821,21 @@ static void udp_alloc_callback(uv_handle_t* handle, size_t suggested_size,
 
 static void udp_send_callback(uv_udp_send_t* req, int status) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) req->data;
+	TJSRuntime* qrt = JS_GetContextOpaque(ctx->ctx);
 
-	if (status < 0) {
-		JSValue error = JS_NewError(ctx->ctx);
-		JS_SetPropertyStr(ctx->ctx, error, "message",
-			JS_NewString(ctx->ctx, uv_strerror(status)));
-		JSValue args[] = { error };
+	// If runtime is being freed, just cleanup without touching JSContext
+	if (!qrt || qrt->freeing) {
+		uv_udp_recv_stop(&ctx->udp);
+		uv_timer_stop(&ctx->timeout_timer);
+		uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);
+		uv_close((uv_handle_t*) &ctx->udp, cleanup_callback);
+		if (ctx->hostname) free(ctx->hostname);
+		return;
+	} else {
+		JS_ThrowPlainError(ctx->ctx, "%s", uv_strerror(status));
+		JSValue args[] = { JS_GetException(ctx->ctx) };
 		JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
-		JS_FreeValue(ctx->ctx, error);
+		JS_FreeValue(ctx->ctx, args[0]);
 		
 		uv_udp_recv_stop(&ctx->udp);
 		uv_timer_stop(&ctx->timeout_timer);
@@ -807,13 +849,22 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 
 static void udp_timeout_callback(uv_timer_t* handle) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) handle->data;
+	TJSRuntime* qrt = JS_GetContextOpaque(ctx->ctx);
 
-	JSValue error = JS_NewError(ctx->ctx);
-	JS_SetPropertyStr(ctx->ctx, error, "message",
-		JS_NewString(ctx->ctx, "DNS query timeout"));
-	JSValue args[] = { error };
-	JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
-	JS_FreeValue(ctx->ctx, error);
+	// If runtime is being freed, just cleanup without touching JSContext
+	if (!qrt || qrt->freeing) {
+		uv_udp_recv_stop(&ctx->udp);
+		uv_timer_stop(&ctx->timeout_timer);
+		uv_close((uv_handle_t*) &ctx->timeout_timer, cleanup_callback);
+		uv_close((uv_handle_t*) &ctx->udp, cleanup_callback);
+		if (ctx->hostname) free(ctx->hostname);
+		return;
+	} else {
+		JS_ThrowPlainError(ctx->ctx, "DNS query timed out");
+		JSValue args[] = { JS_GetException(ctx->ctx) };
+		JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
+		JS_FreeValue(ctx->ctx, args[0]);
+	}
 
 	/* stop recv before closing — any queued recv callback would otherwise
 	 * see freed resolve_func/reject_func and UAF. */
@@ -840,7 +891,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		return JS_ThrowTypeError(ctx, "Invalid query type");
 	}
 
-	const char* server = qtype == DNS_AAAA ? "2001:4860:4860::8888" : "8.8.8.8";  // Default Google DNS
+	const char* server = "8.8.8.8";  // Default Google DNS (IPv4 - DNS queries use IPv4 regardless of record type)
 	bool server_is_js = false;
 	if (argc >= 3 && !JS_IsUndefined(argv[2])) {
 		server = JS_ToCString(ctx, argv[2]);
@@ -903,18 +954,37 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	// Initialize UDP socket
 	// Note: TJS is not using libuv's default loop
 	uv_loop_t* loop = TJS_GetLoop(trt);
-	uv_udp_init(loop, &req_ctx->udp);
+	int r = uv_udp_init(loop, &req_ctx->udp);
+	if (r < 0) {
+		if (server_is_js) JS_FreeCString(ctx, server);
+		JS_FreeValue(ctx, req_ctx->resolve_func);
+		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return JS_ThrowInternalError(ctx, "Failed to initialize UDP socket");
+	}
 
 	// Start receiving
-	uv_udp_recv_start(&req_ctx->udp, udp_alloc_callback, udp_recv_callback);
+	r = uv_udp_recv_start(&req_ctx->udp, udp_alloc_callback, udp_recv_callback);
+	if (r < 0) {
+		if (server_is_js) JS_FreeCString(ctx, server);
+		uv_close((uv_handle_t*) &req_ctx->udp, cleanup_callback);
+		JS_FreeValue(ctx, req_ctx->resolve_func);
+		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return JS_ThrowInternalError(ctx, "Failed to start UDP receive");
+	}
 
 	// Send query
 	uv_buf_t buf = uv_buf_init((char*) query_buf, query_len);
-	int ret = uv_udp_send(&req_ctx->send_req, &req_ctx->udp, &buf, 1,
+	r = uv_udp_send(&req_ctx->send_req, &req_ctx->udp, &buf, 1,
 		(const struct sockaddr*) &req_ctx->server_addr,
 		udp_send_callback);
 
-	if (ret < 0) {
+	if (r < 0) {
 		uv_udp_recv_stop(&req_ctx->udp);
 		req_ctx->__close_count = 1;  // no timer handle to close
 		uv_close((uv_handle_t*) &req_ctx->udp, cleanup_callback);
@@ -927,9 +997,31 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	}
 
 	// Setup timeout
-	uv_timer_init(loop, &req_ctx->timeout_timer);
-	uv_timer_start(&req_ctx->timeout_timer, udp_timeout_callback,
+	r = uv_timer_init(loop, &req_ctx->timeout_timer);
+	if (r < 0) {
+		uv_udp_recv_stop(&req_ctx->udp);
+		uv_close((uv_handle_t*) &req_ctx->udp, cleanup_callback);
+		JS_FreeValue(ctx, req_ctx->resolve_func);
+		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return JS_ThrowInternalError(ctx, "Failed to initialize timer");
+	}
+
+	r = uv_timer_start(&req_ctx->timeout_timer, udp_timeout_callback,
 		timeout_ms, 0);
+	if (r < 0) {
+		uv_udp_recv_stop(&req_ctx->udp);
+		uv_close((uv_handle_t*) &req_ctx->timeout_timer, cleanup_callback);
+		uv_close((uv_handle_t*) &req_ctx->udp, cleanup_callback);
+		JS_FreeValue(ctx, req_ctx->resolve_func);
+		JS_FreeValue(ctx, req_ctx->reject_func);
+		JS_FreeValue(ctx, promise);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return JS_ThrowInternalError(ctx, "Failed to start timer");
+	}
 
 	return promise;
 }

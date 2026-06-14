@@ -33,9 +33,9 @@ typedef struct {
     JSContext *ctx;
     XML_Parser parser;
     JSValue handlers;
-    JSValue current_data;
     bool stopped;
     bool exception;
+    bool parsing;
 } TJSXMLParser;
 
 /* Macro for creating callback wrapper */
@@ -45,8 +45,8 @@ typedef struct {
 /* Macro for invoking JS handler */
 #define INVOKE_HANDLER(state, handler_name, argc, ...) do { \
     JSValue handler = JS_GetPropertyStr((state)->ctx, (state)->handlers, handler_name); \
+    JSValue args[] = { __VA_ARGS__ }; \
     if (JS_IsFunction((state)->ctx, handler)) { \
-        JSValue args[] = { __VA_ARGS__ }; \
         JSValue ret = JS_Call((state)->ctx, handler, JS_UNDEFINED, argc, args); \
         if (JS_IsException(ret)) { \
             (state)->stopped = true; \
@@ -54,8 +54,8 @@ typedef struct {
             if ((state)->parser) XML_StopParser((state)->parser, XML_FALSE); \
         } \
         JS_FreeValue((state)->ctx, ret); \
-        for (int i = 0; i < argc; i++) JS_FreeValue((state)->ctx, args[i]); \
     } \
+    for (int i = 0; i < argc; i++) JS_FreeValue((state)->ctx, args[i]); \
     JS_FreeValue((state)->ctx, handler); \
 } while(0)
 
@@ -153,7 +153,6 @@ static void tjs_xml_parser_finalizer(JSRuntime *rt, JSValue val) {
             XML_ParserFree(state->parser);
         }
         JS_FreeValueRT(rt, state->handlers);
-        JS_FreeValueRT(rt, state->current_data);
         js_free_rt(rt, state);
     }
 }
@@ -164,8 +163,7 @@ static void tjs_xml_parser_mark(JSRuntime *rt, JSValue val,
     TJSXMLParser *p = JS_GetOpaque(val, tjs_xml_parser_class_id);
     if (!p) return;
 
-    JS_MarkValue(rt, p->handlers,    mark_func);
-    JS_MarkValue(rt, p->current_data, mark_func);
+    JS_MarkValue(rt, p->handlers, mark_func);
 }
 
 
@@ -190,8 +188,8 @@ static JSValue tjs_xml_parser_constructor(JSContext *ctx, JSValueConst new_targe
     
     state->ctx = ctx;
     state->handlers = JS_NewObject(ctx);
-    state->current_data = JS_UNDEFINED;
     state->stopped = false;
+    state->parsing = false;
     
     /* Parse options — only valid on objects, otherwise GetPropertyStr would
      * leave a TypeError pending in the runtime. */
@@ -206,9 +204,26 @@ static JSValue tjs_xml_parser_constructor(JSContext *ctx, JSValueConst new_targe
     if (JS_IsString(separator_val)) {
         separator = JS_ToCString(ctx, separator_val);
     }
+    if (JS_IsString(separator_val) && !separator) {
+        JS_FreeValue(ctx, ns_val);
+        JS_FreeValue(ctx, separator_val);
+        JS_FreeValue(ctx, state->handlers);
+        js_free(ctx, state);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     
     /* Create parser with namespace support */
     if (JS_ToBool(ctx, ns_val)) {
+        if (separator && separator[0] == '\0') {
+            if (separator) JS_FreeCString(ctx, separator);
+            JS_FreeValue(ctx, ns_val);
+            JS_FreeValue(ctx, separator_val);
+            JS_FreeValue(ctx, state->handlers);
+            js_free(ctx, state);
+            JS_FreeValue(ctx, obj);
+            return JS_ThrowRangeError(ctx, "namespaceSeparator must not be empty");
+        }
         state->parser = XML_ParserCreateNS(NULL, separator ? separator[0] : '|');
     } else {
         state->parser = XML_ParserCreate(NULL);
@@ -258,6 +273,9 @@ static JSValue tjs_xml_parser_parse(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
+    if (state->parsing) {
+        return JS_ThrowInternalError(ctx, "XML parser is already parsing");
+    }
     
     size_t len;
     const char *data = JS_ToCStringLen(ctx, &len, argv[0]);
@@ -274,7 +292,9 @@ static JSValue tjs_xml_parser_parse(JSContext *ctx, JSValueConst this_val,
     
     state->stopped = false;
     state->exception = false;
+    state->parsing = true;
     int status = XML_Parse(state->parser, data, (int) len, is_final);
+    state->parsing = false;
     JS_FreeCString(ctx, data);
     
     /* A handler threw: propagate the pending JS exception. */
@@ -309,6 +329,9 @@ static JSValue tjs_xml_parser_reset(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
+    if (state->parsing) {
+        return JS_ThrowInternalError(ctx, "Cannot reset parser while parsing");
+    }
     
     const char *encoding = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
     int status = XML_ParserReset(state->parser, encoding);
@@ -339,10 +362,10 @@ static JSValue tjs_xml_parser_get_column(JSContext *ctx, JSValueConst this_val) 
 /* Utility: XML.escape(str) */
 static JSValue tjs_xml_escape(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
-    const char *str = JS_ToCString(ctx, argv[0]);
+    size_t len;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str) return JS_EXCEPTION;
-    
-    size_t len = strlen(str);
+
     size_t new_len = len;
     
     /* Calculate new length */
@@ -375,7 +398,7 @@ static JSValue tjs_xml_escape(JSContext *ctx, JSValueConst this_val,
     escaped[j] = '\0';
     
     JS_FreeCString(ctx, str);
-    JSValue result = JS_NewString(ctx, escaped);
+    JSValue result = JS_NewStringLen(ctx, escaped, j);
     js_free(ctx, escaped);
     return result;
 }

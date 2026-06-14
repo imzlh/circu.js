@@ -39,7 +39,6 @@
 
 #define TJS__DEFAULT_STACK_SIZE 6 * 1024 * 1024  // 6MB
 
-int8_t vm_exit_code;
 static int tjs__argc = 0;
 static char** tjs__argv = NULL;
 
@@ -76,12 +75,12 @@ static const JSMallocFunctions tjs_mf = {
 /* SharedArrayBuffer functions */
 
 typedef struct {
-    int ref_count;
+    _Atomic int ref_count;
     uint8_t buf[0];
 } TJSSABHeader;
 
-static int atomic_add_int(int* ptr, int v) {
-    return atomic_fetch_add((_Atomic(uint32_t)*) ptr, v) + v;
+static int atomic_add_int(_Atomic int* ptr, int v) {
+    return atomic_fetch_add_explicit(ptr, v, memory_order_acq_rel) + v;
 }
 
 static void* tjs__sab_alloc(void* opaque, size_t size) {
@@ -202,7 +201,7 @@ static void uv__stop(uv_async_t* handle) {
      * always made from the correct thread. TJS_Stop may be called from a
      * different thread (e.g. main thread stopping a worker), so JS dispatch
      * must NOT happen in TJS_Stop itself. */
-    tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, vm_exit_code));
+    tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, qrt->exit_code));
     uv_stop(&qrt->loop);
 }
 
@@ -563,6 +562,7 @@ static void uv__check_cb(uv_check_t* handle) {
 
 static int tjs__eval_bytecode(JSContext* ctx, const uint8_t* buf, size_t buf_len, bool check_promise) {
     JSValue obj = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
+    bool obj_owned = !JS_IsException(obj);
     TJSRuntime* trt = TJS_GetRuntime(ctx);
     (void) trt;
 
@@ -572,14 +572,14 @@ static int tjs__eval_bytecode(JSContext* ctx, const uint8_t* buf, size_t buf_len
 
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
         if (JS_ResolveModule(ctx, obj) < 0) {
-            goto error;
+            goto error;  // obj still owned, freed at error label
         }
 
         // define module meta
         JSModuleDef* m = JS_VALUE_GET_PTR(obj);
         JSValue meta = JS_GetImportMeta(ctx, m);
         if (JS_IsException(meta)) {
-            goto error;
+            goto error;  // obj still owned, freed at error label
         }
 
 #ifndef CJS__DISABLE_MODULE_USE
@@ -598,6 +598,7 @@ static int tjs__eval_bytecode(JSContext* ctx, const uint8_t* buf, size_t buf_len
     }
 
     JSValue val = JS_EvalFunction(ctx, obj);
+    obj_owned = false;  // obj consumed by JS_EvalFunction
     if (JS_IsException(val)) {
         goto error;
     }
@@ -622,6 +623,9 @@ static int tjs__eval_bytecode(JSContext* ctx, const uint8_t* buf, size_t buf_len
     return 0;
 
 error:
+    if (obj_owned) {
+        JS_FreeValue(ctx, obj);
+    }
     TJS_DumpException(ctx);
     return -1;
 }
@@ -659,8 +663,8 @@ int TJS_Run(TJSRuntime* qrt) {
         tjs__run_main(qrt);
     }
 
-    if (vm_exit_code != 0) {
-        return vm_exit_code;
+    if (qrt->exit_code != 0) {
+        return qrt->exit_code;
     }
 
     int r;
@@ -669,12 +673,12 @@ int TJS_Run(TJSRuntime* qrt) {
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
     } while (r != 0 && JS_IsJobPending(qrt->rt));
 
-    return vm_exit_code;
+    return qrt->exit_code;
 }
 
 void TJS_Stop(TJSRuntime* qrt) {
     CHECK_NOT_NULL(qrt);
-    if (!qrt->is_worker && vm_exit_code == 0) vm_exit_code = 1;
+    if (!qrt->is_worker && qrt->exit_code == 0) qrt->exit_code = 1;
     /* Only uv_async_send is thread-safe; JS dispatch is deferred to uv__stop
      * which runs inside the target runtime's own event loop thread. */
     uv_async_send(&qrt->stop);

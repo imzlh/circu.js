@@ -78,16 +78,8 @@ static void* console_realloc(void* opaque, void* ptr, size_t size) {
 
 /* STDOUT lock */
 static uv_mutex_t stdout_mutex;
-static int stdout_mutex_initialized = 0;
 
-static void ensure_stdout_mutex_init(void) {
-    if (!stdout_mutex_initialized) {
-        uv_mutex_init(&stdout_mutex);
-        stdout_mutex_initialized = 1;
-    }
-}
-
-#define __mutex(op) ensure_stdout_mutex_init(); uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex);
+#define __mutex(op) do { uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex); } while(0)
 #define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
 #define fprintf2(...) __mutex(fprintf(__VA_ARGS__))
 
@@ -645,7 +637,7 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     default: break;
     }
 
-	size_t offset, len, per;
+	size_t offset = 0, len = 0, per = 0;
     JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &offset, &len, &per);
     if (JS_IsException(buffer)) {
         /* Detached buffer — fall back to generic object display */
@@ -730,8 +722,9 @@ static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* s
 	} else {
 		JSValue result = JS_PromiseResult(ctx, val);
 		format_value(ctx, result, depth + 1, stack, buf, true, opts);
+		JS_FreeValue(ctx, result);
 	}
-	
+
 	put_color(buf, opts, ANSI_CYAN);
 	dbuf_putc(buf, '>');
 		put_reset(buf, opts);
@@ -891,7 +884,7 @@ static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     fprintf2(stderr, ANSI_YELLOW "warn " ANSI_RESET);
-	console_log_internal(ctx, argc, argv, stdout, 2, false);
+	console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
@@ -997,11 +990,16 @@ static const JSCFunctionListEntry console_funcs[] = {
 };
 
 void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
+    static int initialized = 0;
+    if (!initialized) {
+        uv_mutex_init(&stdout_mutex);
+        initialized = 1;
+    }
 #ifdef _WIN32
     // use utf-8 to display correctly in Windows
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    
+
     // ANSI color
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD dwMode = 0;
@@ -1009,7 +1007,7 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hOut, dwMode);
 #endif
-    
+
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }
 

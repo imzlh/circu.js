@@ -25,6 +25,7 @@
 #include "utils.h"
 #include <zlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* Magic values for compression methods */
 enum {
@@ -75,21 +76,21 @@ static int get_window_bits(int method) {
     }
 }
 
+static JSValue tjs_zlib_empty_buffer(JSContext *ctx) {
+    return JS_NewUint8ArrayCopy(ctx, NULL, 0);
+}
+
 /* One-shot compression */
 static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t data_len;
     const uint8_t* data;
     int level = Z_DEFAULT_COMPRESSION;
-    
+
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "compress() requires at least 1 argument: data");
     }
-    
-    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
-    if (!data) {
-        return JS_EXCEPTION;
-    }
-    
+
+    // Convert level parameter BEFORE getting buffer pointer
     if (argc >= 2 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt32(ctx, &level, argv[1]) < 0) {
             return JS_EXCEPTION;
@@ -97,6 +98,12 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
         if (level < -1 || level > 9) {
             return JS_ThrowRangeError(ctx, "Level must be between -1 and 9");
         }
+    }
+
+    // Now safe to get buffer pointer (after conversion callbacks)
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
     }
     
     int method = magic & 0xFF;
@@ -134,6 +141,10 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
     }
     
     size_t out_len = strm.total_out;
+    if (out_len == 0) {
+        js_free(ctx, out);
+        return tjs_zlib_empty_buffer(ctx);
+    }
     uint8_t* out_copy = js_malloc(ctx, out_len);
     if (!out_copy) {
         js_free(ctx, out);
@@ -163,6 +174,9 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
     int window_bits = get_window_bits(method);
     
     /* Initial output buffer size (will grow if needed) */
+    if (data_len > SIZE_MAX / 4) {
+        return JS_ThrowInternalError(ctx, "Decompressed output too large");
+    }
     size_t out_size = data_len * 4;
     if (out_size < 4096) out_size = 4096;
     
@@ -199,6 +213,12 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
         
         if (strm.avail_out == 0) {
             /* Need more output space */
+            /* Limit max decompressed size to prevent decompression bombs (256MB) */
+            if (out_size > 256 * 1024 * 1024) {
+                inflateEnd(&strm);
+                js_free(ctx, out);
+                return JS_ThrowRangeError(ctx, "Decompressed output exceeds maximum size (256MB)");
+            }
             size_t new_size = out_size * 2;
             if (new_size < out_size) {  /* size_t overflow guard */
                 inflateEnd(&strm);
@@ -226,6 +246,10 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
     inflateEnd(&strm);
     
     size_t out_len = strm.total_out;
+    if (out_len == 0) {
+        js_free(ctx, out);
+        return tjs_zlib_empty_buffer(ctx);
+    }
     uint8_t* out_copy = js_malloc(ctx, out_len);
     if (!out_copy) {
         js_free(ctx, out);
@@ -443,18 +467,19 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     
     size_t data_len = 0;
     const uint8_t* data = NULL;
-    
-    /* Data argument is optional for finish/flush */
-    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
-        data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
-        if (!data) {
-            return JS_EXCEPTION;
-        }
-    }
-    
+
     int flush = magic;  /* Flush mode from magic */
     if (argc >= 2 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt32(ctx, &flush, argv[1]) < 0) {
+            return JS_EXCEPTION;
+        }
+    }
+
+    /* Data argument is optional for finish/flush. Convert scalar args first:
+     * JS_ToInt32 may run user code capable of detaching argv[0]. */
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
+        if (!data) {
             return JS_EXCEPTION;
         }
     }
@@ -478,18 +503,48 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     d->strm.next_out = out;
     d->strm.avail_out = out_size;
     
-    int ret = deflate(&d->strm, flush);
+    int ret;
+    size_t produced = 0;
+    while (1) {
+        d->strm.next_out = out + produced;
+        d->strm.avail_out = out_size - produced;
+
+        ret = deflate(&d->strm, flush);
+
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            js_free(ctx, out);
+            return JS_ThrowInternalError(ctx, "Deflate failed");
+        }
+
+        produced = out_size - d->strm.avail_out;
+
+        if (ret == Z_STREAM_END) {
+            d->finished = 1;
+            break;
+        }
+
+        if (d->strm.avail_out != 0) {
+            break;
+        }
+
+        if (out_size > SIZE_MAX / 2) {
+            js_free(ctx, out);
+            return JS_ThrowInternalError(ctx, "Deflated output too large");
+        }
+        size_t new_size = out_size * 2;
+        uint8_t* new_out = js_realloc(ctx, out, new_size);
+        if (!new_out) {
+            js_free(ctx, out);
+            return JS_EXCEPTION;
+        }
+        out = new_out;
+        out_size = new_size;
+    }
     
-    if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+    if (produced == 0) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Deflate failed");
+        return tjs_zlib_empty_buffer(ctx);
     }
-    
-    if (ret == Z_STREAM_END) {
-        d->finished = 1;
-    }
-    
-    size_t produced = out_size - d->strm.avail_out;
     uint8_t* out_copy = js_malloc(ctx, produced);
     if (!out_copy) {
         js_free(ctx, out);
@@ -595,6 +650,9 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     int flush = magic;  /* Flush mode from magic */
     
     /* Allocate output buffer with room to grow */
+    if (data_len > SIZE_MAX / 4) {
+        return JS_ThrowInternalError(ctx, "Inflated output too large");
+    }
     size_t out_size = data_len * 4;
     if (out_size < 4096) out_size = 4096;
     
@@ -625,6 +683,10 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         if (i->strm.avail_out == 0) {
             /* Need more output space */
             size_t new_size = out_size * 2;
+            if (new_size < out_size) {
+                js_free(ctx, out);
+                return JS_ThrowInternalError(ctx, "Inflated output too large");
+            }
             uint8_t* new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {
                 js_free(ctx, out);
@@ -640,6 +702,10 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     size_t produced = out_size - i->strm.avail_out;
+    if (produced == 0) {
+        js_free(ctx, out);
+        return tjs_zlib_empty_buffer(ctx);
+    }
     uint8_t* out_copy = js_malloc(ctx, produced);
     if (!out_copy) {
         js_free(ctx, out);

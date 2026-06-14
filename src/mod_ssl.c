@@ -79,6 +79,7 @@ typedef struct {
     /* ALPN protocol list (heap-allocated; referenced by SSL_CTX callback for
      * server mode, which doesn't copy the buffer). Owned by this context. */
     uint8_t *alpn_list;
+    size_t alpn_list_len;
 } TJSSSLContext;
 
 static thread_local JSClassID tjs_ssl_context_class_id;
@@ -149,10 +150,19 @@ static void set_tls_version_range(SSL_CTX *ctx, const char *min_ver, const char 
 
 static int alpn_cb(SSL* ssl, const unsigned char** out, unsigned char* outlen,
 	const unsigned char* in, unsigned int inlen, void* arg) {
-	/* Simple first-match selection */
+	/* Pass the full ALPN list to SSL_select_next_proto.
+	 * The list format is [len1][proto1][len2][proto2]... with total length */
 	unsigned char* list = (unsigned char*) arg;
-	if (SSL_select_next_proto((unsigned char**) out, outlen,
-		list + 1, list[0], in, inlen)
+	/* Use the full list length stored in ssl_ctx->alpn_list_len */
+	TJSSSLContext *ssl_ctx = SSL_get_app_data(ssl);
+	if (ssl_ctx && ssl_ctx->alpn_list_len > 0) {
+		if (SSL_select_next_proto((unsigned char**) out, outlen,
+			list, (unsigned int)ssl_ctx->alpn_list_len, in, inlen)
+			== OPENSSL_NPN_NEGOTIATED) {
+			return SSL_TLSEXT_ERR_OK;
+		}
+	} else if (SSL_select_next_proto((unsigned char**) out, outlen,
+		list, (unsigned int)strlen((const char*)list), in, inlen)
 		== OPENSSL_NPN_NEGOTIATED) {
 		return SSL_TLSEXT_ERR_OK;
 	}
@@ -360,6 +370,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
             if (ssl_ctx->mode == TJS_SSL_MODE_SERVER) {
                 /* server: callback retains the pointer — keep on ssl_ctx */
                 ssl_ctx->alpn_list = alpn_list;
+                ssl_ctx->alpn_list_len = alpn_list_len;
                 SSL_CTX_set_alpn_select_cb(ssl_ctx->ssl_ctx, alpn_cb, alpn_list);
             } else {
                 /* client: SSL_CTX_set_alpn_protos copies the buffer internally */
@@ -559,8 +570,10 @@ static JSValue tjs_ssl_pipe_feed(JSContext *ctx, JSValueConst this_val,
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) return JS_EXCEPTION;
-    
-    int ret = BIO_write(pipe->rbio, buf, size);
+
+    /* Clamp to INT_MAX to prevent truncation */
+    if (size > INT_MAX) size = INT_MAX;
+    int ret = BIO_write(pipe->rbio, buf, (int)size);
     return JS_NewInt32(ctx, ret);
 }
 
@@ -569,15 +582,21 @@ static JSValue tjs_ssl_pipe_read(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
-    
+
     int32_t size = 16384;
     if (argc > 0) {
-        JS_ToInt32(ctx, &size, argv[0]);
+        if (JS_ToInt32(ctx, &size, argv[0]) < 0) {
+            return JS_EXCEPTION;
+        }
+        /* Validate size range */
+        if (size <= 0 || size > 1048576) {
+            return JS_ThrowRangeError(ctx, "size must be between 1 and 1048576");
+        }
     }
-    
+
     uint8_t *buf = js_malloc(ctx, size);
     if (!buf) return JS_EXCEPTION;
-    
+
     int ret = SSL_read(pipe->ssl, buf, size);
     
     if (ret > 0) {
@@ -600,9 +619,11 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) return JS_EXCEPTION;
-    
-    int ret = SSL_write(pipe->ssl, buf, size);
-    
+
+    /* Clamp to INT_MAX to prevent truncation */
+    if (size > INT_MAX) size = INT_MAX;
+    int ret = SSL_write(pipe->ssl, buf, (int)size);
+
     if (ret > 0) {
         return JS_NewInt32(ctx, ret);
     } else {
@@ -747,16 +768,20 @@ static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst th
     if (san_names) {
         JSValue san_array = JS_NewArray(ctx);
         int san_count = sk_GENERAL_NAME_num(san_names);
-        
+        int san_index = 0;  // Track actual SAN entries (non-DNS skipped)
+
         for (int i = 0; i < san_count; i++) {
             GENERAL_NAME *name = sk_GENERAL_NAME_value(san_names, i);
             if (name->type == GEN_DNS) {
                 ASN1_STRING *dns = name->d.dNSName;
                 const char *dns_str = (const char *)ASN1_STRING_get0_data(dns);
-                JS_SetPropertyUint32(ctx, san_array, i, JS_NewString(ctx, dns_str));
+                int dns_len = ASN1_STRING_length(dns);
+                // Use JS_NewStringLen to handle potential embedded NUL and avoid strlen overflow
+                JS_SetPropertyUint32(ctx, san_array, san_index, JS_NewStringLen(ctx, dns_str, dns_len));
+                san_index++;
             }
         }
-        
+
         JS_SetPropertyStr(ctx, cert_obj, "subjectAltNames", san_array);
         sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
     }
@@ -923,19 +948,23 @@ static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
     const char *data = cstr(ctx, argv[0]);
     if (!data) return JS_EXCEPTION;
-    
+
     const char *type = argc > 1 ? cstr(ctx, argv[1]) : "certificate";
-    
+    if (argc > 1 && !type) {
+        JS_FreeCString(ctx, data);
+        return JS_ThrowTypeError(ctx, "type must be a string");
+    }
+
     BIO *bio = BIO_new_mem_buf(data, -1);
     JS_FreeCString(ctx, data);
-    
+
     if (!bio) {
         if (type != NULL && argc > 1) JS_FreeCString(ctx, type);
         return JS_ThrowOutOfMemory(ctx);
     }
-    
+
     JSValue result = JS_UNDEFINED;
-    
+
     if (strcmp(type, "certificate") == 0) {
         X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
         if (cert) {

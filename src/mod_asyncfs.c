@@ -488,16 +488,16 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
-    /* arg 0: buffer */
-    size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
-    if (!buf) {
+    /* Convert position BEFORE getting buffer pointer (JS_ToInt64 can detach buffer) */
+    int64_t pos = -1;
+    if (!JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &pos, argv[1])) {
         return JS_EXCEPTION;
     }
 
-    /* arg 1: position (on the file) */
-    int64_t pos = -1;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &pos, argv[1])) {
+    /* arg 0: buffer (get pointer after JS conversions to prevent detach UAF) */
+    size_t size;
+    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
+    if (!buf) {
         return JS_EXCEPTION;
     }
 

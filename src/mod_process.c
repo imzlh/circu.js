@@ -270,6 +270,7 @@ static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
     JS_FreeValueRT(rt, p->obj);
     TJS_FreePromiseRT(rt, &p->status.result);
     for (int i = 0; i < 3; i++) JS_FreeValueRT(rt, p->stdio[i]);
+    JS_FreeValueRT(rt, p->ipc_pipe);
 
     if (p->pty_mode) {
         JS_FreeValueRT(rt, p->pty_readable);
@@ -294,6 +295,7 @@ static void tjs_process_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func)
     JS_MarkValue(rt, p->obj, mark_func);
     TJS_MarkPromise(rt, &p->status.result, mark_func);
     for (int i = 0; i < 3; i++) JS_MarkValue(rt, p->stdio[i], mark_func);
+    JS_MarkValue(rt, p->ipc_pipe, mark_func);
     if (p->pty_mode) {
         JS_MarkValue(rt, p->pty_readable, mark_func);
         JS_MarkValue(rt, p->pty_writable, mark_func);
@@ -1531,12 +1533,14 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
         DWORD ws; GetExitCodeProcess(p->process.process_handle, &ws);
         es = (int64_t)ws; ts = 0;
 #else
-        int stat;
-        if (waitpid(p->process.pid, &stat, 0) < 0)
-            return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-        if (WIFEXITED(stat))        { es = WEXITSTATUS(stat); ts = 0; }
-        else if (WIFSIGNALED(stat)) { es = 128 + WTERMSIG(stat); ts = WTERMSIG(stat); }
-        else return JS_ThrowInternalError(ctx, "unexpected waitpid status");
+        // Normal mode: process is managed by libuv (uv__exit_cb handles waitpid).
+        // Don't call waitpid here - it would steal the exit status from libuv.
+        // Instead, drive the event loop until the process exits.
+        while (!p->status.exited) {
+            uv_run(TJS_GetLoop(ctx), UV_RUN_ONCE);
+        }
+        es = p->status.exit_status;
+        ts = p->status.term_signal;
 #endif
     }
 

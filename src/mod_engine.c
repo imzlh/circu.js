@@ -89,11 +89,34 @@ typedef struct {
 
 static inline JSValue module_new(JSContext* ctx, JSModuleDef* def){
     JSValue obj = JS_NewObjectClass(ctx, js_module_class_id);
+    if (JS_IsException(obj)) return obj;
 	tjs_module_t* mt = js_malloc(ctx, sizeof(tjs_module_t));
+	if (!mt) {
+		JS_FreeValue(ctx, obj);
+		return JS_ThrowOutOfMemory(ctx);
+	}
 	init_list_head(&mt->local_def);
     mt->def = def;
     JS_SetOpaque(obj, mt);
     return obj;
+}
+
+static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
+	tjs_module_t* mt = JS_GetOpaque(obj, js_module_class_id);
+	if(!mt) return;
+
+	// Free all exported var_refs
+	if(mt->local_def.next) {
+		struct list_head *pos, *tmp;
+		list_for_each_safe(pos, tmp, &mt->local_def){
+			tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
+			JS_FreeModuleExport(rt, me->var);
+			JS_FreeAtomRT(rt, me->atom);
+			js_free_rt(rt, me);
+		}
+	}
+
+	js_free_rt(rt, mt);
 }
 
 static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
@@ -187,7 +210,10 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 
     JS_FreeCString(ctx, source);
     if(_mname) JS_FreeCString(ctx, _mname);
-    return module_new(ctx, (JSModuleDef*)JS_VALUE_GET_PTR(compiled));
+    JSModuleDef* def = (JSModuleDef*)JS_VALUE_GET_PTR(compiled);
+    JSValue result = module_new(ctx, def);
+    JS_FreeValue(ctx, compiled);  // Release the compiled JSValue; module_new now owns the def
+    return result;
 fail:
     JS_FreeCString(ctx, source);
     if(_mname) JS_FreeCString(ctx, _mname);
@@ -272,7 +298,8 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 	list_for_each(pos, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
 		if(name_atom == me->atom){
-			JS_FreeModuleExport(JS_GetRuntime(ctx), mt->def);
+			// Free the specific export's var_ref, not the whole module def
+			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
 			JS_FreeAtom(ctx, me->atom);
 			list_del(&me->list);
 			js_free(ctx, me);
@@ -338,25 +365,6 @@ JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
 
 JSValue tjs__new_module(JSContext* ctx, JSModuleDef* mt){
 	return module_new(ctx, mt);
-}
-
-static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
-	tjs_module_t* mt = JS_GetOpaque(obj, js_module_class_id);
-	if(!mt) return;
-	
-	// here we should free var
-	// FIXME: link maybe incomplete, we should fix it
-	if(mt->local_def.next) {
-		struct list_head *pos, *tmp;
-		list_for_each_safe(pos, tmp, &mt->local_def){
-			tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
-			// JS_FreeModuleExport(rt, me->var);
-			JS_FreeAtomRT(rt, me->atom);
-			js_free_rt(rt, me);
-		}
-	}
-
-	js_free_rt(rt, mt);
 }
 
 static const JSClassDef js_module_class = {
@@ -446,13 +454,18 @@ static JSValue tjs_deserialize(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
     JSValue ret = JS_ReadObject(ctx, buf, len, flags);
+    if (JS_IsException(ret)) {
+        return ret;
+    }
 	switch (JS_VALUE_GET_NORM_TAG(ret)){
-		case JS_TAG_MODULE:
-			return module_new(ctx, (JSModuleDef*)JS_VALUE_GET_PTR(ret));
-
+		case JS_TAG_MODULE: {
+			JSValue result = module_new(ctx, (JSModuleDef*)JS_VALUE_GET_PTR(ret));
+			JS_FreeValue(ctx, ret);  // Release the module JSValue wrapper
+			return result;
+		}
 		case JS_TAG_FUNCTION_BYTECODE:
-			// to do...
-
+			// Explicit handling (was fallthrough to default)
+			return ret;
 		default:
 			return ret;
 	}
@@ -512,9 +525,12 @@ static JSValue tjs_encodeString(JSContext *ctx, JSValue this_val, int argc, JSVa
 		return JS_ThrowTypeError(ctx, "argument must be a string");
 	}
 
-	size_t strlen;
-	const char* str = JS_ToCStringLen(ctx, &strlen, argv[0]);
-	JSValue buffer = JS_NewUint8ArrayCopy(ctx, (uint8_t*)str, strlen);
+	size_t slen;
+	const char* str = JS_ToCStringLen(ctx, &slen, argv[0]);
+	if (!str) {
+		return JS_EXCEPTION;
+	}
+	JSValue buffer = JS_NewUint8ArrayCopy(ctx, (uint8_t*)str, slen);
 	JS_FreeCString(ctx, str);
 	return buffer;
 }
@@ -526,7 +542,7 @@ typerr:
 	}
 
 	uint8_t* buf = NULL;
-	size_t buflen;
+	size_t buflen = 0;
 	if (JS_GetTypedArrayType(argv[0]) != -1){
 		buf = JS_GetUint8Array(ctx, &buflen, argv[0]);
 	} else if (JS_IsArrayBuffer(argv[0])) {
@@ -546,14 +562,17 @@ static JSValue tjs_encodeU16String(JSContext* ctx, JSValue this_val, int argc, J
 		return JS_ThrowTypeError(ctx, "argument must be a string");
 	}
 
-	size_t strlen;
-	const uint16_t* str = JS_ToCStringLenUTF16(ctx, &strlen, argv[0]);
-	JSValue buffer = JS_NewArrayBufferCopy(ctx, (const uint8_t*)str, strlen *2);
+	size_t slen;
+	const uint16_t* str = JS_ToCStringLenUTF16(ctx, &slen, argv[0]);
+	if (!str) {
+		return JS_EXCEPTION;
+	}
+	JSValue buffer = JS_NewArrayBufferCopy(ctx, (const uint8_t*)str, slen *2);
 	JS_FreeCStringUTF16(ctx, str);
 
 	// to Uint16Array
 	JSValue global = JS_GetGlobalObject(ctx);
-	JSValue u16arrctor = JS_GetPropertyStr(ctx, global, "Uint16Array");	
+	JSValue u16arrctor = JS_GetPropertyStr(ctx, global, "Uint16Array");
 	if (!JS_IsFunction(ctx, u16arrctor)) {
 		JS_FreeValue(ctx, u16arrctor);
 		JS_FreeValue(ctx, global);
@@ -586,22 +605,22 @@ typerr:
 }
 
 
-static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst promise, int argc, JSValueConst* argv) {
-	if (argc == 0 || !JS_IsPromise(promise)) {
+static JSValue tjs_proimise_result(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+	if (argc == 0 || !JS_IsPromise(argv[0])) {
 		return JS_ThrowTypeError(ctx, "argument must be a Promise");
 	}
 
-	JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
+	JSPromiseStateEnum state = JS_PromiseState(ctx, argv[0]);
 	JSValue err;
 	switch (state) {
 		case JS_PROMISE_PENDING:
 		return JS_NULL;
 
 		case JS_PROMISE_FULFILLED:
-		return JS_PromiseResult(ctx, promise);
+		return JS_PromiseResult(ctx, argv[0]);
 
 		case JS_PROMISE_REJECTED:
-			err = JS_PromiseResult(ctx, promise);
+			err = JS_PromiseResult(ctx, argv[0]);
 		return JS_Throw(ctx, err);
 
 		default: abort();
@@ -732,11 +751,11 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	switch (state) {
 		case JS_PROMISE_FULFILLED: {
 			JSValue result = JS_PromiseResult(ctx, argv[0]);
-			return JS_DupValue(ctx, result);
+			return result;  // Already owned reference, don't dup
 		}
 		case JS_PROMISE_REJECTED: {
 			JSValue error = JS_PromiseResult(ctx, argv[0]);
-			return JS_Throw(ctx, JS_DupValue(ctx, error));
+			return JS_Throw(ctx, error);  // Throw consumes the error, don't dup
 		}
 		case JS_PROMISE_PENDING:
 			if (aborted) {

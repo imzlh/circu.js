@@ -443,26 +443,29 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st) {
     JSValue obj = JS_NewObject(ctx);
 
     // The struct is same as stat() in asyncfs
-#define SET_UINT64_FIELD(x)                                                                                            \
+#define SET_UINT64_FIELD(x) \
+    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, st->st_##x), JS_PROP_C_W_E);
+#define SET_UINT32_FIELD(x) \
     JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->st_##x), JS_PROP_C_W_E);
 
-    SET_UINT64_FIELD(dev);
-    SET_UINT64_FIELD(mode);
-    SET_UINT64_FIELD(nlink);
-    SET_UINT64_FIELD(uid);
-    SET_UINT64_FIELD(gid);
-    SET_UINT64_FIELD(rdev);
-    SET_UINT64_FIELD(ino);
-    SET_UINT64_FIELD(size);
+    SET_UINT32_FIELD(dev);
+    SET_UINT32_FIELD(mode);
+    SET_UINT32_FIELD(nlink);
+    SET_UINT32_FIELD(uid);
+    SET_UINT32_FIELD(gid);
+    SET_UINT32_FIELD(rdev);
+    SET_UINT64_FIELD(ino);      // 64-bit inode
+    SET_UINT64_FIELD(size);     // 64-bit file size
 #ifdef _WIN32
     // Windows doesn't have blksize and blocks, set to 0
     JS_DefinePropertyValueStr(ctx, obj, "blksize", JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, obj, "blocks", JS_NewUint32(ctx, 0), JS_PROP_C_W_E);
 #else
-    SET_UINT64_FIELD(blksize);
-    SET_UINT64_FIELD(blocks);
+    SET_UINT32_FIELD(blksize);
+    SET_UINT64_FIELD(blocks);   // 64-bit block count
 #endif
 #undef SET_UINT64_FIELD
+#undef SET_UINT32_FIELD
 
 #ifdef _WIN32
     // Windows uses st_atime, st_mtime, st_ctime (time_t, not timespec)
@@ -792,12 +795,13 @@ static JSValue tjs_syncfs_pread(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
 
-    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
-    if (!buffer) {
+    // Convert offset BEFORE getting buffer pointer (offset conversion can detach buffer)
+    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
         return JS_EXCEPTION;
     }
 
-    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
         return JS_EXCEPTION;
     }
 
@@ -825,12 +829,13 @@ static JSValue tjs_syncfs_pwrite(JSContext* ctx, JSValueConst this_val, int argc
         return JS_EXCEPTION;
     }
 
-    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
-    if (!buffer) {
+    // Convert offset BEFORE getting buffer pointer (offset conversion can detach buffer)
+    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
         return JS_EXCEPTION;
     }
 
-    if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
+    buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
+    if (!buffer) {
         return JS_EXCEPTION;
     }
 
@@ -970,7 +975,8 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         return JS_EXCEPTION;
     }
 
-    ssize_t n, total_read = 0;
+    ssize_t n;
+    size_t total_read = 0;
     while ((n = read(fd, buf + total_read, size - total_read)) != 0) {
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -1009,17 +1015,18 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
         return JS_EXCEPTION;
     }
 
-    data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
-    if (!data) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
+    // Convert mode BEFORE getting data buffer (mode conversion can detach buffer)
     if (argc >= 3 && !JS_IsUndefined(argv[2])) {
         if (JS_ToInt32(ctx, &mode, argv[2]) < 0) {
             JS_FreeCString(ctx, path);
             return JS_EXCEPTION;
         }
+    }
+
+    data = JS_GetAnyBuffer(ctx, &data_len, argv[1]);
+    if (!data) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
     }
 
     int fd;
@@ -1414,7 +1421,6 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
 #ifdef _WIN32
     // Windows implementation for reading symbolic links
     HANDLE hFile = NULL;
-    DWORD buffer_size = 4096; // Initial buffer size
 
     // Convert UTF-8 path to wide-char for Unicode support
     WCHAR *wpath = utf8_to_wcs(path);
@@ -1625,7 +1631,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
 
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, error_msg);
+        return JS_ThrowTypeError(ctx, "%s", error_msg);
     }
 #else
     // Unix high-performance copy using sendfile() for efficient kernel-space copying
@@ -1956,15 +1962,17 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
     JS_FreeCString(ctx, path);
     return result;
 #else
-    char resolved[PATH_MAX];
-    char* ret = realpath(path, resolved);
+    // Use NULL to let realpath allocate, which is safer than PATH_MAX on some platforms
+    char* ret = realpath(path, NULL);
     if (!ret) {
         JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(errno), path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
-    return JS_NewString(ctx, resolved);
+    JSValue result = JS_NewString(ctx, ret);
+    free(ret);
+    return result;
 #endif
 }
 

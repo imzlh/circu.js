@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build build)",
+      "Bash(git add *)",
+      "Bash(git checkout *)",
+      "Bash(cd /d \"d:\\\\project\\\\cno-cli\\\\circu.js\")",
+      "Bash(cmake --build build --config Release)",
+      "Bash(cmake --build .)"
+    ]
+  }
+}

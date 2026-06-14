@@ -98,29 +98,33 @@ char* tjs__get_self() {
 
 static uint8_t* read_file(FILE* file, size_t *file_size) {
     if (!file) return NULL;
-    
+
     fseek(file, 0, SEEK_END);
 #ifdef _WIN32
-    *file_size = _ftelli64(file);
+    __int64 sz = _ftelli64(file);
+    if (sz < 0) return NULL;
+    *file_size = (size_t)sz;
 #else
-    *file_size = ftello(file);
+    off_t sz = ftello(file);
+    if (sz < 0) return NULL;
+    *file_size = (size_t)sz;
 #endif
     fseek(file, 0, SEEK_SET);
-    
-    if (*file_size < 4){
-		return NULL;
-	}
-    
+
+    if (*file_size < 4) {
+        return NULL;
+    }
+
     unsigned char *buffer = malloc(*file_size);
     if (!buffer) {
         return NULL;
     }
-    
+
     if (fread(buffer, 1, *file_size, file) != *file_size) {
         free(buffer);
         return NULL;
     }
-    
+
     return buffer;
 }
 
@@ -130,18 +134,26 @@ uint8_t* tjs__read_attached(FILE* file, uint32_t *binary_length) {
     if (!file_data) {
         return NULL;
     }
-    
-    *binary_length = *(uint32_t*)(file_data + file_size - 4);
-    
-    assert (*binary_length + 4 <= file_size);
-    
-    uint8_t *attach = malloc(*binary_length);
-    if (!attach) {
+
+    /* Read and validate binary length from file tail (use memcpy for alignment safety) */
+    uint32_t len;
+    memcpy(&len, file_data + file_size - 4, sizeof(len));
+
+    /* Prevent integer overflow: len + 4 must not wrap around */
+    if (len > file_size - 4) {
+        free(file_data);
         return NULL;
     }
-    
-    memcpy(attach, file_data + file_size - 4 - *binary_length, *binary_length);
-    
+
+    uint8_t *attach = malloc(len);
+    if (!attach) {
+        free(file_data);
+        return NULL;
+    }
+
+    memcpy(attach, file_data + file_size - 4 - len, len);
+    *binary_length = len;
+
     free(file_data);
     return attach;
 }
@@ -171,12 +183,18 @@ int tjs__build_binary(FILE* file, uint8_t *binary, uint32_t size, int create) {
     if (!original_data) {
         return -1;
     }
-    
+
     size_t program_size;
     if (!create) {
         uint32_t old_binary_length;
         uint8_t *old_binary = tjs__read_attached(file, &old_binary_length);
         if (old_binary) {
+            /* Prevent underflow: check that old length is reasonable */
+            if (old_binary_length + 4 > original_size) {
+                free(old_binary);
+                free(original_data);
+                return -1;
+            }
             program_size = original_size - old_binary_length - 4;
             free(old_binary);
         } else {
@@ -185,10 +203,10 @@ int tjs__build_binary(FILE* file, uint8_t *binary, uint32_t size, int create) {
     } else {
         program_size = original_size;
     }
-    
-    int result = tjs__write_attached(file, original_data, program_size, 
+
+    int result = tjs__write_attached(file, original_data, program_size,
                                     binary, size);
-    
+
     free(original_data);
     return result;
 }
@@ -203,11 +221,17 @@ uint8_t* tjs__read_self_attached(uint32_t *binary_length){
     static uint8_t* js = NULL;
     static uint32_t size = 0;
     static char* self_exe_path = NULL;
-    if(size == 0){
+    if (size == 0) {
         self_exe_path = tjs__get_self();
-        assert(self_exe_path != NULL);
+        if (!self_exe_path) {
+            *binary_length = 0;
+            return NULL;
+        }
         FILE* fp = fopen(self_exe_path, "rb");
-        assert(fp != NULL);
+        if (!fp) {
+            *binary_length = 0;
+            return NULL;
+        }
         js = tjs__read_attached(fp, &size);
         fclose(fp);
     }
@@ -218,17 +242,22 @@ uint8_t* tjs__read_self_attached(uint32_t *binary_length){
 
 int tjs__set_self_attached(uint8_t *binary, uint32_t binary_length, bool overwrite) {
 	static char* self_exe_path = NULL;
-	if(self_exe_path == NULL){
+	if (self_exe_path == NULL) {
 		self_exe_path = tjs__get_self();
+		if (!self_exe_path) {
+			return -1;
+		}
 	}
 
-	// in windows, we need to copy&move
+	/* in windows, we need to copy&move */
 #ifdef _WIN32
-	// todo
+	/* todo */
 #endif
 
 	FILE* self_exe_file = fopen(self_exe_path, "rb+");
-	assert(self_exe_file != NULL);
+	if (!self_exe_file) {
+		return -1;
+	}
 	int ret = tjs__build_binary(self_exe_file, binary, binary_length, overwrite);
 	fclose(self_exe_file);
 	return ret;

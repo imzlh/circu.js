@@ -141,7 +141,9 @@ static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue
         type = REG_SZ; size = (wcslen(wbuf) + 1) * sizeof(WCHAR);
         data = (const BYTE *)wbuf;
     } else if (JS_IsNumber(val)) {
-        JS_ToUint32(ctx, &dword_val, val);
+        uint32_t dword_val32;
+        JS_ToUint32(ctx, &dword_val32, val);
+        dword_val = (DWORD)dword_val32;
         type = REG_DWORD; size = sizeof(DWORD);
         data = (const BYTE *)&dword_val;
     } else {

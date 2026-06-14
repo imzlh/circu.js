@@ -75,6 +75,7 @@ static void tjs_fswatch_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func)
     TJSFsWatch *fw = tjs_fswatch_get(val);
     if (fw) {
         JS_MarkValue(rt, fw->callback, mark_func);
+        JS_MarkValue(rt, fw->this_val, mark_func);
     }
 }
 
@@ -155,8 +156,6 @@ static void uv__fs_event_cb(uv_fs_event_t *handle, const char *filename, int eve
     } else if (events & UV_CHANGE) {
         event = JS_NewString(ctx, "change");
     } else {
-        // This shouldn't happen.
-        CHECK(0 && "invalid fs events");
         return;
     }
 

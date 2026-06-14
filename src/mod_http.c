@@ -72,6 +72,7 @@ typedef struct {
 	JSValue pending_exc;
 
 	bool initialized;
+	bool running;
 } TJSLlhttpParser;
 
 static thread_local JSClassID tjs_llhttp_parser_class_id;
@@ -254,18 +255,15 @@ static void tjs_llhttp_parser_init_llhttp(TJSLlhttpParser* p, int type) {
 }
 
 static void tjs_llhttp_parser_finalizer(JSRuntime* rt, JSValue val) {
-	(void) rt;
 	TJSLlhttpParser* p = JS_GetOpaque(val, tjs_llhttp_parser_class_id);
 	if (!p) return;
 
-	JSContext* ctx = p->ctx;
-
 	for (int i = 0; i < EV_MAX; i++)
-		JS_FreeValue(ctx, p->events[i]);
-	JS_FreeValue(ctx, p->current_buf);
-	JS_FreeValue(ctx, p->pending_exc);
+		JS_FreeValueRT(rt, p->events[i]);
+	JS_FreeValueRT(rt, p->current_buf);
+	JS_FreeValueRT(rt, p->pending_exc);
 
-	js_free(ctx, p);
+	js_free_rt(rt, p);
 }
 
 static void tjs_llhttp_parser_mark(JSRuntime* rt, JSValueConst val, JS_MarkFunc* mark_func) {
@@ -288,11 +286,11 @@ static JSClassDef tjs_llhttp_parser_class = {
 
 static JSValue tjs_llhttp_parser_ctor(JSContext* ctx, JSValueConst new_target,
 	int argc, JSValueConst* argv) {
-	int32_t type32 = HTTP_BOTH;		// default to both types
+	int32_t type32 = 2;		// HTTP_BOTH = 2
 	if (argc > 0) {
 		if (JS_ToInt32(ctx, &type32, argv[0]) == -1) return JS_EXCEPTION;
-		// 0 <= type32 <= 2 (HTTP_REQUEST, HTTP_RESPONSE, HTTP_BOTH)
-		if (type32 < HTTP_BOTH || type32 > HTTP_RESPONSE) {
+		// 0 = HTTP_REQUEST, 1 = HTTP_RESPONSE, 2 = HTTP_BOTH
+		if (type32 < 0 || type32 > 2) {
 			return JS_ThrowRangeError(ctx, "invalid parser type");
 		}
 	}
@@ -313,6 +311,7 @@ static JSValue tjs_llhttp_parser_ctor(JSContext* ctx, JSValueConst new_target,
 	tjs_llhttp_init_ref(&p->pending_exc);
 	p->cur_base = NULL;
 	p->cur_len = 0;
+	p->running = false;
 
 	tjs_llhttp_parser_init_llhttp(p, type32);
 
@@ -354,10 +353,19 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv) {
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
+	if (p->running) {
+		return JS_ThrowInternalError(ctx, "parser is already executing");
+	}
+	if (argc == 0) {
+		return JS_ThrowTypeError(ctx, "execute expects a buffer");
+	}
 
 	size_t len = 0;
-	uint8_t* data = argc == 0 ? NULL : JS_GetAnyBuffer(ctx, &len, argv[0]);
+	uint8_t* data = JS_GetAnyBuffer(ctx, &len, argv[0]);
 	if (!data) return JS_EXCEPTION;
+	uint8_t* parse_data = js_malloc(ctx, len ? len : 1);
+	if (!parse_data) return JS_ThrowOutOfMemory(ctx);
+	memcpy(parse_data, data, len);
 
 	/* clear pending exception before running */
 	if (!JS_IsUndefined(p->pending_exc)) {
@@ -367,12 +375,14 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 
 	tjs_llhttp_set_ref(ctx, &p->current_buf, JS_DupValue(ctx, argv[0]));
 
-	p->cur_base = (const uint8_t*) data;
+	p->cur_base = (const uint8_t*) parse_data;
 	p->cur_len = len;
+	p->running = true;
 
-	llhttp_errno_t err = llhttp_execute(&p->parser, (const char*) data, len);
+	llhttp_errno_t err = llhttp_execute(&p->parser, (const char*) parse_data, len);
 
 	/* release current buffer ref */
+	p->running = false;
 	tjs_llhttp_set_ref(ctx, &p->current_buf, JS_UNDEFINED);
 	p->cur_base = NULL;
 	p->cur_len = 0;
@@ -381,6 +391,7 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 	if (!JS_IsUndefined(p->pending_exc)) {
 		JSValue exc = p->pending_exc;
 		p->pending_exc = JS_UNDEFINED;
+		js_free(ctx, parse_data);
 		return JS_Throw(ctx, exc);
 	}
 
@@ -399,13 +410,14 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 
 	/* bytes consumed: error_pos points to where error occurred; if OK, it's end */
 	const char* err_pos = llhttp_get_error_pos(&p->parser);
-	if (err_pos && data) {
+	if (err_pos) {
 		JS_SetPropertyStr(ctx, res, "bytesConsumed",
-			JS_NewUint32(ctx, (uint32_t) ((const uint8_t*) err_pos - (const uint8_t*) data)));
+			JS_NewUint32(ctx, (uint32_t) ((const uint8_t*) err_pos - (const uint8_t*) parse_data)));
 	} else {
 		JS_SetPropertyStr(ctx, res, "bytesConsumed", JS_NewUint32(ctx, (uint32_t) len));
 	}
 
+	js_free(ctx, parse_data);
 	return res;
 }
 
@@ -414,6 +426,7 @@ static JSValue tjs_llhttp_pause(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
+	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
 	llhttp_pause(&p->parser);
 	return JS_UNDEFINED;
 }
@@ -423,6 +436,7 @@ static JSValue tjs_llhttp_resume(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
+	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
 	llhttp_resume(&p->parser);
 	return JS_UNDEFINED;
 }
@@ -431,11 +445,12 @@ static JSValue tjs_llhttp_reset(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv) {
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
+	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
 
 	int32_t type32 = p->type;
 	if (argc > 0 && !JS_IsUndefined(argv[0])) {
 		if (JS_ToInt32(ctx, &type32, argv[0]) < 0) return JS_EXCEPTION;
-		if (type32 != HTTP_REQUEST && type32 != HTTP_RESPONSE) {
+		if (type32 < 0 || type32 > 2) {
 			return JS_ThrowRangeError(ctx, "invalid parser type");
 		}
 	}
@@ -451,6 +466,7 @@ static JSValue tjs_llhttp_finish(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
+	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
 
 	llhttp_errno_t err = llhttp_finish(&p->parser);
 
@@ -511,7 +527,8 @@ static JSValue tjs_llhttp_static_strerr(JSContext* ctx, JSValueConst this_val, i
 
 	int32_t err = 0;
 	JS_ToInt32(ctx, &err, argv[0]);
-	return JS_NewString(ctx, llhttp_errno_name((llhttp_errno_t) err));
+	const char* name = llhttp_errno_name((llhttp_errno_t) err);
+	return name ? JS_NewString(ctx, name) : JS_NULL;
 }
 
 static JSValue tjs_llhttp_static_status_text(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -524,7 +541,8 @@ static JSValue tjs_llhttp_static_status_text(JSContext* ctx, JSValueConst this_v
 		return JS_ThrowTypeError(ctx, "status code invalid. expects an integer between 100 and 599");
 	}
 	
-	return JS_NewString(ctx, llhttp_status_name((llhttp_status_t ) status));
+	const char* name = llhttp_status_name((llhttp_status_t ) status);
+	return name ? JS_NewString(ctx, name) : JS_NULL;
 }
 
 static const JSCFunctionListEntry tjs_module_consts[] = {

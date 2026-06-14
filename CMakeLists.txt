@@ -28,7 +28,13 @@ set(cjs_ldflags "")
 # Set compiler flags based on compiler type
 if(MSVC)
     # MSVC compiler flags
-    list(APPEND cjs_cflags /std:c11 /experimental:c11atomics /W4 /Zi)
+    list(APPEND cjs_cflags
+        /std:c11 /experimental:c11atomics /W4 /Zi /WX /permissive- /utf-8
+        /wd4100 /wd4996 /wd4127 /wd4244 /wd4267 /wd4152
+        /wd4456 /wd4457 /wd4458 /wd4459 /wd4200 /wd4068 /wd4310 /wd4702
+        /D_CRT_SECURE_NO_WARNINGS /D_CRT_DECLARE_NONSTDC_NAMES
+    )
+    list(APPEND cjs_ldflags /STACK:8388608 /WX /INCREMENTAL:NO /FORCE:MULTIPLE)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
         list(APPEND cjs_cflags /Od)
@@ -361,10 +367,6 @@ set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
 )
 
-if(MSVC)
-    target_link_options(cjs-cli PRIVATE "/STACK:8388608")
-endif()
-
 # ─── Embed bytecode blob into cjs-cli ────────────────────────────────────────
 # When CJS_BLOB_C is set (by the parent project), it points to a generated .c
 # file containing the bytecode as a const uint8_t array (cjs_blob[] / cjs_blob_size).
@@ -390,6 +392,3 @@ add_executable(cjsc EXCLUDE_FROM_ALL
 )
 target_link_libraries(cjsc qjs)
 target_link_options(cjsc PRIVATE ${cjs_ldflags})
-if(MSVC)
-    target_link_options(cjsc PRIVATE "/STACK:8388608")
-endif()

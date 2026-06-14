@@ -253,7 +253,15 @@ static void uv__udp_send_cb(uv_udp_send_t *req, int status) {
     CHECK_NOT_NULL(u);
 
     JSContext *ctx = u->ctx;
+    JSRuntime *rt = JS_GetRuntime(ctx);
     TJSSendReq *sr = req->data;
+    TJSRuntime *qrt = JS_GetRuntimeOpaque(rt);
+
+    // Safeguard: if runtime is being freed, don't call JS functions
+    if (!qrt || qrt->freeing) {
+        tjs_udp_send_req_free_rt(rt, sr);
+        return;
+    }
 
     int is_reject = 0;
     JSValue arg;

@@ -306,10 +306,14 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
 		JSValue ret = JS_Call(ctx, trt->module.loader, JS_UNDEFINED, 2, args);
 		JS_FreeValue(ctx, args[0]);	// args[1] owned by qjs
 		if (JS_IsString(ret)) {
-			size_t strlen;
-			const char *str = JS_ToCStringLen(ctx, &strlen, ret);
-			dbuf_init(&dbuf);
-			dbuf_put(&dbuf, (const uint8_t *) str, strlen +1); // \0 terminator
+			size_t source_len;
+			const char *str = JS_ToCStringLen(ctx, &source_len, ret);
+			if (!str) {
+				JS_FreeValue(ctx, ret);
+				return NULL;
+			}
+			tjs_dbuf_init(ctx, &dbuf);
+			dbuf_put(&dbuf, (const uint8_t *) str, source_len + 1); // \0 terminator
 			JS_FreeCString(ctx, str);
 			JS_FreeValue(ctx, ret);
 			goto compile;
@@ -472,7 +476,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
     return 0;
 }
 
-static inline void tjs__normalize_pathsep(const char *name) {
+static inline void tjs__normalize_pathsep(char *name) {
 #if defined(_WIN32)
     char *p;
 
@@ -525,12 +529,15 @@ char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *
         return js_strdup(ctx, name);
     }
 
-    /* Normalize base_name. This is the path to the importing module, and
-     * it should have the platform native path separator.
-     */
-    tjs__normalize_pathsep(name);
-
     p = strrchr(base_name, TJS__PATHSEP);
+#if defined(_WIN32)
+    {
+        char *p_posix = strrchr(base_name, TJS__PATHSEP_POSIX);
+        if (!p || p_posix > p) {
+            p = p_posix;
+        }
+    }
+#endif
     if (p) {
         len = p - base_name;
     } else {

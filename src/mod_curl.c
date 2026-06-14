@@ -117,6 +117,8 @@ typedef struct {
     char *effective_url;
     char error_buffer[CURL_ERROR_SIZE];
     bool completed;
+    bool in_callback;  /* true while inside a libcurl callback - prevent reentry */
+    bool headers_complete_fired;  /* true after onHeadersComplete has been called */
 } TJSCURL;
 
 typedef struct {
@@ -220,7 +222,10 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         JSValue args[1];
         args[0] = JS_NewArrayBufferCopy(curl->ctx, (const uint8_t *) ptr, realsize);
 
+        // Mark that we're inside a callback to prevent reentry destruction
+        curl->in_callback = true;
         JSValue ret = JS_Call(curl->ctx, curl->on_data, JS_UNDEFINED, 1, args);
+        curl->in_callback = false;
         JS_FreeValue(curl->ctx, args[0]);
 
         if (JS_IsException(ret)) {
@@ -250,7 +255,9 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     if (!JS_IsUndefined(curl->on_header)) {
         JSValue args[1];
         args[0] = JS_NewStringLen(curl->ctx, ptr, realsize);
+        curl->in_callback = true;
         JSValue ret = JS_Call(curl->ctx, curl->on_header, JS_UNDEFINED, 1, args);
+        curl->in_callback = false;
         JS_FreeValue(curl->ctx, args[0]);
         if (JS_IsException(ret)) {
             JS_FreeValue(curl->ctx, ret);
@@ -270,8 +277,10 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
             (realsize == 2 && ptr[0] == '\r' && ptr[1] == '\n')) {
         long status = 0;
         curl_easy_getinfo(curl->handle, CURLINFO_RESPONSE_CODE, &status);
-        /* Skip informational 1xx responses — headers aren't final yet. */
-        if (status >= 200) {
+        /* Skip informational 1xx responses — headers aren't final yet.
+         * Also skip if already fired (e.g., on redirect chain). */
+        if (status >= 200 && !curl->headers_complete_fired) {
+            curl->headers_complete_fired = true;
             JSValue args[2] = {
                 JS_NewInt32(curl->ctx, (int32_t) status),
                 curl->response_headers.size > 0
@@ -299,7 +308,9 @@ static int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow
             JS_NewInt64(curl->ctx, ultotal),
             JS_NewInt64(curl->ctx, ulnow),
         };
+        curl->in_callback = true;
         JSValue ret = JS_Call(curl->ctx, curl->on_progress, JS_UNDEFINED, 4, args);
+        curl->in_callback = false;
         for (int i = 0; i < 4; i++) JS_FreeValue(curl->ctx, args[i]);
 
         if (JS_IsException(ret)) {
@@ -1055,7 +1066,15 @@ static JSValue tjs_curl_set_headers(JSContext *ctx, JSValueConst this_val, int a
                     char *header = js_malloc(ctx, hlen);
                     if (header) {
                         snprintf(header, hlen, "%s: %s", key_str, val_str);
-                        curl->request_headers = curl_slist_append(curl->request_headers, header);
+                        /* Use temp var to preserve old list if append fails */
+                        struct curl_slist *new_headers = curl_slist_append(curl->request_headers, header);
+                        if (new_headers) {
+                            curl->request_headers = new_headers;
+                        } else {
+                            /* OOM: keep existing headers, free temp, report error */
+                            js_free(ctx, header);
+                            return JS_ThrowOutOfMemory(ctx);
+                        }
                         js_free(ctx, header);
                     }
                 }
@@ -1199,7 +1218,16 @@ static int curl_set_slist_opt(JSContext *ctx, TJSCURL *curl, CURLoption id, JSVa
         JSValue item = JS_GetPropertyUint32(ctx, arr, i);
         const char *s = JS_ToCString(ctx, item);
         if (s) {
-            slist = curl_slist_append(slist, s);
+            struct curl_slist *new_slist = curl_slist_append(slist, s);
+            if (new_slist) {
+                slist = new_slist;
+            } else {
+                /* OOM on append: free what we have and fail */
+                curl_slist_free_all(slist);
+                JS_FreeCString(ctx, s);
+                JS_FreeValue(ctx, item);
+                return -1;
+            }
             JS_FreeCString(ctx, s);
         }
         JS_FreeValue(ctx, item);
@@ -1703,6 +1731,7 @@ static void curl_reset_buffers(TJSCURL *curl) {
     tjs_dbuf_init(curl->ctx, &curl->response_body);
     tjs_dbuf_init(curl->ctx, &curl->response_headers);
     curl->completed = false;
+    curl->headers_complete_fired = false;
     curl->upload_offset = 0;
     if (curl->upload_fp) fseek(curl->upload_fp, 0, SEEK_SET);
 }
@@ -1748,6 +1777,11 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     CURL_THIS(ctx, this_val);
     if (!curl->in_flight) return JS_UNDEFINED;
 
+    // Prevent abort while inside a callback - would cause UAF
+    if (curl->in_callback) {
+        return JS_ThrowTypeError(ctx, "Cannot abort() from within a callback");
+    }
+
     if (curl->pool && curl->pool->multi_handle)
         curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
     curl->in_flight = false;
@@ -1788,6 +1822,11 @@ static JSValue tjs_curl_perform_sync(JSContext *ctx, JSValueConst this_val, int 
 static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
 
+    // Prevent reset while inside a callback - would cause UAF
+    if (curl->in_callback) {
+        return JS_ThrowTypeError(ctx, "Cannot reset() from within a callback");
+    }
+
     if (curl->in_flight && curl->pool && curl->pool->multi_handle) {
         curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
         curl->in_flight = false;
@@ -1803,6 +1842,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     tjs_dbuf_init(ctx, &curl->response_body);
     tjs_dbuf_init(ctx, &curl->response_headers);
     curl->completed = false;
+    curl->headers_complete_fired = false;
     curl->stream_mode = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {

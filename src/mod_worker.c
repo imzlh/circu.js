@@ -71,6 +71,9 @@ typedef struct {
         uint64_t u64;
         uint8_t u8[8];
     } data_size;
+    // Track SABs that were dup'd for this write, so we can free them on close
+    void **sab_list;
+    size_t sab_count;
 } TJSMessagePipeWriteReq;
 
 static void uv__close_cb(uv_handle_t *handle) {
@@ -304,6 +307,12 @@ static void uv__write_cb(uv_write_t *req, int status) {
     /* js_malloc/js_free use the same allocator as tjs__malloc/tjs__free,
      * so tjs__free is safe here even after ctx/rt have been freed. */
     tjs__free(wr->data);
+
+    // Free the SAB references that were dup'd for this write
+    for (size_t i = 0; i < wr->sab_count; i++) {
+        tjs__sab_free(NULL, wr->sab_list[i]);
+    }
+    tjs__free(wr->sab_list);
     tjs__free(wr);
 }
 
@@ -317,6 +326,7 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     if (!wr) {
         return JS_EXCEPTION;
     }
+    memset(wr, 0, sizeof(*wr));
 
     size_t len;
     int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE;
@@ -342,9 +352,21 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
         return tjs_throw_errno(ctx, r);
     }
 
-    /* Increment the SAB reference counts. */
-    for (int i = 0; i < sab_tab.len; i++) {
-        tjs__sab_dup(NULL, sab_tab.tab[i]);
+    /* Increment the SAB reference counts and track them for cleanup */
+    if (sab_tab.len > 0) {
+        wr->sab_list = js_malloc(ctx, sizeof(void*) * sab_tab.len);
+        if (!wr->sab_list) {
+            // Cleanup on allocation failure
+            js_free(ctx, buf);
+            js_free(ctx, wr);
+            js_free(ctx, sab_tab.tab);
+            return JS_EXCEPTION;
+        }
+        wr->sab_count = sab_tab.len;
+        for (size_t i = 0; i < sab_tab.len; i++) {
+            tjs__sab_dup(NULL, sab_tab.tab[i]);
+            wr->sab_list[i] = sab_tab.tab[i];
+        }
     }
 
     js_free(ctx, sab_tab.tab);
@@ -417,8 +439,10 @@ static void worker_entry(void *arg) {
     wrt->builtins.message_pipe = message_pipe;
 	if (wd->udata){
 		wrt->builtins.worker_udata = JS_ReadObject(ctx, wd->udata, wd->udata_size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE);
-		tjs__free(wd->udata);
-		wd->udata = NULL; 	// fail safe
+		if (JS_IsException(wrt->builtins.worker_udata)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			wrt->builtins.worker_udata = JS_UNDEFINED;
+		}
 	} else {
 		wrt->builtins.worker_udata = JS_UNDEFINED;
 	}
@@ -440,20 +464,26 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     TJSWorker *w = JS_GetOpaque(val, tjs_worker_class_id);
     if (!w) return;
 
-    /* Stop the worker thread if it is still running, so TJS_FreeRuntime
-     * doesn't trip over a stale TJSWorker on its workers list. */
+    /* Signal the worker thread to stop, but don't block in finalizer.
+     * Blocking here can cause hangs if the worker thread is stuck in a
+     * synchronous operation (deadloop, blocking syscall).
+     * The thread will clean up when it exits. */
     if (w->wrt != NULL && !w->terminated) {
         w->terminated = true;
         TJS_Stop(w->wrt);
-        uv_thread_join(&w->tid);
-        w->wrt = NULL;
+        // Don't call uv_thread_join here - it can block indefinitely
+        // if the worker thread is stuck. The thread will clean up on exit.
     }
 
     JS_FreeValueRT(rt, w->message_pipe);
     w->message_pipe = JS_UNDEFINED;
 
     if (w->link.next) list_del(&w->link);
-    tjs__free(w);
+    // Don't free w here if thread is still running - let thread cleanup handle it
+    if (w->terminated && w->wrt == NULL) {
+        tjs__free(w);
+    }
+    // Otherwise, the thread cleanup will free w when it exits
 }
 
 static void tjs_worker_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
@@ -553,6 +583,10 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     /* Wait for the worker to initialize. */
     uv_sem_wait(&sem);
     uv_sem_destroy(&sem);
+	if (udata) {
+		js_free(ctx, udata);
+		udata = NULL;
+	}
 
     uv_update_time(tjs_get_loop(ctx));
 

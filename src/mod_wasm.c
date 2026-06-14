@@ -146,6 +146,12 @@ static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
         if (i->exec_env) {
             wasm_runtime_destroy_exec_env(i->exec_env);
         }
+        /* Detach memory buffer before deinstantiating to prevent UAF if
+         * the buffer is held externally beyond instance lifetime. */
+        if (!JS_IsUndefined(i->mem_buffer)) {
+            JSContext *ctx = JS_GetRuntimeOpaque(rt);
+            if (ctx) JS_DetachArrayBuffer(ctx, i->mem_buffer);
+        }
         if (i->module_inst) {
             wasm_runtime_deinstantiate(i->module_inst);
         }

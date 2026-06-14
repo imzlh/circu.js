@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 
+#include "mem.h"
 #include "private.h"
 
 /* ── Platform abstractions ─────────────────────────────────────────── */
@@ -109,15 +110,8 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
 static void tjs_sock_poll_close_cb(uv_handle_t *handle) {
     tjs_sock_t *s = uv_handle_get_data(handle);
     if (!s) return;
-    if (!JS_IsUndefined(s->callback)) {
-        JS_FreeValue(s->jsctx, s->callback);
-        s->callback = JS_UNDEFINED;
-    }
-    if (s->finalized) {
-        JS_FreeValue(s->jsctx, s->this_obj);
-        s->this_obj = JS_UNDEFINED;
-        tjs__free(s);
-    }
+    // Only free the structure; JSValues freed in finalizer when rt is alive
+    tjs__free(s);
 }
 
 static JSValue tjs_sock_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -165,12 +159,16 @@ static void tjs_sock_finalizer(JSRuntime *rt, JSValue val) {
     tjs_sock_t *s = JS_GetOpaque(val, tjs_sock_classid);
     if (s) {
         s->finalized = true;
+        JS_FreeValueRT(rt, s->callback);
+        s->callback = JS_UNDEFINED;
+        JS_FreeValueRT(rt, s->this_obj);
+        s->this_obj = JS_UNDEFINED;
         close_sock(s);
+        // Only free if close_cb won't (i.e., handle not pending close)
         if (!uv_is_closing((uv_handle_t *) &s->poll)) {
-            JS_FreeValueRT(rt, s->this_obj);
-            s->this_obj = JS_UNDEFINED;
             js_free_rt(rt, s);
         }
+        // If handle is closing, close_cb will free s
     }
 }
 
@@ -196,6 +194,11 @@ static JSValue tjs_sock_close(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (s->closed)  return JS_ThrowInternalError(ctx, "Socket already closed");
     if (s->in_cb)   return JS_ThrowInternalError(ctx, "Cannot close during poll callback");
     close_sock(s);
+    if (!JS_IsUndefined(s->this_obj)) {
+        JSValue obj = s->this_obj;
+        s->this_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, obj);
+    }
     return JS_UNDEFINED;
 }
 
@@ -233,6 +236,10 @@ static JSValue tjs_sock_accept(JSContext *ctx, JSValue this_val, int argc, JSVal
         return THROW_STRERROR();
     }
     JSValue newSock = tjs_sock_new_from_fd(ctx, fd);
+    if (JS_IsException(newSock)) {
+        js_free(ctx, addr);
+        return newSock;
+    }
     JS_SetPropertyStr(ctx, newSock, "_sockaddr", TJS_NewUint8Array(ctx, (uint8_t *) addr, sz));
     return newSock;
 }
@@ -291,8 +298,11 @@ static JSValue tjs_sock_getsockopt(JSContext *ctx, JSValue this_val, int argc, J
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &optname, argv[1]), 1, "uint");
 
     socklen_t optlen = sizeof(struct sockaddr_storage);
-    if (argc > 2 && !JS_IsUndefined(argv[2]))
-        JS_ToUint32(ctx, &optlen, argv[2]);
+    if (argc > 2 && !JS_IsUndefined(argv[2])) {
+        uint32_t optlen32;
+        if (JS_ToUint32(ctx, &optlen32, argv[2])) return JS_EXCEPTION;
+        optlen = (socklen_t)optlen32;
+    }
 
     void *optval = js_malloc(ctx, optlen);
     if (!optval && optlen != 0)
@@ -315,6 +325,8 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     struct msghdr msg = {0};
     msg.msg_namelen = sizeof(struct sockaddr_storage);
     msg.msg_name    = js_malloc(ctx, msg.msg_namelen);
+    if (!msg.msg_name)
+        return JS_ThrowOutOfMemory(ctx);
 
     if (argc > 1 && !JS_IsUndefined(argv[1])) {
         uint32_t ctrlsz;
@@ -322,10 +334,19 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         if (ctrlsz > 0) {
             msg.msg_controllen = ctrlsz;
             msg.msg_control    = js_malloc(ctx, ctrlsz);
+            if (!msg.msg_control) {
+                js_free(ctx, msg.msg_name);
+                return JS_ThrowOutOfMemory(ctx);
+            }
         }
     }
 
     struct iovec iov = { .iov_base = js_malloc(ctx, bufsz), .iov_len = bufsz };
+    if (!iov.iov_base) {
+        js_free(ctx, msg.msg_name);
+        js_free(ctx, msg.msg_control);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     msg.msg_iov    = &iov;
     msg.msg_iovlen = 1;
 
@@ -497,12 +518,25 @@ static JSValue tjs_sock_sockaddr_inet(JSContext *ctx, JSValue this_val, int argc
         js_free(ctx, ss);
         return JS_EXCEPTION;
     }
-    struct sockaddr *addr = js_realloc(ctx, ss, sizeof(struct sockaddr));
+
+    size_t addr_len;
+    if (ss->ss_family == AF_INET6)
+        addr_len = sizeof(struct sockaddr_in6);
+    else if (ss->ss_family == AF_INET)
+        addr_len = sizeof(struct sockaddr_in);
+#if defined(AF_UNIX) && !defined(_WIN32)
+    else if (ss->ss_family == AF_UNIX)
+        addr_len = sizeof(struct sockaddr_un);
+#endif
+    else
+        addr_len = sizeof(struct sockaddr_storage);
+
+    struct sockaddr *addr = js_realloc(ctx, ss, addr_len);
     if (!addr) {
         js_free(ctx, ss);
         return JS_ThrowOutOfMemory(ctx);
     }
-    return TJS_NewUint8Array(ctx, (uint8_t *) addr, sizeof(struct sockaddr));
+    return TJS_NewUint8Array(ctx, (uint8_t *) addr, addr_len);
 }
 
 static JSValue tjs_posix_if_nametoindex(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

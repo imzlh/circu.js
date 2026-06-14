@@ -86,6 +86,10 @@
 
 #pragma region "FFI Helpers"
 
+static void js__free_rt(JSRuntime *rt, void* ptr, void* opaque) {
+    js_free_rt(rt, ptr);
+}
+
 
 static const char *ffi_strerror(ffi_status status) {
     switch (status) {
@@ -110,20 +114,15 @@ typedef struct {
     JSValue *deps;
     bool dynamic;
     ffi_type *ffi_type;
+    size_t *offsets;  // Pre-calculated field offsets for structs (NULL for non-structs)
 } js_ffi_type;
 
 size_t ffi_type_get_sz(ffi_type *type) {
-    if (type->type == FFI_TYPE_STRUCT) {
-        size_t sz = 0;
-        unsigned i = 0;
-        while (type->elements[i] != NULL) {
-            sz += FFI_ALIGN(ffi_type_get_sz(type->elements[i]), type->alignment);
-            i++;
-        }
-        return sz;
-    } else {
-        return type->size;
-    }
+    /* Use libffi's calculated size directly, don't recompute.
+     * ffi_prep_cif already fills type->size with correct alignment/padding.
+     * Self-computed size can be smaller with nested structs, causing heap overflow.
+     */
+    return type->size;
 }
 
 static thread_local JSClassID js_ffi_type_classid;
@@ -161,12 +160,12 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
 
     if (arrSz > 0) {
         js_ffi_type *jst = JS_GetOpaque(types[0], js_ffi_type_classid);
-        for (unsigned i = 0; i < arrSz; i++) {
+        for (int i = 0; i < arrSz; i++) {
             elements[i] = jst->ffi_type;
         }
         elements[arrSz] = NULL;
     } else {
-        for (unsigned i = 0; i < typeCnt; i++) {
+        for (size_t i = 0; i < typeCnt; i++) {
             js_ffi_type *jst = JS_GetOpaque(types[i], js_ffi_type_classid);
             elements[i] = jst->ffi_type;
         }
@@ -220,12 +219,15 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
             return JS_EXCEPTION;
         }
 
+        // Store offsets in the js_ffi_type for use during packing
+        structType->offsets = offsets;
+
         JSValue arr = JS_NewArray(ctx);
         for (unsigned i = 0; i < typeCnt; i++) {
             JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, offsets[i]));
         }
         JS_SetPropertyStr(ctx, obj, "offsets", arr);
-        js_free(ctx, offsets);
+        // Don't free offsets - they're now owned by structType
     }
 
     structType->deps = js_malloc(ctx, sizeof(JSValue) * typeCnt);
@@ -281,6 +283,9 @@ static void js_ffi_type_finalizer(JSRuntime *rt, JSValue val) {
                     js_free_rt(rt, u->ffi_type->elements);
                 }
                 js_free_rt(rt, u->ffi_type);
+            }
+            if (u->offsets != NULL) {
+                js_free_rt(rt, u->offsets);
             }
         }
         js_free_rt(rt, u);
@@ -518,7 +523,6 @@ static int ffi_type_from_buffer(JSContext *ctx, ffi_type *type, uint8_t *buf, JS
                 JS_ThrowInternalError(ctx, "FFI Unknown type %d", type->type);
                 return -1;
         }
-        return type->size;
     }
 }
 
@@ -757,6 +761,13 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
                 JS_ThrowTypeError(ctx, "argument %d expected to be ptr or buffer", i + 1);
                 return JS_EXCEPTION;
             }
+            /* Validate buffer size matches parameter type */
+            size_t expected_sz = ffi_type_get_sz(cif->ffi_cif.arg_types[i]);
+            if (sz < expected_sz) {
+                js_free(ctx, aval);
+                JS_ThrowRangeError(ctx, "argument %d buffer too small (expected %zu bytes, got %zu)", i + 1, expected_sz, sz);
+                return JS_EXCEPTION;
+            }
         }
         aval[i] = ptr;
     }
@@ -770,7 +781,7 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     ffi_call(&cif->ffi_cif, func, rptr, aval);
     js_free(ctx, aval);
-    
+
     return TJS_NewUint8Array(ctx, rptr, retsz);
 }
 static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
@@ -870,7 +881,14 @@ static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSVa
     TJS_CHECK_ARG_RET(ctx, JS_IsNumber(argv[0]), 0, "number");
     int err;
     JS_TO_INT(ctx, &err, argv[0]);
-    return JS_NewString(ctx, strerror(err));
+    // Use thread-safe strerror_r instead of strerror (worker threads safety)
+    char buf[256];
+#ifdef _WIN32
+    strerror_s(buf, sizeof(buf), err);
+#else
+    strerror_r(err, buf, sizeof(buf));
+#endif
+    return JS_NewString(ctx, buf);
 }
 #pragma endregion "Libc helpers"
 
@@ -983,10 +1001,26 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
     JSValue *jsargs = js_malloc(ctx, sizeof(JSValue) * cif->nargs);
     if (!jsargs) {
         fprintf(stderr, "js_ffi_closure_invoke: out of memory\n");
-        abort();
+        /* Fill return with zeros on OOM */
+        memset(ret, 0, ffi_type_get_sz(cif->rtype));
+        return;
     }
     for (unsigned i = 0; i < cif->nargs; i++) {
-        jsargs[i] = TJS_NewUint8ArrayExternal(ctx, args[i], ffi_type_get_sz(cif->arg_types[i]));
+        // Copy libffi stack memory into a real buffer to prevent UAF
+        // if JS code stores the array beyond this callback
+        size_t arg_sz = ffi_type_get_sz(cif->arg_types[i]);
+        void *arg_copy = js_malloc(ctx, arg_sz);
+        if (!arg_copy) {
+            // Cleanup on OOM
+            for (unsigned j = 0; j < i; j++) {
+                JS_FreeValue(ctx, jsargs[j]);
+            }
+            js_free(ctx, jsargs);
+            memset(ret, 0, ffi_type_get_sz(cif->rtype));
+            return;
+        }
+        memcpy(arg_copy, args[i], arg_sz);
+        jsargs[i] = JS_NewArrayBuffer(ctx, arg_copy, arg_sz, js__free_rt, NULL, true);
     }
     JSValue jsret = JS_Call(ctx, jscl->func, JS_UNDEFINED, cif->nargs, jsargs);
     for (unsigned i = 0; i < cif->nargs; i++) {
@@ -996,20 +1030,30 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
     if (JS_IsException(jsret)) {
         fprintf(stderr, "js_ffi_closure_invoke: function returned exception\n");
         TJS_DumpException(ctx);
-        abort();
+        /* Fill return with zeros on exception */
+        memset(ret, 0, ffi_type_get_sz(cif->rtype));
+        return;
     }
     size_t sz;
     uint8_t *buf = JS_GetUint8Array(ctx, &sz, jsret);
     if (buf == NULL) {
         fprintf(stderr, "js_ffi_closure_invoke: function returned non-buffer\n");
         TJS_DumpException(ctx);
-        abort();
+        /* Fill return with zeros on type error */
+        memset(ret, 0, ffi_type_get_sz(cif->rtype));
+        JS_FreeValue(ctx, jsret);
+        return;
     }
     size_t expected_sz = ffi_type_get_sz(cif->rtype);
     if (sz != expected_sz) {
         fprintf(stderr, "js_ffi_closure_invoke: return buffer size mismatch (expected %zu, got %zu)\n", expected_sz, sz);
-        abort();
+        /* Fill return with zeros on size mismatch */
+        memset(ret, 0, expected_sz);
+        JS_FreeValue(ctx, jsret);
+        return;
     }
+    /* For integer returns smaller than ffi_arg, zero-extend to fill the word */
+    memset(ret, 0, sizeof(ffi_arg));
     memcpy(ret, buf, sz);
     JS_FreeValue(ctx, jsret);
 }

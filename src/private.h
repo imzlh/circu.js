@@ -69,6 +69,7 @@ struct TJSRuntime {
     uv_async_t stop;
 
     bool is_worker;
+    int8_t exit_code;
     struct list_head workers;
 
 	bool freeing;

@@ -26,6 +26,7 @@
 #include "utils.h"
 
 #include <curl/curl.h>
+#include <limits.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -40,17 +41,46 @@
 #include <errno.h>
 #endif
 
+#ifndef _WIN32
+static void tjs_close_received_fds(struct msghdr *msg) {
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
+         cmsg != NULL;
+         cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+            continue;
+        }
+
+        size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+        size_t fd_count = data_len / sizeof(int);
+        int *fds = (int *) CMSG_DATA(cmsg);
+        for (size_t i = 0; i < fd_count; i++) {
+            close(fds[i]);
+        }
+    }
+}
+#endif
+
 
 static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     int status;
     if (JS_ToInt32(ctx, &status, argv[0])) {
         status = -1;
     }
+
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+
+    if (trt && trt->is_worker) {
+        // In a worker: stop only this worker's event loop
+        tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, status));
+        TJS_Stop(trt);
+        return JS_UNDEFINED;
+    }
+
+    // Main thread: exit entire process
     /* Reset TTY state (if it had changed) before exiting. */
     uv_tty_reset_mode();
-	tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, status));
+    tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, status));
     exit(status);
-    return JS_UNDEFINED;
 }
 
 static JSValue tjs_uname(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -380,23 +410,30 @@ static JSValue tjs_memory(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 }
 
 static JSValue tjs_random(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    // Convert all scalar parameters BEFORE getting buffer pointer
+    uint64_t off = 0;
+    if (!JS_IsUndefined(argv[1]) && JS_ToIndex(ctx, &off, argv[1])) {
+        return JS_EXCEPTION;
+    }
+
+    uint64_t len = 0;
+    bool has_len = !JS_IsUndefined(argv[2]);
+    if (!JS_IsUndefined(argv[2]) && JS_ToIndex(ctx, &len, argv[2])) {
+        return JS_EXCEPTION;
+    }
+
+    // Now safe to get buffer pointer (after conversion callbacks)
     size_t size;
     uint8_t *buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
     if (!buf) {
         return JS_EXCEPTION;
     }
 
-    uint64_t off = 0;
-    if (!JS_IsUndefined(argv[1]) && JS_ToIndex(ctx, &off, argv[1])) {
-        return JS_EXCEPTION;
+    if (!has_len) {
+        len = size;
     }
 
-    uint64_t len = size;
-    if (!JS_IsUndefined(argv[2]) && JS_ToIndex(ctx, &len, argv[2])) {
-        return JS_EXCEPTION;
-    }
-
-    if (off + len > size) {
+    if (off > size || len > size - off) {
         return JS_ThrowRangeError(ctx, "array buffer overflow");
     }
 
@@ -469,7 +506,7 @@ static JSValue tjs_network_interfaces(JSContext *ctx, JSValue this_val, int argc
     for (int i = 0; i < count; i++) {
         uv_interface_address_t iface = interfaces[i];
         char mac[18];
-        char buf[INET6_ADDRSTRLEN + 1];
+        char buf[INET6_ADDRSTRLEN + 1] = {0};
 
         JSValue addr = JS_NewObjectProto(ctx, JS_NULL);
 
@@ -502,6 +539,8 @@ static JSValue tjs_network_interfaces(JSContext *ctx, JSValue this_val, int argc
             uv_ip4_name(&iface.netmask.netmask4, buf, sizeof(buf));
         } else if (iface.netmask.netmask4.sin_family == AF_INET6) {
             uv_ip6_name(&iface.netmask.netmask6, buf, sizeof(buf));
+        } else {
+            buf[0] = '\0';
         }
         JS_DefinePropertyValueStr(ctx, addr, "netmask", JS_NewString(ctx, buf), JS_PROP_C_W_E);
 
@@ -597,8 +636,11 @@ static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     if (argc == 0 || -1 == JS_ToInt64(ctx, &time, argv[0])) {
         return JS_ThrowTypeError(ctx, "invalid argument");
     }
+    if (time < 0 || time > UINT_MAX) {
+        return JS_ThrowRangeError(ctx, "sleep duration out of range");
+    }
     
-    uv_sleep(time);
+    uv_sleep((unsigned int) time);
     return JS_UNDEFINED;
 }
 
@@ -713,6 +755,10 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (ret < 0) {
         return tjs_throw_errno(ctx, errno);
     }
+    if (msg.msg_flags & MSG_CTRUNC) {
+        tjs_close_received_fds(&msg);
+        return JS_ThrowInternalError(ctx, "truncated control message");
+    }
 
     // Extract received fd from control message
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
@@ -720,6 +766,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
         cmsg->cmsg_level != SOL_SOCKET ||
         cmsg->cmsg_type != SCM_RIGHTS ||
         cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+        tjs_close_received_fds(&msg);
         return JS_ThrowInternalError(ctx, "invalid control message");
     }
 

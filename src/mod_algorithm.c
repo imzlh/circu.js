@@ -39,6 +39,12 @@ static inline bool JS_IsUint8Array(JSValueConst val){
 	return JS_GetTypedArrayType(val) == JS_TYPED_ARRAY_UINT8;
 }
 
+static inline uint32_t read_u32_le(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
 static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* argv){
 	if(argc < 2 || !JS_IsUint8Array(argv[0]) || !JS_IsUint8Array(argv[1])){
 		return JS_ThrowTypeError(ctx, "Invalid arguments. expected: (Uint8Array, Uint8Array)");
@@ -47,9 +53,15 @@ static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* 
 	size_t inbuflen, keybuflen;
 	uint8_t* inbuf = JS_GetUint8Array(ctx, &inbuflen, argv[0]);
 	uint8_t* keybuf = JS_GetUint8Array(ctx, &keybuflen, argv[1]);
+    if (!inbuf || !keybuf) {
+        return JS_EXCEPTION;
+    }
 	if(keybuflen != 4){
 		return JS_ThrowTypeError(ctx, "Invalid ws mask key. expected: 4 bytes");
 	}
+    if (inbuflen == 0) {
+        return JS_NewUint8ArrayCopy(ctx, NULL, 0);
+    }
 
 	uint8_t* outbuf = js_malloc(ctx, inbuflen);
 	if(!outbuf){
@@ -57,7 +69,7 @@ static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* 
 	}
 
 	// apply/remove mask (XOR is symmetric)
-	for (int i = 0; i < inbuflen; i++){
+	for (size_t i = 0; i < inbuflen; i++){
 		outbuf[i] = inbuf[i] ^ keybuf[i % 4];
 	}
 
@@ -227,6 +239,20 @@ static void xoshiro_finalizer(JSRuntime *rt, JSValue val) {
     }
 }
 
+static void xoshiro_seed256(XoshiroRNG *rng, uint64_t seed) {
+    if (seed == 0) {
+        seed = 0x9e3779b97f4a7c15ULL;
+    }
+    rng->s256.s[0] = seed * 0x9e3779b97f4a7c15ULL;
+    rng->s256.s[1] = rotl64(seed, 21) * 0x9e3779b97f4a7c15ULL;
+    rng->s256.s[2] = rotl64(seed, 42) * 0x9e3779b97f4a7c15ULL;
+    rng->s256.s[3] = rotl64(seed, 63) * 0x9e3779b97f4a7c15ULL;
+}
+
+static bool xoshiro256_is_zero(const XoshiroRNG *rng) {
+    return rng->s256.s[0] == 0 && rng->s256.s[1] == 0 && rng->s256.s[2] == 0 && rng->s256.s[3] == 0;
+}
+
 static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
     XoshiroRNG *rng;
     JSValue obj;
@@ -243,53 +269,33 @@ static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int 
                 return JS_EXCEPTION;
             }
             
-            if (rng->is_256) {
-                rng->s256.s[0] = seed * 0x9e3779b97f4a7c15;
-                rng->s256.s[1] = rotl64(seed, 21) * 0x9e3779b97f4a7c15;
-                rng->s256.s[2] = rotl64(seed, 42) * 0x9e3779b97f4a7c15;
-                rng->s256.s[3] = rotl64(seed, 63) * 0x9e3779b97f4a7c15;
-            } else {
-                rng->s128.s[0] = (uint32_t)(seed * 0x9e3779b9);
-                rng->s128.s[1] = (uint32_t)(rotl32(seed, 11) * 0x9e3779b9);
-                rng->s128.s[2] = (uint32_t)(rotl32(seed, 22) * 0x9e3779b9);
-                rng->s128.s[3] = (uint32_t)(rotl32(seed, 33) * 0x9e3779b9);
-            }
+            xoshiro_seed256(rng, seed);
         } else if (JS_IsArray(argv[0])) {
 			int64_t length;
 			if (-1 == JS_GetLength(ctx, argv[0], &length)) {
 				js_free(ctx, rng);
 				return JS_ThrowTypeError(ctx, "Invalid seed array. expected: Array<number>");
 			}
-            
-            if (rng->is_256) {
-                if (length >= 4) {
-                    for (int i = 0; i < 4; i++) {
-                        JSValue elem = JS_GetPropertyUint32(ctx, argv[0], i);
-                        uint64_t val;
-                        if (JS_ToIndex(ctx, &val, elem)) {
-                            JS_FreeValue(ctx, elem);
-                            js_free(ctx, rng);
-                            return JS_EXCEPTION;
-                        }
-                        rng->s256.s[i] = val;
-                        JS_FreeValue(ctx, elem);
-                    }
-                }
-            } else {
-                if (length >= 4) {
-                    for (int i = 0; i < 4; i++) {
-                        JSValue elem = JS_GetPropertyUint32(ctx, argv[0], i);
-                        uint32_t val;
-                        if (JS_ToUint32(ctx, &val, elem)) {
-                            JS_FreeValue(ctx, elem);
-                            js_free(ctx, rng);
-                            return JS_EXCEPTION;
-                        }
-                        rng->s128.s[i] = val;
-                        JS_FreeValue(ctx, elem);
-                    }
-                }
+
+            if (length < 4) {
+                js_free(ctx, rng);
+                return JS_ThrowRangeError(ctx, "Seed array must contain at least 4 values");
             }
+
+            for (int i = 0; i < 4; i++) {
+                JSValue elem = JS_GetPropertyUint32(ctx, argv[0], i);
+                uint64_t val;
+                if (JS_ToIndex(ctx, &val, elem)) {
+                    JS_FreeValue(ctx, elem);
+                    js_free(ctx, rng);
+                    return JS_EXCEPTION;
+                }
+                rng->s256.s[i] = val;
+                JS_FreeValue(ctx, elem);
+            }
+        } else {
+            js_free(ctx, rng);
+            return JS_ThrowTypeError(ctx, "Invalid seed. expected: number or Array<number>");
         }
     } else {
 		// no seed provided, use current time as seed
@@ -305,17 +311,11 @@ static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int 
         seed = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
         
-        if (rng->is_256) {
-            rng->s256.s[0] = seed * 0x9e3779b97f4a7c15;
-            rng->s256.s[1] = rotl64(seed, 21) * 0x9e3779b97f4a7c15;
-            rng->s256.s[2] = rotl64(seed, 42) * 0x9e3779b97f4a7c15;
-            rng->s256.s[3] = rotl64(seed, 63) * 0x9e3779b97f4a7c15;
-        } else {
-            rng->s128.s[0] = (uint32_t)(seed * 0x9e3779b9);
-            rng->s128.s[1] = (uint32_t)(rotl32(seed, 11) * 0x9e3779b9);
-            rng->s128.s[2] = (uint32_t)(rotl32(seed, 22) * 0x9e3779b9);
-            rng->s128.s[3] = (uint32_t)(rotl32(seed, 33) * 0x9e3779b9);
-        }
+        xoshiro_seed256(rng, seed);
+    }
+
+    if (xoshiro256_is_zero(rng)) {
+        xoshiro_seed256(rng, 0x9e3779b97f4a7c15ULL);
     }
     
     obj = JS_NewObjectClass(ctx, xoshiro_class_id);
@@ -457,15 +457,10 @@ static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
 
     uint32_t hash = seed;
 
-    const int nblocks = len / 4;
-    /* MurmurHash3 walks the body with NEGATIVE indices, so blocks must point at
-     * the END of the block region (key + nblocks*4). Pointing it at the start
-     * caused blocks[-nblocks..-1] to read nblocks*4 bytes BEFORE the buffer
-     * (heap underflow / OOB read) and produced an incorrect hash. */
-    const uint32_t *blocks = (const uint32_t *)(key + nblocks * 4);
+    const size_t nblocks = len / 4;
 
-    for (int i = -nblocks; i; i++) {
-        uint32_t k = blocks[i];
+    for (size_t i = 0; i < nblocks; i++) {
+        uint32_t k = read_u32_le(key + i * 4);
         k *= c1;
         k = (k << r1) | (k >> (32 - r1));
         k *= c2;
@@ -503,6 +498,9 @@ static JSValue tjs_hash_fnv1a32(JSContext *ctx, JSValueConst this_val, int argc,
     }
     size_t len;
     uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
     uint32_t result = fnv1a_32(data, len);
     return JS_NewUint32(ctx, result);
 }
@@ -513,6 +511,9 @@ static JSValue tjs_hash_fnv1a64(JSContext *ctx, JSValueConst this_val, int argc,
     }
     size_t len;
     uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
     uint64_t result = fnv1a_64(data, len);
     return JS_NewBigUint64(ctx, result);
 }
@@ -529,6 +530,9 @@ static JSValue tjs_hash_murmur3(JSContext *ctx, JSValueConst this_val, int argc,
     }
     size_t len;
     uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
     uint32_t result = murmur3_32(data, len, seed);
     return JS_NewUint32(ctx, result);
 }
@@ -558,16 +562,16 @@ static uint32_t xxhash32(const uint8_t *input, size_t len, uint32_t seed) {
         uint32_t v4 = seed - XXH_PRIME32_1;
 
         do {
-            v1 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v1 += read_u32_le(p) * XXH_PRIME32_2;
             v1 = xxh32_rotl(v1, 13) * XXH_PRIME32_1;
             p += 4;
-            v2 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v2 += read_u32_le(p) * XXH_PRIME32_2;
             v2 = xxh32_rotl(v2, 13) * XXH_PRIME32_1;
             p += 4;
-            v3 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v3 += read_u32_le(p) * XXH_PRIME32_2;
             v3 = xxh32_rotl(v3, 13) * XXH_PRIME32_1;
             p += 4;
-            v4 += *(const uint32_t *)p * XXH_PRIME32_2;
+            v4 += read_u32_le(p) * XXH_PRIME32_2;
             v4 = xxh32_rotl(v4, 13) * XXH_PRIME32_1;
             p += 4;
         } while (p <= limit);
@@ -580,7 +584,7 @@ static uint32_t xxhash32(const uint8_t *input, size_t len, uint32_t seed) {
     h32 += (uint32_t)len;
 
     while (p + 4 <= bEnd) {
-        h32 += *(const uint32_t *)p * XXH_PRIME32_3;
+        h32 += read_u32_le(p) * XXH_PRIME32_3;
         h32 = xxh32_rotl(h32, 17) * XXH_PRIME32_4;
         p += 4;
     }
@@ -612,6 +616,9 @@ static JSValue tjs_hash_xxhash32(JSContext *ctx, JSValueConst this_val, int argc
     }
     size_t len;
     uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
     uint32_t result = xxhash32(data, len, seed);
     return JS_NewUint32(ctx, result);
 }

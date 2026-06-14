@@ -236,6 +236,10 @@ static void clear_mappings(FileSourceMap *map) {
 
 static void free_file_map(FileSourceMap *map) {
     if (!map) return;
+    if (map->ref_count > 0) {
+        map->ref_count--;
+        if (map->ref_count > 0) return;
+    }
     clear_mappings(map);
     free(map->hash_table);
     FREE_STR_ARRAY(map->sources, map->sources_count);
