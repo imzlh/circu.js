@@ -82,8 +82,8 @@ typedef struct {
 } encoder_t;
 
 /* Class IDs for QuickJS finalizers */
-static JSClassID tjs_text_decoder_class_id;
-static JSClassID tjs_text_encoder_class_id;
+static thread_local JSClassID tjs_text_decoder_class_id;
+static thread_local JSClassID tjs_text_encoder_class_id;
 
 /* ============================================================================
  * Growable output buffer

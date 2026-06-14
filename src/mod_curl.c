@@ -133,9 +133,9 @@ typedef struct {
 
 #pragma region Forward Declarations
 
-static JSClassID tjs_curl_class_id;
-static JSClassID tjs_connpool_class_id;
-static JSClassID tjs_share_class_id;
+static thread_local JSClassID tjs_curl_class_id;
+static thread_local JSClassID tjs_connpool_class_id;
+static thread_local JSClassID tjs_share_class_id;
 
 static void tjs_curl_finalizer(JSRuntime *rt, JSValue val);
 static void tjs_curl_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
@@ -755,6 +755,7 @@ static void tjs_curl_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     TJS_MarkPromise(rt, &curl->promise, mark_func);
     JS_MarkValue(rt, curl->on_progress, mark_func);
     JS_MarkValue(rt, curl->on_header, mark_func);
+    JS_MarkValue(rt, curl->on_headers_complete, mark_func);
     JS_MarkValue(rt, curl->on_data, mark_func);
     JS_MarkValue(rt, curl->pool_obj, mark_func);
     JS_MarkValue(rt, curl->share_obj, mark_func);

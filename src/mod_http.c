@@ -74,7 +74,7 @@ typedef struct {
 	bool initialized;
 } TJSLlhttpParser;
 
-static JSClassID tjs_llhttp_parser_class_id;
+static thread_local JSClassID tjs_llhttp_parser_class_id;
 
 /* ----------------------------- helpers ------------------------------ */
 

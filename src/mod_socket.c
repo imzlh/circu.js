@@ -54,7 +54,7 @@
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 #define TJS_SOCK_CLASS_NAME "PosixSocket"
-static JSClassID tjs_sock_classid;
+static thread_local JSClassID tjs_sock_classid;
 
 typedef struct {
     sock_fd_t  sock;

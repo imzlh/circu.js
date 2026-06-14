@@ -170,7 +170,7 @@ static JSValue tjs_reg_delete(JSContext *ctx, JSValue this_val, int argc, JSValu
 
 /* ── RegWatch class ──────────────────────────────────────────── */
 
-static JSClassID tjs_regwatch_classid;
+static thread_local JSClassID tjs_regwatch_classid;
 
 typedef struct {
     HKEY        hkey;

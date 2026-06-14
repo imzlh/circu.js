@@ -40,7 +40,7 @@
 
 typedef struct TJSWasmImportGroup TJSWasmImportGroup;
 
-static JSClassID tjs_wasm_module_class_id;
+static thread_local JSClassID tjs_wasm_module_class_id;
 
 typedef struct {
     wasm_module_t module;
@@ -124,7 +124,7 @@ typedef struct TJSWasmImportGroup {
     struct TJSWasmImportGroup *next;
 } TJSWasmImportGroup;
 
-static JSClassID tjs_wasm_instance_class_id;
+static thread_local JSClassID tjs_wasm_instance_class_id;
 
 typedef struct {
     wasm_module_inst_t module_inst;

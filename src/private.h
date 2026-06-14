@@ -38,6 +38,12 @@
 #include <uv.h>
 #include <openssl/ssl.h>
 
+#ifdef HAVE_THREADS_H
+#include <threads.h>
+#else
+#define thread_local _Thread_local
+#endif
+
 enum {
     __JS_ATOM_NULL = JS_ATOM_NULL,
 #define DEF(name, str) JS_ATOM_ ## name,
@@ -128,7 +134,6 @@ void tjs__mod_process_init(JSContext *ctx, JSValue ns);
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns);
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns);
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
-void tjs__mod_sys_init(JSContext *ctx, JSValue ns);
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);

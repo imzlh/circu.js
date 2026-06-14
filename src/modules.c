@@ -67,7 +67,6 @@ static const struct TJSModule tjs_modules[] = {
 	{ "sqlite3", tjs__mod_sqlite3_init, true },
 	{ "ssl", tjs__mod_ssl_init, true },
 	{ "streams", tjs__mod_streams_init, true },
-	{ "sys", tjs__mod_sys_init, true },
 #ifdef CJS__HAS_ICONV
 	{ "text", tjs__mod_text_init, true },
 #endif

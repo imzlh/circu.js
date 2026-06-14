@@ -82,13 +82,14 @@ cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
 # we recommend to enable to make attached binary smaller
 cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
 # ASan is enabled by default in Debug builds, disabled in Release
-# if(CMAKE_BUILD_TYPE MATCHES "Debug")
-#     set(_asan_default ON)
-# else()
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
+    set(_asan_default ON)
+else()
     set(_asan_default OFF)
-# endif()
+endif()
 cpr_option(ENABLE_ASAN "Enable AddressSanitizer (ASan)" ${_asan_default})
 
+set(QJS_ENABLE_ASAN ${ENABLE_ASAN} FORCE BOOL "Enable AddressSanitizer (ASan)")
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
 
 option(libuv_buildtests "" OFF)
@@ -188,7 +189,6 @@ add_library(libcjs
     src/mod_process.c
     src/mod_sqlite3.c
     src/mod_streams.c
-    src/mod_sys.c
     src/mod_udp.c
     src/mod_zlib.c
     src/mod_ssl.c

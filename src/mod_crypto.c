@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "utils.h"
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -1653,10 +1654,10 @@ static JSValue tjs_crypto_verify(JSContext* ctx, JSValueConst this_val, int argc
 }
 
 /* Class IDs */
-static JSClassID tjs_hash_class_id;
-static JSClassID tjs_hmac_class_id;
-static JSClassID tjs_cipher_class_id;
-static JSClassID tjs_gcm_class_id;
+static thread_local JSClassID tjs_hash_class_id;
+static thread_local JSClassID tjs_hmac_class_id;
+static thread_local JSClassID tjs_cipher_class_id;
+static thread_local JSClassID tjs_gcm_class_id;
 
 typedef struct {
     EVP_CIPHER_CTX *ctx;

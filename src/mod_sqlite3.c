@@ -27,8 +27,7 @@
 
 #include <sqlite3.h>
 
-
-static JSClassID tjs_sqlite3_class_id;
+static thread_local JSClassID tjs_sqlite3_class_id;
 
 typedef struct {
     sqlite3 *handle;
@@ -75,7 +74,7 @@ static TJSSqlite3Handle *tjs_sqlite3_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_sqlite3_class_id);
 }
 
-static JSClassID tjs_sqlite3_stmt_class_id;
+static thread_local JSClassID tjs_sqlite3_stmt_class_id;
 
 typedef struct {
     sqlite3_stmt *stmt;
@@ -339,10 +338,17 @@ static JSValue tjs_sqlite3_stmt_expand(JSContext *ctx, JSValue this_val, int arg
 
 static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(obj))
+        return obj;
+
     int count = sqlite3_column_count(h->stmt);
 
     for (int i = 0; i < count; i++) {
         const char *name = sqlite3_column_name(h->stmt, i);
+        if (!name) {
+            JS_FreeValue(ctx, obj);
+            return JS_ThrowOutOfMemory(ctx);
+        }
         JSValue value;
 
         switch (sqlite3_column_type(h->stmt, i)) {
@@ -368,6 +374,11 @@ static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {
                 value = JS_NULL;
                 break;
             }
+        }
+
+        if (JS_IsException(value)) {
+            JS_FreeValue(ctx, obj);
+            return value;
         }
 
         JS_DefinePropertyValueStr(ctx, obj, name, value, JS_PROP_C_W_E);

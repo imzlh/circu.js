@@ -75,7 +75,7 @@ static JSValue tjs_gc_getThreshold(JSContext *ctx, JSValue this_val, int argc, J
 
 
 // fixme: thread_local?
-static JSClassID js_module_class_id;
+static thread_local JSClassID js_module_class_id;
 typedef struct {
 	struct list_head local_def;
 	JSModuleDef* def;

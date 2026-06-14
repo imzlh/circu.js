@@ -292,8 +292,8 @@ static JSValue tjs_zlib_adler32(JSContext* ctx, JSValueConst this_val, int argc,
 }
 
 /* Class IDs */
-static JSClassID tjs_deflate_class_id;
-static JSClassID tjs_inflate_class_id;
+static thread_local JSClassID tjs_deflate_class_id;
+static thread_local JSClassID tjs_inflate_class_id;
 
 /* Deflate stream object */
 typedef struct {

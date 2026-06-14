@@ -29,8 +29,7 @@
 #include <string.h>
 #include <uv.h>
 
-
-static JSClassID tjs_file_class_id;
+static thread_local JSClassID tjs_file_class_id;
 
 typedef struct {
     JSContext *ctx;
@@ -64,7 +63,7 @@ static JSClassDef tjs_file_class = {
 	.gc_mark = tjs_file_gc_mark,
 };
 
-static JSClassID tjs_dir_class_id;
+static thread_local JSClassID tjs_dir_class_id;
 
 typedef struct {
     JSContext *ctx;
@@ -100,7 +99,7 @@ static JSClassDef tjs_dir_class = {
 	.gc_mark = tjs_dir_gc_mark,
 };
 
-static JSClassID tjs_dirent_class_id;
+static thread_local JSClassID tjs_dirent_class_id;
 
 typedef struct {
     JSValue name;
@@ -128,7 +127,7 @@ static JSClassDef tjs_dirent_class = {
 	.gc_mark = tjs_dirent_gc_mark 
 };
 
-static JSClassID tjs_stat_class_id;
+static thread_local JSClassID tjs_stat_class_id;
 
 typedef struct {
     uint64_t st_mode;

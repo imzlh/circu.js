@@ -53,7 +53,7 @@ typedef struct {
     uint8_t *data;
 } TJSSendReq;
 
-static JSClassID tjs_udp_class_id;
+static thread_local JSClassID tjs_udp_class_id;
 
 static void tjs_udp_read_clear(JSContext *ctx, TJSUdp *u) {
     js_free(ctx, u->read.b.data);

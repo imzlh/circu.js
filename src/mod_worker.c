@@ -42,7 +42,7 @@ enum {
     MSGPIPE_EVENT_MAX,
 };
 
-static JSClassID tjs_msgpipe_class_id;
+static thread_local JSClassID tjs_msgpipe_class_id;
 
 typedef struct {
     JSContext *ctx;
@@ -389,7 +389,7 @@ static void reg_msgpipe(JSContext* ctx) {
 
 static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd);
 
-static JSClassID tjs_worker_class_id;
+static thread_local JSClassID tjs_worker_class_id;
 
 /* Worker thread data passed to worker_entry */
 typedef struct {

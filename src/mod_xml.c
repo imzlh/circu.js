@@ -143,7 +143,7 @@ XML_CALLBACK(namespace_end, const XML_Char *prefix) {
 }
 
 /* Class ID */
-static JSClassID tjs_xml_parser_class_id;
+static thread_local JSClassID tjs_xml_parser_class_id;
 
 /* Finalizer */
 static void tjs_xml_parser_finalizer(JSRuntime *rt, JSValue val) {

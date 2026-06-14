@@ -81,7 +81,7 @@ typedef struct {
     uint8_t *alpn_list;
 } TJSSSLContext;
 
-static JSClassID tjs_ssl_context_class_id;
+static thread_local JSClassID tjs_ssl_context_class_id;
 
 static void tjs_ssl_context_finalizer(JSRuntime *rt, JSValue val) {
     TJSSSLContext *ssl_ctx = JS_GetOpaque(val, tjs_ssl_context_class_id);
@@ -449,7 +449,7 @@ typedef struct {
     char *hostname;
 } TJSSSLPipe;
 
-static JSClassID tjs_ssl_pipe_class_id;
+static thread_local JSClassID tjs_ssl_pipe_class_id;
 
 static void tjs_ssl_pipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSSSLPipe *pipe = JS_GetOpaque(val, tjs_ssl_pipe_class_id);

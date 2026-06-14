@@ -98,7 +98,7 @@ static bool load_conpty(void) {
  * PTY mode:     fork+openpty (Unix) / ConPTY (Windows).
  *               p->process is NOT initialized in PTY mode.
  * ============================================================ */
-JSClassID tjs_process_class_id;
+static thread_local JSClassID tjs_process_class_id;
 
 typedef struct {
     JSContext *ctx;

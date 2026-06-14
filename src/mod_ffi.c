@@ -126,7 +126,7 @@ size_t ffi_type_get_sz(ffi_type *type) {
     }
 }
 
-static JSClassID js_ffi_type_classid;
+static thread_local JSClassID js_ffi_type_classid;
 static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JSValue *types = argv;
     size_t typeCnt = argc;
@@ -569,7 +569,7 @@ static const JSCFunctionListEntry js_ffi_type_proto_funcs[] = {
 
 #pragma region "UvDlSym class definition"
 
-static JSClassID js_uv_dlsym_classid;
+static thread_local JSClassID js_uv_dlsym_classid;
 
 JSClassDef js_uv_dlsym_class = {
     "UvDlSym",
@@ -596,7 +596,7 @@ static const JSCFunctionListEntry js_uv_dlsym_proto_funcs[] = {
 
 #pragma region "FfiCif class definition"
 
-static JSClassID js_ffi_cif_classid;
+static thread_local JSClassID js_ffi_cif_classid;
 typedef struct {
     ffi_cif ffi_cif;
     ffi_type **args;
@@ -781,7 +781,7 @@ static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
 
 #pragma region "UvLib class definition"
 
-static JSClassID js_uv_lib_classid;
+static thread_local JSClassID js_uv_lib_classid;
 static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJS_CHECK_ARG_RET(ctx, JS_IsString(argv[0]), 0, "string");
     JSValue obj = JS_NewObjectClass(ctx, js_uv_lib_classid);
@@ -968,7 +968,7 @@ static JSValue js_deref_ptr(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
 #pragma region "FfiClosure class definition"
 
-static JSClassID js_ffi_closure_classid;
+static thread_local JSClassID js_ffi_closure_classid;
 typedef struct {
     ffi_closure closure;
     void *code;

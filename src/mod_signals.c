@@ -26,7 +26,6 @@
 #include "private.h"
 #include "utils.h"
 
-
 typedef struct {
     JSContext *ctx;
     int closed;
@@ -37,7 +36,7 @@ typedef struct {
 
 } TJSSignalHandler;
 
-static JSClassID tjs_signal_handler_class_id;
+static thread_local JSClassID tjs_signal_handler_class_id;
 
 static void uv__signal_close_cb(uv_handle_t *handle) {
     TJSSignalHandler *sh = handle->data;

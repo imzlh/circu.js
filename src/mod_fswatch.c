@@ -35,7 +35,7 @@ typedef struct {
     int finalized;
 } TJSFsWatch;
 
-static JSClassID tjs_fswatch_class_id;
+static thread_local JSClassID tjs_fswatch_class_id;
 
 static TJSFsWatch *tjs_fswatch_get(JSValue obj) {
     return JS_GetOpaque(obj, tjs_fswatch_class_id);

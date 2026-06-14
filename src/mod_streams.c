@@ -119,9 +119,9 @@ static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
 
 
 /* ---- Class IDs (assigned at init time, used by finalizers and gc_mark) ---- */
-static JSClassID tjs_tcp_class_id;
-static JSClassID tjs_tty_class_id;
-static JSClassID tjs_pipe_class_id;
+static thread_local JSClassID tjs_tcp_class_id;
+static thread_local JSClassID tjs_tty_class_id;
+static thread_local JSClassID tjs_pipe_class_id;
 
 #pragma region Inline helpers
 /* Get the TJSStream from any stream-derived JS object (TCP/TTY/Pipe). */

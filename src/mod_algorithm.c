@@ -218,7 +218,7 @@ typedef struct {
     int is_256; // 0 for 128-bit, 1 for 256-bit
 } XoshiroRNG;
 
-static JSClassID xoshiro_class_id;
+static thread_local JSClassID xoshiro_class_id;
 
 static void xoshiro_finalizer(JSRuntime *rt, JSValue val) {
     XoshiroRNG *rng = JS_GetOpaque(val, xoshiro_class_id);
