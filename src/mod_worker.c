@@ -431,7 +431,7 @@ static void worker_entry(void *arg) {
 
     TJSRuntime *wrt = TJS_NewRuntimeWorker();
     CHECK_NOT_NULL(wrt);
-    JSContext *ctx = TJS_GetJSContext(wrt);
+    JSContext *ctx = wrt->main_ctx;
 
     /* Bootstrap the worker scope. */
 	reg_msgpipe(ctx);	// we should register class MessagePipe before creating
@@ -628,7 +628,7 @@ static const JSCFunctionListEntry tjs_worker_proto_funcs[] = {
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSValue proto, obj;
-	TJSRuntime* trt = JS_GetContextOpaque(ctx);
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
 
     /* Worker class */
     JS_NewClassID(rt, &tjs_worker_class_id);

@@ -113,6 +113,20 @@ static const JSSharedArrayBufferFunctions tjs_sf = {
     .sab_opaque = NULL,
 };
 
+// utils
+
+JSContext* TJS_GetJSContext(App* app) {
+    return app->ctx;
+}
+
+App* TJS_GetApp(JSContext* ctx) {
+    return JS_GetContextOpaque(ctx);
+}
+
+TJSRuntime* TJS_GetRuntime(JSContext* ctx) {
+    return JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+}
+
 JSValue tjs__get_args(JSContext* ctx) {
     JSValue args = JS_NewArray(ctx);
     for (int i = 0; i < tjs__argc; i++) {
@@ -133,8 +147,16 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
 
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
     JSValueConst promise, JSValueConst parent_promise, void* opaque) {
-    // here we removed EV_PROMISE due to it is too slow and will cause GC problem
-    // we just capture promise stack
+    // TJSRuntime *qrt = TJS_GetRuntime(ctx);
+
+    // call JS event handler
+    JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]) {
+        JS_NewUint32(ctx, type),
+            JS_DupValue(ctx, promise),
+            JS_DupValue(ctx, parent_promise)
+    });
+    tjs__dispatch_event2(ctx, EV_PROMISE, args);
+    JS_FreeValue(ctx, args);
 }
 
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
@@ -171,29 +193,26 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
     return JS_UNDEFINED;
 }
 
-static void tjs__promise_rejection_tracker(JSContext* ctx,
-    JSValue promise,
-    JSValue reason,
-    bool is_handled,
-    void* opaque) {
+static void tjs__promise_rejection_tracker(JSContext* ctx, JSValue promise, JSValue reason, bool is_handled, void* opaque) {
     TJSRuntime* qrt = TJS_GetRuntime(ctx);
-    CHECK_NOT_NULL(qrt);
+    App* app = TJS_GetApp(ctx);
+    CHECK_NOT_NULL(app);
 
     if (!qrt->freeing && !is_handled) {
-        JS_EnqueueJob(qrt->ctx, tjs__promise_rejection_dispatch, 2, (JSValueConst[]) { promise, reason });
+        JS_EnqueueJob(app->ctx, tjs__promise_rejection_dispatch, 2, (JSValueConst[]) { promise, reason });
     }
 }
 
 static void uv__stop(uv_async_t* handle) {
-    TJSRuntime* qrt = handle->data;
-    CHECK_NOT_NULL(qrt);
+    TJSRuntime* trt = handle->data;
+    CHECK_NOT_NULL(trt);
 
     /* Dispatch EV_EXIT here (inside the event loop) to ensure JS calls are
      * always made from the correct thread. TJS_Stop may be called from a
      * different thread (e.g. main thread stopping a worker), so JS dispatch
      * must NOT happen in TJS_Stop itself. */
-    tjs__dispatch_event2(qrt->ctx, EV_EXIT, JS_NewInt32(qrt->ctx, qrt->exit_code));
-    uv_stop(&qrt->loop);
+    tjs__dispatch_event2(trt->main_ctx, EV_EXIT, JS_NewInt32(trt->main_ctx, trt->exit_code));
+    uv_stop(&trt->loop);
 }
 
 void TJS_DefaultOptions(TJSRunOptions* options) {
@@ -218,23 +237,42 @@ TJSRuntime* TJS_NewRuntimeWorker(void) {
     return TJS_NewRuntimeInternal(true, &options);
 }
 
+App* TJS_NewAppInternal(TJSRuntime* trt, bool is_sandbox) {
+    JSContext* ctx = JS_NewContext(trt->rt);
+    App* app = tjs__mallocz(sizeof(App));
+    app->ctx = ctx;
+    app->is_sandbox = is_sandbox;
+    app->trt = trt;
+    init_list_head(&app->link);
+    JS_SetContextOpaque(ctx, app);
+
+    if (is_sandbox) {
+        App* main_app = TJS_GetApp(trt->main_ctx);
+        list_add_tail(&app->link, &main_app->link);
+    }
+    return app;
+}
+
+App* TJS_NewApp(TJSRuntime* trt) {
+    return TJS_NewAppInternal(trt, false);
+}
+
 TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     JSRuntime* rt = NULL;
-    JSContext* ctx = NULL;
     TJSRuntime* qrt = tjs__mallocz(sizeof(*qrt));
 
     memcpy(&qrt->options, options, sizeof(*options));
 
+    /* Create Runtime */
     rt = JS_NewRuntime2(&tjs_mf, NULL);
     CHECK_NOT_NULL(rt);
     qrt->rt = rt;
-
-    ctx = JS_NewContext(rt);
-    CHECK_NOT_NULL(ctx);
-    qrt->ctx = ctx;
-
     JS_SetRuntimeOpaque(rt, qrt);
-    JS_SetContextOpaque(ctx, qrt);
+
+    /* Create main app */
+    App* app = TJS_NewAppInternal(qrt, false);
+    JSContext* ctx = app->ctx;
+    qrt->main_ctx = ctx;
 
     /* Set memory limit */
     JS_SetMemoryLimit(rt, options->mem_limit);
@@ -247,7 +285,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* Debug */
 #ifdef DEBUG
-    JS_SetDumpFlags(rt, JS_DUMP_LEAKS);
+    JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_FREE | JS_DUMP_GC_FREE | JS_DUMP_GC);
 #endif
 
     /* Worker support */
@@ -377,14 +415,16 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
      * join to ensure the thread has exited. The TJSWorker struct itself is
      * owned by the JS Worker object and freed by tjs_worker_finalizer below
      * (which runs from JS_FreeRuntime). */
-    struct list_head* p, * tmp;
-    list_for_each_safe(p, tmp, &qrt->workers) {
-        TJSWorker* worker = list_entry(p, TJSWorker, link);
-        if (!worker->terminated) {
-            worker->terminated = true;
-            TJS_Stop(worker->wrt);
-            uv_thread_join(&worker->tid);  /* wait; prevents UAF of worker->wrt */
-            worker->wrt = NULL;
+    {
+        struct list_head* p, * tmp;
+        list_for_each_safe(p, tmp, &qrt->workers) {
+            TJSWorker* worker = list_entry(p, TJSWorker, link);
+            if (!worker->terminated) {
+                worker->terminated = true;
+                TJS_Stop(worker->wrt);
+                uv_thread_join(&worker->tid);  /* wait; prevents UAF of worker->wrt */
+                worker->wrt = NULL;
+            }
         }
     }
 
@@ -394,28 +434,33 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     uv_close((uv_handle_t*) &qrt->jobs.check, NULL);
     uv_close((uv_handle_t*) &qrt->stop, NULL);
 
+    /* Drain the Promise job queue before freeing module hooks. */
+    JSContext *job_ctx;
+    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) > 0);
+
     /* Free module loader */
-    JS_FreeValue(qrt->ctx, qrt->module.resolver);
-    JS_FreeValue(qrt->ctx, qrt->module.loader);
-    JS_FreeValue(qrt->ctx, qrt->module.metaloader);
-    JS_FreeValue(qrt->ctx, qrt->module.attrchecker);
+    JSContext* ctx = qrt->main_ctx;
+    JS_FreeValue(ctx, qrt->module.resolver);
+    JS_FreeValue(ctx, qrt->module.loader);
+    JS_FreeValue(ctx, qrt->module.metaloader);
+    JS_FreeValue(ctx, qrt->module.attrchecker);
 
     qrt->module.resolver = qrt->module.loader =
         qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
 
     /* remove built-in data */
-    JS_FreeValue(qrt->ctx, qrt->builtins.worker_udata);
+    JS_FreeValue(ctx, qrt->builtins.worker_udata);
     qrt->builtins.worker_udata = JS_UNDEFINED;
-    JS_FreeValue(qrt->ctx, qrt->builtins.dispatch_event_func);
+    JS_FreeValue(ctx, qrt->builtins.dispatch_event_func);
     qrt->builtins.dispatch_event_func = JS_UNDEFINED;
-    JS_FreeValue(qrt->ctx, qrt->builtins.message_pipe);
+    JS_FreeValue(ctx, qrt->builtins.message_pipe);
     qrt->builtins.message_pipe = JS_UNDEFINED;
 
     /* Destroy shared module namespace */
-    JS_FreeValue(qrt->ctx, qrt->module.imod_ns);
+    JS_FreeValue(ctx, qrt->module.imod_ns);
 
     /* Destroy external native module registry */
-    JS_FreeValue(qrt->ctx, qrt->module.dyn_registry);
+    JS_FreeValue(ctx, qrt->module.dyn_registry);
 
     /* remove debug sourcemap */
     js_destroy_mapping_context(qrt->module.mapctx);
@@ -423,14 +468,25 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* Destroy all timers */
     tjs__destroy_timers(qrt);
 
+    /* Cleanup all contexts: main app first, then sandbox apps.
+     * The list is headed by &main_app->link (created in
+     * TJS_NewRuntimeInternal).  Sandbox apps are appended via
+     * list_add_tail in TJS_NewAppInternal. */
+    {
+        App* main_app = TJS_GetApp(ctx);
+        struct list_head *cur, *tmp;
+        list_for_each_safe(cur, tmp, &main_app->link) {
+            App* app = list_entry(cur, App, link);
+            JS_FreeContext(app->ctx);
+            list_del(&app->link);
+            tjs__free(app);
+        }
+    }
+
     /* Destroy the JS engine. */
-    JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
 
-    /* Close external native module handles AFTER the JS runtime is fully
-     * torn down — finalizers for classes/functions registered by the .so
-     * may run during JS_FreeRuntime and would otherwise call into freed
-     * code. */
+
     {
         struct list_head* p, * tmp;
         list_for_each_safe(p, tmp, &qrt->module.dyn_libs) {
@@ -481,14 +537,6 @@ void TJS_Initialize(int argc, char** argv) {
 #endif
 }
 
-JSContext* TJS_GetJSContext(TJSRuntime* qrt) {
-    return qrt->ctx;
-}
-
-TJSRuntime* TJS_GetRuntime(JSContext* ctx) {
-    return JS_GetContextOpaque(ctx);
-}
-
 static void uv__idle_cb(uv_idle_t* handle) {
     // Noop
 }
@@ -509,16 +557,17 @@ static void uv__prepare_cb(uv_prepare_t* handle) {
     uv__maybe_idle(qrt);
 }
 
-void tjs__execute_jobs(JSContext* ctx) {
+void tjs__execute_jobs(TJSRuntime* trt) {
     JSContext* ctx1;
-    TJSRuntime* trt = TJS_GetRuntime(ctx);
     int err;
 
     assert(trt != NULL);
 
     /* execute the pending jobs */
     while (!trt->jobs.paused) {
-        err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
+        JS_RunGC(trt->rt);
+        err = JS_ExecutePendingJob(trt->rt, &ctx1);
+        JS_RunGC(trt->rt);
         if (err <= 0) {
             if (err < 0) {
                 JSValue js_err = JS_GetException(ctx1);
@@ -545,7 +594,7 @@ static void uv__check_cb(uv_check_t* handle) {
 
     /* Don't execute jobs here if we're inside waitIO - it handles jobs itself */
     if (qrt->jobs.waitio_depth == 0) {
-        tjs__execute_jobs(qrt->ctx);
+        tjs__execute_jobs(qrt);
     }
 
     uv__maybe_idle(qrt);
@@ -632,7 +681,7 @@ void tjs__run_main(TJSRuntime* qrt) {
     }
 
     /* If we are running the main interpreter, run the entrypoint. */
-    if (tjs__eval_bytecode(qrt->ctx, tjs__core_js, tjs__core_js_size, true) != 0) {
+    if (tjs__eval_bytecode(qrt->main_ctx, tjs__core_js, tjs__core_js_size, true) != 0) {
 #ifdef DEBUG
         fprintf(stderr, "CorePanic: Eval entry script failed immediately\n");
 #endif

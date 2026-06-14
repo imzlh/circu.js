@@ -505,7 +505,7 @@ static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
     JSContext *ctx = s->ctx;
 
     // Guard against runtime freeing
-    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
     if (!qrt || qrt->freeing) {
         tjs__free(req);
         return;

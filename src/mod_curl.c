@@ -719,6 +719,7 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
 
     TJS_FreePromiseRT(rt, &curl->promise);
     curl_release_self_rt(rt, curl);
+    JS_FreeValueRT(rt, curl->on_headers_complete);
     JS_FreeValueRT(rt, curl->on_progress);
     JS_FreeValueRT(rt, curl->on_header);
     JS_FreeValueRT(rt, curl->on_data);

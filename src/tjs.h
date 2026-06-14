@@ -37,6 +37,7 @@
 #include <stdint.h>
 
 typedef struct TJSRuntime TJSRuntime;
+typedef struct TJSApp App;
 
 /* External native module ABI.
  *
@@ -84,8 +85,9 @@ TJSRuntime *TJS_NewRuntime(void);
 TJSRuntime *TJS_NewRuntimeOptions(TJSRunOptions *options);
 void TJS_FreeRuntime(TJSRuntime *qrt);
 void TJS_Initialize(int argc, char **argv);
-JSContext *TJS_GetJSContext(TJSRuntime *qrt);
+JSContext *TJS_GetJSContext(App *app);
 TJSRuntime *TJS_GetRuntime(JSContext *ctx);
+App *TJS_GetApp(JSContext *ctx);
 int TJS_Run(TJSRuntime *qrt);
 void TJS_Stop(TJSRuntime *qrt);
 

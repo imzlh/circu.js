@@ -48,7 +48,7 @@ static void uv__timer_close(uv_handle_t *handle) {
 
 static void destroy_timer(TJSTimer *th) {
     JSContext *ctx = th->ctx;
-    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
     /* Already being destroyed. */
@@ -88,7 +88,7 @@ static void uv__timer_cb(uv_timer_t *handle) {
     }
 
     /* Micro-tasks should run before timers. */
-    tjs__execute_jobs(th->ctx);
+    tjs__execute_jobs(TJS_GetRuntime(th->ctx));
 
 	/* Check again in case the timer was destroyed during job execution. */
     if (uv_is_closing((uv_handle_t *) handle)) {
@@ -102,7 +102,7 @@ static void uv__timer_cb(uv_timer_t *handle) {
 }
 
 static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
     int64_t delay;
@@ -158,7 +158,7 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_clearTimeout(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
     int64_t timer_id;
     TJSTimer *th = NULL;

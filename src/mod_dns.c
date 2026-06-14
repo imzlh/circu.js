@@ -39,7 +39,6 @@
 
 typedef struct {
 	JSContext* ctx;
-	JSRuntime* rt;
 	uv_getaddrinfo_t req;
 	TJSPromise result;
 	struct addrinfo* res;  // For sync operations
@@ -69,14 +68,13 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 	CHECK_NOT_NULL(gr);
 
 	JSContext* ctx = gr->ctx;
-	JSRuntime* rt = gr->rt;
-	TJSRuntime* qrt = JS_GetRuntimeOpaque(rt);
+	TJSRuntime* qrt = TJS_GetRuntime(ctx);
 
 	// Safeguard: if runtime is being freed, don't call JS functions
 	if (!qrt || qrt->freeing) {
 		if (res) uv_freeaddrinfo(res);
-		TJS_FreePromiseRT(rt, &gr->result);
-		js_free_rt(rt, gr);
+		TJS_FreePromise(ctx, &gr->result);
+		js_free(ctx, gr);
 		return;
 	}
 
@@ -132,7 +130,6 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 
 	gr->ctx = ctx;
-	gr->rt = JS_GetRuntime(ctx);
 	gr->req.data = gr;
 
 	struct addrinfo hints;
@@ -750,7 +747,7 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 	unsigned flags) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) handle->data;
 	JSContext* js_ctx = ctx->ctx;
-	TJSRuntime* qrt = JS_GetContextOpaque(js_ctx);
+	TJSRuntime* qrt = TJS_GetRuntime(js_ctx);
 
 	// If runtime is being freed, just cleanup without touching JSContext
 	if (!qrt || qrt->freeing) {
@@ -821,7 +818,7 @@ static void udp_alloc_callback(uv_handle_t* handle, size_t suggested_size,
 
 static void udp_send_callback(uv_udp_send_t* req, int status) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) req->data;
-	TJSRuntime* qrt = JS_GetContextOpaque(ctx->ctx);
+	TJSRuntime* qrt = TJS_GetRuntime(ctx->ctx);
 
 	// If runtime is being freed, just cleanup without touching JSContext
 	if (!qrt || qrt->freeing) {
@@ -849,7 +846,7 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 
 static void udp_timeout_callback(uv_timer_t* handle) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) handle->data;
-	TJSRuntime* qrt = JS_GetContextOpaque(ctx->ctx);
+	TJSRuntime* qrt = TJS_GetRuntime(ctx->ctx);
 
 	// If runtime is being freed, just cleanup without touching JSContext
 	if (!qrt || qrt->freeing) {

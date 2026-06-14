@@ -43,7 +43,7 @@ void tjs_assert(const struct AssertionInfo info) {
 }
 
 uv_loop_t *tjs_get_loop(JSContext *ctx) {
-    TJSRuntime *qrt = JS_GetContextOpaque(ctx);
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
     return TJS_GetLoop(qrt);

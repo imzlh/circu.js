@@ -57,7 +57,7 @@ typedef struct TJSTimer TJSTimer;
 struct TJSRuntime {
     TJSRunOptions options;
     JSRuntime *rt;
-    JSContext *ctx;
+    JSContext *main_ctx;
     uv_loop_t loop;
     struct {
         uv_check_t check;
@@ -73,11 +73,6 @@ struct TJSRuntime {
     struct list_head workers;
 
 	bool freeing;
-#ifdef CJS__HAS_WASM
-    // struct {
-	// 	bool initialized;
-	// } wasm_ctx;
-#endif
     struct {
         TJSTimer *timers;
         int64_t next_timer;
@@ -98,6 +93,14 @@ struct TJSRuntime {
 		struct list_head dyn_libs;  /* loaded uv_lib_t handles, freed after JS shutdown */
 		MappingContext* mapctx;
 	} module;
+};
+
+struct TJSApp {
+    TJSRuntime* trt;
+    JSContext *ctx;
+
+    bool is_sandbox;
+    struct list_head link;
 };
 
 typedef struct TJSDynLib {
@@ -169,8 +172,7 @@ JSValue tjs_new_pipe(JSContext *ctx);
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);
 uv_pipe_t *tjs_pipe_get_pipe(JSContext *ctx, JSValue obj);
 
-void tjs__execute_jobs(JSContext *ctx);
-JSModuleDef *tjs__load_builtin(JSContext *ctx, const char *name);
+void tjs__execute_jobs(TJSRuntime *trt);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);
 
 JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value);

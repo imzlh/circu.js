@@ -484,7 +484,7 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 		return JS_ThrowTypeError(ctx, "options must be an object");
 	}
 
-	TJSRuntime* trt = JS_GetContextOpaque(ctx);
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	assert(trt != NULL);
 	JSValue valtmp = JS_UNDEFINED;
 	IFOPT2("load", JS_IsFunction, {
@@ -665,7 +665,7 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	bool aborted = false;
 	JSValue abort_exception = JS_UNDEFINED;
 	int loop_iterations = 0;
-	const int MAX_ITERATIONS = 100000;
+	const int MAX_ITERATIONS = 1000;
 
 	while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
 		// Safety: prevent infinite loops
@@ -674,33 +674,6 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 			aborted = true;
 			break;
 		}
-
-		// Execute pending jobs BEFORE uv_run
-		// This is critical: jobs may create/start uv handles needed for I/O
-		JSContext *ctx1;
-		int err;
-		while (1) {
-			err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
-			if (err <= 0) {
-				if (err < 0) {
-					// Job threw an exception
-					JSValue js_err = JS_GetException(ctx1);
-					JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
-					bool should_stop = (JS_IsEqual(ctx1, retv, JS_FALSE) == 1);
-					JS_FreeValue(ctx1, js_err);
-					JS_FreeValue(ctx1, retv);
-
-					if (should_stop) {
-						abort_exception = JS_ThrowInternalError(ctx, "Job exception caused runtime stop");
-						aborted = true;
-						break;
-					}
-				}
-				break;  // No more jobs
-			}
-		}
-
-		if (aborted) break;
 
 		// Run event loop to process I/O
 		int uv_result = uv_run(loop, UV_RUN_ONCE);
