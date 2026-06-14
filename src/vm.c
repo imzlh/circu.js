@@ -132,18 +132,9 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
 }
 
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
-    JSValueConst promise, JSValueConst parent_promise,
-    void* opaque) {
-    // TJSRuntime *qrt = TJS_GetRuntime(ctx);
-
-    // call JS event handler
-    JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]) {
-        JS_NewUint32(ctx, type),
-            JS_DupValue(ctx, promise),
-            JS_DupValue(ctx, parent_promise)
-    });
-    tjs__dispatch_event2(ctx, EV_PROMISE, args);
-    JS_FreeValue(ctx, args);
+    JSValueConst promise, JSValueConst parent_promise, void* opaque) {
+    // here we removed EV_PROMISE due to it is too slow and will cause GC problem
+    // we just capture promise stack
 }
 
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {

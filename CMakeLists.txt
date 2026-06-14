@@ -63,7 +63,7 @@ endif()
 
 set(CJS__VERSION_MAJOR 1)
 set(CJS__VERSION_MINOR 2)
-set(CJS__VERSION_PATCH 1)
+set(CJS__VERSION_PATCH 2)
 set(CJS__VERSION_SUFFIX "")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
