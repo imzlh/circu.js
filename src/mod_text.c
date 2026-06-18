@@ -426,21 +426,25 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
 
     /* Assemble pending + new bytes into one contiguous run first, so a BOM (or
      * any multi-byte sequence) split across streamed chunks is handled
-     * correctly. */
+     * correctly.
+     *
+     * IMPORTANT: Always copy input into a QJS-managed buffer. The source
+     * `inbuf` may point into WASM linear memory (via a typed array view),
+     * which can be invalidated by memory.grow or other WASM runtime events.
+     * We must not rely on the raw pointer remaining valid past this point. */
     const char *conv_in;
     size_t conv_len = dec->pending_len + inlen;
-    char *merged = NULL;
+    char *merged = js_malloc(ctx, conv_len ? conv_len : 1);
+    if (!merged)
+        return JS_ThrowOutOfMemory(ctx);
     if (dec->pending_len > 0) {
-        merged = js_malloc(ctx, conv_len ? conv_len : 1);
-        if (!merged)
-            return JS_ThrowOutOfMemory(ctx);
         memcpy(merged, dec->pending, dec->pending_len);
         memcpy(merged + dec->pending_len, inbuf, inlen);
         dec->pending_len = 0;
-        conv_in = merged;
     } else {
-        conv_in = (const char *)inbuf;
+        memcpy(merged, inbuf, inlen);
     }
+    conv_in = merged;
 
     /* BOM handling, evaluated on the assembled bytes (so a BOM straddling a
      * chunk boundary is still recognized). Only at the very start of a stream. */

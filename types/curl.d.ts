@@ -214,6 +214,11 @@ declare namespace CModuleCURL {
         setHeaders(headers: Record<string, string>): this;
 
         /**
+         * Get the current request headers as an array of "Name: Value" strings.
+         */
+        getHeaders(): string[];
+
+        /**
          * Set request body (for POST/PUT, etc.)
          * @param body Request body string
          * @returns Current CURL instance (supports chaining)
@@ -464,9 +469,74 @@ declare namespace CModuleCURL {
      */
     export const version: VersionInfo;
 
-    export const CURLOPT: Record<string, number>;
-    export const CURLINFO: Record<string, number>;
-    export const constants: Record<string, number>;
+    /* ---- getInfo() constants (CURLINFO_*) ---- */
+    export const CURLINFO_EFFECTIVE_URL: number;
+    export const CURLINFO_RESPONSE_CODE: number;
+    export const CURLINFO_HTTP_VERSION: number;
+    export const CURLINFO_TOTAL_TIME: number;
+    export const CURLINFO_NAMELOOKUP_TIME: number;
+    export const CURLINFO_CONNECT_TIME: number;
+    export const CURLINFO_APPCONNECT_TIME: number;
+    export const CURLINFO_PRETRANSFER_TIME: number;
+    export const CURLINFO_STARTTRANSFER_TIME: number;
+    export const CURLINFO_REDIRECT_TIME: number;
+    export const CURLINFO_REDIRECT_COUNT: number;
+    export const CURLINFO_REDIRECT_URL: number;
+    export const CURLINFO_SIZE_UPLOAD_T: number;
+    export const CURLINFO_SIZE_DOWNLOAD_T: number;
+    export const CURLINFO_SPEED_DOWNLOAD_T: number;
+    export const CURLINFO_SPEED_UPLOAD_T: number;
+    export const CURLINFO_CONTENT_TYPE: number;
+    export const CURLINFO_CONTENT_LENGTH_DOWNLOAD_T: number;
+    export const CURLINFO_PRIMARY_IP: number;
+    export const CURLINFO_PRIMARY_PORT: number;
+    export const CURLINFO_LOCAL_IP: number;
+    export const CURLINFO_LOCAL_PORT: number;
+    export const CURLINFO_NUM_CONNECTS: number;
+    export const CURLINFO_COOKIELIST: number;
+    export const CURLINFO_SSL_VERIFYRESULT: number;
+    export const CURLINFO_OS_ERRNO: number;
+    export const CURLINFO_SCHEME: number;
+    export const CURLINFO_HEADER_SIZE: number;
+    /** @deprecated Use CURLINFO_SIZE_DOWNLOAD_T */
+    export const CURLINFO_SIZE_DOWNLOAD: number;
+    /** @deprecated Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T */
+    export const CURLINFO_CONTENT_LENGTH_DOWNLOAD: number;
+
+    /* ---- setOpt() / misc constants ---- */
+    /** CA certificate file path. Passed to setOpt(CURLOPT_CAINFO, path). */
+    export const CURLOPT_CAINFO: number;
+    /** Client certificate file path. Passed to setOpt(CURLOPT_SSLCERT, path). */
+    export const CURLOPT_SSLCERT: number;
+    /** Private key file path. Passed to setOpt(CURLOPT_SSLKEY, path). */
+    export const CURLOPT_SSLKEY: number;
+    export const CURLAUTH_BASIC: number;
+    export const CURLAUTH_DIGEST: number;
+    export const CURLAUTH_NTLM: number;
+    export const CURLAUTH_BEARER: number;
+    export const CURLAUTH_NEGOTIATE: number;
+    export const CURLAUTH_ANY: number;
+    export const CURLAUTH_ANYSAFE: number;
+    export const CURLPROXY_HTTP: number;
+    export const CURLPROXY_HTTPS: number;
+    export const CURLPROXY_SOCKS4: number;
+    export const CURLPROXY_SOCKS4A: number;
+    export const CURLPROXY_SOCKS5: number;
+    export const CURLPROXY_SOCKS5_HOSTNAME: number;
+    export const CURL_HTTP_VERSION_1_0: number;
+    export const CURL_HTTP_VERSION_1_1: number;
+    export const CURL_HTTP_VERSION_2_0: number;
+    export const CURL_HTTP_VERSION_2TLS: number;
+    export const CURL_HTTP_VERSION_3: number;
+    export const CURLUSESSL_NONE: number;
+    export const CURLUSESSL_TRY: number;
+    export const CURLUSESSL_CONTROL: number;
+    export const CURLUSESSL_ALL: number;
+    export const CURLSSLOPT_ALLOW_BEAST: number;
+    export const CURLSSLOPT_NO_REVOKE: number;
+    export const CURL_IPRESOLVE_WHATEVER: number;
+    export const CURL_IPRESOLVE_V4: number;
+    export const CURL_IPRESOLVE_V6: number;
 
     export function strerror(code: number): string;
     export function escape(value: string): string | null;

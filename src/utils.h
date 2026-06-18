@@ -109,7 +109,6 @@ uv_loop_t *tjs_get_loop(JSContext *ctx);
 int tjs_obj2addr(JSContext *ctx, JSValue obj, struct sockaddr_storage *ss);
 void tjs_addr2obj(JSContext *ctx, JSValue obj, const struct sockaddr *sa, bool skip_port);
 void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv);
-void TJS_DumpException(JSContext *ctx);
 void tjs_dump_error(JSContext *ctx, JSValue exception_val);
 
 typedef struct {

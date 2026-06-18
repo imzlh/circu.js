@@ -36,7 +36,8 @@
 
 #define TJS__WASM_MAX_ARGS       		32
 #define TJS__WASM_ERROR_BUF_SIZE		256
-#define WAMR_APP_THREAD_STACK_SIZE_MAX	16 * 1024
+#define TJS__WASM_DEFAULT_STACK_SIZE    (16 * 1024)
+#define TJS__WASM_MAX_STACK_SIZE        (64 * 1024 * 1024)
 
 typedef struct TJSWasmImportGroup TJSWasmImportGroup;
 
@@ -138,7 +139,12 @@ typedef struct {
     uint32_t externref_capacity;
     /* Live ArrayBuffer view over linear memory; detached when memory grows. */
     JSValue mem_buffer;
+    void *mem_base;
+    size_t mem_byte_length;
 } TJSWasmInstance;
+
+/* Forward declarations — used by the import trampoline before their definition. */
+static void tjs__wasm_invalidate_membuf(JSContext *ctx, TJSWasmInstance *inst);
 
 static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
     TJSWasmInstance *i = JS_GetOpaque(val, tjs_wasm_instance_class_id);
@@ -206,6 +212,8 @@ static JSClassDef tjs_wasm_instance_class = {
     .finalizer = tjs_wasm_instance_finalizer,
     .gc_mark = tjs_wasm_instance_mark,
 };
+
+static uint32_t tjs__wasm_stack_size = TJS__WASM_DEFAULT_STACK_SIZE;
 
 static JSValue tjs_new_wasm_module(JSContext *ctx) {
     TJSWasmModule *m;
@@ -451,10 +459,44 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
         js_args[i] = tjs__wasm_val_to_js(ctx, &val);
     }
 
+    /* ------------------------------------------------------------------
+     * Guard against stale WASM-memory ArrayBuffers.
+     *
+     * WAMR may relocate linear memory during memory.grow, freeing the old
+     * block.  If that happened earlier in the current WASM call, the cached
+     * mem_buffer still points at freed memory, and any TypedArray views
+     * derived from it are dangling pointers.
+     *
+     * Invalidate BEFORE the JS call so getMemoryBuffer() hands out a fresh
+     * ArrayBuffer backed by the current memory base.
+     * ------------------------------------------------------------------ */
+    TJSWasmInstance *tjs__tramp_inst = wasm_runtime_get_user_data(exec_env);
+    wasm_memory_inst_t tjs__tramp_mem = NULL;
+    void *tjs__tramp_mem_base = NULL;
+    if (tjs__tramp_inst && !JS_IsUndefined(tjs__tramp_inst->mem_buffer)) {
+        wasm_module_inst_t tjs__mod = wasm_runtime_get_module_inst(exec_env);
+        tjs__tramp_mem = tjs__mod ? wasm_runtime_get_default_memory(tjs__mod) : NULL;
+        if (tjs__tramp_mem) {
+            tjs__tramp_mem_base = wasm_memory_get_base_address(tjs__tramp_mem);
+            if (tjs__tramp_mem_base != tjs__tramp_inst->mem_base)
+                tjs__wasm_invalidate_membuf(ctx, tjs__tramp_inst);
+        }
+    }
+
     /* Call the JS function */
     JSValue global_obj = JS_GetGlobalObject(ctx);
     JSValue ret = JS_Call(ctx, import_ctx->func, global_obj, param_count, js_args);
     JS_FreeValue(ctx, global_obj);
+
+    /* Re-check: the JS import may have triggered a nested WASM call that
+     * grew memory (e.g. JS → callfunction → memory.grow → return).
+     * Reuse the already-resolved memory instance to save API calls. */
+    if (tjs__tramp_mem && tjs__tramp_inst &&
+        !JS_IsUndefined(tjs__tramp_inst->mem_buffer)) {
+        void *tjs__after = wasm_memory_get_base_address(tjs__tramp_mem);
+        if (tjs__after != tjs__tramp_mem_base)
+            tjs__wasm_invalidate_membuf(ctx, tjs__tramp_inst);
+    }
 
     for (uint32_t i = 0; i < param_count; i++) {
         JS_FreeValue(ctx, js_args[i]);
@@ -718,7 +760,44 @@ static void tjs__wasm_invalidate_membuf(JSContext *ctx, TJSWasmInstance *inst) {
         JS_DetachArrayBuffer(ctx, inst->mem_buffer);
         JS_FreeValue(ctx, inst->mem_buffer);
         inst->mem_buffer = JS_UNDEFINED;
+        inst->mem_base = NULL;
+        inst->mem_byte_length = 0;
     }
+}
+
+static int tjs__wasm_cached_membuf_is_stale(JSContext *ctx,
+                                            TJSWasmInstance *inst,
+                                            void *base,
+                                            size_t byte_length,
+                                            bool *pstale) {
+    *pstale = true;
+    if (JS_IsUndefined(inst->mem_buffer))
+        return 0;
+
+    if (inst->mem_base != base || inst->mem_byte_length != byte_length)
+        return 0;
+
+    JSValue detached = JS_GetPropertyStr(ctx, inst->mem_buffer, "detached");
+    if (JS_IsException(detached))
+        return -1;
+    int is_detached = JS_ToBool(ctx, detached);
+    JS_FreeValue(ctx, detached);
+    if (is_detached < 0)
+        return -1;
+    if (is_detached)
+        return 0;
+
+    JSValue len_val = JS_GetPropertyStr(ctx, inst->mem_buffer, "byteLength");
+    if (JS_IsException(len_val))
+        return -1;
+    uint64_t cached_len;
+    int rc = JS_ToIndex(ctx, &cached_len, len_val);
+    JS_FreeValue(ctx, len_val);
+    if (rc)
+        return -1;
+
+    *pstale = cached_len != byte_length;
+    return 0;
 }
 
 static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
@@ -860,19 +939,20 @@ static JSValue tjs_wasm_buildinstance(JSContext *ctx, JSValue this_val, int argc
     TJSWasmInstance *i = tjs_wasm_instance_get(ctx, obj);
 
     char error_buf[TJS__WASM_ERROR_BUF_SIZE];
+    uint32_t stack_size = tjs__wasm_stack_size;
 
     // Resolve any remaining symbols (WASI, etc.) if not already resolved
     wasm_runtime_resolve_symbols(m->module);
 
     // Instantiate the module
-    i->module_inst = wasm_runtime_instantiate(m->module, WAMR_APP_THREAD_STACK_SIZE_MAX, 0, error_buf, sizeof(error_buf));
+    i->module_inst = wasm_runtime_instantiate(m->module, stack_size, 0, error_buf, sizeof(error_buf));
     if (!i->module_inst) {
         JS_FreeValue(ctx, obj);
         return tjs_throw_wasm_error(ctx, "LinkError", error_buf);
     }
 
     // Create execution environment
-    i->exec_env = wasm_runtime_create_exec_env(i->module_inst, WAMR_APP_THREAD_STACK_SIZE_MAX);
+    i->exec_env = wasm_runtime_create_exec_env(i->module_inst, stack_size);
     if (!i->exec_env) {
         wasm_runtime_deinstantiate(i->module_inst);
         i->module_inst = NULL;
@@ -1761,21 +1841,30 @@ static JSValue tjs_wasm_getmemorybuffer(JSContext *ctx, JSValue this_val, int ar
         return tjs_throw_wasm_error(ctx, "RuntimeError", "no memory instance");
     }
 
-    /* Reuse the cached buffer while it is still live (WebAssembly.Memory
-     * semantics: memory.buffer is stable until the memory grows). */
-    if (!JS_IsUndefined(i->mem_buffer))
-        return JS_DupValue(ctx, i->mem_buffer);
-
     void *base = wasm_memory_get_base_address(mem);
     uint64_t page_count = wasm_memory_get_cur_page_count(mem);
     uint64_t bytes_per_page = wasm_memory_get_bytes_per_page(mem);
     size_t byte_length = (size_t) (page_count * bytes_per_page);
+
+    /* Reuse the cached buffer only while it still describes the current WAMR
+     * linear memory. Internal memory.grow can detach or resize behind our JS
+     * wrapper before growMemory() is called explicitly. */
+    if (!JS_IsUndefined(i->mem_buffer)) {
+        bool stale = true;
+        if (tjs__wasm_cached_membuf_is_stale(ctx, i, base, byte_length, &stale))
+            return JS_EXCEPTION;
+        if (!stale)
+            return JS_DupValue(ctx, i->mem_buffer);
+        tjs__wasm_invalidate_membuf(ctx, i);
+    }
 
     JSValue buf = JS_NewArrayBuffer(ctx, (uint8_t *) base, byte_length, tjs__wasm_memory_free, NULL, false);
     if (JS_IsException(buf))
         return buf;
     /* Keep our own tracking reference so we can detach it on grow. */
     i->mem_buffer = JS_DupValue(ctx, buf);
+    i->mem_base = base;
+    i->mem_byte_length = byte_length;
     return buf;
 }
 
@@ -2325,6 +2414,23 @@ static JSValue tjs_wasm_validate(JSContext *ctx, JSValue this_val, int argc, JSV
     return JS_FALSE;
 }
 
+static JSValue tjs_wasm_setstacksize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    uint32_t size;
+    if (JS_ToUint32(ctx, &size, argv[0])) {
+        return JS_EXCEPTION;
+    }
+    if (size < TJS__WASM_DEFAULT_STACK_SIZE || size > TJS__WASM_MAX_STACK_SIZE) {
+        return JS_ThrowRangeError(ctx, "WASM stack size must be between %u and %u bytes",
+                                  TJS__WASM_DEFAULT_STACK_SIZE, TJS__WASM_MAX_STACK_SIZE);
+    }
+    tjs__wasm_stack_size = size;
+    return JS_UNDEFINED;
+}
+
+static JSValue tjs_wasm_getstacksize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    return JS_NewUint32(ctx, tjs__wasm_stack_size);
+}
+
 static const JSCFunctionListEntry tjs_wasm_funcs[] = {
     TJS_CFUNC_DEF("buildInstance", 1, tjs_wasm_buildinstance),
     TJS_CFUNC_DEF("callFuncByIndex", 3, tjs_wasm_callfuncbyindex),
@@ -2332,6 +2438,7 @@ static const JSCFunctionListEntry tjs_wasm_funcs[] = {
     TJS_CFUNC_DEF("getGlobal", 2, tjs_wasm_getglobal),
     TJS_CFUNC_DEF("getGlobalInfo", 2, tjs_wasm_getglobalinfo),
     TJS_CFUNC_DEF("getMemoryBuffer", 1, tjs_wasm_getmemorybuffer),
+    TJS_CFUNC_DEF("getStackSize", 0, tjs_wasm_getstacksize),
     TJS_CFUNC_DEF("getTableInfo", 2, tjs_wasm_gettableinfo),
     TJS_CFUNC_DEF("growMemory", 2, tjs_wasm_growmemory),
     TJS_CFUNC_DEF("moduleExports", 1, tjs_wasm_moduleexports),
@@ -2342,6 +2449,7 @@ static const JSCFunctionListEntry tjs_wasm_funcs[] = {
     TJS_CFUNC_DEF("resolveMemoryImports", 2, tjs_wasm_resolvememoryimports),
     TJS_CFUNC_DEF("resolveTableImports", 2, tjs_wasm_resolvetableimports),
     TJS_CFUNC_DEF("setGlobal", 3, tjs_wasm_setglobal),
+    TJS_CFUNC_DEF("setStackSize", 1, tjs_wasm_setstacksize),
     TJS_CFUNC_DEF("setWasiOptions", 4, tjs_wasm_setwasioptions),
     TJS_CFUNC_DEF("tableGet", 3, tjs_wasm_tableget),
     TJS_CFUNC_DEF("tableGrow", 3, tjs_wasm_tablegrow),

@@ -21,13 +21,10 @@ set(CMAKE_C_STANDARD 11)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Initialize flag lists
 set(cjs_cflags "")
 set(cjs_ldflags "")
 
-# Set compiler flags based on compiler type
 if(MSVC)
-    # MSVC compiler flags
     list(APPEND cjs_cflags
         /std:c11 /experimental:c11atomics /W4 /Zi /WX /permissive- /utf-8
         /wd4100 /wd4996 /wd4127 /wd4244 /wd4267 /wd4152
@@ -41,18 +38,18 @@ if(MSVC)
         add_compile_definitions(DEBUG)
     endif()
 else()
-    # GCC/Clang compiler flags
-    list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror)
+    list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror -rdynamic)
+    list(APPEND cjs_ldflags -rdynamic)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
         list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
         add_compile_definitions(DEBUG)
     endif()
 endif()
 
-# AddressSanitizer support
 if(ENABLE_ASAN)
     if(MSVC)
         list(APPEND cjs_cflags /fsanitize=address)
+        list(APPEND cjs_ldflags /DEBUG)
     else()
         list(APPEND cjs_cflags -fsanitize=address -fno-omit-frame-pointer)
         list(APPEND cjs_ldflags -fsanitize=address)
@@ -62,8 +59,8 @@ if(ENABLE_ASAN)
 endif()
 
 set(CJS__VERSION_MAJOR 1)
-set(CJS__VERSION_MINOR 2)
-set(CJS__VERSION_PATCH 2)
+set(CJS__VERSION_MINOR 3)
+set(CJS__VERSION_PATCH 0)
 set(CJS__VERSION_SUFFIX "")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
@@ -73,7 +70,6 @@ configure_file(
 macro(cpr_option OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
     option(${OPTION_NAME} ${OPTION_TEXT} ${OPTION_DEFAULT})
     if(DEFINED ENV{${OPTION_NAME}})
-        # Allow setting the option through an environment variable
         set(${OPTION_NAME} $ENV{${OPTION_NAME}})
     endif()
     if(${OPTION_NAME})
@@ -85,9 +81,8 @@ endmacro()
 cpr_option(BUILD_WITH_MIMALLOC "If ON (default), build with mimalloc" OFF)
 cpr_option(USE_EXTERNAL_FFI "Specify to use external ffi dependency" ON)
 cpr_option(BUILD_WITH_WASM "Enable WebAssembly support" ON)
-# we recommend to enable to make attached binary smaller
 cpr_option(CJS_USE_SYMBOL_INTERNAL "use symbol to pass through use fn instead of import.meta.use" OFF)
-# ASan is enabled by default in Debug builds, disabled in Release
+
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     set(_asan_default ON)
 else()
@@ -95,10 +90,11 @@ else()
 endif()
 cpr_option(ENABLE_ASAN "Enable AddressSanitizer (ASan)" ${_asan_default})
 
-set(QJS_ENABLE_ASAN ${ENABLE_ASAN} FORCE BOOL "Enable AddressSanitizer (ASan)")
+if (WIN32)
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared library for QJS" FORCE)
+endif()
+set(QJS_ENABLE_ASAN ${ENABLE_ASAN} CACHE BOOL "Enable AddressSanitizer (ASan)" FORCE)
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
-
-option(libuv_buildtests "" OFF)
 
 if(BUILD_WITH_MIMALLOC)
     option(MI_OVERRIDE "" OFF)
@@ -117,7 +113,6 @@ if(NOT HAVE_THREADS_H)
     add_compile_definitions(thread_local=_Thread_local)
 endif()
 
-# use symbol instead of import.meta.use
 if (CJS_USE_SYMBOL_INTERNAL)
     add_compile_definitions(CJS__DISABLE_MODULE_USE)
 endif()
@@ -125,8 +120,8 @@ endif()
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# Check if SQLite3 supports extension loading
 include(CheckCSourceCompiles)
+
 set(CMAKE_REQUIRED_INCLUDES ${SQLite3_INCLUDE_DIRS})
 set(CMAKE_REQUIRED_LIBRARIES ${SQLite3_LIBRARIES})
 check_c_source_compiles("
@@ -141,18 +136,16 @@ check_c_source_compiles("
 if(NOT SQLITE_HAS_LOAD_EXTENSION)
     message(WARNING "SQLite3 does not support extension loading. Some features may be disabled.")
 endif()
+
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv REQUIRED)
 find_package(CURL REQUIRED)
-find_package(llhttp) # optional
+find_package(llhttp)
 
-# Check expat version for XML_ExpatVersion function availability
 if(EXPAT_FOUND)
-    include(CheckCSourceCompiles)
     set(CMAKE_REQUIRED_INCLUDES ${EXPAT_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES ${EXPAT_LIBRARIES})
-    
     check_c_source_compiles("
         #include <expat.h>
         int main() {
@@ -161,17 +154,17 @@ if(EXPAT_FOUND)
             return 0;
         }
     " HAVE_XML_EXPAT_VERSION)
-    
+
     if(NOT HAVE_XML_EXPAT_VERSION)
         message(STATUS "Old expat detected - using version macros instead of XML_ExpatVersion()")
-        add_compile_definitions(HAVE_XML_EXPAT_VERSION)
+        add_compile_definitions(CJS__NO_XML_EXPAT_VERSION)
     endif()
 endif()
 
 option(libuv_buildtests "" OFF)
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
-add_library(libcjs
+add_library(libcjs STATIC
     src/binary.c
     src/mod_error.c
     src/mem.c
@@ -203,6 +196,7 @@ add_library(libcjs
     src/mod_http.c
     src/mod_socket.c
     src/mod_curl.c
+    src/mod_debug.c
 )
 
 if (WIN32)
@@ -210,9 +204,7 @@ if (WIN32)
 endif()
 
 if(llhttp_FOUND)
-    # System-installed llhttp may not provide CMake targets
-    # Use the traditional variables instead
-    target_link_libraries(libcjs llhttp)
+    target_link_libraries(libcjs PRIVATE llhttp)
 else()
     message(NOTICE "build with llhttp github repo")
     FetchContent_Declare(llhttp
@@ -222,14 +214,13 @@ else()
     set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(llhttp)
 
-    # Link with the llhttp::llhttp alias (points to llhttp_static when BUILD_STATIC_LIBS=ON)
-    target_link_libraries(libcjs llhttp::llhttp)
+    target_link_libraries(libcjs PRIVATE llhttp::llhttp)
 endif()
 
 if (Iconv_FOUND)
     add_compile_definitions(CJS__HAS_ICONV)
     target_sources(libcjs PUBLIC src/mod_text.c)
-    target_link_libraries(libcjs Iconv::Iconv)
+    target_link_libraries(libcjs PRIVATE Iconv::Iconv)
 else()
     message(NOTICE "build without iconv")
 endif()
@@ -238,10 +229,8 @@ if (BUILD_WITH_WASM)
     add_compile_definitions(CJS__HAS_WASM)
     target_sources(libcjs PUBLIC src/mod_wasm.c)
 
-    # WAMR Configuration (interpreter only for maximum portability)
     set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/wamr)
 
-    # Detect platform for WAMR
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         set(WAMR_BUILD_PLATFORM "darwin")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -250,7 +239,6 @@ if (BUILD_WITH_WASM)
         set(WAMR_BUILD_PLATFORM "linux")
     endif()
 
-    # Configure WAMR build options
     set(WAMR_BUILD_INTERP 1)
     set(WAMR_BUILD_FAST_INTERP 1)
     set(WAMR_BUILD_AOT 0)
@@ -266,12 +254,11 @@ if (BUILD_WITH_WASM)
     set(WAMR_BUILD_LOAD_CUSTOM_SECTION 1)
     set(WAMR_DISABLE_HW_BOUND_CHECK 1)
     set(WAMR_DISABLE_STACK_HW_BOUND_CHECK 1)
-    # Use C version of invokeNative on macOS to avoid Apple Clang assembly issues
+    # Apple Clang doesn't support the assembly version of invokeNative
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         set(WAMR_BUILD_INVOKE_NATIVE_GENERAL 1)
     endif()
 
-    # Include WAMR build scripts
     include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 
     add_library(vmlib STATIC ${WAMR_RUNTIME_LIB_SOURCE})
@@ -280,62 +267,23 @@ if (BUILD_WITH_WASM)
         target_link_libraries(vmlib PUBLIC ntdll)
     endif()
     target_include_directories(libcjs PRIVATE ${WAMR_ROOT_DIR}/core/iwasm/include)
-    target_link_libraries(libcjs vmlib)
+    target_link_libraries(libcjs PRIVATE vmlib)
 endif()
 
-# add_library(ffi-test SHARED
-#     tests/fixtures/ffi-test-lib.c
-# )
+find_library(FFI_LIB NAMES libffi ffi REQUIRED)
+find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
+target_include_directories(libcjs PRIVATE ${FFI_INCLUDE_DIR})
+target_link_libraries(libcjs PRIVATE ${FFI_LIB})
 
-# add_library(sqlite-test SHARED
-#     tests/fixtures/sqlite-test-ext.c
-# )
-
-# target_link_libraries(sqlite-test sqlite3)
-
-
-# if(NOT USE_EXTERNAL_FFI AND NOT MINGW AND NOT APPLE)
-#     set(LIBFFI_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/libffi")
-#     set(TMP_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffi_root")
-#     if(MINGW)
-#         set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.dll.a)
-#     else()
-#         set(LIBFFI_STATIC_PATH ${TMP_INSTALL_DIR}/usr/local/lib/libffi.a)
-#     endif()
-#     ExternalProject_Add(
-#         libffi
-#         BUILD_IN_SOURCE 1
-#         SOURCE_DIR "${LIBFFI_SRC}"
-#         CONFIGURE_COMMAND ./autogen.sh COMMAND ./configure --enable-static=yes --disable-shared --disable-docs --disable-multi-os-directory
-#         BUILD_COMMAND make
-#         INSTALL_DIR ${TMP_INSTALL_DIR}
-#         INSTALL_COMMAND make DESTDIR=${TMP_INSTALL_DIR} install
-#         EXCLUDE_FROM_ALL TRUE
-#         BUILD_BYPRODUCTS ${LIBFFI_STATIC_PATH}
-#     )
-#     add_dependencies(cjs libffi)
-#     add_library(libffi_a STATIC IMPORTED)
-#     set_target_properties(libffi_a PROPERTIES IMPORTED_LOCATION ${LIBFFI_STATIC_PATH})
-#     target_include_directories(cjs PRIVATE ${TMP_INSTALL_DIR}/usr/local/include)
-#     target_link_libraries(cjs libffi_a)
-# else()
-    find_library(FFI_LIB NAMES libffi ffi REQUIRED)
-    find_path(FFI_INCLUDE_DIR NAMES ffi.h PATH_SUFFIXES ffi REQUIRED)
-    target_include_directories(libcjs PRIVATE ${FFI_INCLUDE_DIR})
-    target_link_libraries(libcjs ${FFI_LIB})
-
-    file(READ "${FFI_INCLUDE_DIR}/ffi.h" FFI_HEADER)
-    string(FIND "${FFI_HEADER}" "FFI_BAD_ARGTYPE" FFI_HAS_BAD_ARGTYPE)
-
-    # old versions of libffi don't have FFI_BAD_ARGTYPE
-    if(FFI_HAS_BAD_ARGTYPE EQUAL -1)
-        add_definitions(-DFFI_BAD_ARGTYPE=3)
-    endif()
-# endif()
+file(READ "${FFI_INCLUDE_DIR}/ffi.h" FFI_HEADER)
+string(FIND "${FFI_HEADER}" "FFI_BAD_ARGTYPE" FFI_HAS_BAD_ARGTYPE)
+if(FFI_HAS_BAD_ARGTYPE EQUAL -1)
+    add_definitions(-DFFI_BAD_ARGTYPE=3)
+endif()
 
 if (BUILD_WITH_MIMALLOC)
     target_compile_definitions(libcjs PRIVATE CJS__HAS_MIMALLOC)
-    target_link_libraries(libcjs mimalloc-static)
+    target_link_libraries(libcjs PRIVATE mimalloc-static)
 endif()
 
 set_target_properties(libcjs PROPERTIES
@@ -348,29 +296,33 @@ target_compile_options(libcjs PRIVATE ${cjs_cflags})
 target_link_options(libcjs PRIVATE ${cjs_ldflags})
 target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(libcjs PUBLIC src)
-# libutil is required for openpty
-target_link_libraries(libcjs qjs uv_a OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB EXPAT::EXPAT)
+# qjs is PRIVATE so USING_QJS_SHARED doesn't propagate automatically on Windows
+if(WIN32)
+    target_compile_definitions(libcjs PRIVATE USING_QJS_SHARED)
+endif()
+target_link_libraries(libcjs PRIVATE qjs uv_a OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB EXPAT::EXPAT)
 if(TARGET SQLite3::SQLite3)
-    target_link_libraries(libcjs SQLite3::SQLite3)
+    target_link_libraries(libcjs PRIVATE SQLite3::SQLite3)
 elseif(TARGET SQLite::SQLite3)
-    target_link_libraries(libcjs SQLite::SQLite3)
+    target_link_libraries(libcjs PRIVATE SQLite::SQLite3)
 else()
-    target_link_libraries(libcjs sqlite3)
+    target_link_libraries(libcjs PRIVATE sqlite3)
 endif()
 
 add_executable(cjs-cli
     src/cli.c
 )
-target_link_libraries(cjs-cli libcjs)
+target_link_libraries(cjs-cli PRIVATE libcjs uv_a)
 target_link_options(cjs-cli PRIVATE ${cjs_ldflags})
 set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
 )
+# cjs-cli includes tjs.h which needs uv.h and iconv.h
+if(Iconv_FOUND)
+    target_include_directories(cjs-cli PRIVATE ${Iconv_INCLUDE_DIR})
+    target_link_libraries(cjs-cli PRIVATE Iconv::Iconv)
+endif()
 
-# ─── Embed bytecode blob into cjs-cli ────────────────────────────────────────
-# When CJS_BLOB_C is set (by the parent project), it points to a generated .c
-# file containing the bytecode as a const uint8_t array (cjs_blob[] / cjs_blob_size).
-# This is produced by cjsc -o blob.h and compiled directly into libcjs.
 if(CJS_BLOB_C)
     target_compile_definitions(libcjs PRIVATE CJS_BLOB_EMBEDDED)
     target_include_directories(libcjs PRIVATE "${CMAKE_BINARY_DIR}")
@@ -392,3 +344,18 @@ add_executable(cjsc EXCLUDE_FROM_ALL
 )
 target_link_libraries(cjsc qjs)
 target_link_options(cjsc PRIVATE ${cjs_ldflags})
+
+if (WIN32)
+    add_custom_command(TARGET cjs-cli POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:qjs>
+            $<TARGET_FILE_DIR:cjs-cli>/qjs.dll
+        COMMENT "Copying qjs.dll to cjs-cli output directory"
+    )
+    add_custom_command(TARGET cjsc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:qjs>
+            $<TARGET_FILE_DIR:cjsc>/qjs.dll
+        COMMENT "Copying qjs.dll to cjsc output directory"
+    )
+endif()

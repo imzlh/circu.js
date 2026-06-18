@@ -19,7 +19,7 @@ declare namespace CModuleWorker {
          * Send message
          * @param data Data to send
          */
-        postMessage(data: any): Promise<void>;
+        postMessage(data: any): void;
 
         /**
          * Message event handler
@@ -47,7 +47,7 @@ declare namespace CModuleWorker {
         /**
          * Terminate Worker
          */
-        terminate(): Promise<void>;
+        terminate(): void;
 
         /**
          * Get MessagePipe object

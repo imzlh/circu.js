@@ -83,7 +83,7 @@ declare namespace CModuleEngine {
     interface GlobalEvents {
         [EventType.PROMISE]: [this: Promise, error: Error | any],
         [EventType.EXIT]: number,
-        [EventType.UNHANDLED_REJECTION]: [this: Promise, state: PromiseState, parent: Promise],
+        [EventType.UNHANDLED_REJECTION]: [this: Promise, reason: Error | any],
         [EventType.JOB_EXCEPTION]: Error | unknown,
         [EventType.LOAD]: undefined
     }
@@ -155,13 +155,19 @@ declare namespace CModuleEngine {
     export function setMaxStackSize(size: number): void;
 
     /**
+     * Temporarily allow or disallow Atomics.wait on this runtime.
+     * Main thread defaults to false; set true inside debug pause loop.
+     */
+    export function setCanBlock(val: boolean): void;
+
+    /**
      * Execute JavaScript code, defaults to module mode
      * @param code Code to compile
      * @param moduleName Module name (for error messages)
      * @param flags Compile options, default `EVAL_MODULE`
      * @returns Compiled bytecode
      */
-    export function eval<T = any>(code: string, moduleName: string, flags?: number): { value: T } | globalThis.Promise<{ value: T }>;
+    export function eval<T = any>(code: string, moduleName: string, flags?: number): T | globalThis.Promise<T>;
 
     /**
      * Serialize JavaScript object to bytecode
@@ -201,7 +207,7 @@ declare namespace CModuleEngine {
      * Decode to text
      * @param buffer Buffer containing text
      */
-    export function decodeString(buffer: Uint8Array | ArrayBuffer): string;
+    export function decodeString(buffer: globalThis.Uint8Array | ArrayBufferLike): string;
 
     /**
      * Like `new TextEncoder('utf-16').encode(str)`
@@ -353,4 +359,48 @@ declare namespace CModuleEngine {
      * @param immutable Whether to make it immutable
      */
     export function setImmutableArrayBuffer(buffer: ArrayBuffer, immutable: boolean): void;
+
+    /**
+     * Get global lexical scope variables
+     */
+    export function getGlobalLexVar(): Record<string | symbol | number, any>;
+
+    /**
+     * Isolated JavaScript context within the same runtime.
+     * Each Sandbox has its own global scope — variables and modules
+     * in one sandbox cannot pollute another or the main context.
+     *
+     * @example
+     * const engine = import.meta.use('engine');
+     * const sb = new engine.Sandbox();
+     * sb.call('var x = 42');
+     * sb.call('x'); // 42
+     */
+    export class Sandbox {
+        /**
+         * Create a new isolated context
+         */
+        constructor();
+
+        /**
+         * Evaluate code in the sandbox context (global scope)
+         * @param code JavaScript code to execute
+         * @param name Optional filename for stack traces
+         * @returns Result of evaluation
+         */
+        call<T = any>(code: string, name?: string): T;
+
+        /**
+         * Compile and evaluate an ES module in the sandbox context
+         * @param code Module source code
+         * @param name Module name (for stack traces and import resolution)
+         * @returns Module namespace object
+         */
+        loadModule<T = Record<string, any>>(code: string, name: string): T;
+
+        /**
+         * The sandbox's global object
+         */
+        get global(): Record<string, any> & typeof globalThis;
+    }
 }

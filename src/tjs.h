@@ -52,9 +52,9 @@ typedef struct TJSApp App;
 #define TJS_ABI_VERSION 1u
 
 #ifdef _WIN32
-#define TJS_EXPORT __declspec(dllexport)
+#define EXPORT __declspec(dllexport)
 #else
-#define TJS_EXPORT __attribute__((visibility("default")))
+#define EXPORT __attribute__((visibility("default")))
 #endif
 
 typedef struct TJSModuleInfo {
@@ -80,23 +80,24 @@ typedef struct TJSRunOptions {
     size_t stack_size;
 } TJSRunOptions;
 
-void TJS_DefaultOptions(TJSRunOptions *options);
-TJSRuntime *TJS_NewRuntime(void);
-TJSRuntime *TJS_NewRuntimeOptions(TJSRunOptions *options);
-void TJS_FreeRuntime(TJSRuntime *qrt);
-void TJS_Initialize(int argc, char **argv);
-JSContext *TJS_GetJSContext(App *app);
-TJSRuntime *TJS_GetRuntime(JSContext *ctx);
-App *TJS_GetApp(JSContext *ctx);
-int TJS_Run(TJSRuntime *qrt);
-void TJS_Stop(TJSRuntime *qrt);
+EXPORT void TJS_DefaultOptions(TJSRunOptions *options);
+EXPORT TJSRuntime *TJS_NewRuntime(void);
+EXPORT TJSRuntime *TJS_NewRuntimeOptions(TJSRunOptions *options);
+EXPORT App* TJS_NewApp(TJSRuntime* trt);
+EXPORT void TJS_FreeRuntime(TJSRuntime *qrt);
+EXPORT void TJS_Initialize(int argc, char **argv);
+EXPORT JSContext *TJS_GetJSContext(App *app);
+EXPORT TJSRuntime *TJS_GetRuntime(JSContext *ctx);
+EXPORT App *TJS_GetApp(JSContext *ctx);
+EXPORT int TJS_Run(TJSRuntime *qrt);
+EXPORT void TJS_Stop(TJSRuntime *qrt);
 
-uv_loop_t *TJS_GetLoop(TJSRuntime *qrt);
-TJSRuntime *TJS_NewRuntimeWorker(void);
-TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options);
-JSValue TJS_EvalScript(JSContext *ctx, const char *filename);
-JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main);
-JSValue TJS_EvalModuleContent(JSContext *ctx,
+EXPORT uv_loop_t *TJS_GetLoop(TJSRuntime *qrt);
+EXPORT TJSRuntime *TJS_NewRuntimeWorker(void);
+EXPORT TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options);
+EXPORT JSValue TJS_EvalScript(JSContext *ctx, const char *filename);
+EXPORT JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main);
+EXPORT JSValue TJS_EvalModuleContent(JSContext *ctx,
                               const char *filename,
                               bool is_main,
                               bool use_realpath,
@@ -104,6 +105,6 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
                               size_t len);
 
 
-void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val);
-void TJS_DumpException(JSContext *ctx);
+EXPORT void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val);
+EXPORT void TJS_DumpException(JSContext *ctx);
 #endif

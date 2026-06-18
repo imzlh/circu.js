@@ -20,6 +20,7 @@ interface TjsModules {
     worker: typeof CModuleWorker,
     crypto: typeof CModuleCrypto,
     console: typeof CModuleConsole,
+    debug: typeof CModuleDebug,
     zlib: typeof CModuleZLib,
     sourcemap: typeof CModuleSourceMap,
     ssl: typeof CModuleSSL,

@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "version.h"
+#include "mem.h"
 
 #include <string.h>
 
@@ -52,6 +53,13 @@
 #include <llhttp.h>
 #define LLHTTP_VERSION STRINGIFY(LLHTTP_VERSION_MAJOR) "." STRINGIFY(LLHTTP_VERSION_MINOR) "." STRINGIFY(LLHTTP_VERSION_PATCH)
 
+#define CHECK_IF_IN_SANDBOX() do {\
+	App* app = TJS_GetApp(ctx); \
+	if (app->is_sandbox) { \
+		return JS_ThrowTypeError(ctx, "cannot call in sandbox mode"); \
+	} \
+} while(0)
+
 static JSValue tjs_gc_run(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JS_RunGC(JS_GetRuntime(ctx));
     return JS_UNDEFINED;
@@ -74,7 +82,6 @@ static JSValue tjs_gc_getThreshold(JSContext *ctx, JSValue this_val, int argc, J
 }
 
 
-// fixme: thread_local?
 static thread_local JSClassID js_module_class_id;
 typedef struct {
 	struct list_head local_def;
@@ -105,12 +112,12 @@ static void js_module_finalizer(JSRuntime *rt, JSValueConst obj){
 	tjs_module_t* mt = JS_GetOpaque(obj, js_module_class_id);
 	if(!mt) return;
 
-	// Free all exported var_refs
+	// QuickJS owns the module export var_refs and frees them with JSModuleDef.
+	// The wrapper only owns this bookkeeping list and its atom references.
 	if(mt->local_def.next) {
 		struct list_head *pos, *tmp;
 		list_for_each_safe(pos, tmp, &mt->local_def){
 			tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
-			JS_FreeModuleExport(rt, me->var);
 			JS_FreeAtomRT(rt, me->atom);
 			js_free_rt(rt, me);
 		}
@@ -224,6 +231,16 @@ static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, J
 	tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
 	if(!mt) return JS_EXCEPTION;
 	JSValue mod_val = JS_MKPTR(JS_TAG_MODULE, mt->def);
+	/* Resolve dependencies and initialize import.meta (including metaloader
+	 * / init hook) before evaluating. The standard QuickJS eval path in
+	 * quickjs-libc.c does JS_ResolveModule → js_module_set_import_meta →
+	 * JS_EvalFunction, but js_module_eval was only calling the last step,
+	 * so the entry module's import.meta was never set up and the init hook
+	 * (which fires Debugger.scriptParsed) never triggered. */
+	if (JS_ResolveModule(ctx, mod_val) < 0)
+		return JS_EXCEPTION;
+	if (js_module_set_import_meta(ctx, mod_val, false, false) < 0)
+		return JS_EXCEPTION;
 	/* JS_EvalFunction expects the module value to have ref_count >= 2,
 	 * as it will JS_FreeValue it internally */
 	return JS_EvalFunction(ctx, JS_DupValue(ctx, mod_val));
@@ -298,8 +315,7 @@ static JSValue js_module_unref(JSContext *ctx, JSValueConst this_val, int argc, 
 	list_for_each(pos, &mt->local_def){
 		tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
 		if(name_atom == me->atom){
-			// Free the specific export's var_ref, not the whole module def
-			JS_FreeModuleExport(JS_GetRuntime(ctx), me->var);
+			// QuickJS keeps owning the export var_ref through JSModuleDef.
 			JS_FreeAtom(ctx, me->atom);
 			list_del(&me->list);
 			js_free(ctx, me);
@@ -383,8 +399,179 @@ static const JSCFunctionListEntry js_module_proto_funcs[] = {
 	JS_CFUNC_DEF("unref", 0, js_module_unref),
 };
 
+/* ── Sandbox class ─────────────────────────────────────────────────────── */
+
+static thread_local JSClassID js_sandbox_class_id;
+
+static JSValue js_sandbox_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+
+    App *app = TJS_NewAppInternal(trt, true);
+    if (!app)
+        return JS_ThrowOutOfMemory(ctx);
+
+    /* Create the Sandbox JS object */
+    JSValue obj = JS_NewObjectClass(ctx, js_sandbox_class_id);
+    if (JS_IsException(obj)) {
+        JS_FreeContext(app->ctx);
+        list_del(&app->link);
+        tjs__free(app);
+        return obj;
+    }
+
+    TJSSandbox *sb = tjs__mallocz(sizeof(*sb));
+    if (!sb) {
+        JS_FreeValue(ctx, obj);
+        JS_FreeContext(app->ctx);
+        list_del(&app->link);
+        tjs__free(app);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    sb->app = app;
+    sb->global = JS_GetGlobalObject(app->ctx);
+
+    JS_SetOpaque(obj, sb);
+    return obj;
+}
+
+static void js_sandbox_finalizer(JSRuntime *rt, JSValueConst val) {
+    TJSSandbox *sb = JS_GetOpaque(val, js_sandbox_class_id);
+    if (!sb) return;
+
+    JS_FreeValueRT(rt, sb->global);
+    sb->global = JS_UNDEFINED;
+
+    /* During JS_FreeRuntime shutdown, TJS_FreeRuntime already frees all
+     * contexts (including sandbox ones).  So we only free the context
+     * here during normal GC (not shutdown). */
+    App *app = sb->app;
+    if (app) {
+        TJSRuntime *trt = app->trt;
+        if (!trt->freeing) {
+            JS_FreeContext(app->ctx);
+            list_del(&app->link);
+            tjs__free(app);
+        }
+        sb->app = NULL;
+    }
+
+    tjs__free(sb);
+}
+
+static void js_sandbox_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
+    TJSSandbox *sb = JS_GetOpaque(val, js_sandbox_class_id);
+    if (sb)
+        JS_MarkValue(rt, sb->global, mark_func);
+}
+
+static JSClassDef js_sandbox_class = {
+    "Sandbox",
+    .finalizer = js_sandbox_finalizer,
+    .gc_mark = js_sandbox_mark,
+};
+
+static JSValue js_sandbox_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
+    if (!sb) return JS_EXCEPTION;
+
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "call(code: string, name?: string)");
+
+    size_t len;
+    const char *code = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!code) return JS_EXCEPTION;
+
+    const char *name = "<sandbox>";
+    if (argc >= 2 && JS_IsString(argv[1])) {
+        name = JS_ToCString(ctx, argv[1]);
+        if (!name) {
+            JS_FreeCString(ctx, code);
+            return JS_EXCEPTION;
+        }
+    }
+
+    JSValue ret = JS_Eval(sb->app->ctx, code, len, name,
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_BACKTRACE_BARRIER);
+
+    if (argc >= 2 && JS_IsString(argv[1]))
+        JS_FreeCString(ctx, name);
+    JS_FreeCString(ctx, code);
+
+    return ret;
+}
+
+static JSValue js_sandbox_get_global(JSContext *ctx, JSValueConst this_val) {
+    TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
+    if (!sb) return JS_EXCEPTION;
+    return JS_DupValue(ctx, sb->global);
+}
+
+static JSValue js_sandbox_loadModule(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
+    if (!sb) return JS_EXCEPTION;
+
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "loadModule(code: string, name: string)");
+
+    size_t len;
+    const char *code = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!code) return JS_EXCEPTION;
+
+    const char *name = "<sandbox-module>";
+    if (argc >= 2 && JS_IsString(argv[1])) {
+        name = JS_ToCString(ctx, argv[1]);
+        if (!name) {
+            JS_FreeCString(ctx, code);
+            return JS_EXCEPTION;
+        }
+    }
+
+    JSValue ret = JS_Eval(sb->app->ctx, code, len, name,
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_BACKTRACE_BARRIER);
+
+    if (argc >= 2 && JS_IsString(argv[1]))
+        JS_FreeCString(ctx, name);
+    JS_FreeCString(ctx, code);
+
+    if (JS_IsException(ret))
+        return ret;
+
+    /* Resolve and eval the module */
+    if (JS_ResolveModule(sb->app->ctx, ret) < 0) {
+        JS_FreeValue(sb->app->ctx, ret);
+        return JS_EXCEPTION;
+    }
+
+    JSValue eval_ret = JS_EvalFunction(sb->app->ctx, JS_DupValue(sb->app->ctx, ret));
+    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(ret);
+    JS_FreeValue(sb->app->ctx, ret);
+
+    if (JS_IsException(eval_ret)) {
+        JS_FreeValue(sb->app->ctx, eval_ret);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(sb->app->ctx, eval_ret);
+
+    return JS_GetModuleNamespace(sb->app->ctx, m);
+}
+
+static const JSCFunctionListEntry js_sandbox_proto_funcs[] = {
+    JS_CFUNC_DEF("call", 2, js_sandbox_call),
+    JS_CFUNC_DEF("loadModule", 2, js_sandbox_loadModule),
+    JS_CGETSET_DEF("global", js_sandbox_get_global, NULL),
+};
+
+static JSValue tjs_setCanBlock(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    CHECK_IF_IN_SANDBOX();
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_SetCanBlock(rt, argc > 0 && JS_ToBool(ctx, argv[0]) ? TRUE : FALSE);
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_setMemoryLimit(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     uint32_t v;
+	CHECK_IF_IN_SANDBOX();
+
     if (JS_ToUint32(ctx, &v, argv[0])) {
         return JS_EXCEPTION;
     }
@@ -394,6 +581,8 @@ static JSValue tjs_setMemoryLimit(JSContext *ctx, JSValue this_val, int argc, JS
 
 static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     uint32_t v;
+	CHECK_IF_IN_SANDBOX();
+	
     if (JS_ToUint32(ctx, &v, argv[0])) {
         return JS_EXCEPTION;
     }
@@ -484,6 +673,8 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 		return JS_ThrowTypeError(ctx, "options must be an object");
 	}
 
+	CHECK_IF_IN_SANDBOX();
+
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	assert(trt != NULL);
 	JSValue valtmp = JS_UNDEFINED;
@@ -510,6 +701,8 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 #undef IFOPT2
 
 static JSValue tjs__set_event_receiver(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	CHECK_IF_IN_SANDBOX();
+	
 	if (argc == 0 || !JS_IsFunction(ctx, argv[0])){
 		return JS_ThrowTypeError(ctx, "argument must be a function");
 	}
@@ -740,7 +933,12 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 	}
 }
 
+static JSValue tjs_get_global_lexvar(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	return JS_GetGlobalLexicalVariables(ctx);
+}
+
 static const JSCFunctionListEntry tjs_engine_funcs[] = {
+    TJS_CFUNC_DEF("setCanBlock", 1, tjs_setCanBlock),
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
     TJS_CFUNC_DEF("eval", 3, tjs_eval),
@@ -756,6 +954,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
 	TJS_CFUNC_DEF("setImmutableArrayBuffer", 2, tjs_immutArrayBuffer),
+	TJS_CFUNC_DEF("getGlobalLexVar", 0, tjs_get_global_lexvar),
 	TJS_CFUNC_DEF("waitIO", 2, tjs_waitIO),
 
 	TJS_CONST2("DUMP_BYTECODE", JS_WRITE_OBJ_BYTECODE),
@@ -859,4 +1058,14 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 	// Module.from
 	JSValue mfrom = JS_NewCFunction(ctx, js_module_static_from, "from", 1);
 	JS_DefinePropertyValueStr(ctx, ctor, "from", mfrom, JS_PROP_C_W_E);
+
+	// class Sandbox
+	JS_NewClassID(JS_GetRuntime(ctx), &js_sandbox_class_id);
+	JS_NewClass(JS_GetRuntime(ctx), js_sandbox_class_id, &js_sandbox_class);
+	JSValue sb_proto = JS_NewObjectProto(ctx, JS_NULL);
+	JS_SetPropertyFunctionList(ctx, sb_proto, js_sandbox_proto_funcs, countof(js_sandbox_proto_funcs));
+	JS_SetClassProto(ctx, js_sandbox_class_id, sb_proto);
+	JSValue sb_ctor = JS_NewCFunction2(ctx, js_sandbox_ctor, "Sandbox", 0, JS_CFUNC_constructor, 0);
+	JS_SetConstructor(ctx, sb_ctor, sb_proto);
+	JS_DefinePropertyValueStr(ctx, ns, "Sandbox", sb_ctor, JS_PROP_C_W_E);
 }

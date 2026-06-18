@@ -254,7 +254,7 @@ App* TJS_NewAppInternal(TJSRuntime* trt, bool is_sandbox) {
 }
 
 App* TJS_NewApp(TJSRuntime* trt) {
-    return TJS_NewAppInternal(trt, false);
+    return TJS_NewAppInternal(trt, true);
 }
 
 TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
@@ -285,7 +285,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* Debug */
 #ifdef DEBUG
-    JS_SetDumpFlags(rt, JS_DUMP_LEAKS | JS_DUMP_FREE | JS_DUMP_GC_FREE | JS_DUMP_GC);
+    JS_SetDumpFlags(rt, JS_DUMP_LEAKS /* | JS_DUMP_FREE | JS_DUMP_GC_FREE | JS_DUMP_GC */);
 #endif
 
     /* Worker support */
@@ -339,6 +339,14 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->builtins.dispatch_event_func =
         qrt->builtins.worker_udata =
         qrt->builtins.message_pipe = JS_UNDEFINED;
+
+    /* debug */
+    qrt->debug.onBreak = JS_UNDEFINED;
+    qrt->debug.onException = JS_UNDEFINED;
+    qrt->debug.active = false;
+    qrt->debug.break_on_exceptions = false;
+    qrt->debug.breakpoints_active = true;
+    qrt->debug.breakpoints = NULL;
 
     /* runtime-shared module namespace cache */
     qrt->module.imod_ns = JS_NewObjectProto(ctx, JS_NULL);
@@ -434,19 +442,23 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     uv_close((uv_handle_t*) &qrt->jobs.check, NULL);
     uv_close((uv_handle_t*) &qrt->stop, NULL);
 
-    /* Drain the Promise job queue before freeing module hooks. */
-    JSContext *job_ctx;
-    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) > 0);
-
-    /* Free module loader */
+    /* Poison module hooks so that any subsequent access from C closures
+     * (e.g. enqueue/tryDone) triggers an immediate ASan report instead of
+     * silent use-after-free inside JS_FreeRuntime's GC phase. */
     JSContext* ctx = qrt->main_ctx;
-    JS_FreeValue(ctx, qrt->module.resolver);
-    JS_FreeValue(ctx, qrt->module.loader);
-    JS_FreeValue(ctx, qrt->module.metaloader);
-    JS_FreeValue(ctx, qrt->module.attrchecker);
-
+    JSValue old_resolver = qrt->module.resolver;
+    JSValue old_loader = qrt->module.loader;
+    JSValue old_metaloader = qrt->module.metaloader;
+    JSValue old_attrchecker = qrt->module.attrchecker;
     qrt->module.resolver = qrt->module.loader =
         qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
+
+    /* Now free the JSValues.  If any C closure still holds a reference,
+     * ASan will flag the access to old_resolver/old_loader below. */
+    JS_FreeValue(ctx, old_resolver);
+    JS_FreeValue(ctx, old_loader);
+    JS_FreeValue(ctx, old_metaloader);
+    JS_FreeValue(ctx, old_attrchecker);
 
     /* remove built-in data */
     JS_FreeValue(ctx, qrt->builtins.worker_udata);
@@ -465,8 +477,22 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* remove debug sourcemap */
     js_destroy_mapping_context(qrt->module.mapctx);
 
-    /* Destroy all timers */
+    /* cleanup debug state */
+    {
+        TJSBreakpoint *bp, *tmp;
+        HASH_ITER(hh, qrt->debug.breakpoints, bp, tmp) {
+            HASH_DEL(qrt->debug.breakpoints, bp);
+            JS_FreeAtom(ctx, bp->filename);
+            js_free(ctx, bp);
+        }
+    }
+    JS_FreeValue(ctx, qrt->debug.onBreak);
+    JS_FreeValue(ctx, qrt->debug.onException);
+
+    /* Destroy all timers and drain the Promise job queue. */
+    JSContext *job_ctx;
     tjs__destroy_timers(qrt);
+    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0);
 
     /* Cleanup all contexts: main app first, then sandbox apps.
      * The list is headed by &main_app->link (created in
@@ -474,6 +500,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
      * list_add_tail in TJS_NewAppInternal. */
     {
         App* main_app = TJS_GetApp(ctx);
+        JS_FreeContext(main_app->ctx);
         struct list_head *cur, *tmp;
         list_for_each_safe(cur, tmp, &main_app->link) {
             App* app = list_entry(cur, App, link);
@@ -481,6 +508,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
             list_del(&app->link);
             tjs__free(app);
         }
+        tjs__free(main_app);
     }
 
     /* Destroy the JS engine. */
@@ -565,9 +593,7 @@ void tjs__execute_jobs(TJSRuntime* trt) {
 
     /* execute the pending jobs */
     while (!trt->jobs.paused) {
-        JS_RunGC(trt->rt);
         err = JS_ExecutePendingJob(trt->rt, &ctx1);
-        JS_RunGC(trt->rt);
         if (err <= 0) {
             if (err < 0) {
                 JSValue js_err = JS_GetException(ctx1);

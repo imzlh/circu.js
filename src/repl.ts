@@ -440,7 +440,7 @@ class CJSRepl {
         this.#onExit(() => {
         // Disable bracketed paste mode before exiting
             if (this.#isatty) {
-                this.#stdin.write(engine.encodeString('\x1b[?2004l'));
+                sfs.write(os.STDOUT_FILENO, engine.encodeString('\x1b[?2004l'));
                 (this.#stdin as CModuleStreams.TTY).mode = (streams.TTY_MODE_NORMAL);
             }
         });
@@ -960,10 +960,6 @@ class CJSRepl {
         switch (cmd) {
             case 'h': case 'help':
                 this.#showHelp();
-                return false;
-            case 'load':
-                const file = rest.trim() || 'script.js';
-                await import(file.endsWith('.js') ? file : file + '.js');
                 return false;
             case 'x': this.#config.hexMode = true; return false;
             case 'd': this.#config.hexMode = false; return false;

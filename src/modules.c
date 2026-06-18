@@ -52,6 +52,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "curl", tjs__mod_curl_init, true },
 	{ "crypto", tjs__mod_crypto_init, true },
 	{ "console", tjs__mod_console_init, true },
+	{ "debug", tjs__mod_debug_init, true },
 	{ "dns", tjs__mod_dns_init, true },
 	{ "engine", tjs__mod_engine_init, true },
 	{ "error", tjs__mod_error_init, true },
@@ -318,8 +319,15 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
 			JS_FreeValue(ctx, ret);
 			goto compile;
 		} else if(JS_IsObject(ret)){
-			// try class Module
+			// try class Module — initialize import.meta and fire init hook
 			JSModuleDef* m = tjs__module_getdef(ctx, ret);
+			if (m) {
+				/* js_module_set_import_meta needs a JS_TAG_MODULE value;
+				 * construct it from the JSModuleDef pointer. The module
+				 * is alive (referenced by the Module class instance), so
+				 * this temporary tagged value is safe to pass. */
+				js_module_set_import_meta(ctx, JS_MKPTR(JS_TAG_MODULE, m), false, false);
+			}
 			JS_FreeValue(ctx, ret);
 			return m;
 		} else if(JS_IsException(ret)){

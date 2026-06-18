@@ -28,6 +28,7 @@
 #include "../deps/quickjs/cutils.h"
 #include "../deps/quickjs/quickjs.h"
 #include "../deps/quickjs/list.h"
+#include "uthash.h"
 #include "tjs.h"
 #include "utils.h"
 #include "sourcemap.h"
@@ -53,6 +54,15 @@ enum {
 };
 
 typedef struct TJSTimer TJSTimer;
+
+typedef struct DebugControlBlock DebugControlBlock;
+
+typedef struct TJSBreakpoint {
+    JSAtom filename;
+    int line;
+    int col;                // -1 = match line only
+    UT_hash_handle hh;
+} TJSBreakpoint;
 
 struct TJSRuntime {
     TJSRunOptions options;
@@ -93,6 +103,17 @@ struct TJSRuntime {
 		struct list_head dyn_libs;  /* loaded uv_lib_t handles, freed after JS shutdown */
 		MappingContext* mapctx;
 	} module;
+    struct {
+        JSValue onBreak;
+        JSValue onException;
+        bool active;
+        bool break_on_exceptions;
+        bool breakpoints_active;  // DevTools "Deactivate breakpoints" toggle
+        TJSBreakpoint *breakpoints;
+        int step_mode;   // 0=none, 1=into, 2=over, 3=out
+        int step_depth;  // stack depth at pause time (for over/out)
+        DebugControlBlock *channel;  // owned ref (decref on stop)
+    } debug;
 };
 
 struct TJSApp {
@@ -102,6 +123,11 @@ struct TJSApp {
     bool is_sandbox;
     struct list_head link;
 };
+
+typedef struct {
+    App *app;
+    JSValue global;
+} TJSSandbox;
 
 typedef struct TJSDynLib {
 	uv_lib_t lib;
@@ -150,6 +176,7 @@ void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 void tjs__mod_socket_init(JSContext *ctx, JSValue ns);
+void tjs__mod_debug_init(JSContext *ctx, JSValue ns);
 
 #ifdef _WIN32
 void tjs__mod_win32_init(JSContext *ctx, JSValue ns);
@@ -199,4 +226,6 @@ SSL_CTX* tjs__sslctx_get(JSContext *ctx, JSValueConst obj);
 
 JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents evname, JSValue data);
 void tjs__dispatch_event2(JSContext *ctx, TJSEvents evname, JSValue data);
+
+App* TJS_NewAppInternal(TJSRuntime* trt, bool is_sandbox);
 #endif

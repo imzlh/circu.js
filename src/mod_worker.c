@@ -438,7 +438,7 @@ static void worker_entry(void *arg) {
     JSValue message_pipe = tjs_new_msgpipe(ctx, wd->channel_fd);
     wrt->builtins.message_pipe = message_pipe;
 	if (wd->udata){
-		wrt->builtins.worker_udata = JS_ReadObject(ctx, wd->udata, wd->udata_size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE);
+		wrt->builtins.worker_udata = JS_ReadObject(ctx, wd->udata, wd->udata_size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE | JS_READ_OBJ_SAB);
 		if (JS_IsException(wrt->builtins.worker_udata)) {
 			JS_FreeValue(ctx, JS_GetException(ctx));
 			wrt->builtins.worker_udata = JS_UNDEFINED;
@@ -537,7 +537,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 	size_t udata_size = 0;
 	uint8_t* udata = NULL;
 	if (!JS_IsUndefined(user_data) && !JS_IsNull(user_data)){
-		udata = JS_WriteObject(ctx, &udata_size, user_data, JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE);
+		udata = JS_WriteObject(ctx, &udata_size, user_data, JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_SAB);
 		if (!udata) {
 			return JS_EXCEPTION;
 		}

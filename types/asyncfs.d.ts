@@ -72,7 +72,7 @@ declare namespace CModuleAsyncFS {
         write(buffer: Uint8Array, position?: number | null): Promise<number>;
 
         /** Close file (force release resource) */
-        close(): Promise<void>;
+        close(): void;
 
         /** Get underlying file descriptor (for debugging) */
         fileno(): number;

@@ -237,6 +237,15 @@ declare namespace CModuleWASM {
      */
     function validate(buffer: ArrayBuffer | ArrayBufferView): boolean;
 
+    /**
+     * Set the WAMR execution stack size used by subsequently created instances.
+     * Existing instances keep their original stack size.
+     */
+    function setStackSize(bytes: number): void;
+
+    /** Get the WAMR execution stack size used for new instances. */
+    function getStackSize(): number;
+
     // ============================================
     // Instance functions
     // ============================================
