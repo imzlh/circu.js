@@ -81,6 +81,7 @@ struct TJSRuntime {
     bool is_worker;
     int8_t exit_code;
     struct list_head workers;
+    struct list_head streams;
 
 	bool freeing;
     struct {
@@ -112,6 +113,7 @@ struct TJSRuntime {
         TJSBreakpoint *breakpoints;
         int step_mode;   // 0=none, 1=into, 2=over, 3=out
         int step_depth;  // stack depth at pause time (for over/out)
+        int pause_depth; // stack depth captured at the most recent pause site
         DebugControlBlock *channel;  // owned ref (decref on stop)
     } debug;
 };
@@ -215,6 +217,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 JSValue tjs__get_args(JSContext *ctx);
 void tjs__run_main(TJSRuntime* qrt);
 void tjs__destroy_timers(TJSRuntime *qrt);
+void tjs__close_all_streams(TJSRuntime *qrt);
 
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);

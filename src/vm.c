@@ -292,6 +292,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->is_worker = is_worker;
     JS_SetCanBlock(rt, is_worker);
     init_list_head(&qrt->workers);
+    init_list_head(&qrt->streams);
 
     CHECK_EQ(uv_loop_init(&qrt->loop), 0);
 
@@ -347,6 +348,9 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->debug.break_on_exceptions = false;
     qrt->debug.breakpoints_active = true;
     qrt->debug.breakpoints = NULL;
+    qrt->debug.step_mode = 0;
+    qrt->debug.step_depth = 0;
+    qrt->debug.pause_depth = 0;
 
     /* runtime-shared module namespace cache */
     qrt->module.imod_ns = JS_NewObjectProto(ctx, JS_NULL);
@@ -435,6 +439,10 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
             }
         }
     }
+
+    /* Close stream handles before freeing JS so stream_pin() self-references
+     * don't survive into QuickJS leak checking as TCP/Pipe/TTY objects. */
+    tjs__close_all_streams(qrt);
 
     /* Close all core loop handles. */
     uv_close((uv_handle_t*) &qrt->jobs.prepare, NULL);

@@ -1,5 +1,5 @@
 /*
- * circu.js debug module — DebugChannel
+ * circu.js debug module 鈥?DebugChannel
  *
  * Copyright (c) 2025 iz
  *
@@ -167,7 +167,7 @@ static inline void ring_msg_free(RingMsg *m) {
 
 /* ---- Message types ------------------------------------------------------- */
 
-/* Control class (§5a) — handled in C safepoint, never needs JS */
+/* Control class (搂5a) 鈥?handled in C safepoint, never needs JS */
 #define MSG_ADD_BP       1
 #define MSG_REMOVE_BP    2
 #define MSG_CLEAR_BP     3
@@ -175,13 +175,13 @@ static inline void ring_msg_free(RingMsg *m) {
 #define MSG_SET_STEP     5
 #define MSG_SET_BP_ACTIVE 6
 
-/* Inspect class (§5b) — carried to_main, handled by JS onBreak loop.
+/* Inspect class (搂5b) 鈥?carried to_main, handled by JS onBreak loop.
  * A single generic carrier type is used; the real CDP method lives in the
  * payload as `method '\0' params '\0'`. */
 #define MSG_INSPECT      10
 #define MSG_RESUME       15
 
-/* Events / replies — from main to worker */
+/* Events / replies 鈥?from main to worker */
 #define MSG_REPLY        20
 #define MSG_EV_PAUSED    21
 #define MSG_EV_RESUMED   22
@@ -200,15 +200,17 @@ static inline void ring_msg_free(RingMsg *m) {
 typedef struct DebugControlBlock {
     _Atomic uint32_t refcount;     /* main handle + worker handle (2 at alloc) */
     _Atomic int32_t  state;        /* DCB_STATE_* */
-    _Atomic uint32_t interrupt;    /* set by worker → main breaks at next safepoint */
+    _Atomic uint32_t interrupt;    /* set by worker 鈫?main breaks at next safepoint */
     _Atomic uint32_t pending_step; /* reserved (resume step is driven via JS) */
 
-    MsgRing to_main;    /* worker → main: control + inspect requests */
-    MsgRing to_worker;  /* main  → worker: events + replies */
+    MsgRing to_main;    /* worker 鈫?main: control + inspect requests */
+    MsgRing to_worker;  /* main  鈫?worker: events + replies */
 
     tjs_sem_t main_sem;    /* posted when to_main gets a message; main waits on this */
     tjs_sem_t worker_sem;  /* posted when to_worker gets a message; worker timedwaits */
 } DebugControlBlock;
+
+static inline int tjs__debug_current_pause_depth(TJSRuntime *trt, JSContext *ctx);
 
 static DebugControlBlock *dcb_alloc(void) {
     DebugControlBlock *cb = tjs__calloc(1, sizeof(DebugControlBlock));
@@ -299,7 +301,7 @@ static bool debug_breakpoint_matches(JSContext *ctx, const TJSBreakpoint *bp, JS
  * bytecode), so they travel as a QuickJS object-serialization blob instead of
  * JSON text: no parsing, no printing, no string interning on the message path.
  * Flags mirror the worker postMessage convention (SAB | REFERENCE); BYTECODE is
- * deliberately omitted — we never ship code across the debug channel. The blob
+ * deliberately omitted 鈥?we never ship code across the debug channel. The blob
  * is allocated on `ctx`'s runtime allocator, so it must be freed with
  * js_free(ctx, .); ring_push copies it into a neutral buffer before it crosses
  * to the other runtime. */
@@ -379,13 +381,13 @@ static bool dcb_apply_control(JSContext *ctx, TJSRuntime *trt, const RingMsg *m)
             return true;
         case MSG_SET_STEP:
             trt->debug.step_mode  = (int)payload_u32(m->data, m->len, &off);
-            trt->debug.step_depth = JS_GetStackDepth(ctx);
+            trt->debug.step_depth = tjs__debug_current_pause_depth(trt, ctx);
             return true;
         case MSG_SET_BP_ACTIVE:
             trt->debug.breakpoints_active = (payload_u32(m->data, m->len, &off) != 0);
             return true;
         default:
-            return false;   /* inspect / resume — not handled here */
+            return false;   /* inspect / resume 鈥?not handled here */
     }
 }
 
@@ -416,6 +418,11 @@ enum {
  * still installed; it must never recursively invoke onBreak. */
 static thread_local bool tjs__in_debug_break = false;
 
+static inline int tjs__debug_current_pause_depth(TJSRuntime *trt, JSContext *ctx) {
+    if (trt->debug.pause_depth > 0) return trt->debug.pause_depth;
+    return JS_GetStackDepth(ctx);
+}
+
 static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
                                 int line, int col, int flags, void *opaque) {
     TJSRuntime *trt = TJS_GetRuntime(ctx);
@@ -432,7 +439,7 @@ static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
      * barrier): `tail` is written only by us (the consumer); `head` and
      * `interrupt` are written by the worker, and observing either one line late
      * is harmless for a debugger. We only touch the ring or perform the costly
-     * lock-prefixed atomic_exchange when something is actually pending — the
+     * lock-prefixed atomic_exchange when something is actually pending 鈥?the
      * previous code ran an unconditional drain + atomic_exchange every line. */
     if (cb) {
         uint32_t h = atomic_load_explicit(&cb->to_main.head, memory_order_relaxed);
@@ -448,7 +455,7 @@ static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
     bool should_break = (flags & JS_DEBUG_TRACE_DEBUGGER_STMT) && trt->debug.breakpoints_active;
 
     /* Free-running fast path: no debugger statement, not stepping, and no
-     * breakpoints installed → bail before hashing or any further work. */
+     * breakpoints installed 鈫?bail before hashing or any further work. */
     if (DC_LIKELY(!should_break && trt->debug.step_mode == 0 && (trt->debug.breakpoints == NULL || !trt->debug.breakpoints_active)))
         return 0;
 
@@ -488,6 +495,7 @@ static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
     if (DC_LIKELY(!should_break)) return 0;
 
 do_break:;
+    trt->debug.pause_depth = JS_GetStackDepth(ctx);
     int reason;
     if (interrupted)
         reason = TJS_DEBUG_DEBUGGER;
@@ -568,6 +576,9 @@ static JSValue tjs_debug_stop(JSContext *ctx, JSValue this_val, int argc, JSValu
     trt->debug.onException = JS_UNDEFINED;
     trt->debug.active = false;
     trt->debug.break_on_exceptions = false;
+    trt->debug.step_mode = 0;
+    trt->debug.step_depth = 0;
+    trt->debug.pause_depth = 0;
     TJSBreakpoint *bp, *tmp;
     HASH_ITER(hh, trt->debug.breakpoints, bp, tmp) {
         HASH_DEL(trt->debug.breakpoints, bp);
@@ -734,7 +745,7 @@ static JSValue tjs_debug_set_step_mode(JSContext *ctx, JSValue this_val, int arg
     int32_t mode;
     if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
     trt->debug.step_mode  = (int)mode;
-    trt->debug.step_depth = JS_GetStackDepth(ctx);
+    trt->debug.step_depth = tjs__debug_current_pause_depth(trt, ctx);
     return JS_UNDEFINED;
 }
 
@@ -779,7 +790,7 @@ static void tjs_dc_main_finalizer(JSRuntime *rt, JSValue val) {
 
 static JSClassDef tjs_dc_main_class = { "DebugChannel", .finalizer = tjs_dc_main_finalizer };
 
-/* dc.notify(evType, payload) — main → worker; payload serialized with JS_WriteObject (true if enqueued) */
+/* dc.notify(evType, payload) 鈥?main 鈫?worker; payload serialized with JS_WriteObject (true if enqueued) */
 static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
     if (!h || !h->cb) return JS_EXCEPTION;
@@ -794,7 +805,7 @@ static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JS
     return JS_NewBool(ctx, ok);
 }
 
-/* dc.waitRequest() — blocks on main_sem; applies control msgs inline and only
+/* dc.waitRequest() 鈥?blocks on main_sem; applies control msgs inline and only
  * returns inspect / resume requests to JS. Shapes:
  *   { kind: 'inspect', id, method, params }
  *   { kind: 'resume',  step }                                                */
@@ -843,7 +854,7 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
          * so dc.stop() wakes this thread immediately without needing uv. */
 #ifdef _WIN32
         /* Register Ctrl+C handler: libuv signals need the event loop to dispatch,
-         * but we're blocked here — go direct via SetConsoleCtrlHandler. */
+         * but we're blocked here 鈥?go direct via SetConsoleCtrlHandler. */
         tjs_dc_active_stop_event = h->stop_event;
         SetConsoleCtrlHandler(tjs_dc_ctrl_handler, TRUE);
 
@@ -865,7 +876,7 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
     }
 }
 
-/* dc.reply(id, result) — main → worker; result serialized with JS_WriteObject */
+/* dc.reply(id, result) 鈥?main 鈫?worker; result serialized with JS_WriteObject */
 static JSValue tjs_dc_main_reply(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
     if (!h || !h->cb) return JS_EXCEPTION;
@@ -880,7 +891,7 @@ static JSValue tjs_dc_main_reply(JSContext *ctx, JSValue this_val, int argc, JSV
     return JS_NewBool(ctx, ok);
 }
 
-/* dc.stop() — detach weak pointer (if ours), wake blocked waitRequest, release refcount */
+/* dc.stop() 鈥?detach weak pointer (if ours), wake blocked waitRequest, release refcount */
 static JSValue tjs_dc_main_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
     if (!h || !h->cb) return JS_UNDEFINED;
@@ -945,7 +956,7 @@ static JSValue tjs_debug_create_channel(JSContext *ctx, JSValue this_val, int ar
     /* Publish the weak pointer used by the trace hook. */
     trt->debug.channel = cb;
 
-    /* Pass the control block by POINTER VALUE (8 bytes) — never by embedding the struct.  */
+    /* Pass the control block by POINTER VALUE (8 bytes) 鈥?never by embedding the struct.  */
     void *cbptr = cb;
     JSValue ab = JS_NewArrayBufferCopy(ctx, (const uint8_t *)&cbptr, sizeof cbptr);
     JSValue result = JS_NewObject(ctx);
@@ -1064,7 +1075,7 @@ static JSValue tjs_dc_worker_set_breakpoints_active(JSContext *ctx, JSValue this
     return JS_UNDEFINED;
 }
 
-/* dc.send(id, method, params) — inspect request: worker → main; params serialized with JS_WriteObject */
+/* dc.send(id, method, params) 鈥?inspect request: worker 鈫?main; params serialized with JS_WriteObject */
 static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb || argc < 3) return JS_EXCEPTION;
@@ -1090,7 +1101,7 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
     return JS_NewBool(ctx, ok);
 }
 
-/* dc.recv() → { kind, type, id, payload? } | null — non-blocking */
+/* dc.recv() 鈫?{ kind, type, id, payload? } | null 鈥?non-blocking */
 static JSValue tjs_dc_worker_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb) return JS_EXCEPTION;
@@ -1109,7 +1120,7 @@ static JSValue tjs_dc_worker_recv(JSContext *ctx, JSValue this_val, int argc, JS
     return obj;
 }
 
-/* dc.waitRecv(timeoutMs) → boolean — timed-wait on worker_sem */
+/* dc.waitRecv(timeoutMs) 鈫?boolean 鈥?timed-wait on worker_sem */
 static JSValue tjs_dc_worker_wait_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb) return JS_EXCEPTION;
@@ -1119,7 +1130,7 @@ static JSValue tjs_dc_worker_wait_recv(JSContext *ctx, JSValue this_val, int arg
     return JS_NewBool(ctx, ret == 0);
 }
 
-/* dc.resume(step) — push MSG_RESUME into to_main + post main_sem */
+/* dc.resume(step) 鈥?push MSG_RESUME into to_main + post main_sem */
 static JSValue tjs_dc_worker_resume(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb) return JS_EXCEPTION;
@@ -1130,7 +1141,7 @@ static JSValue tjs_dc_worker_resume(JSContext *ctx, JSValue this_val, int argc, 
     return JS_NewBool(ctx, ok);
 }
 
-/* dc.stop() — release worker's refcount */
+/* dc.stop() 鈥?release worker's refcount */
 static JSValue tjs_dc_worker_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb) return JS_UNDEFINED;
@@ -1168,7 +1179,7 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
     if (!cb)
         return JS_ThrowTypeError(ctx, "null debug channel pointer");
 
-    /* Worker claims the second baked-in ref (refcount started at 2) — do NOT
+    /* Worker claims the second baked-in ref (refcount started at 2) 鈥?do NOT
      * increment here, and do NOT detach: detaching would not affect the shared
      * DCB, and the 8 handle bytes are harmless to leave in place. */
 

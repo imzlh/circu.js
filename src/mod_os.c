@@ -651,6 +651,23 @@ static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
  * Returns [readable_fd, writable_fd].
  * On Windows, uses _pipe(); on POSIX, uses pipe().
  */
+typedef struct {
+    uint32_t count;
+} TJSRefHandleCount;
+
+static void tjs_ref_handle_count_walk_cb(uv_handle_t *handle, void *opaque) {
+    TJSRefHandleCount *state = opaque;
+    if (!uv_is_closing(handle) && uv_is_active(handle) && uv_has_ref(handle)) {
+        state->count++;
+    }
+}
+
+static JSValue tjs_ref_handle_count(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSRefHandleCount state = { 0 };
+    uv_walk(tjs_get_loop(ctx), tjs_ref_handle_count_walk_cb, &state);
+    return JS_NewUint32(ctx, state.count);
+}
+
 static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     int fds[2];
     int r;
@@ -799,6 +816,7 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CFUNC_DEF("availableParallelism", 0, tjs_availableParallelism),
 	TJS_CFUNC_DEF("memoryUsage", 0, tjs_memory),
     TJS_CFUNC_DEF("sleep", 0, tjs_sleep),
+    TJS_CFUNC_DEF("refHandleCount", 0, tjs_ref_handle_count),
     // IPC helpers
     TJS_CFUNC_DEF("ipcPipe", 0, tjs_ipc_pipe),
     TJS_CFUNC_DEF("sendfd", 2, tjs_send_fd),

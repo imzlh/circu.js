@@ -374,6 +374,28 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_msgpipe_ref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
+    if (!p) {
+        return JS_EXCEPTION;
+    }
+    if (!uv_is_closing(&p->h.handle)) {
+        uv_ref(&p->h.handle);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue tjs_msgpipe_unref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
+    if (!p) {
+        return JS_EXCEPTION;
+    }
+    if (!uv_is_closing(&p->h.handle)) {
+        uv_unref(&p->h.handle);
+    }
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_msgpipe_event_get(JSContext *ctx, JSValue this_val, int magic) {
     TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
     if (!p) {
@@ -396,6 +418,8 @@ static JSValue tjs_msgpipe_event_set(JSContext *ctx, JSValue this_val, JSValue v
 
 static const JSCFunctionListEntry tjs_msgpipe_proto_funcs[] = {
     TJS_CFUNC_DEF("postMessage", 1, tjs_msgpipe_postmessage),
+    TJS_CFUNC_DEF("ref", 0, tjs_msgpipe_ref),
+    TJS_CFUNC_DEF("unref", 0, tjs_msgpipe_unref),
     JS_CGETSET_MAGIC_DEF("onmessage", tjs_msgpipe_event_get, tjs_msgpipe_event_set, MSGPIPE_EVENT_MESSAGE),
     JS_CGETSET_MAGIC_DEF("onmessageerror", tjs_msgpipe_event_get, tjs_msgpipe_event_set, MSGPIPE_EVENT_MESSAGE_ERROR),
 };

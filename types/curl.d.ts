@@ -219,6 +219,14 @@ declare namespace CModuleCURL {
         getHeaders(): string[];
 
         /**
+         * Observe libcurl debug events. Passing a function enables CURLOPT_VERBOSE
+         * internally but does not write verbose output to stderr. The data argument
+         * is raw bytes; HEADER_* events can be decoded as UTF-8, DATA_* and
+         * SSL_DATA_* may be binary.
+         */
+        onDebug(callback: ((type: number, data: ArrayBuffer) => void) | null | undefined): this;
+
+        /**
          * Set request body (for POST/PUT, etc.)
          * @param body Request body string
          * @returns Current CURL instance (supports chaining)
@@ -498,6 +506,13 @@ declare namespace CModuleCURL {
     export const CURLINFO_OS_ERRNO: number;
     export const CURLINFO_SCHEME: number;
     export const CURLINFO_HEADER_SIZE: number;
+    export const CURLINFO_TEXT: number;
+    export const CURLINFO_HEADER_IN: number;
+    export const CURLINFO_HEADER_OUT: number;
+    export const CURLINFO_DATA_IN: number;
+    export const CURLINFO_DATA_OUT: number;
+    export const CURLINFO_SSL_DATA_IN: number;
+    export const CURLINFO_SSL_DATA_OUT: number;
     /** @deprecated Use CURLINFO_SIZE_DOWNLOAD_T */
     export const CURLINFO_SIZE_DOWNLOAD: number;
     /** @deprecated Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T */

@@ -111,6 +111,7 @@ typedef struct {
     JSValue on_progress;
     JSValue on_header;
     JSValue on_headers_complete;  /* fired once with (status, headersString) when headers end */
+    JSValue on_debug;
 
     /* Status / scratch */
     long response_code;
@@ -119,6 +120,7 @@ typedef struct {
     bool completed;
     bool in_callback;  /* true while inside a libcurl callback - prevent reentry */
     bool headers_complete_fired;  /* true after onHeadersComplete has been called */
+    bool verbose;
 } TJSCURL;
 
 typedef struct {
@@ -322,6 +324,29 @@ static int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow
         JS_FreeValue(curl->ctx, ret);
         return keep_going ? 0 : 1;
     }
+    return 0;
+}
+
+static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t size, void *clientp) {
+    (void) handle;
+    TJSCURL *curl = (TJSCURL *) clientp;
+    if (!curl || JS_IsUndefined(curl->on_debug)) return 0;
+
+    JSValue args[2] = {
+        JS_NewInt32(curl->ctx, (int32_t) type),
+        JS_NewArrayBufferCopy(curl->ctx, (const uint8_t *) data, size),
+    };
+    curl->in_callback = true;
+    JSValue ret = JS_Call(curl->ctx, curl->on_debug, JS_UNDEFINED, 2, args);
+    curl->in_callback = false;
+    JS_FreeValue(curl->ctx, args[0]);
+    JS_FreeValue(curl->ctx, args[1]);
+
+    if (JS_IsException(ret)) {
+        JS_FreeValue(curl->ctx, ret);
+        return 0;
+    }
+    JS_FreeValue(curl->ctx, ret);
     return 0;
 }
 
@@ -722,6 +747,7 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     JS_FreeValueRT(rt, curl->on_headers_complete);
     JS_FreeValueRT(rt, curl->on_progress);
     JS_FreeValueRT(rt, curl->on_header);
+    JS_FreeValueRT(rt, curl->on_debug);
     JS_FreeValueRT(rt, curl->on_data);
     JS_FreeValueRT(rt, curl->pool_obj);
     JS_FreeValueRT(rt, curl->share_obj);
@@ -768,6 +794,7 @@ static void tjs_curl_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     JS_MarkValue(rt, curl->on_progress, mark_func);
     JS_MarkValue(rt, curl->on_header, mark_func);
     JS_MarkValue(rt, curl->on_headers_complete, mark_func);
+    JS_MarkValue(rt, curl->on_debug, mark_func);
     JS_MarkValue(rt, curl->on_data, mark_func);
     JS_MarkValue(rt, curl->pool_obj, mark_func);
     JS_MarkValue(rt, curl->share_obj, mark_func);
@@ -946,6 +973,8 @@ static void curl_apply_default_opts(TJSCURL *curl) {
     curl_easy_setopt(curl->handle, CURLOPT_HEADERDATA, curl);
     curl_easy_setopt(curl->handle, CURLOPT_XFERINFOFUNCTION, progress_callback);
     curl_easy_setopt(curl->handle, CURLOPT_XFERINFODATA, curl);
+    curl_easy_setopt(curl->handle, CURLOPT_DEBUGFUNCTION, debug_callback);
+    curl_easy_setopt(curl->handle, CURLOPT_DEBUGDATA, curl);
     curl_easy_setopt(curl->handle, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl->handle, CURLOPT_ERRORBUFFER, curl->error_buffer);
     curl_easy_setopt(curl->handle, CURLOPT_FOLLOWLOCATION, 1L);
@@ -988,6 +1017,7 @@ static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
     curl->on_progress = JS_UNDEFINED;
     curl->on_header = JS_UNDEFINED;
     curl->on_headers_complete = JS_UNDEFINED;
+    curl->on_debug = JS_UNDEFINED;
     curl->on_data = JS_UNDEFINED;
     curl->self_obj = JS_UNDEFINED;
     curl->share_obj = JS_UNDEFINED;
@@ -1186,6 +1216,19 @@ static JSValue tjs_curl_on_headers_complete(JSContext *ctx, JSValueConst this_va
     return JS_DupValue(ctx, this_val);
 }
 
+static JSValue tjs_curl_on_debug(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CURL_THIS(ctx, this_val);
+    JS_FreeValue(ctx, curl->on_debug);
+    if (JS_IsFunction(ctx, argv[0])) {
+        curl->on_debug = JS_DupValue(ctx, argv[0]);
+        curl_easy_setopt(curl->handle, CURLOPT_VERBOSE, 1L);
+    } else {
+        curl->on_debug = JS_UNDEFINED;
+        curl_easy_setopt(curl->handle, CURLOPT_VERBOSE, curl->verbose ? 1L : 0L);
+    }
+    return JS_DupValue(ctx, this_val);
+}
+
 #pragma endregion
 
 #pragma region Generic setOpt / getInfo
@@ -1209,6 +1252,8 @@ static bool curl_option_is_reserved(CURLoption id) {
         case CURLOPT_HEADERDATA:
         case CURLOPT_XFERINFOFUNCTION:
         case CURLOPT_XFERINFODATA:
+        case CURLOPT_DEBUGFUNCTION:
+        case CURLOPT_DEBUGDATA:
         case CURLOPT_READFUNCTION:
         case CURLOPT_READDATA:
             return true;
@@ -1569,7 +1614,9 @@ static JSValue tjs_curl_set_keepalive(JSContext *ctx, JSValueConst this_val, int
 
 static JSValue tjs_curl_set_verbose(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
-    curl_easy_setopt(curl->handle, CURLOPT_VERBOSE, JS_ToBool(ctx, argv[0]) ? 1L : 0L);
+    curl->verbose = JS_ToBool(ctx, argv[0]);
+    curl_easy_setopt(curl->handle, CURLOPT_VERBOSE,
+                     (curl->verbose || !JS_IsUndefined(curl->on_debug)) ? 1L : 0L);
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1854,6 +1901,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->completed = false;
     curl->headers_complete_fired = false;
     curl->stream_mode = false;
+    curl->verbose = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {
         JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
@@ -1865,6 +1913,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_FreeValue(ctx, curl->on_progress); curl->on_progress = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_header); curl->on_header = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_headers_complete); curl->on_headers_complete = JS_UNDEFINED;
+    JS_FreeValue(ctx, curl->on_debug); curl->on_debug = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->share_obj); curl->share_obj = JS_UNDEFINED;
 
     return JS_UNDEFINED;
@@ -1950,6 +1999,7 @@ static const JSCFunctionListEntry tjs_curl_proto_funcs[] = {
     TJS_CFUNC_DEF("onProgress", 1, tjs_curl_on_progress),
     TJS_CFUNC_DEF("onHeader", 1, tjs_curl_on_header),
     TJS_CFUNC_DEF("onHeadersComplete", 1, tjs_curl_on_headers_complete),
+    TJS_CFUNC_DEF("onDebug", 1, tjs_curl_on_debug),
     TJS_CFUNC_DEF("setStreamMode", 1, tjs_curl_set_stream_mode),
     TJS_CFUNC_DEF("onData", 1, tjs_curl_on_data),
 
@@ -2051,6 +2101,13 @@ static void export_constants(JSContext *ctx, JSValue ns) {
     EXPORT_CONST(ns, CURLINFO_OS_ERRNO);
     EXPORT_CONST(ns, CURLINFO_SCHEME);
     EXPORT_CONST(ns, CURLINFO_HEADER_SIZE);
+    EXPORT_CONST(ns, CURLINFO_TEXT);
+    EXPORT_CONST(ns, CURLINFO_HEADER_IN);
+    EXPORT_CONST(ns, CURLINFO_HEADER_OUT);
+    EXPORT_CONST(ns, CURLINFO_DATA_IN);
+    EXPORT_CONST(ns, CURLINFO_DATA_OUT);
+    EXPORT_CONST(ns, CURLINFO_SSL_DATA_IN);
+    EXPORT_CONST(ns, CURLINFO_SSL_DATA_OUT);
     EXPORT_CONST(ns, CURLAUTH_BASIC);
     EXPORT_CONST(ns, CURLAUTH_DIGEST);
     EXPORT_CONST(ns, CURLAUTH_NTLM);

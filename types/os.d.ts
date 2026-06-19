@@ -325,6 +325,12 @@ declare namespace CModuleOS {
      */
     function sleep(ms: number): void;
 
+    /**
+     * Count active referenced libuv handles in the current runtime loop.
+     * Handles that were unref()'d are intentionally excluded.
+     */
+    function refHandleCount(): number;
+
     // ==================== Network Info ====================
 
     /** Hostname (getter property) */

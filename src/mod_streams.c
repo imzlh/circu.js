@@ -58,8 +58,11 @@ typedef struct TJSReadReq TJSReadReq;
 
 typedef struct {
     JSContext *ctx;
+    TJSRuntime *trt;
     int closed;
     int finalized;
+    int closing_for_runtime;
+    struct list_head link;
     union {
         uv_handle_t handle;
         uv_stream_t stream;
@@ -118,6 +121,14 @@ static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
     js_free(ctx, wr);
 }
 
+static void stream_unlink(TJSStream *s) {
+    if (s && s->link.next) {
+        list_del(&s->link);
+        s->link.next = NULL;
+        s->link.prev = NULL;
+    }
+}
+
 
 /* ---- Class IDs (assigned at init time, used by finalizers and gc_mark) ---- */
 static thread_local JSClassID tjs_tcp_class_id;
@@ -172,6 +183,7 @@ static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
     s->closed = 1;
+    stream_unlink(s);
 
     if (s->finalized) {
         tjs__free(s);
@@ -185,7 +197,7 @@ static void uv__close_cb(uv_handle_t *handle) {
 
     /* Fire onclose callback if set. */
     JSValue fn = s->callbacks[STREAM_CB_CLOSE];
-    if (JS_IsFunction(s->ctx, fn)) {
+    if (!s->closing_for_runtime && JS_IsFunction(s->ctx, fn)) {
         tjs_call_handler(s->ctx, fn, 0, NULL);
     }
 
@@ -714,12 +726,16 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
 #pragma region C apis
 
 static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
     s->ctx           = ctx;
+    s->trt           = trt;
     s->h.handle.data = s;
     s->obj           = JS_UNDEFINED;
     s->pin_count     = 0;
     s->read_buf      = NULL;
     s->read_req      = NULL;
+    init_list_head(&s->link);
+    list_add_tail(&s->link, &trt->streams);
 
     for (int i = 0; i < STREAM_CB_MAX; i++)
         s->callbacks[i] = JS_UNDEFINED;
@@ -739,6 +755,7 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
 
 static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     if (!s) return;
+    stream_unlink(s);
 
     JS_FreeValueRT(rt, s->obj);
     s->obj = JS_UNDEFINED;
@@ -782,6 +799,31 @@ static void tjs_stream_mark(JSRuntime *rt, TJSStream *s, JS_MarkFunc *mark_func)
 
     TJS_MarkPromise(rt, &s->connect_promise, mark_func);
     TJS_MarkPromise(rt, &s->shutdown_promise, mark_func);
+}
+
+void tjs__close_all_streams(TJSRuntime *qrt) {
+    struct list_head *p, *tmp;
+    list_for_each_safe(p, tmp, &qrt->streams) {
+        TJSStream *s = list_entry(p, TJSStream, link);
+        s->closing_for_runtime = 1;
+        stream_unlink(s);
+
+        if (s->read_req) {
+            s->read_req->canceled = 1;
+            uv_read_stop(&s->h.stream);
+        }
+        uv_read_stop(&s->h.stream);
+        js_free(s->ctx, s->read_buf);
+        s->read_buf = NULL;
+
+        if (!uv_is_closing(&s->h.handle)) {
+            uv_close(&s->h.handle, uv__close_cb);
+        }
+        while (s->pin_count > 0) {
+            stream_unpin(s);
+        }
+    }
+    uv_run(&qrt->loop, UV_RUN_NOWAIT);
 }
 
 
