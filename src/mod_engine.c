@@ -934,7 +934,11 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
 }
 
 static JSValue tjs_get_global_lexvar(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+#ifdef CJS_DISABLE_DEBUG
+	return JS_ThrowTypeError(ctx, "Debug features are disabled. Please rebuild cjs");
+#else
 	return JS_GetGlobalLexicalVariables(ctx);
+#endif
 }
 
 static const JSCFunctionListEntry tjs_engine_funcs[] = {

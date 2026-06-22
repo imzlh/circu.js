@@ -24,6 +24,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(cjs_cflags "")
 set(cjs_ldflags "")
 
+# add_compile_definitions(CJS_DISABLE_DEBUG) # reverse the comment to disable debug
+
 if(MSVC)
     list(APPEND cjs_cflags
         /std:c11 /experimental:c11atomics /W4 /Zi /WX /permissive- /utf-8

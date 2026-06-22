@@ -286,6 +286,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     /* Blank line signals end of headers (also handles HTTP/2 where status line
      * may repeat on redirects — fire only when we have a final 2xx/3xx/4xx/5xx). */
     if (!JS_IsUndefined(curl->on_headers_complete) &&
+            curl->in_flight && !curl->completed &&
             (realsize == 2 && ptr[0] == '\r' && ptr[1] == '\n')) {
         long status = 0;
         curl_easy_getinfo(curl->handle, CURLINFO_RESPONSE_CODE, &status);
@@ -300,7 +301,9 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
                                       curl->response_headers.size)
                     : JS_NewString(curl->ctx, ""),
             };
+            curl->in_callback = true;
             JSValue ret = JS_Call(curl->ctx, curl->on_headers_complete, JS_UNDEFINED, 2, args);
+            curl->in_callback = false;
             JS_FreeValue(curl->ctx, args[0]);
             JS_FreeValue(curl->ctx, args[1]);
             JS_FreeValue(curl->ctx, ret);
@@ -815,6 +818,12 @@ static void tjs_connpool_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *m
     if (!pool) return;
 
     JS_MarkValue(rt, pool->err_cb, mark_func);
+    struct list_head *el;
+    list_for_each(el, &pool->curls) {
+        TJSCURL *c = list_entry(el, TJSCURL, link);
+        if (c->in_flight && !JS_IsUndefined(c->self_obj))
+            JS_MarkValue(rt, c->self_obj, mark_func);
+    }
 }
 
 #pragma endregion

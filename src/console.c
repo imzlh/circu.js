@@ -78,6 +78,22 @@ static void* console_realloc(void* opaque, void* ptr, size_t size) {
 
 /* STDOUT lock */
 static uv_mutex_t stdout_mutex;
+static int console_group_indent = 0;
+
+typedef struct ConsoleCounter {
+    char* label;
+    int count;
+    struct ConsoleCounter* next;
+} ConsoleCounter;
+
+typedef struct ConsoleTimer {
+    char* label;
+    uint64_t start;
+    struct ConsoleTimer* next;
+} ConsoleTimer;
+
+static ConsoleCounter* console_counters = NULL;
+static ConsoleTimer* console_timers = NULL;
 
 #define __mutex(op) do { uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex); } while(0)
 #define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
@@ -225,6 +241,195 @@ static inline void put_color(DynBuf* buf, const InspectOptions* opts, const char
 
 static inline void put_reset(DynBuf* buf, const InspectOptions* opts) {
     if (opts->colors) dbuf_putstr(buf, ANSI_RESET);
+}
+
+static void put_group_indent(DynBuf* buf) {
+    for (int i = 0; i < console_group_indent; i++) dbuf_putc(buf, ' ');
+}
+
+static void format_value_with_depth(JSContext* ctx, JSValueConst val, DynBuf* buf, int depth,
+                                    bool quoted, FILE* stream) {
+    InspectOptions opts = {
+        .depth = depth,
+        .break_length = DEFAULT_BREAK_LENGTH,
+        .colors = isatty(fileno(stream)),
+        .show_hidden = false,
+        .max_array_length = MAX_ARRAY_LENGTH,
+        .max_string_length = MAX_STRING_LENGTH,
+        .compact = true,
+    };
+    VisitStack stack = {0};
+    format_value(ctx, val, 0, &stack, buf, quoted, &opts);
+}
+
+static void format_to_string(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    const char* str = JS_ToCString(ctx, val);
+    dbuf_putstr(buf, str ? str : "");
+    if (str) JS_FreeCString(ctx, str);
+}
+
+static void format_to_number(JSContext* ctx, JSValueConst val, DynBuf* buf, bool integer) {
+    double num = 0;
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT || JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
+        format_to_string(ctx, val, buf);
+        return;
+    }
+    if (JS_ToFloat64(ctx, &num, val) < 0 || isnan(num)) {
+        dbuf_putstr(buf, "NaN");
+    } else if (integer) {
+        dbuf_printf(buf, "%.0f", trunc(num));
+    } else if (isinf(num)) {
+        dbuf_printf(buf, "%cInfinity", num < 0 ? '-' : '+');
+    } else {
+        dbuf_printf(buf, "%g", num);
+    }
+}
+
+static void format_json(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
+    JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
+    JSValue ret = JS_UNDEFINED;
+
+    if (JS_IsFunction(ctx, stringify)) {
+        JSValueConst args[1] = { val };
+        ret = JS_Call(ctx, stringify, json, 1, args);
+    }
+
+    if (JS_IsException(ret)) {
+        JSValue exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        dbuf_putstr(buf, "[Circular]");
+    } else if (JS_IsUndefined(ret)) {
+        dbuf_putstr(buf, "undefined");
+    } else {
+        format_to_string(ctx, ret, buf);
+    }
+
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, stringify);
+    JS_FreeValue(ctx, json);
+    JS_FreeValue(ctx, global);
+}
+
+static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBuf* buf, FILE* stream) {
+    if (argc <= 0) return false;
+
+    bool used_format = false;
+    bool wrote = false;
+    int consumed = 0;
+
+    if (JS_IsString(argv[0])) {
+        const char* fmt = JS_ToCString(ctx, argv[0]);
+        if (!fmt) return false;
+
+        DynBuf fmt_buf;
+        dbuf_init2(&fmt_buf, JS_GetRuntime(ctx), console_realloc);
+
+        for (const char* p = fmt; *p; p++) {
+            if (*p != '%' || p[1] == '\0') {
+                dbuf_putc(&fmt_buf, *p);
+                continue;
+            }
+
+            char spec = p[1];
+            if (spec == '%') {
+                dbuf_putc(&fmt_buf, '%');
+                p++;
+                used_format = true;
+                continue;
+            }
+
+            if (spec == 's' || spec == 'd' || spec == 'i' || spec == 'f' ||
+                spec == 'j' || spec == 'o' || spec == 'O' || spec == 'c') {
+                used_format = true;
+                if (consumed + 1 >= argc) {
+                    dbuf_putc(&fmt_buf, '%');
+                    dbuf_putc(&fmt_buf, spec);
+                    p++;
+                    continue;
+                }
+
+                JSValueConst arg = argv[++consumed];
+                switch (spec) {
+                    case 's':
+                        format_to_string(ctx, arg, &fmt_buf);
+                        break;
+                    case 'd':
+                    case 'i':
+                        format_to_number(ctx, arg, &fmt_buf, true);
+                        break;
+                    case 'f':
+                        format_to_number(ctx, arg, &fmt_buf, false);
+                        break;
+                    case 'j':
+                        format_json(ctx, arg, &fmt_buf);
+                        break;
+                    case 'o':
+                        format_value_with_depth(ctx, arg, &fmt_buf, 4, false, stream);
+                        break;
+                    case 'O':
+                        format_value_with_depth(ctx, arg, &fmt_buf, 100, false, stream);
+                        break;
+                    case 'c':
+                        /* Node ignores CSS in non-browser terminals. */
+                        break;
+                }
+                p++;
+                continue;
+            }
+
+            dbuf_putc(&fmt_buf, *p);
+        }
+
+        if (used_format) {
+            dbuf_put(buf, fmt_buf.buf, fmt_buf.size);
+            wrote = fmt_buf.size > 0;
+        }
+
+        dbuf_free(&fmt_buf);
+        JS_FreeCString(ctx, fmt);
+    }
+
+    int start = used_format ? consumed + 1 : 0;
+    for (int i = start; i < argc; i++) {
+        if (wrote) dbuf_putc(buf, ' ');
+        if (JS_IsString(argv[i])) format_to_string(ctx, argv[i], buf);
+        else format_value_with_depth(ctx, argv[i], buf, 2, false, stream);
+        wrote = true;
+    }
+    return true;
+}
+
+static void console_write_args(JSContext* ctx, int argc, JSValueConst* argv, FILE* stream) {
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    put_group_indent(&buf);
+    format_args_node(ctx, argc, argv, &buf, stream);
+    dbuf_putc(&buf, '\n');
+    fwrite2(buf.buf, 1, buf.size, stream);
+    fflush(stream);
+    dbuf_free(&buf);
+}
+
+static char* console_label(JSContext* ctx, JSValueConst val, const char* fallback) {
+    if (JS_IsUndefined(val)) return js_strdup(ctx, fallback);
+    const char* str = JS_ToCString(ctx, val);
+    char* label = js_strdup(ctx, str ? str : fallback);
+    if (str) JS_FreeCString(ctx, str);
+    return label;
+}
+
+static ConsoleCounter* find_counter(const char* label) {
+    for (ConsoleCounter* c = console_counters; c; c = c->next)
+        if (strcmp(c->label, label) == 0) return c;
+    return NULL;
+}
+
+static ConsoleTimer* find_timer(const char* label) {
+    for (ConsoleTimer* t = console_timers; t; t = t->next)
+        if (strcmp(t->label, label) == 0) return t;
+    return NULL;
 }
 
 /* Format primitives */
@@ -1068,10 +1273,10 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 				format_error(ctx, val, depth, buf, opts);
 			} else if (JS_IsArrayBuffer(val)) {
 				format_array_buffer(ctx, val, buf, opts);
-			} else if (JS_GetTypedArrayType(val) != -1) {
-				format_typed_array(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsDataView(val)) {
 				format_dataview(ctx, val, buf, opts);
+			} else if (JS_GetTypedArrayType(val) != -1) {
+				format_typed_array(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsArray(val)) {
 				format_array(ctx, val, depth, stack, buf, opts);
 			} else {
@@ -1141,34 +1346,9 @@ static JSValue js_console_inspect(JSContext* ctx, JSValueConst this_val, int arg
 
 static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
                                 FILE* stream, int default_depth, bool show_hidden) {
-    if (argc == 0) {
-        fwrite2("\n", 1, 1, stream);
-        return;
-    }
-
-    InspectOptions opts = {
-        .depth = default_depth,
-        .break_length = 80,
-        .colors = isatty(fileno(stream)),
-        .show_hidden = show_hidden,
-        .max_array_length = 100,
-        .max_string_length = 10000,
-        .compact = true
-    };
-
-    VisitStack stack = {0};
-    DynBuf buf;
-    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
-
-    for (int i = 0; i < argc; i++) {
-        if (i > 0) dbuf_putc(&buf, ' ');
-        format_value(ctx, argv[i], 0, &stack, &buf, false, &opts);
-    }
-
-    dbuf_putc(&buf, '\n');
-    fwrite2(buf.buf, 1, buf.size, stream);
-    fflush(stream);
-    dbuf_free(&buf);
+    (void)default_depth;
+    (void)show_hidden;
+    console_write_args(ctx, argc, argv, stream);
 }
 
 static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -1177,25 +1357,21 @@ static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, J
 }
 
 static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-	fprintf2(stderr, ANSI_RED "error " ANSI_RESET);
     console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    fprintf2(stderr, ANSI_YELLOW "warn " ANSI_RESET);
 	console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_info(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    fprintf2(stdout, ANSI_CYAN "info " ANSI_RESET);
 	console_log_internal(ctx, argc, argv, stdout, 2, false);
 	return JS_UNDEFINED;
 }
 
 static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    if (!getenv("DEBUG")) return JS_UNDEFINED;
     console_log_internal(ctx, argc, argv, stdout, 2, false);
 	return JS_UNDEFINED;
 }
@@ -1228,16 +1404,15 @@ static JSValue js_console_clear(JSContext* ctx, JSValueConst this_val, int argc,
 }
 
 static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    js_console_log(ctx, this_val, argc, argv);
-
-	fprintf2(stderr, ANSI_MAGENTA "trace " ANSI_RESET);
+    if (argc > 0) console_log_internal(ctx, argc, argv, stderr, 2, false);
+    else console_log_internal(ctx, 0, argv, stderr, 2, false);
     
     JSValue err = JS_NewError(ctx);
     JSValue stack = JS_GetProperty(ctx, err, JS_ATOM_stack);
     if (JS_IsString(stack)) {
         const char* s = JS_ToCString(ctx, stack);
         if (s) {
-            printf("%s\n", s);
+            fprintf2(stderr, "Trace\n%s\n", s);
             JS_FreeCString(ctx, s);
         }
     }
@@ -1248,31 +1423,269 @@ static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (argc == 0 || !JS_ToBool(ctx, argv[0])) {
-        fprintf2(stderr, ANSI_RED "Assertion failed " ANSI_RESET);
+        DynBuf buf;
+        dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+        dbuf_putstr(&buf, "Assertion failed");
         if (argc > 1) {
-            fprintf2(stderr, ": ");
-            InspectOptions opts = {
-                .depth = 2,
-                .break_length = DEFAULT_BREAK_LENGTH,
-                .colors = isatty(STDERR_FILENO),
-                .show_hidden = false,
-                .max_array_length = MAX_ARRAY_LENGTH,
-                .max_string_length = MAX_STRING_LENGTH,
-                .compact = true,
-            };
-            VisitStack stack = {0};
-            DynBuf buf;
-            dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
-            for (int i = 1; i < argc; i++) {
-                if (i > 1) dbuf_putc(&buf, ' ');
-                format_value(ctx, argv[i], 0, &stack, &buf, false, &opts);
+            DynBuf msg;
+            dbuf_init2(&msg, JS_GetRuntime(ctx), console_realloc);
+            format_args_node(ctx, argc - 1, argv + 1, &msg, stderr);
+            if (msg.size > 0) {
+                dbuf_putstr(&buf, ": ");
+                dbuf_put(&buf, msg.buf, msg.size);
             }
-            fwrite2(buf.buf, 1, buf.size, stderr);
-            dbuf_free(&buf);
+            dbuf_free(&msg);
         }
-        fwrite2("\n", 1, 1, stderr);
+        dbuf_putc(&buf, '\n');
+        fwrite2(buf.buf, 1, buf.size, stderr);
         fflush(stderr);
+        dbuf_free(&buf);
     }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_count(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    ConsoleCounter* counter = find_counter(label);
+    if (!counter) {
+        counter = js_mallocz(ctx, sizeof(*counter));
+        if (!counter) {
+            js_free(ctx, label);
+            return JS_EXCEPTION;
+        }
+        counter->label = label;
+        counter->next = console_counters;
+        console_counters = counter;
+    } else {
+        js_free(ctx, label);
+    }
+    counter->count++;
+
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    dbuf_printf(&buf, "%s: %d", counter->label, counter->count);
+    JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+    dbuf_free(&buf);
+    JSValueConst args[1] = { msg };
+    console_log_internal(ctx, 1, args, stdout, 2, false);
+    JS_FreeValue(ctx, msg);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_count_reset(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    ConsoleCounter* prev = NULL;
+    ConsoleCounter* cur = console_counters;
+    while (cur) {
+        if (strcmp(cur->label, label) == 0) {
+            if (prev) prev->next = cur->next;
+            else console_counters = cur->next;
+            js_free(ctx, cur->label);
+            js_free(ctx, cur);
+            js_free(ctx, label);
+            return JS_UNDEFINED;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    dbuf_printf(&buf, "Count for '%s' does not exist", label);
+    JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+    dbuf_free(&buf);
+    JSValueConst args[1] = { msg };
+    console_log_internal(ctx, 1, args, stderr, 2, false);
+    JS_FreeValue(ctx, msg);
+    js_free(ctx, label);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_time(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    ConsoleTimer* timer = find_timer(label);
+    if (!timer) {
+        timer = js_mallocz(ctx, sizeof(*timer));
+        if (!timer) {
+            js_free(ctx, label);
+            return JS_EXCEPTION;
+        }
+        timer->label = label;
+        timer->next = console_timers;
+        console_timers = timer;
+    } else {
+        js_free(ctx, label);
+    }
+    timer->start = uv_hrtime();
+    return JS_UNDEFINED;
+}
+
+static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSValueConst* argv, bool remove_timer) {
+    double ms = (double)(uv_hrtime() - timer->start) / 1000000.0;
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+    dbuf_printf(&buf, "%s: %.3fms", timer->label, ms);
+
+    if (argc > 1) {
+        DynBuf extra;
+        dbuf_init2(&extra, JS_GetRuntime(ctx), console_realloc);
+        format_args_node(ctx, argc - 1, argv + 1, &extra, stdout);
+        if (extra.size > 0) {
+            dbuf_putc(&buf, ' ');
+            dbuf_put(&buf, extra.buf, extra.size);
+        }
+        dbuf_free(&extra);
+    }
+
+    JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+    dbuf_free(&buf);
+    JSValueConst args[1] = { msg };
+    console_log_internal(ctx, 1, args, stdout, 2, false);
+    JS_FreeValue(ctx, msg);
+
+    if (remove_timer) {
+        ConsoleTimer* prev = NULL;
+        ConsoleTimer* cur = console_timers;
+        while (cur) {
+            if (cur == timer) {
+                if (prev) prev->next = cur->next;
+                else console_timers = cur->next;
+                js_free(ctx, cur->label);
+                js_free(ctx, cur);
+                break;
+            }
+            prev = cur;
+            cur = cur->next;
+        }
+    }
+}
+
+static JSValue js_console_time_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    ConsoleTimer* timer = find_timer(label);
+    if (!timer) {
+        DynBuf buf;
+        dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+        dbuf_printf(&buf, "Timer '%s' does not exist", label);
+        JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+        dbuf_free(&buf);
+        JSValueConst args[1] = { msg };
+        console_log_internal(ctx, 1, args, stderr, 2, false);
+        JS_FreeValue(ctx, msg);
+        js_free(ctx, label);
+        return JS_UNDEFINED;
+    }
+    js_free(ctx, label);
+    console_time_log(ctx, timer, argc, argv, false);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_time_end(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    ConsoleTimer* timer = find_timer(label);
+    if (!timer) {
+        DynBuf buf;
+        dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+        dbuf_printf(&buf, "Timer '%s' does not exist", label);
+        JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+        dbuf_free(&buf);
+        JSValueConst args[1] = { msg };
+        console_log_internal(ctx, 1, args, stderr, 2, false);
+        JS_FreeValue(ctx, msg);
+        js_free(ctx, label);
+        return JS_UNDEFINED;
+    }
+    js_free(ctx, label);
+    console_time_log(ctx, timer, argc, argv, true);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_time_stamp(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_group(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (argc > 0) console_log_internal(ctx, argc, argv, stdout, 2, false);
+    console_group_indent += 2;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_group_end(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (console_group_indent >= 2) console_group_indent -= 2;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_dirxml(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    return js_console_log(ctx, this_val, argc, argv);
+}
+
+static JSValue js_console_table(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    if (argc == 0 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+        console_log_internal(ctx, argc, argv, stdout, 2, false);
+        return JS_UNDEFINED;
+    }
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue array_ctor = JS_GetPropertyStr(ctx, global, "Array");
+    JSValue is_array_fn = JS_GetPropertyStr(ctx, array_ctor, "isArray");
+    JSValue is_arr_val = JS_IsFunction(ctx, is_array_fn) ? JS_Call(ctx, is_array_fn, array_ctor, 1, argv) : JS_FALSE;
+    bool is_arr = JS_ToBool(ctx, is_arr_val);
+    JS_FreeValue(ctx, is_arr_val);
+    JS_FreeValue(ctx, is_array_fn);
+    JS_FreeValue(ctx, array_ctor);
+    JS_FreeValue(ctx, global);
+
+    DynBuf out;
+    dbuf_init2(&out, JS_GetRuntime(ctx), console_realloc);
+
+    if (is_arr) {
+        int64_t len = 0;
+        JSValue len_val = JS_GetProperty(ctx, argv[0], JS_ATOM_length);
+        JS_ToInt64(ctx, &len, len_val);
+        JS_FreeValue(ctx, len_val);
+        dbuf_putstr(&out, "(index)  Value\n");
+        int64_t show = len < 100 ? len : 100;
+        for (int64_t i = 0; i < show; i++) {
+            JSValue elem = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+            dbuf_printf(&out, "%lld        ", (long long)i);
+            format_value_with_depth(ctx, elem, &out, 1, false, stdout);
+            dbuf_putc(&out, '\n');
+            JS_FreeValue(ctx, elem);
+        }
+        if (len > show) dbuf_printf(&out, "... %lld more items\n", (long long)(len - show));
+    } else if (JS_IsObject(argv[0])) {
+        JSPropertyEnum* props = NULL;
+        uint32_t count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &count, argv[0], JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+            dbuf_putstr(&out, "(index)  Value\n");
+            for (uint32_t i = 0; i < count && i < 100; i++) {
+                const char* key = JS_AtomToCString(ctx, props[i].atom);
+                JSValue val = JS_GetProperty(ctx, argv[0], props[i].atom);
+                dbuf_printf(&out, "%s        ", key ? key : "");
+                format_value_with_depth(ctx, val, &out, 1, false, stdout);
+                dbuf_putc(&out, '\n');
+                if (key) JS_FreeCString(ctx, key);
+                JS_FreeValue(ctx, val);
+            }
+            JS_FreePropertyEnum(ctx, props, count);
+        }
+    }
+
+    if (out.size == 0) {
+        format_value_with_depth(ctx, argv[0], &out, 2, false, stdout);
+        dbuf_putc(&out, '\n');
+    }
+    fwrite2(out.buf, 1, out.size, stdout);
+    fflush(stdout);
+    dbuf_free(&out);
     return JS_UNDEFINED;
 }
 
@@ -1283,9 +1696,20 @@ static const JSCFunctionListEntry console_funcs[] = {
     JS_CFUNC_DEF("info", 0, js_console_info),
     JS_CFUNC_DEF("debug", 0, js_console_debug),
     JS_CFUNC_DEF("dir", 1, js_console_dir),
+    JS_CFUNC_DEF("dirxml", 0, js_console_dirxml),
+    JS_CFUNC_DEF("table", 1, js_console_table),
     JS_CFUNC_DEF("trace", 0, js_console_trace),
     JS_CFUNC_DEF("clear", 0, js_console_clear),
     JS_CFUNC_DEF("assert", 1, js_console_assert),
+    JS_CFUNC_DEF("count", 1, js_console_count),
+    JS_CFUNC_DEF("countReset", 1, js_console_count_reset),
+    JS_CFUNC_DEF("time", 1, js_console_time),
+    JS_CFUNC_DEF("timeLog", 1, js_console_time_log),
+    JS_CFUNC_DEF("timeEnd", 1, js_console_time_end),
+    JS_CFUNC_DEF("timeStamp", 1, js_console_time_stamp),
+    JS_CFUNC_DEF("group", 0, js_console_group),
+    JS_CFUNC_DEF("groupCollapsed", 0, js_console_group),
+    JS_CFUNC_DEF("groupEnd", 0, js_console_group_end),
     JS_CFUNC_DEF("inspect", 1, js_console_inspect),
 };
 

@@ -152,9 +152,43 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 		return JS_GetArrayBuffer(ctx, psize, obj);
 
 	size_t poffset = 0, plen = 0, pbytes_per_element = 0;
-	JSValue arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
-	if (JS_IsException(arrbuf)){
-		return NULL;
+	JSValue arrbuf;
+	if (JS_IsDataView(obj)) {
+		JSValue off_val, len_val;
+		arrbuf = JS_GetPropertyStr(ctx, obj, "buffer");
+		if (JS_IsException(arrbuf))
+			return NULL;
+		off_val = JS_GetPropertyStr(ctx, obj, "byteOffset");
+		if (JS_IsException(off_val)) {
+			JS_FreeValue(ctx, arrbuf);
+			return NULL;
+		}
+		len_val = JS_GetPropertyStr(ctx, obj, "byteLength");
+		if (JS_IsException(len_val)) {
+			JS_FreeValue(ctx, off_val);
+			JS_FreeValue(ctx, arrbuf);
+			return NULL;
+		}
+		uint64_t off64 = 0, len64 = 0;
+		if (JS_ToIndex(ctx, &off64, off_val) || JS_ToIndex(ctx, &len64, len_val)) {
+			JS_FreeValue(ctx, len_val);
+			JS_FreeValue(ctx, off_val);
+			JS_FreeValue(ctx, arrbuf);
+			return NULL;
+		}
+		JS_FreeValue(ctx, len_val);
+		JS_FreeValue(ctx, off_val);
+		if (off64 > SIZE_MAX || len64 > SIZE_MAX) {
+			JS_FreeValue(ctx, arrbuf);
+			return NULL;
+		}
+		poffset = (size_t)off64;
+		plen = (size_t)len64;
+	} else {
+		arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
+		if (JS_IsException(arrbuf)){
+			return NULL;
+		}
 	}
 	size_t bufsz = 0;
 	uint8_t* ret = JS_GetArrayBuffer(ctx, &bufsz, arrbuf);

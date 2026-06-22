@@ -27,6 +27,8 @@
 #include "utils.h"
 #include "mem.h"
 
+#ifndef CJS_DISABLE_DEBUG
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -747,7 +749,7 @@ static JSValue tjs_debug_get_frame_info(JSContext *ctx, JSValue this_val, int ar
     JSValue info = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, info, "line",   JS_NewInt32(ctx, frame.line_num));
     JS_SetPropertyStr(ctx, info, "column", JS_NewInt32(ctx, frame.col_num));
-    JS_SetPropertyStr(ctx, info, "func",   JS_DupValue(ctx, frame.func));  /* dup: frame.func is borrowed, JS_SetPropertyStr steals a ref */
+    JS_SetPropertyStr(ctx, info, "func",   frame.func);
     JS_SetPropertyStr(ctx, info, "file",   JS_AtomToString(ctx, frame.func_path));
     return info;
 }
@@ -1344,3 +1346,9 @@ void tjs__mod_debug_init(JSContext *ctx, JSValue ns) {
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_debug_funcs, countof(tjs_debug_funcs));
 }
+
+#else
+void tjs__mod_debug_init(JSContext *ctx, JSValue ns) {
+    (void*)&ctx; (void*)&ns;
+}
+#endif

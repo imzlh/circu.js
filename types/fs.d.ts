@@ -316,7 +316,33 @@ declare namespace CModuleFS {
      * @returns Array of filenames (excluding '.' and '..')
      * @throws Error if directory doesn't exist or read fails
      */
+    export interface DirEnt {
+        readonly name: string;
+        readonly isBlockDevice: boolean;
+        readonly isCharacterDevice: boolean;
+        readonly isDirectory: boolean;
+        readonly isFIFO: boolean;
+        readonly isFile: boolean;
+        readonly isSocket: boolean;
+        readonly isSymbolicLink: boolean;
+    }
+
+    export interface DirEnt {
+        readonly name: string;
+        readonly isBlockDevice: boolean;
+        readonly isCharacterDevice: boolean;
+        readonly isDirectory: boolean;
+        readonly isFIFO: boolean;
+        readonly isFile: boolean;
+        readonly isSocket: boolean;
+        readonly isSymbolicLink: boolean;
+    }
+
     export function readdir(path: string): string[];
+    export function readdir(path: string, withFileTypes: false): string[];
+    export function readdir(path: string, withFileTypes: true): DirEnt[];
+    export function readdir(path: string, withFileTypes: false): string[];
+    export function readdir(path: string, withFileTypes: true): DirEnt[];
 
     // ============================================================================
     // File Management

@@ -39,6 +39,7 @@ declare namespace CModuleConsole {
      * [MDN Reference](https://developer.mozilla.org/docs/Web/API/console/dir_static)
      */
     export function dir(item?: any, options?: any): void;
+    export function dirxml(...data: any[]): void;
     /**
      * The **`console.error()`** static method outputs a message to the console at the 'error' log level.
      *
@@ -57,6 +58,16 @@ declare namespace CModuleConsole {
      * [MDN Reference](https://developer.mozilla.org/docs/Web/API/console/log_static)
      */
     export function log(...data: any[]): void;
+    export function table(tabularData?: any, properties?: readonly string[]): void;
+    export function count(label?: string): void;
+    export function countReset(label?: string): void;
+    export function time(label?: string): void;
+    export function timeLog(label?: string, ...data: any[]): void;
+    export function timeEnd(label?: string): void;
+    export function timeStamp(label?: string): void;
+    export function group(...label: any[]): void;
+    export function groupCollapsed(...label: any[]): void;
+    export function groupEnd(): void;
     /**
      * The **`console.trace()`** static method outputs a stack trace to the console.
      *

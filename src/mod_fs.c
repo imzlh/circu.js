@@ -514,6 +514,23 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st) {
     return obj;
 }
 
+static JSValue build_dirent_obj(JSContext* ctx, const char* name, int kind) {
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj)) {
+        return obj;
+    }
+
+    JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, name));
+    JS_SetPropertyStr(ctx, obj, "isBlockDevice", JS_NewBool(ctx, kind == UV_DIRENT_BLOCK));
+    JS_SetPropertyStr(ctx, obj, "isCharacterDevice", JS_NewBool(ctx, kind == UV_DIRENT_CHAR));
+    JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewBool(ctx, kind == UV_DIRENT_DIR));
+    JS_SetPropertyStr(ctx, obj, "isFIFO", JS_NewBool(ctx, kind == UV_DIRENT_FIFO));
+    JS_SetPropertyStr(ctx, obj, "isFile", JS_NewBool(ctx, kind == UV_DIRENT_FILE));
+    JS_SetPropertyStr(ctx, obj, "isSocket", JS_NewBool(ctx, kind == UV_DIRENT_SOCKET));
+    JS_SetPropertyStr(ctx, obj, "isSymbolicLink", JS_NewBool(ctx, kind == UV_DIRENT_LINK));
+    return obj;
+}
+
 
 /* stat() - get file status */
 static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -1276,7 +1293,7 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
 #ifdef _WIN32
     // Windows implementation using CreateSymbolicLink
     DWORD flags = 0;
-    BOOL is_directory = FALSE;
+    BOOL is_directory = false;
 
     // Check if we should treat as directory (third argument or auto-detect)
     if (argc >= 3) {
@@ -1286,11 +1303,11 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
             if (type_str) {
                 if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
                     flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-                    is_directory = TRUE;
+                    is_directory = true;
                 }
                 else if (strcmp(type_str, "file") == 0) {
                     flags = 0;
-                    is_directory = FALSE;
+                    is_directory = false;
                 }
                 else {
                     JS_FreeCString(ctx, target);
@@ -1313,11 +1330,11 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
         if (attribs != INVALID_FILE_ATTRIBUTES) {
             if (attribs & FILE_ATTRIBUTE_DIRECTORY) {
                 flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-                is_directory = TRUE;
+                is_directory = true;
             }
             else {
                 flags = 0;
-                is_directory = FALSE;
+                is_directory = false;
             }
         }
         else {
@@ -1329,12 +1346,12 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
             if (last_dot && (!last_slash || last_dot > last_slash)) {
                 // Has file extension, treat as file
                 flags = 0;
-                is_directory = FALSE;
+                is_directory = false;
             }
             else {
                 // No extension or extension before slash, treat as directory
                 flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-                is_directory = TRUE;
+                is_directory = true;
             }
         }
     }
@@ -1343,7 +1360,7 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
     wchar_t* w_target = NULL;
     wchar_t* w_path = NULL;
     int w_target_len = 0, w_path_len = 0;
-    BOOL success = FALSE;
+    BOOL success = false;
 
     do {
         w_target_len = MultiByteToWideChar(CP_UTF8, 0, target, -1, NULL, 0);
@@ -1635,7 +1652,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     // Note: We use 0 flags (not COPY_FILE_FAIL_IF_EXISTS) to match Unix behavior (overwrite)
     WCHAR *wsrc_copy = utf8_to_wcs(src_path);
     WCHAR *wdest_copy = utf8_to_wcs(dest_path);
-    BOOL result = FALSE;
+    BOOL result = false;
     if (wsrc_copy && wdest_copy) {
         result = CopyFileExW(wsrc_copy, wdest_copy, NULL, NULL, NULL, 0);
     }
@@ -1837,6 +1854,7 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
 /* readdir() - read directory contents */
 static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* path;
+    BOOL with_types = false;
 
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "readdir() requires 1 argument: path");
@@ -1845,6 +1863,13 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
+    }
+    if (argc >= 2) {
+        with_types = JS_ToBool(ctx, argv[1]);
+        if (with_types < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
     }
 
 #ifdef _WIN32
@@ -1880,7 +1905,16 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
             wcscmp(find_data.cFileName, L"..") != 0) {
             char *utf8_name = wcs_to_utf8(find_data.cFileName, -1);
             if (utf8_name) {
-                JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, utf8_name));
+                if (with_types) {
+                    int kind = UV_DIRENT_UNKNOWN;
+                    DWORD attrs = find_data.dwFileAttributes;
+                    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) kind = UV_DIRENT_LINK;
+                    else if (attrs & FILE_ATTRIBUTE_DIRECTORY) kind = UV_DIRENT_DIR;
+                    else kind = UV_DIRENT_FILE;
+                    JS_SetPropertyUint32(ctx, arr, idx++, build_dirent_obj(ctx, utf8_name, kind));
+                } else {
+                    JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, utf8_name));
+                }
                 free(utf8_name);
             }
         }
@@ -1904,7 +1938,33 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") != 0 &&
             strcmp(entry->d_name, "..") != 0) {
-            JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, entry->d_name));
+            if (with_types) {
+                int kind = UV_DIRENT_UNKNOWN;
+#ifdef DT_BLK
+                if (entry->d_type == DT_BLK) kind = UV_DIRENT_BLOCK;
+#endif
+#ifdef DT_CHR
+                else if (entry->d_type == DT_CHR) kind = UV_DIRENT_CHAR;
+#endif
+#ifdef DT_DIR
+                else if (entry->d_type == DT_DIR) kind = UV_DIRENT_DIR;
+#endif
+#ifdef DT_FIFO
+                else if (entry->d_type == DT_FIFO) kind = UV_DIRENT_FIFO;
+#endif
+#ifdef DT_REG
+                else if (entry->d_type == DT_REG) kind = UV_DIRENT_FILE;
+#endif
+#ifdef DT_LNK
+                else if (entry->d_type == DT_LNK) kind = UV_DIRENT_LINK;
+#endif
+#ifdef DT_SOCK
+                else if (entry->d_type == DT_SOCK) kind = UV_DIRENT_SOCKET;
+#endif
+                JS_SetPropertyUint32(ctx, arr, idx++, build_dirent_obj(ctx, entry->d_name, kind));
+            } else {
+                JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, entry->d_name));
+            }
         }
     }
 
