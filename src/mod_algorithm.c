@@ -68,10 +68,49 @@ static JSValue tjs_ws_mask(JSContext* ctx, JSValue this_arg, int argc, JSValue* 
 		return JS_ThrowOutOfMemory(ctx);
 	}
 
-	// apply/remove mask (XOR is symmetric)
-	for (size_t i = 0; i < inbuflen; i++){
-		outbuf[i] = inbuf[i] ^ keybuf[i % 4];
-	}
+    /* Build a 64-bit word: key[0..3] repeated twice. */
+    uint32_t key32;
+    memcpy(&key32, keybuf, 4);
+
+    size_t i = 0;
+
+    /* --- head: align output pointer to 8 bytes --- */
+    size_t align_bytes = (8 - ((uintptr_t)outbuf & 7)) & 7;
+    if (align_bytes > inbuflen) align_bytes = inbuflen;
+    for (; i < align_bytes; i++) {
+        outbuf[i] = inbuf[i] ^ keybuf[i & 3];
+    }
+
+    /* --- bulk: 8 bytes per iteration ---
+     * Re-rotate key64 so that key64[0] corresponds to mask position i.
+     * Because i is now 8-byte aligned in the output but may start at any
+     * mask phase, we rotate the 4-byte key by (i % 4) bytes before
+     * expanding to 64 bits.  This is done once, outside the loop.
+     */
+    if (i < inbuflen) {
+        uint32_t phase = (uint32_t)(i & 3); /* i % 4 */
+        uint32_t rotated_key32;
+        if (phase == 0) {
+            rotated_key32 = key32;
+        } else {
+            /* rotate right by `phase` bytes (little-endian byte order) */
+            rotated_key32 = (key32 >> (phase * 8)) | (key32 << (32 - phase * 8));
+        }
+        uint64_t bulk_key64 = ((uint64_t)rotated_key32 << 32) | rotated_key32;
+
+        size_t bulk_end = i + ((inbuflen - i) & ~(size_t)7);
+        for (; i < bulk_end; i += 8) {
+            uint64_t v;
+            memcpy(&v, inbuf + i, 8);
+            v ^= bulk_key64;
+            memcpy(outbuf + i, &v, 8);
+        }
+    }
+
+    /* --- tail: remaining < 8 bytes --- */
+    for (; i < inbuflen; i++) {
+        outbuf[i] = inbuf[i] ^ keybuf[i & 3];
+    }
 
 	return TJS_NewUint8Array(ctx, outbuf, inbuflen);
 }

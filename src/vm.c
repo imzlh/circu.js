@@ -145,18 +145,37 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
     }
 }
 
-static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
-    JSValueConst promise, JSValueConst parent_promise, void* opaque) {
-    // TJSRuntime *qrt = TJS_GetRuntime(ctx);
-
-    // call JS event handler
+__maybe_unused static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
+    (void) argc;
     JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]) {
-        JS_NewUint32(ctx, type),
-            JS_DupValue(ctx, promise),
-            JS_DupValue(ctx, parent_promise)
+        JS_NewUint32(ctx, JS_VALUE_GET_INT(argv[0])),
+        JS_DupValue(ctx, argv[1]),
+        JS_DupValue(ctx, argv[2]),
     });
     tjs__dispatch_event2(ctx, EV_PROMISE, args);
     JS_FreeValue(ctx, args);
+
+    return JS_UNDEFINED;
+}
+
+__maybe_unused static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
+    JSValueConst promise, JSValueConst parent_promise, void* opaque) {
+    (void) opaque;
+
+    JSValue argv[3] = {
+        JS_NewUint32(ctx, type),
+        JS_DupValue(ctx, promise),
+        JS_DupValue(ctx, parent_promise),
+    };
+
+    int ret = JS_EnqueueJob(ctx, tjs__promise_hook_dispatch, 3, (JSValueConst*) argv);
+    for (int i = 0; i < 3; i++) {
+        JS_FreeValue(ctx, argv[i]);
+    }
+
+    if (ret < 0) {
+        TJS_DumpException(ctx);
+    }
 }
 
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
@@ -194,12 +213,16 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
 }
 
 static void tjs__promise_rejection_tracker(JSContext* ctx, JSValue promise, JSValue reason, bool is_handled, void* opaque) {
+    (void) opaque;
     TJSRuntime* qrt = TJS_GetRuntime(ctx);
     App* app = TJS_GetApp(ctx);
     CHECK_NOT_NULL(app);
 
     if (!qrt->freeing && !is_handled) {
-        JS_EnqueueJob(app->ctx, tjs__promise_rejection_dispatch, 2, (JSValueConst[]) { promise, reason });
+        JSValue argv[2] = { promise, reason };
+        if (JS_EnqueueJob(app->ctx, tjs__promise_rejection_dispatch, 2, (JSValueConst*) argv) < 0) {
+            TJS_DumpException(ctx);
+        }
     }
 }
 
@@ -323,7 +346,10 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
+
+    #ifdef DEBUG
     JS_SetPromiseHook(rt, tjs__promise_hook, NULL);
+#endif
 
     /* debug hook */
     qrt->module.mapctx = js_create_mapping_context();
@@ -345,7 +371,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->debug.onBreak = JS_UNDEFINED;
     qrt->debug.onException = JS_UNDEFINED;
     qrt->debug.active = false;
-    qrt->debug.break_on_exceptions = false;
+    qrt->debug.exception_break_mode = 0;
     qrt->debug.breakpoints_active = true;
     qrt->debug.breakpoints = NULL;
     qrt->debug.step_mode = 0;
@@ -431,12 +457,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
         struct list_head* p, * tmp;
         list_for_each_safe(p, tmp, &qrt->workers) {
             TJSWorker* worker = list_entry(p, TJSWorker, link);
-            if (!worker->terminated) {
-                worker->terminated = true;
-                TJS_Stop(worker->wrt);
-                uv_thread_join(&worker->tid);  /* wait; prevents UAF of worker->wrt */
-                worker->wrt = NULL;
-            }
+            tjs__worker_stop_and_join(worker->ctx, worker);
         }
     }
 

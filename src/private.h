@@ -108,7 +108,7 @@ struct TJSRuntime {
         JSValue onBreak;
         JSValue onException;
         bool active;
-        bool break_on_exceptions;
+        int exception_break_mode;
         bool breakpoints_active;  // DevTools "Deactivate breakpoints" toggle
         TJSBreakpoint *breakpoints;
         int step_mode;   // 0=none, 1=into, 2=over, 3=out
@@ -139,9 +139,12 @@ typedef struct TJSDynLib {
 typedef struct {
     JSContext *ctx;
     uv_thread_t tid;
+    uv_mutex_t lock;
+    JSValue self_obj;
     JSValue message_pipe;
     TJSRuntime *wrt;
     bool terminated;
+    bool joined;
 	struct list_head link;
 } TJSWorker;
 
@@ -169,6 +172,7 @@ void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
+void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w);
 void tjs__mod_http_init(JSContext *ctx, JSValue ns);
 void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);

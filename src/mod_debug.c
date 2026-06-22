@@ -191,6 +191,13 @@ static inline void ring_msg_free(RingMsg *m) {
 #define MSG_RES_EVENT    32
 #define MSG_RES_REPLY    33
 
+enum {
+    TJS_DEBUG_EXCEPTION_NONE     = 0,
+    TJS_DEBUG_EXCEPTION_CAUGHT   = 1,
+    TJS_DEBUG_EXCEPTION_UNCAUGHT = 2,
+    TJS_DEBUG_EXCEPTION_ALL      = 3,
+};
+
 /* ---- DebugControlBlock --------------------------------------------------- */
 
 #define DCB_STATE_IDLE    0
@@ -377,7 +384,10 @@ static bool dcb_apply_control(JSContext *ctx, TJSRuntime *trt, const RingMsg *m)
             return true;
         }
         case MSG_SET_EXC_BP:
-            trt->debug.break_on_exceptions = (payload_u32(m->data, m->len, &off) != 0);
+            trt->debug.exception_break_mode = (int)payload_u32(m->data, m->len, &off);
+            if (trt->debug.exception_break_mode < TJS_DEBUG_EXCEPTION_NONE ||
+                trt->debug.exception_break_mode > TJS_DEBUG_EXCEPTION_ALL)
+                trt->debug.exception_break_mode = TJS_DEBUG_EXCEPTION_NONE;
             return true;
         case MSG_SET_STEP:
             trt->debug.step_mode  = (int)payload_u32(m->data, m->len, &off);
@@ -410,7 +420,8 @@ enum {
     TJS_DEBUG_BREAKPOINT = 0,
     TJS_DEBUG_EXCEPTION  = 1,
     TJS_DEBUG_DEBUGGER   = 2,
-    TJS_DEBUG_STEP      = 3,
+    TJS_DEBUG_STEP       = 3,
+    TJS_DEBUG_INTERRUPT  = 4,
 };
 
 /* Guard against re-entering the break logic while already paused. Debugger-
@@ -421,6 +432,19 @@ static thread_local bool tjs__in_debug_break = false;
 static inline int tjs__debug_current_pause_depth(TJSRuntime *trt, JSContext *ctx) {
     if (trt->debug.pause_depth > 0) return trt->debug.pause_depth;
     return JS_GetStackDepth(ctx);
+}
+
+static int tjs__debug_exception_mode_from_arg(JSContext *ctx, JSValueConst val, uint32_t *out) {
+    uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
+    if (JS_IsBool(val)) {
+        mode = JS_ToBool(ctx, val) ? TJS_DEBUG_EXCEPTION_ALL : TJS_DEBUG_EXCEPTION_NONE;
+    } else if (JS_ToUint32(ctx, &mode, val)) {
+        return -1;
+    }
+    if (mode > TJS_DEBUG_EXCEPTION_ALL)
+        return JS_ThrowRangeError(ctx, "invalid exception breakpoint mode"), -1;
+    *out = mode;
+    return 0;
 }
 
 static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
@@ -498,25 +522,26 @@ do_break:;
     trt->debug.pause_depth = JS_GetStackDepth(ctx);
     int reason;
     if (interrupted)
-        reason = TJS_DEBUG_DEBUGGER;
+        reason = TJS_DEBUG_INTERRUPT;
     else if (trt->debug.step_mode == 0 && step_mode_at_entry != 0)
         reason = TJS_DEBUG_STEP;
     else
         reason = (flags & JS_DEBUG_TRACE_DEBUGGER_STMT)
                  ? TJS_DEBUG_DEBUGGER : TJS_DEBUG_BREAKPOINT;
 
-    JSValue argv[5] = {
+    JSValue argv[6] = {
         JS_NewInt32(ctx, reason),
         JS_AtomToString(ctx, filename),
         JS_AtomToString(ctx, funcname),
         JS_NewInt32(ctx, line),
         JS_NewInt32(ctx, col),
+        JS_UNDEFINED,
     };
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
-    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 5, argv);
+    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
     tjs__in_debug_break = prev_in_break;
-    for (int i = 0; i < 5; i++) JS_FreeValue(ctx, argv[i]);
+    for (int i = 0; i < 6; i++) JS_FreeValue(ctx, argv[i]);
 
     int result = 0;
     if (JS_IsException(ret)) {
@@ -532,23 +557,69 @@ do_break:;
     return result;
 }
 
-static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, void *opaque) {
+static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, int throw_state, void *opaque) {
+    (void)opaque;
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt->debug.active || !trt->debug.break_on_exceptions) return 0;
+    int mode = trt->debug.exception_break_mode;
+    if (!trt->debug.active || mode == TJS_DEBUG_EXCEPTION_NONE) return 0;
     if (tjs__in_debug_break) return 0;
 
-    JSValue argv[5] = {
+    bool should_break = false;
+    switch (mode) {
+        case TJS_DEBUG_EXCEPTION_ALL:
+            should_break = (throw_state == JS_DEBUG_THROW_AT_THROW);
+            break;
+        case TJS_DEBUG_EXCEPTION_CAUGHT:
+            should_break = (throw_state == JS_DEBUG_THROW_CAUGHT_IN_FRAME);
+            break;
+        case TJS_DEBUG_EXCEPTION_UNCAUGHT:
+            should_break = (throw_state == JS_DEBUG_THROW_UNCAUGHT_IN_FRAME);
+            break;
+    }
+    if (!should_break) return 0;
+
+    JSValue saved_exception = JS_UNINITIALIZED;
+    if (JS_HasException(ctx))
+        saved_exception = JS_GetException(ctx);
+
+    JSValue filename = JS_UNDEFINED;
+    JSValue funcname = JS_UNDEFINED;
+    int line = 0;
+    int col = 0;
+    JSFrameInfo frame = JS_GetStackFrame(ctx, 0);
+    if (frame.line_num != -1) {
+        line = frame.line_num;
+        col = frame.col_num;
+        if (frame.func_path != JS_ATOM_NULL) {
+            filename = JS_AtomToString(ctx, frame.func_path);
+            if (JS_IsException(filename)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                filename = JS_UNDEFINED;
+            }
+        }
+        JS_FreeValue(ctx, frame.func);
+    }
+
+    JSValue argv[6] = {
         JS_NewInt32(ctx, TJS_DEBUG_EXCEPTION),
-        JS_UNDEFINED, JS_UNDEFINED,
-        JS_NewInt32(ctx, 0),
-        JS_NewInt32(ctx, 0),
+        filename,
+        funcname,
+        JS_NewInt32(ctx, line),
+        JS_NewInt32(ctx, col),
+        JS_DupValue(ctx, exception),
     };
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
-    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 5, argv);
-    tjs__in_debug_break = prev_in_break;
-    for (int i = 0; i < 5; i++) JS_FreeValue(ctx, argv[i]);
+    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
+    if (JS_IsException(ret)) {
+        JSValue cb_exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, cb_exception);
+    }
+    for (int i = 0; i < 6; i++) JS_FreeValue(ctx, argv[i]);
     JS_FreeValue(ctx, ret);
+    if (!JS_IsUninitialized(saved_exception))
+        JS_Throw(ctx, saved_exception);
+    tjs__in_debug_break = prev_in_break;
     return 0;
 }
 
@@ -575,7 +646,7 @@ static JSValue tjs_debug_stop(JSContext *ctx, JSValue this_val, int argc, JSValu
     JS_FreeValue(ctx, trt->debug.onException);
     trt->debug.onException = JS_UNDEFINED;
     trt->debug.active = false;
-    trt->debug.break_on_exceptions = false;
+    trt->debug.exception_break_mode = TJS_DEBUG_EXCEPTION_NONE;
     trt->debug.step_mode = 0;
     trt->debug.step_depth = 0;
     trt->debug.pause_depth = 0;
@@ -694,8 +765,9 @@ static JSValue tjs_debug_get_local_variables(JSContext *ctx, JSValue this_val, i
         JSValue obj = JS_NewObject(ctx);
         JS_DefinePropertyValue(ctx, obj, JS_ATOM_name,    JS_NewString(ctx, vars[i].name), JS_PROP_C_W_E);
         JS_DefinePropertyValue(ctx, obj, JS_ATOM_value,   JS_DupValue(ctx, vars[i].value), JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, obj, "isArg",      JS_NewBool(ctx, vars[i].is_arg),     JS_PROP_C_W_E);
-        JS_DefinePropertyValueStr(ctx, obj, "isClosure",  JS_NewBool(ctx, vars[i].is_closure), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "isArg",           JS_NewBool(ctx, vars[i].is_arg),          JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "isClosure",       JS_NewBool(ctx, vars[i].is_closure),      JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "isUninitialized", JS_NewBool(ctx, vars[i].is_uninitialized), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, obj, "scopeLevel", JS_NewInt32(ctx, vars[i].scope_level), JS_PROP_C_W_E);
         JS_SetPropertyUint32(ctx, arr, i, obj);
     }
@@ -704,13 +776,27 @@ static JSValue tjs_debug_get_local_variables(JSContext *ctx, JSValue this_val, i
 }
 
 static JSValue tjs_debug_set_variable(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 3) return JS_ThrowTypeError(ctx, "setVariable requires (level, name, value)");
+    if (argc < 3) return JS_ThrowTypeError(ctx, "setVariable requires (level, name, value[, scopeNumber])");
     int32_t level;
     if (JS_ToInt32(ctx, &level, argv[0])) return JS_EXCEPTION;
     if (!JS_IsString(argv[1])) return JS_ThrowTypeError(ctx, "name must be a string");
     const char *name = JS_ToCString(ctx, argv[1]);
     if (!name) return JS_EXCEPTION;
-    int ret = JS_SetVariableAtLevel(ctx, level, name, JS_DupValue(ctx, argv[2]));
+    int32_t scopeNumber = -1;
+    if (argc >= 4) {
+        if (JS_ToInt32(ctx, &scopeNumber, argv[3])) {
+            JS_FreeCString(ctx, name);
+            return JS_EXCEPTION;
+        }
+    }
+    if (scopeNumber == 2) {
+        /* CDP global scope — set property on the global object. */
+        int ret = JS_SetPropertyStr(ctx, JS_GetGlobalObject(ctx), name, JS_DupValue(ctx, argv[2]));
+        JS_FreeCString(ctx, name);
+        if (ret < 0) return JS_EXCEPTION;
+        return JS_UNDEFINED;
+    }
+    int ret = JS_SetVariableAtLevel(ctx, level, name, JS_DupValue(ctx, argv[2]), scopeNumber);
     JS_FreeCString(ctx, name);
     if (ret < 0) {
         if (ret == -1) return JS_ThrowTypeError(ctx, "variable not found");
@@ -733,9 +819,12 @@ static JSValue tjs_debug_eval_in_frame(JSContext *ctx, JSValue this_val, int arg
 }
 
 static JSValue tjs_debug_set_exception_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc == 0) return JS_ThrowTypeError(ctx, "setExceptionBreakpoint requires (enabled: boolean)");
+    if (argc == 0) return JS_ThrowTypeError(ctx, "setExceptionBreakpoint requires (mode: number | boolean)");
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    trt->debug.break_on_exceptions = JS_ToBool(ctx, argv[0]);
+    uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
+    if (tjs__debug_exception_mode_from_arg(ctx, argv[0], &mode))
+        return JS_EXCEPTION;
+    trt->debug.exception_break_mode = (int)mode;
     return JS_UNDEFINED;
 }
 
@@ -1053,8 +1142,10 @@ static JSValue tjs_dc_worker_clear_breakpoints(JSContext *ctx, JSValue this_val,
 static JSValue tjs_dc_worker_set_exception_bp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
     if (!h || !h->cb || argc == 0) return JS_EXCEPTION;
-    uint32_t enabled = JS_ToBool(ctx, argv[0]) ? 1 : 0;
-    dc_push_control(h->cb, MSG_SET_EXC_BP, 0, (const uint8_t *)&enabled, 4);
+    uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
+    if (tjs__debug_exception_mode_from_arg(ctx, argv[0], &mode))
+        return JS_EXCEPTION;
+    dc_push_control(h->cb, MSG_SET_EXC_BP, 0, (const uint8_t *)&mode, 4);
     return JS_UNDEFINED;
 }
 
@@ -1220,6 +1311,11 @@ static const JSCFunctionListEntry tjs_debug_funcs[] = {
     TJS_CONST2("EXCEPTION",      TJS_DEBUG_EXCEPTION),
     TJS_CONST2("DEBUGGER",       TJS_DEBUG_DEBUGGER),
     TJS_CONST2("STEP",           TJS_DEBUG_STEP),
+    TJS_CONST2("INTERRUPT",      TJS_DEBUG_INTERRUPT),
+    TJS_CONST2("EXCEPTION_NONE", TJS_DEBUG_EXCEPTION_NONE),
+    TJS_CONST2("EXCEPTION_CAUGHT", TJS_DEBUG_EXCEPTION_CAUGHT),
+    TJS_CONST2("EXCEPTION_UNCAUGHT", TJS_DEBUG_EXCEPTION_UNCAUGHT),
+    TJS_CONST2("EXCEPTION_ALL",  TJS_DEBUG_EXCEPTION_ALL),
     TJS_CONST2("DEBUGGER_STMT",  JS_DEBUG_TRACE_DEBUGGER_STMT),
     TJS_CONST2("STEP_NONE",      0),
     TJS_CONST2("STEP_INTO",      1),

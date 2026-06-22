@@ -313,6 +313,32 @@ declare namespace CModuleCrypto {
     ): ArrayBuffer;
 
     /**
+     * Encrypt data using AES-192-CBC
+     * @param key - Encryption key (24 bytes)
+     * @param iv - Initialization vector (16 bytes)
+     * @param data - Plaintext data
+     * @returns Encrypted ciphertext
+     */
+    export function aes192CbcEncrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /**
+     * Decrypt data using AES-192-CBC
+     * @param key - Decryption key (24 bytes)
+     * @param iv - Initialization vector (16 bytes)
+     * @param data - Ciphertext data
+     * @returns Decrypted plaintext
+     */
+    export function aes192CbcDecrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /**
      * Encrypt data using AES-256-CBC
      * @param key - Encryption key (32 bytes)
      * @param iv - Initialization vector (16 bytes)
@@ -359,6 +385,32 @@ declare namespace CModuleCrypto {
      * @returns Decrypted plaintext
      */
     export function aes128GcmDecrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /**
+     * Encrypt data using AES-192-GCM
+     * @param key - Encryption key (24 bytes)
+     * @param iv - Initialization vector
+     * @param data - Plaintext data
+     * @returns Encrypted ciphertext with authentication tag
+     */
+    export function aes192GcmEncrypt(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /**
+     * Decrypt data using AES-192-GCM
+     * @param key - Decryption key (24 bytes)
+     * @param iv - Initialization vector
+     * @param data - Ciphertext data with authentication tag
+     * @returns Decrypted plaintext
+     */
+    export function aes192GcmDecrypt(
         key: ArrayBuffer | Uint8Array,
         iv: ArrayBuffer | Uint8Array,
         data: ArrayBuffer | Uint8Array
@@ -423,6 +475,29 @@ declare namespace CModuleCrypto {
         iv: ArrayBuffer | Uint8Array
     ): Cipher;
 
+    /** AES-256-CBC streaming cipher, no PKCS7 padding (raw blocks). */
+    export function createCipherAes256CbcRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
+    /**
+     * Create AES-192-CBC cipher for streaming encryption
+     * @param key - Encryption key (24 bytes)
+     * @param iv - Initialization vector (16 bytes)
+     * @returns Cipher object
+     */
+    export function createCipherAes192Cbc(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
+    /** AES-192-CBC streaming cipher, no PKCS7 padding (raw blocks). */
+    export function createCipherAes192CbcRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
     /**
      * Create AES-256-CBC decipher for streaming decryption
      * @param key - Decryption key (32 bytes)
@@ -433,6 +508,64 @@ declare namespace CModuleCrypto {
         key: ArrayBuffer | Uint8Array,
         iv: ArrayBuffer | Uint8Array
     ): Cipher;
+
+    /** AES-256-CBC streaming decipher, no PKCS7 padding (raw blocks). */
+    export function createDecipherAes256CbcRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
+    /**
+     * Create AES-192-CBC decipher for streaming decryption
+     * @param key - Decryption key (24 bytes)
+     * @param iv - Initialization vector (16 bytes)
+     * @returns Cipher object
+     */
+    export function createDecipherAes192Cbc(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
+    /** AES-192-CBC streaming decipher, no PKCS7 padding (raw blocks). */
+    export function createDecipherAes192CbcRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array
+    ): Cipher;
+
+    /** AES-128-CBC one-shot encrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
+    export function aes128CbcEncryptRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /** AES-128-CBC one-shot decrypt, no PKCS7 padding. */
+    export function aes128CbcDecryptRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /** AES-192-CBC one-shot encrypt, no PKCS7 padding. */
+    export function aes192CbcEncryptRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /** AES-192-CBC one-shot decrypt, no PKCS7 padding. */
+    export function aes192CbcDecryptRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
+
+    /** AES-256-CBC one-shot encrypt, no PKCS7 padding. */
+    export function aes256CbcEncryptRaw(
+        key: ArrayBuffer | Uint8Array,
+        iv: ArrayBuffer | Uint8Array,
+        data: ArrayBuffer | Uint8Array
+    ): ArrayBuffer;
 
     // ============================================================================
     // Key Derivation

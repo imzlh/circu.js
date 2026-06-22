@@ -1201,6 +1201,9 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowInternalError(ctx, "Failed to create cipher context");
     }
 
+    /* Bit 9 of magic: disable PKCS7 padding (raw/no-padding mode) */
+    int no_padding = (magic >> 9) & 1;
+
     /* Prevent integer overflow: data_len + block_size */
     int block_size = EVP_CIPHER_block_size(cipher);
     if (data_len > (size_t)(INT_MAX - block_size)) {
@@ -1215,9 +1218,16 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     int len, final_len;
-    
-    if (EVP_CipherInit_ex(cctx, cipher, NULL, key, iv, encrypt) != 1 ||
-        EVP_CipherUpdate(cctx, out, &len, data, data_len) != 1 ||
+
+    if (EVP_CipherInit_ex(cctx, cipher, NULL, key, iv, encrypt) != 1) {
+        js_free(ctx, out);
+        EVP_CIPHER_CTX_free(cctx);
+        return JS_ThrowInternalError(ctx, "Cipher operation failed");
+    }
+    if (no_padding) {
+        EVP_CIPHER_CTX_set_padding(cctx, 0);
+    }
+    if (EVP_CipherUpdate(cctx, out, &len, data, data_len) != 1 ||
         EVP_CipherFinal_ex(cctx, out + len, &final_len) != 1) {
         js_free(ctx, out);
         EVP_CIPHER_CTX_free(cctx);
@@ -2252,12 +2262,18 @@ static JSValue tjs_crypto_create_cipher(JSContext* ctx, JSValueConst this_val, i
     if (!c) {
         return JS_EXCEPTION;
     }
-    
+
+    /* Bit 9 of magic: disable PKCS7 padding */
+    int no_padding = (magic >> 9) & 1;
+
     c->ctx = EVP_CIPHER_CTX_new();
     if (!c->ctx || EVP_CipherInit_ex(c->ctx, cipher, NULL, key, iv, encrypt) != 1) {
         if (c->ctx) EVP_CIPHER_CTX_free(c->ctx);
         js_free(ctx, c);
         return JS_ThrowInternalError(ctx, "Failed to initialize cipher");
+    }
+    if (no_padding) {
+        EVP_CIPHER_CTX_set_padding(c->ctx, 0);
     }
     
     c->initialized = 1;
@@ -2374,39 +2390,47 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     }
 
     size_t str_len = strlen(str);
-    /* Prevent integer overflow and signed/unsigned confusion */
     if (str_len > (size_t)INT_MAX) {
         JS_FreeCString(ctx, str);
         return JS_ThrowRangeError(ctx, "Input string too large");
     }
-    int out_len = ((int)str_len / 4) * 3;
-    uint8_t* out = js_malloc(ctx, out_len + 1);
+
+    /* Use EVP_DecodeInit/Update/Final which tolerates embedded '=' and is
+     * more lenient than EVP_DecodeBlock. */
+    EVP_ENCODE_CTX* ectx = EVP_ENCODE_CTX_new();
+    if (!ectx) {
+        JS_FreeCString(ctx, str);
+        return JS_ThrowInternalError(ctx, "Base64 decode failed: out of memory");
+    }
+    EVP_DecodeInit(ectx);
+
+    /* Output buffer: base64 decodes to at most 3/4 of input length. */
+    int out_max = ((int)str_len / 4 + 1) * 3 + 4;
+    uint8_t* out = js_malloc(ctx, out_max);
     if (!out) {
+        EVP_ENCODE_CTX_free(ectx);
         JS_FreeCString(ctx, str);
         return JS_EXCEPTION;
     }
 
-    int decoded = EVP_DecodeBlock(out, (const uint8_t*)str, (int)str_len);
-
-    int padding = 0;
-    if (str_len >= 2 && str[str_len - 1] == '=') {
-        padding++;
-        if (str[str_len - 2] == '=') padding++;
-    }
+    int out_len = 0, final_len = 0;
+    int rc = EVP_DecodeUpdate(ectx, out, &out_len, (const uint8_t*)str, (int)str_len);
     JS_FreeCString(ctx, str);
 
-    if (decoded < 0) {
+    if (rc < 0) {
         js_free(ctx, out);
+        EVP_ENCODE_CTX_free(ectx);
         return JS_ThrowInternalError(ctx, "Base64 decode failed");
     }
 
-    decoded -= padding;
-    if (decoded < 0) {
+    if (EVP_DecodeFinal(ectx, out + out_len, &final_len) < 0) {
         js_free(ctx, out);
+        EVP_ENCODE_CTX_free(ectx);
         return JS_ThrowInternalError(ctx, "Base64 decode failed: invalid padding");
     }
+    EVP_ENCODE_CTX_free(ectx);
 
-    JSValue result = js_fastab(ctx, out, decoded);
+    JSValue result = js_fastab(ctx, out, out_len + final_len);
     return result;
 }
 
@@ -2553,19 +2577,38 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     
     /* Cipher functions - encrypt (high bit set) */
     JS_CFUNC_MAGIC_DEF("aes128CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_128_CBC),
+    JS_CFUNC_MAGIC_DEF("aes192CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_256_CBC),
     JS_CFUNC_MAGIC_DEF("aes128GcmEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_128_GCM),
+    JS_CFUNC_MAGIC_DEF("aes192GcmEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_192_GCM),
     JS_CFUNC_MAGIC_DEF("aes256GcmEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_256_GCM),
-    
+    /* No-padding variants (bit 9 set) */
+    JS_CFUNC_MAGIC_DEF("aes128CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_128_CBC),
+    JS_CFUNC_MAGIC_DEF("aes192CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_192_CBC),
+    JS_CFUNC_MAGIC_DEF("aes256CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_256_CBC),
+
     /* Cipher functions - decrypt */
     JS_CFUNC_MAGIC_DEF("aes128CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_128_CBC),
+    JS_CFUNC_MAGIC_DEF("aes192CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_256_CBC),
     JS_CFUNC_MAGIC_DEF("aes128GcmDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_128_GCM),
+    JS_CFUNC_MAGIC_DEF("aes192GcmDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_192_GCM),
     JS_CFUNC_MAGIC_DEF("aes256GcmDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_256_GCM),
-    
+    /* No-padding variants (bit 9 set) */
+    JS_CFUNC_MAGIC_DEF("aes128CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_128_CBC),
+    JS_CFUNC_MAGIC_DEF("aes192CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_192_CBC),
+    JS_CFUNC_MAGIC_DEF("aes256CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_256_CBC),
+
     /* Streaming cipher */
     JS_CFUNC_MAGIC_DEF("createCipherAes256Cbc", 2, tjs_crypto_create_cipher, (1 << 8) | CIPHER_AES_256_CBC),
+    JS_CFUNC_MAGIC_DEF("createCipherAes192Cbc", 2, tjs_crypto_create_cipher, (1 << 8) | CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("createDecipherAes256Cbc", 2, tjs_crypto_create_cipher, CIPHER_AES_256_CBC),
+    JS_CFUNC_MAGIC_DEF("createDecipherAes192Cbc", 2, tjs_crypto_create_cipher, CIPHER_AES_192_CBC),
+    /* No-padding streaming variants */
+    JS_CFUNC_MAGIC_DEF("createCipherAes256CbcRaw", 2, tjs_crypto_create_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_256_CBC),
+    JS_CFUNC_MAGIC_DEF("createCipherAes192CbcRaw", 2, tjs_crypto_create_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_192_CBC),
+    JS_CFUNC_MAGIC_DEF("createDecipherAes256CbcRaw", 2, tjs_crypto_create_cipher, (1 << 9) | CIPHER_AES_256_CBC),
+    JS_CFUNC_MAGIC_DEF("createDecipherAes192CbcRaw", 2, tjs_crypto_create_cipher, (1 << 9) | CIPHER_AES_192_CBC),
     
     /* PBKDF2 */
     JS_CFUNC_MAGIC_DEF("pbkdf2Sha256", 4, tjs_crypto_pbkdf2, HASH_SHA256),

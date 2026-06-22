@@ -250,6 +250,16 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     TJSCURL *curl = (TJSCURL *) userdata;
     size_t realsize = size * nmemb;
 
+    /* New HTTP status line means a new response (e.g. redirect hop).
+     * Reset the buffer and the fired-flag so onHeadersComplete fires again
+     * for the final response status/headers. */
+    if (realsize >= 5 &&
+            ptr[0] == 'H' && ptr[1] == 'T' && ptr[2] == 'T' && ptr[3] == 'P' && ptr[4] == '/') {
+        dbuf_free(&curl->response_headers);
+        dbuf_init(&curl->response_headers);
+        curl->headers_complete_fired = false;
+    }
+
     if (dbuf_put(&curl->response_headers, (const uint8_t *) ptr, realsize) < 0) {
         return 0;
     }
@@ -802,7 +812,9 @@ static void tjs_curl_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
 
 static void tjs_connpool_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func) {
     TJSConnPool *pool = JS_GetOpaque(val, tjs_connpool_class_id);
-    if (pool) JS_MarkValue(rt, pool->err_cb, mark_func);
+    if (!pool) return;
+
+    JS_MarkValue(rt, pool->err_cb, mark_func);
 }
 
 #pragma endregion
@@ -1839,10 +1851,16 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
         return JS_ThrowTypeError(ctx, "Cannot abort() from within a callback");
     }
 
-    if (curl->pool && curl->pool->multi_handle)
+    if (curl->pool && curl->pool->multi_handle) {
         curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
+        int running = 0;
+        MSACT(curl->pool, curl->pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
+        check_multi_info(curl->pool);
+        if (curl->pool->multi_handle) kick_prep_once(curl->pool);
+    }
     curl->in_flight = false;
     curl->completed = true;
+    curl->headers_complete_fired = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {
         JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);

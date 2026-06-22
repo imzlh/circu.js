@@ -132,12 +132,13 @@ static TJSMessagePipe *tjs_msgpipe_get(JSContext *ctx, JSValue obj) {
 static JSValue emit_event(JSContext *ctx, int argc, JSValue *argv) {
     CHECK_EQ(argc, 2);
 
-    JSValue func = argv[0];
-    JSValue arg = argv[1];
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (trt && trt->freeing) {
+        return JS_UNDEFINED;
+    }
 
-    tjs_call_handler(ctx, func, 1, &arg);
-
-    JS_FreeValue(ctx, func);
+    JSValue arg = JS_DupValue(ctx, argv[1]);
+    tjs_call_handler(ctx, argv[0], 1, &arg);
     JS_FreeValue(ctx, arg);
 
     return JS_UNDEFINED;
@@ -153,7 +154,9 @@ static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg) {
     JSValue args[2];
     args[0] = JS_DupValue(ctx, event_func);
     args[1] = JS_DupValue(ctx, arg);
-    CHECK_EQ(JS_EnqueueJob(ctx, emit_event, 2, (JSValue *) &args), 0);
+    CHECK_EQ(JS_EnqueueJob(ctx, emit_event, 2, (JSValue *) args), 0);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
 }
 
 static void uv__alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -284,6 +287,7 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
 
     CHECK_EQ(uv_tcp_init(tjs_get_loop(ctx), &p->h.tcp), 0);
     CHECK_EQ(uv_tcp_open(&p->h.tcp, fd), 0);
+    uv_tcp_nodelay(&p->h.tcp, 1);  // Disable Nagle — small events must flush immediately.
     CHECK_EQ(uv_read_start(&p->h.stream, uv__alloc_cb, uv__read_cb), 0);
 
     JS_SetOpaque(obj, p);
@@ -441,6 +445,7 @@ static thread_local JSClassID tjs_worker_class_id;
 typedef struct {
     uv_os_sock_t channel_fd;
     uv_sem_t *sem;
+    TJSWorker *worker;
     TJSRuntime *wrt;
     int init_error;
 
@@ -448,6 +453,89 @@ typedef struct {
 	uint8_t* udata;
 	size_t udata_size;
 } worker_data_t;
+
+static void worker_release_self(JSContext *ctx, TJSWorker *w) {
+    if (!JS_IsUndefined(w->self_obj)) {
+        JSValue self = w->self_obj;
+        w->self_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, self);
+    }
+}
+
+static void worker_release_self_rt(JSRuntime *rt, TJSWorker *w) {
+    if (!JS_IsUndefined(w->self_obj)) {
+        JSValue self = w->self_obj;
+        w->self_obj = JS_UNDEFINED;
+        JS_FreeValueRT(rt, self);
+    }
+}
+
+static void worker_mark_exited(TJSWorker *w) {
+    uv_mutex_lock(&w->lock);
+    w->terminated = true;
+    w->wrt = NULL;
+    uv_mutex_unlock(&w->lock);
+}
+
+static void worker_mark_started(TJSWorker *w, TJSRuntime *wrt) {
+    uv_mutex_lock(&w->lock);
+    w->wrt = wrt;
+    uv_mutex_unlock(&w->lock);
+}
+
+static TJSRuntime *worker_get_runtime(TJSWorker *w) {
+    TJSRuntime *wrt;
+    uv_mutex_lock(&w->lock);
+    wrt = w->wrt;
+    uv_mutex_unlock(&w->lock);
+    return wrt;
+}
+
+static TJSRuntime *worker_request_stop(TJSWorker *w) {
+    TJSRuntime *wrt = NULL;
+    uv_mutex_lock(&w->lock);
+    if (!w->terminated) {
+        w->terminated = true;
+        wrt = w->wrt;
+    }
+    uv_mutex_unlock(&w->lock);
+    return wrt;
+}
+
+static bool worker_should_join(TJSWorker *w) {
+    bool should_join;
+    uv_mutex_lock(&w->lock);
+    should_join = !w->joined;
+    uv_mutex_unlock(&w->lock);
+    return should_join;
+}
+
+static void worker_mark_joined(TJSWorker *w) {
+    uv_mutex_lock(&w->lock);
+    w->joined = true;
+    w->wrt = NULL;
+    uv_mutex_unlock(&w->lock);
+}
+
+static bool worker_is_done(TJSWorker *w) {
+    bool done;
+    uv_mutex_lock(&w->lock);
+    done = w->joined || w->wrt == NULL;
+    uv_mutex_unlock(&w->lock);
+    return done;
+}
+
+void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w) {
+    TJSRuntime *wrt = worker_request_stop(w);
+    if (wrt != NULL) TJS_Stop(wrt);
+
+    if (worker_should_join(w)) {
+        CHECK_EQ(uv_thread_join(&w->tid), 0);
+        worker_mark_joined(w);
+        uv_update_time(tjs_get_loop(ctx));
+        worker_release_self(ctx, w);
+    }
+}
 
 /* This is what the worker runs */
 static void worker_entry(void *arg) {
@@ -474,12 +562,16 @@ static void worker_entry(void *arg) {
 	/* run core bootstrap code */
 	tjs__run_main(wrt);
 
-    /* Notify the caller we are setup.  */
-    wd->wrt = wrt;
+    /* Notify the caller we are setup. */
+    TJSWorker *owner = wd->worker;
+    if (owner) worker_mark_started(owner, wrt);
     uv_sem_post(wd->sem);
+    tjs__free(wd);
     wd = NULL;
 
     TJS_Run(wrt);
+
+    if (owner) worker_mark_exited(owner);
 
     TJS_FreeRuntime(wrt);
 }
@@ -492,19 +584,23 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
      * Blocking here can cause hangs if the worker thread is stuck in a
      * synchronous operation (deadloop, blocking syscall).
      * The thread will clean up when it exits. */
-    if (w->wrt != NULL && !w->terminated) {
-        w->terminated = true;
-        TJS_Stop(w->wrt);
+    TJSRuntime *wrt = worker_request_stop(w);
+    if (wrt != NULL) {
+        TJS_Stop(wrt);
         // Don't call uv_thread_join here - it can block indefinitely
         // if the worker thread is stuck. The thread will clean up on exit.
     }
 
-    JS_FreeValueRT(rt, w->message_pipe);
-    w->message_pipe = JS_UNDEFINED;
+    if (worker_is_done(w)) {
+        worker_release_self_rt(rt, w);
+        JS_FreeValueRT(rt, w->message_pipe);
+        w->message_pipe = JS_UNDEFINED;
+    }
 
     if (w->link.next) list_del(&w->link);
     // Don't free w here if thread is still running - let thread cleanup handle it
-    if (w->terminated && w->wrt == NULL) {
+    if (worker_is_done(w)) {
+        uv_mutex_destroy(&w->lock);
         tjs__free(w);
     }
     // Otherwise, the thread cleanup will free w when it exits
@@ -541,10 +637,14 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
 
     w->ctx = ctx;
     w->terminated = false;
+    w->joined = false;
+    CHECK_EQ(uv_mutex_init(&w->lock), 0);
+    w->self_obj = JS_UNDEFINED;
     w->message_pipe = tjs_new_msgpipe(ctx, channel_fd);
 
     if (JS_IsException(w->message_pipe)) {
         JS_FreeValue(ctx, obj);
+        uv_mutex_destroy(&w->lock);
         tjs__free(w);
         return JS_EXCEPTION;
     }
@@ -588,20 +688,31 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     }
 
     TJSWorker *w = tjs_worker_get(ctx, obj);
+    w->self_obj = JS_DupValue(ctx, obj);
 
     /* We will wait for the worker to complete the creation of the VM. */
     uv_sem_t sem;
     CHECK_EQ(uv_sem_init(&sem, 0), 0);
 
-    worker_data_t worker_data = {
-		.channel_fd = fds[1],
-		.sem = &sem,
-		.wrt = NULL,
-		.udata = udata,
-		.udata_size = udata_size
-	};
+    worker_data_t *worker_data = tjs__mallocz(sizeof(*worker_data));
+    if (!worker_data) {
+        uv_sem_destroy(&sem);
+#ifndef _WIN32
+        close(fds[1]);
+#else
+        closesocket(fds[1]);
+#endif
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, udata);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    worker_data->channel_fd = fds[1];
+    worker_data->sem = &sem;
+    worker_data->worker = w;
+    worker_data->udata = udata;
+    worker_data->udata_size = udata_size;
 
-    CHECK_EQ(uv_thread_create(&w->tid, worker_entry, (void *) &worker_data), 0);
+    CHECK_EQ(uv_thread_create(&w->tid, worker_entry, (void *) worker_data), 0);
 	list_add(&w->link, &qrt->workers);
 
     /* Wait for the worker to initialize. */
@@ -614,9 +725,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     uv_update_time(tjs_get_loop(ctx));
 
-    worker_data.sem = NULL;
-    w->wrt = worker_data.wrt;
-    CHECK_NOT_NULL(w->wrt);
+    CHECK_NOT_NULL(worker_get_runtime(w));
 
     return obj;
 }
@@ -626,13 +735,7 @@ static JSValue tjs_worker_terminate(JSContext *ctx, JSValue this_val, int argc, 
     if (!w) {
         return JS_EXCEPTION;
     }
-    if (w->wrt != NULL && !w->terminated) {
-        w->terminated = true;
-        TJS_Stop(w->wrt);
-        CHECK_EQ(uv_thread_join(&w->tid), 0);
-        uv_update_time(tjs_get_loop(ctx));
-        w->wrt = NULL;
-    }
+    tjs__worker_stop_and_join(ctx, w);
     return JS_UNDEFINED;
 }
 

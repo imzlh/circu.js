@@ -151,6 +151,14 @@ declare namespace CModuleFS {
     export function stat(path: string): Stats;
 
     /**
+     * Get file status by fd (follows symlinks)
+     * @param fd - File descriptor
+     * @returns File statistics
+     * @throws Error if file doesn't exist or access denied
+     */
+    export function fstat(fd: number): Stats;
+
+    /**
      * Get file status (doesn't follow symlinks)
      * @param path - File path
      * @returns File statistics
@@ -441,6 +449,15 @@ declare namespace CModuleFS {
      * @throws Error if utimes fails
      */
     export function utimes(path: string, atime: number, mtime: number): void;
+
+    /**
+     * Change file access and modification times by fd
+     * @param fd - File descriptor
+     * @param atime - Access time (seconds since epoch)
+     * @param mtime - Modification time (seconds since epoch)
+     * @throws Error if utimes fails
+     */
+    export function futimes(fd: number, atime: number, mtime: number): void;
 
     // ============================================================================
     // Access Checks

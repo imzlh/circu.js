@@ -548,6 +548,25 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
     return build_stat_obj(ctx, &st);
 }
 
+/* fstat() - get file status by fd */
+static JSValue tjs_syncfs_fstat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    struct stat st;
+    int fd;
+
+    if (argc < 1 || -1 == JS_ToInt32(ctx, &fd, argv[0])) {
+        return JS_ThrowTypeError(ctx, "stat() requires 1 number argument: fd");
+    }
+
+    int ret = fstat(fd, &st);
+
+    if (ret < 0) {
+        JSValue err = tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+        return err;
+    }
+
+    return build_stat_obj(ctx, &st);
+}
+
 /* lstat() - like stat but doesn't follow symlinks */
 static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* path;
@@ -2412,6 +2431,62 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
     return JS_UNDEFINED;
 }
 
+/* futimes() - change file access and modification times by fd */
+static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int32_t fd;
+    double atime, mtime;
+
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "futimes() requires 3 arguments: fd, atime, mtime");
+    }
+
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+#ifdef _WIN32
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return JS_ThrowTypeError(ctx, "futimes: invalid file descriptor");
+    }
+
+    FILETIME ft_atime, ft_mtime;
+    ULARGE_INTEGER ul;
+
+    ul.QuadPart = (ULONGLONG) ((atime + 11644473600.0) * 10000000.0);
+    ft_atime.dwLowDateTime = ul.LowPart;
+    ft_atime.dwHighDateTime = ul.HighPart;
+
+    ul.QuadPart = (ULONGLONG) ((mtime + 11644473600.0) * 10000000.0);
+    ft_mtime.dwLowDateTime = ul.LowPart;
+    ft_mtime.dwHighDateTime = ul.HighPart;
+
+    if (!SetFileTime(hFile, NULL, &ft_atime, &ft_mtime)) {
+        return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
+    }
+#else
+    struct timeval times[2];
+    times[0].tv_sec = (time_t) atime;
+    times[0].tv_usec = (suseconds_t) ((atime - times[0].tv_sec) * 1000000);
+    times[1].tv_sec = (time_t) mtime;
+    times[1].tv_usec = (suseconds_t) ((mtime - times[1].tv_sec) * 1000000);
+
+    if (futimes(fd, times) < 0) {
+        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+    }
+#endif
+
+    return JS_UNDEFINED;
+}
+
 /* access() - check file accessibility */
 static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* path;
@@ -2453,6 +2528,7 @@ static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc
 static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     /* File status */
     JS_CFUNC_DEF("stat", 1, tjs_syncfs_stat),
+    JS_CFUNC_DEF("fstat", 1, tjs_syncfs_fstat),
     JS_CFUNC_DEF("lstat", 1, tjs_syncfs_lstat),
     JS_CFUNC_DEF("exists", 1, tjs_syncfs_exists),
 
@@ -2495,6 +2571,7 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
 
     /* Time manipulation */
     JS_CFUNC_DEF("utimes", 3, tjs_syncfs_utimes),
+    JS_CFUNC_DEF("futimes", 3, tjs_syncfs_futimes),
 
     /* Access checks */
     JS_CFUNC_DEF("access", 2, tjs_syncfs_access),

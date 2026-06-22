@@ -164,10 +164,10 @@ declare namespace CModuleAsyncFS {
         readonly blksize: number;
         readonly blocks: number;
         readonly flags: number;
-        readonly atime: Date;
-        readonly mtime: Date;
-        readonly ctime: Date;
-        readonly birthtime: Date;
+        readonly atim: Date;
+        readonly mtim: Date;
+        readonly ctim: Date;
+        readonly birthtim: Date;
         readonly [Symbol.toStringTag]: 'StatResult';
     }
 

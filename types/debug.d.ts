@@ -15,9 +15,16 @@ declare namespace CModuleDebug {
 	/** Break reason passed to the onBreak callback. */
 	export const BREAKPOINT: number; // 0
 	export const EXCEPTION: number; // 1
-	export const DEBUGGER: number; // 2 (debugger statement OR worker-requested pause)
-	export const STEP: number; // 3 (step-mode pause — into/over/out finished one line)
+	export const DEBUGGER: number; // 2 (debugger; statement)
+	export const STEP: number; // 3 (step-mode pause)
+	export const INTERRUPT: number; // 4 (explicit pause via dc.interrupt())
 	export const DEBUGGER_STMT: number; // trace flag bit
+
+	/** Exception breakpoint modes accepted by setExceptionBreakpoint(). */
+	export const EXCEPTION_NONE: number; // 0
+	export const EXCEPTION_CAUGHT: number; // 1
+	export const EXCEPTION_UNCAUGHT: number; // 2
+	export const EXCEPTION_ALL: number; // 3
 
 	/** Step modes (also accepted by DebugChannelWorker.setStep / resume). */
 	export const STEP_NONE: number; // 0
@@ -52,6 +59,7 @@ declare namespace CModuleDebug {
 		func: string | undefined,
 		line: number,
 		column: number,
+		thrown?: unknown,
 	) => number | void;
 
 	export function start(onBreak: BreakCallback): void;
@@ -81,10 +89,10 @@ declare namespace CModuleDebug {
 		scopeLevel: number;
 	}>;
 
-	export function setVariable(level: number, name: string, value: unknown): void;
+	export function setVariable(level: number, name: string, value: unknown, scopeNumber?: number): void;
 	export function evalInFrame(level: number, expr: string): unknown;
 
-	export function setExceptionBreakpoint(enabled: boolean): void;
+	export function setExceptionBreakpoint(mode: boolean | number): void;
 	/** Must be called from within an onBreak callback. */
 	export function step(mode: number): void;
 
@@ -126,7 +134,7 @@ declare namespace CModuleDebug {
 		removeBreakpoint(file: string, line: number): void;
 		clearBreakpoints(): void;
 		setBreakpointsActive(active: boolean): void;
-		setExceptionBreakpoint(enabled: boolean): void;
+		setExceptionBreakpoint(mode: boolean | number): void;
 		setStep(mode: number): void;
 
 		/** Send an inspect request; the reply arrives via recv() with the same id. */

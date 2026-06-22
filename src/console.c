@@ -295,7 +295,7 @@ static void format_bigint(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 static void format_function(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
-    
+
     put_color(buf, opts, ANSI_CYAN);
     if (JS_IsConstructor(ctx, val)) {
         dbuf_printf(buf, "[class %s]", name_str && name_str[0] ? name_str : "anonymous");
@@ -303,9 +303,49 @@ static void format_function(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
         dbuf_printf(buf, "[Function: %s]", name_str && name_str[0] ? name_str : "anonymous");
     }
     put_reset(buf, opts);
-    
+
     if (name_str) JS_FreeCString(ctx, name_str);
     JS_FreeValue(ctx, name);
+
+    /* Show own enumerable properties attached to the function */
+    JSPropertyEnum* props = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &count, val,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+        uint32_t extra = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const char* k = JS_AtomToCString(ctx, props[i].atom);
+            bool skip = k && (strcmp(k, "length") == 0 || strcmp(k, "name") == 0 ||
+                              strcmp(k, "prototype") == 0 || strcmp(k, "arguments") == 0 ||
+                              strcmp(k, "caller") == 0);
+            if (k) JS_FreeCString(ctx, k);
+            if (!skip) extra++;
+        }
+        if (extra > 0) {
+            dbuf_putstr(buf, " {");
+            uint32_t shown = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                const char* k = JS_AtomToCString(ctx, props[i].atom);
+                bool skip = k && (strcmp(k, "length") == 0 || strcmp(k, "name") == 0 ||
+                                  strcmp(k, "prototype") == 0 || strcmp(k, "arguments") == 0 ||
+                                  strcmp(k, "caller") == 0);
+                if (skip) { if (k) JS_FreeCString(ctx, k); continue; }
+                dbuf_putstr(buf, shown == 0 ? " " : ", ");
+                put_color(buf, opts, ANSI_GREEN);
+                dbuf_printf(buf, "%s", k ? k : "");
+                put_reset(buf, opts);
+                dbuf_putstr(buf, ": ");
+                if (k) JS_FreeCString(ctx, k);
+                JSValue v = JS_GetProperty(ctx, val, props[i].atom);
+                VisitStack dummy = {0};
+                format_value(ctx, v, 1, &dummy, buf, true, opts);
+                JS_FreeValue(ctx, v);
+                shown++;
+            }
+            dbuf_putstr(buf, " }");
+        }
+        JS_FreePropertyEnum(ctx, props, count);
+    }
 }
 
 static void format_symbol(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
@@ -346,20 +386,59 @@ static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     JS_FreeValue(ctx, flags);
 }
 
-static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf, 
+static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
                         const InspectOptions* opts) {
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     JSValue msg = JS_GetProperty(ctx, val, JS_ATOM_message);
     JSValue stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
-    
+
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     const char* msg_str = JS_IsString(msg) ? JS_ToCString(ctx, msg) : NULL;
-    
+
     put_color(buf, opts, ANSI_RED);
     dbuf_printf(buf, "%s", name_str ? name_str : "Error");
     if (msg_str && msg_str[0]) dbuf_printf(buf, ": %s", msg_str);
     put_reset(buf, opts);
-    
+
+    /* Show extra own enumerable properties (e.g. err.code, err.errno) */
+    JSPropertyEnum* props = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &count, val,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+        uint32_t extra = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const char* k = JS_AtomToCString(ctx, props[i].atom);
+            bool skip = k && (strcmp(k, "name") == 0 || strcmp(k, "message") == 0 ||
+                              strcmp(k, "stack") == 0);
+            if (k) JS_FreeCString(ctx, k);
+            if (!skip) extra++;
+        }
+        if (extra > 0) {
+            dbuf_putstr(buf, " {");
+            uint32_t shown = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                const char* k = JS_AtomToCString(ctx, props[i].atom);
+                bool skip = k && (strcmp(k, "name") == 0 || strcmp(k, "message") == 0 ||
+                                  strcmp(k, "stack") == 0);
+                if (skip) { if (k) JS_FreeCString(ctx, k); continue; }
+                if (shown > 0) dbuf_putstr(buf, ", ");
+                else dbuf_putstr(buf, " ");
+                put_color(buf, opts, ANSI_GREEN);
+                dbuf_printf(buf, "%s", k ? k : "");
+                put_reset(buf, opts);
+                dbuf_putstr(buf, ": ");
+                if (k) JS_FreeCString(ctx, k);
+                JSValue v = JS_GetProperty(ctx, val, props[i].atom);
+                VisitStack dummy = {0};
+                format_value(ctx, v, depth + 1, &dummy, buf, true, opts);
+                JS_FreeValue(ctx, v);
+                shown++;
+            }
+            dbuf_putstr(buf, " }");
+        }
+        JS_FreePropertyEnum(ctx, props, count);
+    }
+
     if (JS_IsString(stack)) {
         const char* stack_str = JS_ToCString(ctx, stack);
         if (stack_str && stack_str[0]) {
@@ -379,7 +458,7 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
             JS_FreeCString(ctx, stack_str);
         }
     }
-    
+
     if (name_str) JS_FreeCString(ctx, name_str);
     if (msg_str) JS_FreeCString(ctx, msg_str);
     JS_FreeValue(ctx, name);
@@ -534,8 +613,69 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
     }
 
     if (valid == 0) {
-        dbuf_putstr(buf, "{}");
         JS_FreePropertyEnum(ctx, props, count);
+
+        /* No own enumerable props: fall back to prototype getters (e.g. TS class with only get accessors).
+         * Only one level up — avoids showing every Object.prototype method. */
+        JSValue proto = JS_GetPrototype(ctx, val);
+        if (!JS_IsNull(proto) && !JS_IsException(proto)) {
+            JSPropertyEnum* pprops = NULL;
+            uint32_t pcount = 0;
+            if (JS_GetOwnPropertyNames(ctx, &pprops, &pcount, proto, JS_GPN_STRING_MASK) == 0) {
+                uint32_t gshown = 0;
+                for (uint32_t i = 0; i < pcount; i++) {
+                    const char* k = JS_AtomToCString(ctx, pprops[i].atom);
+                    if (!k || strcmp(k, "constructor") == 0) { if (k) JS_FreeCString(ctx, k); continue; }
+
+                    JSPropertyDescriptor desc = {0};
+                    if (JS_GetOwnProperty(ctx, &desc, proto, pprops[i].atom) <= 0) {
+                        JS_FreeCString(ctx, k); continue;
+                    }
+
+                    if ((desc.flags & JS_PROP_GETSET) && !JS_IsUndefined(desc.getter)) {
+                        JSValue result = JS_Call(ctx, desc.getter, val, 0, NULL);
+                        JS_FreeValue(ctx, desc.getter);
+                        JS_FreeValue(ctx, desc.setter);
+                        if (JS_IsException(result)) {
+                            JSValue exc = JS_GetException(ctx);
+                            JS_FreeValue(ctx, exc);
+                        } else if (!JS_IsFunction(ctx, result)) {
+                            if (gshown == 0) dbuf_putstr(buf, "{\n");
+                            else dbuf_putstr(buf, ",\n");
+                            dbuf_putstr(buf, get_indent(depth + 1));
+                            put_color(buf, opts, ANSI_GREEN);
+                            dbuf_printf(buf, "%s", k);
+                            put_reset(buf, opts);
+                            dbuf_putstr(buf, ": ");
+                            format_value(ctx, result, depth + 1, stack, buf, true, opts);
+                            gshown++;
+                            JS_FreeValue(ctx, result);
+                        } else {
+                            JS_FreeValue(ctx, result);
+                        }
+                    } else if (desc.flags & JS_PROP_NORMAL) {
+                        JS_FreeValue(ctx, desc.value);
+                    } else {
+                        JS_FreeValue(ctx, desc.getter);
+                        JS_FreeValue(ctx, desc.setter);
+                    }
+                    JS_FreeCString(ctx, k);
+                }
+                JS_FreePropertyEnum(ctx, pprops, pcount);
+
+                if (gshown > 0) {
+                    dbuf_putstr(buf, "\n");
+                    dbuf_putstr(buf, get_indent(depth));
+                    dbuf_putstr(buf, "}");
+                    JS_FreeValue(ctx, proto);
+                    visit_pop(stack);
+                    return;
+                }
+            }
+        }
+        JS_FreeValue(ctx, proto);
+
+        dbuf_putstr(buf, "{}");
         visit_pop(stack);
         return;
     }
@@ -712,6 +852,153 @@ static void format_dataview(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
     put_reset(buf, opts);
 }
 
+static void format_map(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
+                       DynBuf* buf, const InspectOptions* opts) {
+    JSValue size_val = JS_GetPropertyStr(ctx, val, "size");
+    int32_t size = 0;
+    if (!JS_IsException(size_val)) JS_ToInt32(ctx, &size, size_val);
+    JS_FreeValue(ctx, size_val);
+
+    put_color(buf, opts, ANSI_CYAN);
+    dbuf_printf(buf, "Map(%d) ", size);
+    put_reset(buf, opts);
+
+    if (is_circular(stack, val)) {
+        put_color(buf, opts, ANSI_CYAN);
+        dbuf_putstr(buf, "[Circular]");
+        put_reset(buf, opts);
+        return;
+    }
+    if (size == 0) { dbuf_putstr(buf, "{}"); return; }
+
+    visit_push(stack, val);
+
+    JSValue entries_fn = JS_GetPropertyStr(ctx, val, "entries");
+    JSValue iterator = JS_Call(ctx, entries_fn, val, 0, NULL);
+    JS_FreeValue(ctx, entries_fn);
+    if (JS_IsException(iterator)) {
+        JS_FreeValue(ctx, iterator);
+        visit_pop(stack);
+        dbuf_putstr(buf, "{ ... }");
+        return;
+    }
+
+    JSValue next_fn = JS_GetPropertyStr(ctx, iterator, "next");
+    int32_t max_show = size < opts->max_array_length ? size : opts->max_array_length;
+    bool inline_disp = opts->compact && size <= 4;
+    dbuf_putstr(buf, inline_disp ? "{ " : "{\n");
+
+    int shown = 0;
+    while (shown < max_show) {
+        JSValue step = JS_Call(ctx, next_fn, iterator, 0, NULL);
+        if (JS_IsException(step)) { JS_FreeValue(ctx, step); break; }
+        JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
+        bool done = JS_ToBool(ctx, done_val);
+        JS_FreeValue(ctx, done_val);
+        if (done) { JS_FreeValue(ctx, step); break; }
+
+        JSValue entry = JS_GetPropertyStr(ctx, step, "value");
+        JS_FreeValue(ctx, step);
+        JSValue key   = JS_GetPropertyUint32(ctx, entry, 0);
+        JSValue value = JS_GetPropertyUint32(ctx, entry, 1);
+        JS_FreeValue(ctx, entry);
+
+        if (shown > 0) dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
+        format_value(ctx, key,   depth + 1, stack, buf, true, opts);
+        dbuf_putstr(buf, " => ");
+        format_value(ctx, value, depth + 1, stack, buf, true, opts);
+        JS_FreeValue(ctx, key);
+        JS_FreeValue(ctx, value);
+        shown++;
+    }
+
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iterator);
+
+    if (size > max_show) {
+        dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
+        put_color(buf, opts, ANSI_GRAY);
+        dbuf_printf(buf, "... %d more items", size - max_show);
+        put_reset(buf, opts);
+    }
+    if (!inline_disp) { dbuf_putstr(buf, "\n"); dbuf_putstr(buf, get_indent(depth)); }
+    else dbuf_putstr(buf, " ");
+    dbuf_putstr(buf, "}");
+    visit_pop(stack);
+}
+
+static void format_set(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
+                       DynBuf* buf, const InspectOptions* opts) {
+    JSValue size_val = JS_GetPropertyStr(ctx, val, "size");
+    int32_t size = 0;
+    if (!JS_IsException(size_val)) JS_ToInt32(ctx, &size, size_val);
+    JS_FreeValue(ctx, size_val);
+
+    put_color(buf, opts, ANSI_CYAN);
+    dbuf_printf(buf, "Set(%d) ", size);
+    put_reset(buf, opts);
+
+    if (is_circular(stack, val)) {
+        put_color(buf, opts, ANSI_CYAN);
+        dbuf_putstr(buf, "[Circular]");
+        put_reset(buf, opts);
+        return;
+    }
+    if (size == 0) { dbuf_putstr(buf, "{}"); return; }
+
+    visit_push(stack, val);
+
+    JSValue values_fn = JS_GetPropertyStr(ctx, val, "values");
+    JSValue iterator  = JS_Call(ctx, values_fn, val, 0, NULL);
+    JS_FreeValue(ctx, values_fn);
+    if (JS_IsException(iterator)) {
+        JS_FreeValue(ctx, iterator);
+        visit_pop(stack);
+        dbuf_putstr(buf, "{ ... }");
+        return;
+    }
+
+    JSValue next_fn = JS_GetPropertyStr(ctx, iterator, "next");
+    int32_t max_show = size < opts->max_array_length ? size : opts->max_array_length;
+    bool inline_disp = opts->compact && size <= 4;
+    dbuf_putstr(buf, inline_disp ? "{ " : "{\n");
+
+    int shown = 0;
+    while (shown < max_show) {
+        JSValue step = JS_Call(ctx, next_fn, iterator, 0, NULL);
+        if (JS_IsException(step)) { JS_FreeValue(ctx, step); break; }
+        JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
+        bool done = JS_ToBool(ctx, done_val);
+        JS_FreeValue(ctx, done_val);
+        if (done) { JS_FreeValue(ctx, step); break; }
+
+        JSValue item = JS_GetPropertyStr(ctx, step, "value");
+        JS_FreeValue(ctx, step);
+        if (shown > 0) dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
+        format_value(ctx, item, depth + 1, stack, buf, true, opts);
+        JS_FreeValue(ctx, item);
+        shown++;
+    }
+
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iterator);
+
+    if (size > max_show) {
+        dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
+        put_color(buf, opts, ANSI_GRAY);
+        dbuf_printf(buf, "... %d more items", size - max_show);
+        put_reset(buf, opts);
+    }
+    if (!inline_disp) { dbuf_putstr(buf, "\n"); dbuf_putstr(buf, get_indent(depth)); }
+    else dbuf_putstr(buf, " ");
+    dbuf_putstr(buf, "}");
+    visit_pop(stack);
+}
+
 static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
     put_color(buf, opts, ANSI_CYAN);
 	dbuf_printf(buf, "Promise<");
@@ -788,7 +1075,20 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			} else if (JS_IsArray(val)) {
 				format_array(ctx, val, depth, stack, buf, opts);
 			} else {
-				format_object(ctx, val, depth, stack, buf, opts);
+				/* Detect Map/Set via Symbol.toStringTag before generic object path */
+				JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
+				const char* tag_str = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
+				bool handled = false;
+				if (tag_str && strcmp(tag_str, "Map") == 0) {
+					format_map(ctx, val, depth, stack, buf, opts);
+					handled = true;
+				} else if (tag_str && strcmp(tag_str, "Set") == 0) {
+					format_set(ctx, val, depth, stack, buf, opts);
+					handled = true;
+				}
+				if (tag_str) JS_FreeCString(ctx, tag_str);
+				JS_FreeValue(ctx, tag);
+				if (!handled) format_object(ctx, val, depth, stack, buf, opts);
 			}
 			break;
 		case JS_TAG_EXCEPTION:
