@@ -600,6 +600,8 @@ static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, int throw
             }
         }
         JS_FreeValue(ctx, frame.func);
+    } else {
+        JS_FreeValue(ctx, frame.func);
     }
 
     JSValue argv[6] = {
@@ -745,7 +747,10 @@ static JSValue tjs_debug_get_frame_info(JSContext *ctx, JSValue this_val, int ar
     if (argc == 0 || -1 == JS_ToInt32(ctx, &level, argv[0]))
         return JS_ThrowTypeError(ctx, "getFrameInfo requires (level: number)");
     JSFrameInfo frame = JS_GetStackFrame(ctx, level);
-    if (frame.line_num == -1) return JS_ThrowTypeError(ctx, "stack frame at level %i is not a JS function", level);
+    if (frame.line_num == -1) {
+        JS_FreeValue(ctx, frame.func);
+        return JS_ThrowTypeError(ctx, "stack frame at level %i is not a JS function", level);
+    }
     JSValue info = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, info, "line",   JS_NewInt32(ctx, frame.line_num));
     JS_SetPropertyStr(ctx, info, "column", JS_NewInt32(ctx, frame.col_num));

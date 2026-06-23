@@ -121,6 +121,8 @@ typedef struct {
     bool in_callback;  /* true while inside a libcurl callback - prevent reentry */
     bool headers_complete_fired;  /* true after onHeadersComplete has been called */
     bool verbose;
+    bool recv_paused;
+    bool recv_pause_requested;
 } TJSCURL;
 
 typedef struct {
@@ -237,6 +239,15 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
         bool should_abort = JS_ToBool(curl->ctx, ret);
         JS_FreeValue(curl->ctx, ret);
+        if (curl->recv_pause_requested) {
+            CURLcode rc;
+            curl->recv_pause_requested = false;
+            rc = curl_easy_pause(curl->handle, CURLPAUSE_RECV);
+            if (rc != CURLE_OK) {
+                return 0; /* abort transfer; perform() will reject */
+            }
+            curl->recv_paused = true;
+        }
         return should_abort ? 0 : realsize;
     }
 
@@ -1043,6 +1054,7 @@ static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
     curl->self_obj = JS_UNDEFINED;
     curl->share_obj = JS_UNDEFINED;
     TJS_ClearPromise(ctx, &curl->promise);
+    curl->recv_paused = false;
 
     curl->pool_obj = JS_DupValue(ctx, argv[0]);
     curl->pool = pool;
@@ -1870,6 +1882,7 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->in_flight = false;
     curl->completed = true;
     curl->headers_complete_fired = false;
+    curl->recv_paused = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {
         JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
@@ -1877,6 +1890,45 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     }
     curl_release_self(ctx, curl);
     return JS_UNDEFINED;
+}
+
+static JSValue tjs_curl_pause_recv(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CURL_THIS(ctx, this_val);
+    if (!curl->in_flight || curl->recv_paused) {
+        return JS_DupValue(ctx, this_val);
+    }
+    if (curl->in_callback) {
+        curl->recv_pause_requested = true;
+        return JS_DupValue(ctx, this_val);
+    }
+
+    CURLcode rc = curl_easy_pause(curl->handle, CURLPAUSE_RECV);
+    if (rc != CURLE_OK) {
+        return JS_ThrowPlainError(ctx, "pauseRecv() failed: %s", curl_easy_strerror(rc));
+    }
+    curl->recv_paused = true;
+    return JS_DupValue(ctx, this_val);
+}
+
+static JSValue tjs_curl_resume_recv(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CURL_THIS(ctx, this_val);
+    if (curl->in_callback) {
+        return JS_ThrowTypeError(ctx, "Cannot resumeRecv() from within a callback");
+    }
+    if (!curl->in_flight || !curl->recv_paused) {
+        return JS_DupValue(ctx, this_val);
+    }
+
+    CURLcode rc = curl_easy_pause(curl->handle, CURLPAUSE_CONT);
+    if (rc != CURLE_OK) {
+        return JS_ThrowPlainError(ctx, "resumeRecv() failed: %s", curl_easy_strerror(rc));
+    }
+    curl->recv_paused = false;
+    curl->recv_pause_requested = false;
+    if (curl->pool && curl->pool->multi_handle) {
+        kick_prep_once(curl->pool);
+    }
+    return JS_DupValue(ctx, this_val);
 }
 
 static JSValue tjs_curl_perform_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1929,6 +1981,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->headers_complete_fired = false;
     curl->stream_mode = false;
     curl->verbose = false;
+    curl->recv_paused = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {
         JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
@@ -2034,6 +2087,8 @@ static const JSCFunctionListEntry tjs_curl_proto_funcs[] = {
     TJS_CFUNC_DEF("perform", 0, tjs_curl_perform),
     TJS_CFUNC_DEF("performSync", 0, tjs_curl_perform_sync),
     TJS_CFUNC_DEF("abort", 0, tjs_curl_abort),
+    TJS_CFUNC_DEF("pauseRecv", 0, tjs_curl_pause_recv),
+    TJS_CFUNC_DEF("resumeRecv", 0, tjs_curl_resume_recv),
     TJS_CFUNC_DEF("reset", 0, tjs_curl_reset),
 
     /* SSL/TLS */

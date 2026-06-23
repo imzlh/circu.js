@@ -219,6 +219,8 @@ declare namespace CModuleOS {
 
     /**
      * Get environment variable (sync)
+     * 
+     * **NOTE** will throw ENOENT IOError if the variable doesn't exist
      * @param name Variable name (e.g., 'PATH')
      * @returns Variable value
      * @throws {Error} Throws errno exception if variable doesn't exist

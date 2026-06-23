@@ -441,6 +441,16 @@ declare namespace CModuleCURL {
         reset(): void;
 
         /**
+         * Resume receive stream
+         */
+        resumeRecv(): void;
+
+        /**
+         * Pause receive stream
+         */
+        pauseRecv(): void;
+
+        /**
          * Set streaming mode. Don't save body, trigger `ondata` instead
          * @param mode Streaming mode
          */

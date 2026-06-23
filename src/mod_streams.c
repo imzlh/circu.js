@@ -261,10 +261,12 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
         }
     }
 
-    /* Pin the JS wrapper so the GC finalizer cannot run before uv__close_cb.
-     * Without this, callbacks are freed by the finalizer while the pending
-     * close callback still holds a pointer to them. */
-    stream_pin(ctx, s, this_val);
+    /* Pin the JS wrapper only if nothing else already keeps it alive until
+     * uv__close_cb. Long-lived operations such as listen()/startRead() already
+     * hold a self-pin; adding another one here would leak because close has
+     * only one matching unpin in uv__close_cb. */
+    if (s->pin_count == 0)
+        stream_pin(ctx, s, this_val);
     maybe_close(s);
     return JS_UNDEFINED;
 }

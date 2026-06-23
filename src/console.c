@@ -395,7 +395,7 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
     for (int i = start; i < argc; i++) {
         if (wrote) dbuf_putc(buf, ' ');
         if (JS_IsString(argv[i])) format_to_string(ctx, argv[i], buf);
-        else format_value_with_depth(ctx, argv[i], buf, 2, false, stream);
+        else format_value_with_depth(ctx, argv[i], buf, 3, false, stream);
         wrote = true;
     }
     return true;
@@ -497,7 +497,7 @@ static void format_bigint(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     if (str) JS_FreeCString(ctx, str);
 }
 
-static void format_function(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
+static void format_function(JSContext* ctx, JSValue val, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
 
@@ -542,8 +542,13 @@ static void format_function(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
                 dbuf_putstr(buf, ": ");
                 if (k) JS_FreeCString(ctx, k);
                 JSValue v = JS_GetProperty(ctx, val, props[i].atom);
-                VisitStack dummy = {0};
-                format_value(ctx, v, 1, &dummy, buf, true, opts);
+                if (JS_IsException(v)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                    shown++;
+                    dbuf_putstr(buf, "[Exception]");
+                    continue;
+                }
+                format_value(ctx, v, 1, stack, buf, true, opts);
                 JS_FreeValue(ctx, v);
                 shown++;
             }
@@ -634,8 +639,14 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
                 dbuf_putstr(buf, ": ");
                 if (k) JS_FreeCString(ctx, k);
                 JSValue v = JS_GetProperty(ctx, val, props[i].atom);
-                VisitStack dummy = {0};
-                format_value(ctx, v, depth + 1, &dummy, buf, true, opts);
+                if (JS_IsException(v)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                    shown++;
+                    dbuf_putstr(buf, "[Exception]");
+                    continue;
+                }
+                VisitStack err_stack = {0};
+                format_value(ctx, v, depth + 1, &err_stack, buf, true, opts);
                 JS_FreeValue(ctx, v);
                 shown++;
             }
@@ -832,37 +843,41 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
                     const char* k = JS_AtomToCString(ctx, pprops[i].atom);
                     if (!k || strcmp(k, "constructor") == 0) { if (k) JS_FreeCString(ctx, k); continue; }
 
-                    JSPropertyDescriptor desc = {0};
-                    if (JS_GetOwnProperty(ctx, &desc, proto, pprops[i].atom) <= 0) {
-                        JS_FreeCString(ctx, k); continue;
+                    JSPropertyDescriptor desc;
+                    int res = JS_GetOwnProperty(ctx, &desc, proto, pprops[i].atom);
+                    if (res <= 0) {
+                        JS_FreeCString(ctx, k);
+                        if (res < 0) { JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc); }
+                        continue;
                     }
 
-                    if ((desc.flags & JS_PROP_GETSET) && !JS_IsUndefined(desc.getter)) {
-                        JSValue result = JS_Call(ctx, desc.getter, val, 0, NULL);
-                        JS_FreeValue(ctx, desc.getter);
-                        JS_FreeValue(ctx, desc.setter);
-                        if (JS_IsException(result)) {
-                            JSValue exc = JS_GetException(ctx);
-                            JS_FreeValue(ctx, exc);
-                        } else if (!JS_IsFunction(ctx, result)) {
-                            if (gshown == 0) dbuf_putstr(buf, "{\n");
-                            else dbuf_putstr(buf, ",\n");
-                            dbuf_putstr(buf, get_indent(depth + 1));
-                            put_color(buf, opts, ANSI_GREEN);
-                            dbuf_printf(buf, "%s", k);
-                            put_reset(buf, opts);
-                            dbuf_putstr(buf, ": ");
-                            format_value(ctx, result, depth + 1, stack, buf, true, opts);
-                            gshown++;
-                            JS_FreeValue(ctx, result);
-                        } else {
+                    if (desc.flags & JS_PROP_GETSET) {
+                        /* Free both unconditionally — QuickJS sets unused half to JS_UNDEFINED */
+                        JSValue getter = desc.getter;
+                        JSValue setter = desc.setter;
+                        if (!JS_IsUndefined(getter) && !JS_IsException(getter)) {
+                            JSValue result = JS_Call(ctx, getter, val, 0, NULL);
+                            if (JS_IsException(result)) {
+                                JSValue exc = JS_GetException(ctx);
+                                JS_FreeValue(ctx, exc);
+                            } else if (!JS_IsFunction(ctx, result)) {
+                                if (gshown == 0) dbuf_putstr(buf, "{\n");
+                                else dbuf_putstr(buf, ",\n");
+                                dbuf_putstr(buf, get_indent(depth + 1));
+                                put_color(buf, opts, ANSI_GREEN);
+                                dbuf_printf(buf, "%s", k);
+                                put_reset(buf, opts);
+                                dbuf_putstr(buf, ": ");
+                                format_value(ctx, result, depth + 1, stack, buf, true, opts);
+                                gshown++;
+                            }
                             JS_FreeValue(ctx, result);
                         }
-                    } else if (desc.flags & JS_PROP_NORMAL) {
-                        JS_FreeValue(ctx, desc.value);
+                        JS_FreeValue(ctx, getter);
+                        JS_FreeValue(ctx, setter);
                     } else {
-                        JS_FreeValue(ctx, desc.getter);
-                        JS_FreeValue(ctx, desc.setter);
+                        /* JS_PROP_NORMAL: desc.value is set, getter/setter are NOT initialized */
+                        JS_FreeValue(ctx, desc.value);
                     }
                     JS_FreeCString(ctx, k);
                 }
@@ -1225,9 +1240,47 @@ static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* s
 /* Main dispatch */
 static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
                         DynBuf* buf, bool quoted, const InspectOptions* opts) {
-    if (depth > opts->depth) {
+    if (depth > opts->depth && JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+        /* Primitives (string, number, bool, null, undefined, symbol, bigint) always
+         * pass through regardless of depth — only objects are collapsed. */
         put_color(buf, opts, ANSI_GRAY);
-        dbuf_putstr(buf, "[Object]");
+        if (JS_IsArray(val)) {
+            int64_t alen = 0;
+            JSValue lv = JS_GetProperty(ctx, val, JS_ATOM_length);
+            if (!JS_IsException(lv)) JS_ToInt64(ctx, &alen, lv);
+            JS_FreeValue(ctx, lv);
+            dbuf_printf(buf, "[Array(%lld)]", (long long)alen);
+        } else if (JS_IsFunction(ctx, val)) {
+            JSValue nm = JS_GetProperty(ctx, val, JS_ATOM_name);
+            const char* ns = JS_IsString(nm) ? JS_ToCString(ctx, nm) : NULL;
+            if (ns && ns[0]) dbuf_printf(buf, "[Function: %s]", ns);
+            else              dbuf_putstr(buf, "[Function]");
+            if (ns) JS_FreeCString(ctx, ns);
+            JS_FreeValue(ctx, nm);
+        } else {
+            /* Map / Set / named class — give a hint */
+            JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
+            const char* ts = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
+            if (ts && strcmp(ts, "Map") == 0) {
+                JSValue sv = JS_GetPropertyStr(ctx, val, "size");
+                int32_t sz = 0;
+                if (!JS_IsException(sv)) JS_ToInt32(ctx, &sz, sv);
+                JS_FreeValue(ctx, sv);
+                dbuf_printf(buf, "[Map(%d)]", sz);
+            } else if (ts && strcmp(ts, "Set") == 0) {
+                JSValue sv = JS_GetPropertyStr(ctx, val, "size");
+                int32_t sz = 0;
+                if (!JS_IsException(sv)) JS_ToInt32(ctx, &sz, sv);
+                JS_FreeValue(ctx, sv);
+                dbuf_printf(buf, "[Set(%d)]", sz);
+            } else {
+                char* cls = get_class_name(ctx, val);
+                if (cls) { dbuf_printf(buf, "[%s]", cls); js_free(ctx, cls); }
+                else        dbuf_putstr(buf, "[Object]");
+            }
+            if (ts) JS_FreeCString(ctx, ts);
+            JS_FreeValue(ctx, tag);
+        }
         put_reset(buf, opts);
         return;
     }
@@ -1268,7 +1321,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			} else if (JS_IsRegExp(val)) {
 				format_regexp(ctx, val, buf, opts);
 			} else if (JS_IsFunction(ctx, val)) {
-				format_function(ctx, val, buf, opts);
+				format_function(ctx, val, stack, buf, opts);
 			} else if (JS_IsError(val)) {
 				format_error(ctx, val, depth, buf, opts);
 			} else if (JS_IsArrayBuffer(val)) {
