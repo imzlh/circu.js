@@ -51,7 +51,7 @@ typedef struct {
         if (JS_IsException(ret)) { \
             (state)->stopped = true; \
             (state)->exception = true; \
-            if ((state)->parser) XML_StopParser((state)->parser, XML_FALSE); \
+            if ((state)->parser) XML_StopParser((state)->parser, 0); \
         } \
         JS_FreeValue((state)->ctx, ret); \
     } \
@@ -318,7 +318,7 @@ static JSValue tjs_xml_parser_stop(JSContext *ctx, JSValueConst this_val,
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
     
-    XML_StopParser(state->parser, XML_TRUE);
+    XML_StopParser(state->parser, 1);
     state->stopped = true;
     
     return JS_UNDEFINED;

@@ -564,7 +564,7 @@ static const JSCFunctionListEntry js_sandbox_proto_funcs[] = {
 static JSValue tjs_setCanBlock(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     CHECK_IF_IN_SANDBOX();
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_SetCanBlock(rt, argc > 0 && JS_ToBool(ctx, argv[0]) ? TRUE : FALSE);
+    JS_SetCanBlock(rt, argc > 0 && JS_ToBool(ctx, argv[0]) ? true : false);
     return JS_UNDEFINED;
 }
 

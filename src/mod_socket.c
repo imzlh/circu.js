@@ -39,6 +39,7 @@
 #else
 # include <net/if.h>
 # include <sys/socket.h>
+# include <sys/un.h>
 # include <unistd.h>
   typedef int sock_fd_t;
 # define SOCK_INVALID        (-1)

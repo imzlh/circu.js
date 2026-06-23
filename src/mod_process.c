@@ -39,7 +39,7 @@
     typedef int pid_t;
     #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
     #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
-        ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
+        ProcThreadAttributeValue(22, false, true, false)
     typedef VOID *HPCON;
     #endif
     #define STDIN_FILENO  0
@@ -425,7 +425,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     WCHAR *wcmd = NULL, *wcwd = NULL;
     JSValue ret = JS_EXCEPTION;
 
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, true };
     if (!CreatePipe(&hConIn, &hPipeIn, &sa, 0) ||
         !CreatePipe(&hPipeOut, &hConOut, &sa, 0)) {
         JS_ThrowInternalError(ctx, "CreatePipe failed: %lu", GetLastError());
@@ -472,7 +472,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     siEx.StartupInfo.cb = sizeof(STARTUPINFOEXW);
     siEx.lpAttributeList = attrList;
     PROCESS_INFORMATION pi = { 0 };
-    if (!CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
+    if (!CreateProcessW(NULL, wcmd, NULL, NULL, false,
                         EXTENDED_STARTUPINFO_PRESENT, NULL, wcwd,
                         &siEx.StartupInfo, &pi)) {
         JS_ThrowInternalError(ctx, "CreateProcess failed: %lu", GetLastError());
@@ -823,9 +823,12 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         else if (!strcmp(stderr_mode, "ignore")) {
             int fd = open("/dev/null", O_WRONLY); if (fd >= 0) { dup2(fd, STDERR_FILENO); if (fd > STDERR_FILENO) close(fd); }
         }
-        if (in_pipe[0] != -1) close(in_pipe[0]); if (in_pipe[1] != -1) close(in_pipe[1]);
-        if (out_pipe[0] != -1) close(out_pipe[0]); if (out_pipe[1] != -1) close(out_pipe[1]);
-        if (err_pipe[0] != -1) close(err_pipe[0]); if (err_pipe[1] != -1) close(err_pipe[1]);
+        if (in_pipe[0] != -1) close(in_pipe[0]);
+        if (in_pipe[1] != -1) close(in_pipe[1]);
+        if (out_pipe[0] != -1) close(out_pipe[0]);
+        if (out_pipe[1] != -1) close(out_pipe[1]);
+        if (err_pipe[0] != -1) close(err_pipe[0]);
+        if (err_pipe[1] != -1) close(err_pipe[1]);
         if (cwd && chdir(cwd) < 0) _exit(127);
         if (env_arr) {
             for (int i = 0; env_arr[i]; i++) {
@@ -902,9 +905,12 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     ret = spawn_sync_make_result(ctx, (int)pid, es, ts, &out, &err, cap_out, cap_err);
 
 cleanup:
-    if (in_pipe[0] != -1) close(in_pipe[0]); if (in_pipe[1] != -1) close(in_pipe[1]);
-    if (out_pipe[0] != -1) close(out_pipe[0]); if (out_pipe[1] != -1) close(out_pipe[1]);
-    if (err_pipe[0] != -1) close(err_pipe[0]); if (err_pipe[1] != -1) close(err_pipe[1]);
+    if (in_pipe[0] != -1) close(in_pipe[0]);
+    if (in_pipe[1] != -1) close(in_pipe[1]);
+    if (out_pipe[0] != -1) close(out_pipe[0]);
+    if (out_pipe[1] != -1) close(out_pipe[1]);
+    if (err_pipe[0] != -1) close(err_pipe[0]);
+    if (err_pipe[1] != -1) close(err_pipe[1]);
     spawn_sync_buf_free(&out);
     spawn_sync_buf_free(&err);
     spawn_sync_free_input(input);
@@ -1050,7 +1056,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     bool cap_out = strcmp(stdout_mode, "pipe") == 0;
     bool cap_err = strcmp(stderr_mode, "pipe") == 0;
 
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, true };
     HANDLE in_r = INVALID_HANDLE_VALUE, in_w = INVALID_HANDLE_VALUE;
     HANDLE out_r = INVALID_HANDLE_VALUE, out_w = INVALID_HANDLE_VALUE;
     HANDLE err_r = INVALID_HANDLE_VALUE, err_w = INVALID_HANDLE_VALUE;
@@ -1107,7 +1113,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         JS_FreeValue(ctx, bg);
     }
 
-    if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, flags, wenv, wcwd, &si, &pi)) {
+    if (!CreateProcessW(NULL, wcmd, NULL, NULL, true, flags, wenv, wcwd, &si, &pi)) {
         JS_ThrowInternalError(ctx, "CreateProcess failed: %lu", GetLastError());
         goto cleanup;
     }
@@ -1537,7 +1543,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
         // Don't call waitpid here - it would steal the exit status from libuv.
         // Instead, drive the event loop until the process exits.
         while (!p->status.exited) {
-            uv_run(TJS_GetLoop(ctx), UV_RUN_ONCE);
+            uv_run(TJS_GetLoop(TJS_GetRuntime(ctx)), UV_RUN_ONCE);
         }
         es = p->status.exit_status;
         ts = p->status.term_signal;

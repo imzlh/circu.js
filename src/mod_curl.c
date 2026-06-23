@@ -1349,7 +1349,11 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "setOpt(%d) is reserved by the CURL binding", id32);
     }
 
+#if CURL_AT_LEAST_VERSION(7, 73, 0)
     const struct curl_easyoption *opt = curl_easy_option_by_id(id);
+#else
+    const struct curl_easyoption *opt = NULL;
+#endif
     if (!opt && id32 >= CURLOPTTYPE_OBJECTPOINT && id32 < CURLOPTTYPE_OFF_T) {
         return JS_ThrowTypeError(ctx, "unknown object pointer option %d is unsafe for setOpt()", id32);
     }
@@ -1409,6 +1413,7 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
 
 /* setOptByName("URL", value) same dispatch keyed by curl option name. */
 static JSValue tjs_curl_set_opt_by_name(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+#if CURL_AT_LEAST_VERSION(7, 73, 0)
     CURL_THIS(ctx, this_val);
     if (argc < 2) return JS_ThrowTypeError(ctx, "setOptByName(name, value) requires 2 arguments");
     const char *name = JS_ToCString(ctx, argv[0]);
@@ -1421,6 +1426,9 @@ static JSValue tjs_curl_set_opt_by_name(JSContext *ctx, JSValueConst this_val, i
     JSValue r = tjs_curl_set_opt(ctx, this_val, 2, forwarded);
     JS_FreeValue(ctx, forwarded[0]);
     return r;
+#else
+    return JS_ThrowTypeError(ctx, "setOptByName() requires libcurl >= 7.73.0");
+#endif
 }
 
 static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
@@ -2143,12 +2151,17 @@ static const JSCFunctionListEntry tjs_connpool_proto_funcs[] = {
 
 /* Populate ns.CURLOPT with every value option libcurl exposes at runtime. */
 static void export_curlopt_table(JSContext *ctx, JSValue ns) {
+#if CURL_AT_LEAST_VERSION(7, 73, 0)
     JSValue tbl = JS_NewObject(ctx);
     const struct curl_easyoption *o = NULL;
     while ((o = curl_easy_option_next(o)) != NULL) {
         JS_DefinePropertyValueStr(ctx, tbl, o->name, JS_NewInt32(ctx, o->id), JS_PROP_C_W_E);
     }
     JS_DefinePropertyValueStr(ctx, ns, "CURLOPT", tbl, JS_PROP_C_W_E);
+#else
+    (void)ctx;
+    (void)ns;
+#endif
 }
 
 #define EXPORT_CONST(obj, name) \

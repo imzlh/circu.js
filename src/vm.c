@@ -521,7 +521,9 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* Destroy all timers and drain the Promise job queue. */
     JSContext *job_ctx;
     tjs__destroy_timers(qrt);
-    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0);
+    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0) {
+        /* drain */
+    }
 
     /* Cleanup all contexts: main app first, then sandbox apps.
      * The list is headed by &main_app->link (created in

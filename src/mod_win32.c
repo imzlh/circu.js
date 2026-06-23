@@ -188,9 +188,9 @@ static void reg_watch_thread(void *arg) {
     tjs_regwatch_t *w = arg;
     for (;;) {
         /* re-arm before waiting to avoid missing changes */
-        RegNotifyChangeKeyValue(w->hkey, TRUE,
+        RegNotifyChangeKeyValue(w->hkey, true,
             REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES,
-            w->event, TRUE);
+            w->event, true);
         if (WaitForSingleObject(w->event, INFINITE) == WAIT_OBJECT_0) {
             if (InterlockedCompareExchange(&w->stopped, 0, 0)) break;
             uv_async_send(&w->async);
@@ -257,7 +257,7 @@ static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_NOTIFY);
     if (!hk) return JS_EXCEPTION;
 
-    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE event = CreateEventW(NULL, false, false, NULL);
     if (!event) { RegCloseKey(hk); return THROW_WIN32(); }
 
     tjs_regwatch_t *w = js_mallocz(ctx, sizeof(*w));

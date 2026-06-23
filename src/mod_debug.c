@@ -261,6 +261,7 @@ static uint32_t payload_u32(const uint8_t *p, uint32_t len, uint32_t *off) {
     return v;
 }
 
+#ifdef _WIN32
 static void normalize_debug_path_inplace(char *path) {
     if (!path) return;
     for (char *p = path; *p; p++) {
@@ -271,6 +272,7 @@ static void normalize_debug_path_inplace(char *path) {
         path[0] = (char)(path[0] - 'a' + 'A');
     }
 }
+#endif
 
 static bool debug_path_eq(JSContext *ctx, JSAtom a, JSAtom b) {
     const char *sa = JS_AtomToCString(ctx, a);
@@ -856,11 +858,11 @@ static thread_local JSClassID tjs_dc_main_class_id;
  * through the libuv signal path (which needs the event loop to be running). */
 static HANDLE tjs_dc_active_stop_event = NULL;
 
-static BOOL WINAPI tjs_dc_ctrl_handler(DWORD type) {
+static bool WINAPI tjs_dc_ctrl_handler(DWORD type) {
     (void)type;
     if (tjs_dc_active_stop_event)
         SetEvent(tjs_dc_active_stop_event);
-    return TRUE;  /* handled -- don't let Windows terminate us */
+    return true;  /* handled -- don't let Windows terminate us */
 }
 #endif
 
@@ -952,12 +954,12 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
         /* Register Ctrl+C handler: libuv signals need the event loop to dispatch,
          * but we're blocked here 鈥?go direct via SetConsoleCtrlHandler. */
         tjs_dc_active_stop_event = h->stop_event;
-        SetConsoleCtrlHandler(tjs_dc_ctrl_handler, TRUE);
+        SetConsoleCtrlHandler(tjs_dc_ctrl_handler, true);
 
         HANDLE wait_hdls[2] = { cb->main_sem, h->stop_event };
-        DWORD wr = WaitForMultipleObjects(2, wait_hdls, FALSE, INFINITE);
+        DWORD wr = WaitForMultipleObjects(2, wait_hdls, false, INFINITE);
 
-        SetConsoleCtrlHandler(tjs_dc_ctrl_handler, FALSE);
+        SetConsoleCtrlHandler(tjs_dc_ctrl_handler, false);
         tjs_dc_active_stop_event = NULL;
 
         if (wr == WAIT_OBJECT_0 + 1 || !h->cb)
@@ -1035,7 +1037,7 @@ static JSValue tjs_debug_create_channel(JSContext *ctx, JSValue this_val, int ar
     }
     h->cb = cb;
 #ifdef _WIN32
-    h->stop_event = CreateEventW(NULL, TRUE /* manual-reset */, FALSE /* initial */, NULL);
+    h->stop_event = CreateEventW(NULL, true /* manual-reset */, false /* initial */, NULL);
 #endif
 
     JSValue handle_obj = JS_NewObjectClass(ctx, tjs_dc_main_class_id);

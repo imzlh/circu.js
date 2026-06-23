@@ -1232,7 +1232,7 @@ static JSValue tjs_syncfs_link(JSContext* ctx, JSValueConst this_val,
     // Platform-specific link creation
 #ifdef _WIN32
     // Windows implementation using CreateHardLink
-    BOOL result = CreateHardLinkA(new_path, existing_path, NULL);
+    bool result = CreateHardLinkA(new_path, existing_path, NULL);
     (void) result;  // Silence unused variable warning in case of macro weirdness
     if (!result) {
         JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), new_path);
@@ -1293,7 +1293,7 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
 #ifdef _WIN32
     // Windows implementation using CreateSymbolicLink
     DWORD flags = 0;
-    BOOL is_directory = false;
+    bool is_directory = false;
 
     // Check if we should treat as directory (third argument or auto-detect)
     if (argc >= 3) {
@@ -1360,7 +1360,7 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
     wchar_t* w_target = NULL;
     wchar_t* w_path = NULL;
     int w_target_len = 0, w_path_len = 0;
-    BOOL success = false;
+    bool success = false;
 
     do {
         w_target_len = MultiByteToWideChar(CP_UTF8, 0, target, -1, NULL, 0);
@@ -1496,7 +1496,7 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
 
     // Read the reparse point data
     DWORD bytes_returned;
-    BOOL success = DeviceIoControl(
+    bool success = DeviceIoControl(
         hFile,
         FSCTL_GET_REPARSE_POINT,
         NULL,
@@ -1652,7 +1652,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     // Note: We use 0 flags (not COPY_FILE_FAIL_IF_EXISTS) to match Unix behavior (overwrite)
     WCHAR *wsrc_copy = utf8_to_wcs(src_path);
     WCHAR *wdest_copy = utf8_to_wcs(dest_path);
-    BOOL result = false;
+    bool result = false;
     if (wsrc_copy && wdest_copy) {
         result = CopyFileExW(wsrc_copy, wdest_copy, NULL, NULL, NULL, 0);
     }
@@ -1854,7 +1854,7 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
 /* readdir() - read directory contents */
 static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     const char* path;
-    BOOL with_types = false;
+    bool with_types = false;
 
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "readdir() requires 1 argument: path");
@@ -1865,11 +1865,12 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
         return JS_EXCEPTION;
     }
     if (argc >= 2) {
-        with_types = JS_ToBool(ctx, argv[1]);
-        if (with_types < 0) {
+        int32_t types_flag;
+        if (JS_ToInt32(ctx, &types_flag, argv[1]) < 0) {
             JS_FreeCString(ctx, path);
             return JS_EXCEPTION;
         }
+        with_types = types_flag != 0;
     }
 
 #ifdef _WIN32
