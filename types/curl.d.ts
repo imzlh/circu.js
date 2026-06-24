@@ -384,11 +384,6 @@ declare namespace CModuleCURL {
         setOpt(option: number, value: CurlOptionValue): this;
 
         /**
-         * Set a libcurl easy option by runtime option name, for example "URL".
-         */
-        setOptByName(name: string, value: CurlOptionValue): this;
-
-        /**
          * Set progress callback function
          * @param callback Progress callback function
          * @returns Current CURL instance (supports chaining)
@@ -528,13 +523,61 @@ declare namespace CModuleCURL {
     /** @deprecated Use CURLINFO_CONTENT_LENGTH_DOWNLOAD_T */
     export const CURLINFO_CONTENT_LENGTH_DOWNLOAD: number;
 
-    /* ---- setOpt() / misc constants ---- */
-    /** CA certificate file path. Passed to setOpt(CURLOPT_CAINFO, path). */
+    /* ---- setOpt() constants ---- */
+    export const CURLOPT_URL: number;
+    export const CURLOPT_PORT: number;
+    export const CURLOPT_TIMEOUT: number;
+    export const CURLOPT_CONNECTTIMEOUT: number;
+    export const CURLOPT_FOLLOWLOCATION: number;
+    export const CURLOPT_MAXREDIRS: number;
+    export const CURLOPT_POST: number;
+    export const CURLOPT_HTTPGET: number;
+    export const CURLOPT_UPLOAD: number;
+    export const CURLOPT_NOBODY: number;
+    export const CURLOPT_CUSTOMREQUEST: number;
+    export const CURLOPT_HTTPHEADER: number;
+    export const CURLOPT_POSTFIELDS: number;
+    export const CURLOPT_POSTFIELDSIZE_LARGE: number;
+    export const CURLOPT_USERAGENT: number;
+    export const CURLOPT_ACCEPT_ENCODING: number;
+    export const CURLOPT_HTTP_VERSION: number;
+    export const CURLOPT_HTTPAUTH: number;
+    export const CURLOPT_USERNAME: number;
+    export const CURLOPT_PASSWORD: number;
+    export const CURLOPT_PROXY: number;
+    export const CURLOPT_PROXYPORT: number;
+    export const CURLOPT_PROXYTYPE: number;
     export const CURLOPT_CAINFO: number;
-    /** Client certificate file path. Passed to setOpt(CURLOPT_SSLCERT, path). */
     export const CURLOPT_SSLCERT: number;
-    /** Private key file path. Passed to setOpt(CURLOPT_SSLKEY, path). */
     export const CURLOPT_SSLKEY: number;
+    export const CURLOPT_KEYPASSWD: number;
+    export const CURLOPT_SSL_VERIFYPEER: number;
+    export const CURLOPT_SSL_VERIFYHOST: number;
+    export const CURLOPT_USE_SSL: number;
+    export const CURLOPT_IPRESOLVE: number;
+    export const CURLOPT_INTERFACE: number;
+    export const CURLOPT_TCP_KEEPALIVE: number;
+    export const CURLOPT_TCP_NODELAY: number;
+    export const CURLOPT_BUFFERSIZE: number;
+    export const CURLOPT_PRIVATE: number;
+    export const CURLOPT_VERBOSE: number;
+    export const CURLOPT_NOPROGRESS: number;
+    export const CURLOPT_NOSIGNAL: number;
+    export const CURLOPT_COOKIEFILE: number;
+    export const CURLOPT_COOKIEJAR: number;
+    export const CURLOPT_AUTOREFERER: number;
+    export const CURLOPT_DNS_CACHE_TIMEOUT: number;
+    export const CURLOPT_LOW_SPEED_LIMIT: number;
+    export const CURLOPT_LOW_SPEED_TIME: number;
+    export const CURLOPT_MAXFILESIZE_LARGE: number;
+    export const CURLOPT_HEADERDATA: number;
+    export const CURLOPT_READDATA: number;
+    export const CURLOPT_WRITEDATA: number;
+    export const CURLOPT_INFILESIZE_LARGE: number;
+    export const CURLOPT_RESUME_FROM_LARGE: number;
+    export const CURLOPT_LOCALPORT: number;
+    export const CURLOPT_DNS_SERVERS: number;
+    export const CURLOPT_CAINFO_BLOB: number;
     export const CURLAUTH_BASIC: number;
     export const CURLAUTH_DIGEST: number;
     export const CURLAUTH_NTLM: number;

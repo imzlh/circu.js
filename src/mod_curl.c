@@ -28,7 +28,6 @@
 #include "mem.h"
 
 #include <curl/curl.h>
-#include <curl/options.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1266,7 +1265,7 @@ static JSValue tjs_curl_on_debug(JSContext *ctx, JSValueConst this_val, int argc
 
 #pragma region Generic setOpt / getInfo
 
-/* Resolve a JS value to a long for CURLOT_LONG / CURLOT_VALUES options. */
+/* Resolve a JS value to a long for LONG / VALUES options. */
 static int js_to_curl_long(JSContext *ctx, JSValueConst v, long *out) {
     if (JS_IsBool(v)) { *out = JS_ToBool(ctx, v) ? 1 : 0; return 0; }
     int64_t n;
@@ -1335,7 +1334,7 @@ static int curl_set_slist_opt(JSContext *ctx, TJSCURL *curl, CURLoption id, JSVa
     return 0;
 }
 
-/* setOpt(optId, value) typed by the option id via curl_easy_option_by_id. */
+/* setOpt(optId, value) — type dispatched by CURLOPTTYPE_* numeric range. */
 static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
     if (argc < 2) return JS_ThrowTypeError(ctx, "setOpt(optId, value) requires 2 arguments");
@@ -1349,35 +1348,38 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "setOpt(%d) is reserved by the CURL binding", id32);
     }
 
-#if CURL_AT_LEAST_VERSION(7, 73, 0)
-    const struct curl_easyoption *opt = curl_easy_option_by_id(id);
-#else
-    const struct curl_easyoption *opt = NULL;
-#endif
-    if (!opt && id32 >= CURLOPTTYPE_OBJECTPOINT && id32 < CURLOPTTYPE_OFF_T) {
-        return JS_ThrowTypeError(ctx, "unknown object pointer option %d is unsafe for setOpt()", id32);
-    }
-    curl_easytype type = opt ? opt->type
-                             : (curl_easytype) /* fallback by numeric range */
-                               (id32 >= CURLOPTTYPE_BLOB ? CURLOT_BLOB :
-                                id32 >= CURLOPTTYPE_OFF_T ? CURLOT_OFF_T : CURLOT_LONG);
+    /* Classify option by its numeric type range (CURLOPTTYPE_*, stable since
+       curl 7.x).  OBJECTPOINT covers STRING/SLIST/CBPTR — all passed as
+       pointers via the generic curl_easy_setopt path below. */
+    enum { T_LONG, T_OBJ, T_FUNC, T_OFFT, T_BLOB } kind =
+        id32 >= CURLOPTTYPE_BLOB          ? T_BLOB :
+        id32 >= CURLOPTTYPE_OFF_T         ? T_OFFT :
+        id32 >= CURLOPTTYPE_FUNCTIONPOINT ? T_FUNC :
+        id32 >= CURLOPTTYPE_OBJECTPOINT   ? T_OBJ  : T_LONG;
 
     CURLcode rc = CURLE_OK;
-    switch (type) {
-        case CURLOT_LONG:
-        case CURLOT_VALUES: {
+    switch (kind) {
+        case T_LONG: {
             long n;
             if (js_to_curl_long(ctx, value, &n) < 0) return JS_EXCEPTION;
             rc = curl_easy_setopt(curl->handle, id, n);
             break;
         }
-        case CURLOT_OFF_T: {
+        case T_OFFT: {
             int64_t n;
             if (JS_ToInt64(ctx, &n, value) < 0) return JS_EXCEPTION;
             rc = curl_easy_setopt(curl->handle, id, (curl_off_t) n);
             break;
         }
-        case CURLOT_STRING: {
+        case T_FUNC:
+            return JS_ThrowTypeError(ctx, "option %d is a function pointer — not settable from JS", id32);
+        case T_OBJ: {
+            /* OBJECTPOINT: could be string, slist, cbptr, or blob-alias.
+               Distinguish by JS type. */
+            if (JS_IsArray(value)) {
+                if (curl_set_slist_opt(ctx, curl, id, value) < 0) return JS_ThrowOutOfMemory(ctx);
+                return JS_DupValue(ctx, this_val);
+            }
             if (JS_IsNull(value) || JS_IsUndefined(value)) {
                 rc = curl_easy_setopt(curl->handle, id, NULL);
             } else {
@@ -1388,12 +1390,7 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
             }
             break;
         }
-        case CURLOT_SLIST: {
-            if (!JS_IsObject(value)) return JS_ThrowTypeError(ctx, "slist option expects an array of strings");
-            if (curl_set_slist_opt(ctx, curl, id, value) < 0) return JS_ThrowOutOfMemory(ctx);
-            return JS_DupValue(ctx, this_val);
-        }
-        case CURLOT_BLOB: {
+        case T_BLOB: {
             size_t len;
             uint8_t *data = JS_GetAnyBuffer(ctx, &len, value);
             if (!data) return JS_ThrowTypeError(ctx, "blob option expects an ArrayBuffer");
@@ -1409,26 +1406,6 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_ThrowPlainError(ctx, "setOpt(%d) failed: %s", id32, curl_easy_strerror(rc));
     }
     return JS_DupValue(ctx, this_val);
-}
-
-/* setOptByName("URL", value) same dispatch keyed by curl option name. */
-static JSValue tjs_curl_set_opt_by_name(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-#if CURL_AT_LEAST_VERSION(7, 73, 0)
-    CURL_THIS(ctx, this_val);
-    if (argc < 2) return JS_ThrowTypeError(ctx, "setOptByName(name, value) requires 2 arguments");
-    const char *name = JS_ToCString(ctx, argv[0]);
-    if (!name) return JS_EXCEPTION;
-    const struct curl_easyoption *opt = curl_easy_option_by_name(name);
-    JS_FreeCString(ctx, name);
-    if (!opt) return JS_ThrowTypeError(ctx, "unknown curl option name");
-
-    JSValueConst forwarded[2] = { JS_NewInt32(ctx, opt->id), argv[1] };
-    JSValue r = tjs_curl_set_opt(ctx, this_val, 2, forwarded);
-    JS_FreeValue(ctx, forwarded[0]);
-    return r;
-#else
-    return JS_ThrowTypeError(ctx, "setOptByName() requires libcurl >= 7.73.0");
-#endif
 }
 
 static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
@@ -2080,7 +2057,6 @@ static const JSCFunctionListEntry tjs_curl_proto_funcs[] = {
 
     /* generic escape hatch: near-complete libcurl access */
     TJS_CFUNC_DEF("setOpt", 2, tjs_curl_set_opt),
-    TJS_CFUNC_DEF("setOptByName", 2, tjs_curl_set_opt_by_name),
     TJS_CFUNC_DEF("getInfo", 0, tjs_curl_get_info),
 
     /* callbacks */
@@ -2149,20 +2125,74 @@ static const JSCFunctionListEntry tjs_connpool_proto_funcs[] = {
 
 #pragma region Module Initialization
 
-/* Populate ns.CURLOPT with every value option libcurl exposes at runtime. */
+/* Populate ns.CURLOPT with hardcoded commonly-used options.
+   Avoids curl_easy_option_* which requires 7.73+. */
+#define CURLOPT_ENTRY(name) { #name, name }
 static void export_curlopt_table(JSContext *ctx, JSValue ns) {
-#if CURL_AT_LEAST_VERSION(7, 73, 0)
-    JSValue tbl = JS_NewObject(ctx);
-    const struct curl_easyoption *o = NULL;
-    while ((o = curl_easy_option_next(o)) != NULL) {
-        JS_DefinePropertyValueStr(ctx, tbl, o->name, JS_NewInt32(ctx, o->id), JS_PROP_C_W_E);
-    }
-    JS_DefinePropertyValueStr(ctx, ns, "CURLOPT", tbl, JS_PROP_C_W_E);
-#else
-    (void)ctx;
-    (void)ns;
+    static const struct { const char *name; int id; } opts[] = {
+        CURLOPT_ENTRY(CURLOPT_URL),
+        CURLOPT_ENTRY(CURLOPT_PORT),
+        CURLOPT_ENTRY(CURLOPT_TIMEOUT),
+        CURLOPT_ENTRY(CURLOPT_CONNECTTIMEOUT),
+        CURLOPT_ENTRY(CURLOPT_DNS_CACHE_TIMEOUT),
+        CURLOPT_ENTRY(CURLOPT_LOW_SPEED_LIMIT),
+        CURLOPT_ENTRY(CURLOPT_LOW_SPEED_TIME),
+        CURLOPT_ENTRY(CURLOPT_MAXFILESIZE_LARGE),
+        CURLOPT_ENTRY(CURLOPT_FOLLOWLOCATION),
+        CURLOPT_ENTRY(CURLOPT_MAXREDIRS),
+        CURLOPT_ENTRY(CURLOPT_POST),
+        CURLOPT_ENTRY(CURLOPT_HTTPGET),
+        CURLOPT_ENTRY(CURLOPT_UPLOAD),
+        CURLOPT_ENTRY(CURLOPT_NOBODY),
+        CURLOPT_ENTRY(CURLOPT_CUSTOMREQUEST),
+        CURLOPT_ENTRY(CURLOPT_HTTPHEADER),
+        CURLOPT_ENTRY(CURLOPT_POSTFIELDS),
+        CURLOPT_ENTRY(CURLOPT_POSTFIELDSIZE_LARGE),
+        CURLOPT_ENTRY(CURLOPT_READDATA),
+        CURLOPT_ENTRY(CURLOPT_WRITEDATA),
+        CURLOPT_ENTRY(CURLOPT_HEADERDATA),
+        CURLOPT_ENTRY(CURLOPT_USERAGENT),
+        CURLOPT_ENTRY(CURLOPT_ACCEPT_ENCODING),
+        CURLOPT_ENTRY(CURLOPT_HTTP_VERSION),
+        CURLOPT_ENTRY(CURLOPT_HTTPAUTH),
+        CURLOPT_ENTRY(CURLOPT_USERNAME),
+        CURLOPT_ENTRY(CURLOPT_PASSWORD),
+        CURLOPT_ENTRY(CURLOPT_PROXY),
+        CURLOPT_ENTRY(CURLOPT_PROXYPORT),
+        CURLOPT_ENTRY(CURLOPT_PROXYTYPE),
+        CURLOPT_ENTRY(CURLOPT_CAINFO),
+        CURLOPT_ENTRY(CURLOPT_SSLCERT),
+        CURLOPT_ENTRY(CURLOPT_SSLKEY),
+        CURLOPT_ENTRY(CURLOPT_KEYPASSWD),
+        CURLOPT_ENTRY(CURLOPT_SSL_VERIFYPEER),
+        CURLOPT_ENTRY(CURLOPT_SSL_VERIFYHOST),
+        CURLOPT_ENTRY(CURLOPT_USE_SSL),
+        CURLOPT_ENTRY(CURLOPT_IPRESOLVE),
+        CURLOPT_ENTRY(CURLOPT_INTERFACE),
+        CURLOPT_ENTRY(CURLOPT_LOCALPORT),
+        CURLOPT_ENTRY(CURLOPT_TCP_KEEPALIVE),
+        CURLOPT_ENTRY(CURLOPT_TCP_NODELAY),
+        CURLOPT_ENTRY(CURLOPT_BUFFERSIZE),
+        CURLOPT_ENTRY(CURLOPT_PRIVATE),
+        CURLOPT_ENTRY(CURLOPT_VERBOSE),
+        CURLOPT_ENTRY(CURLOPT_NOPROGRESS),
+        CURLOPT_ENTRY(CURLOPT_NOSIGNAL),
+        CURLOPT_ENTRY(CURLOPT_COOKIEFILE),
+        CURLOPT_ENTRY(CURLOPT_COOKIEJAR),
+        CURLOPT_ENTRY(CURLOPT_INFILESIZE_LARGE),
+        CURLOPT_ENTRY(CURLOPT_RESUME_FROM_LARGE),
+        CURLOPT_ENTRY(CURLOPT_AUTOREFERER),
+        CURLOPT_ENTRY(CURLOPT_DNS_SERVERS),
+#ifdef CURLOPT_CAINFO_BLOB
+        CURLOPT_ENTRY(CURLOPT_CAINFO_BLOB),
 #endif
+    };
+    for (size_t i = 0; i < sizeof(opts)/sizeof(opts[0]); i++) {
+        JS_DefinePropertyValueStr(ctx, ns, opts[i].name,
+            JS_NewInt32(ctx, opts[i].id), JS_PROP_C_W_E);
+    }
 }
+#undef CURLOPT_ENTRY
 
 #define EXPORT_CONST(obj, name) \
     JS_DefinePropertyValueStr(ctx, obj, #name, JS_NewInt64(ctx, (int64_t) name), JS_PROP_C_W_E)
