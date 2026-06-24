@@ -36,6 +36,11 @@ declare namespace CModuleWin32 {
          * Safe to call multiple times. Must NOT be called from within the callback.
          */
         close(): void;
+        /**
+         * Unref the underlying libuv handle so it does not prevent the process from exiting.
+         * The watcher continues to fire callbacks but will not keep the event loop alive.
+         */
+        unref(): void;
     }
 
     /** Registry value types that can be read and written. */

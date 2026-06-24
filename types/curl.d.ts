@@ -547,6 +547,9 @@ declare namespace CModuleCURL {
     export const CURLOPT_PROXY: number;
     export const CURLOPT_PROXYPORT: number;
     export const CURLOPT_PROXYTYPE: number;
+    export const CURLOPT_NOPROXY: number;
+    export const CURLOPT_PROXYUSERNAME: number;
+    export const CURLOPT_PROXYPASSWORD: number;
     export const CURLOPT_CAINFO: number;
     export const CURLOPT_SSLCERT: number;
     export const CURLOPT_SSLKEY: number;

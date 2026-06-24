@@ -23,6 +23,7 @@
  */
 
 #include "private.h"
+#include "mem.h"
 
 #include <windows.h>
 #include <wincrypt.h>
@@ -205,6 +206,8 @@ static void reg_watch_async_cb(uv_async_t *handle) {
     JS_FreeValue(w->jsctx, ret);
 }
 
+static void regwatch_close_cb(uv_handle_t *handle);
+
 /* Stop the watcher (idempotent, pure C, no JS calls) */
 static void regwatch_stop(tjs_regwatch_t *w) {
     if (!InterlockedExchange(&w->stopped, 1)) {
@@ -213,7 +216,7 @@ static void regwatch_stop(tjs_regwatch_t *w) {
         RegCloseKey(w->hkey);
         CloseHandle(w->event);
         if (!uv_is_closing((uv_handle_t *)&w->async))
-            uv_close((uv_handle_t *)&w->async, NULL);
+            uv_close((uv_handle_t *)&w->async, regwatch_close_cb);
     }
 }
 
@@ -228,12 +231,18 @@ static JSValue tjs_regwatch_close(JSContext *ctx, JSValue this_val, int argc, JS
     return JS_UNDEFINED;
 }
 
+static void regwatch_close_cb(uv_handle_t *handle) {
+    tjs_regwatch_t *w = uv_handle_get_data(handle);
+    tjs__free(w);
+}
+
 static void tjs_regwatch_finalizer(JSRuntime *rt, JSValue val) {
     tjs_regwatch_t *w = JS_GetOpaque(val, tjs_regwatch_classid);
     if (!w) return;
     regwatch_stop(w);
     JS_FreeValueRT(rt, w->callback);
-    js_free_rt(rt, w);
+    w->callback = JS_UNDEFINED;
+    /* w is freed in regwatch_close_cb after libuv finishes processing the handle */
 }
 
 static void tjs_regwatch_gc_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
@@ -246,8 +255,15 @@ static JSClassDef tjs_regwatch_class = {
     "RegWatch", .finalizer = tjs_regwatch_finalizer, .gc_mark = tjs_regwatch_gc_mark
 };
 
+static JSValue tjs_regwatch_unref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    tjs_regwatch_t *w = JS_GetOpaque(this_val, tjs_regwatch_classid);
+    if (w) uv_unref((uv_handle_t *)&w->async);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry tjs_regwatch_proto_funcs[] = {
     TJS_CFUNC_DEF("close", 0, tjs_regwatch_close),
+    TJS_CFUNC_DEF("unref", 0, tjs_regwatch_unref),
 };
 
 /* ── reg_watch(hive, key, callback) → RegWatch ──────────────── */
