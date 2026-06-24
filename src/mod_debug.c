@@ -136,6 +136,12 @@ typedef struct {
     uint8_t  inline_buf[MSG_INLINE_MAX];
 } RingMsg;
 
+/* GCC false-positive: -Wstringop-overflow fires when memcpy-ing into a
+ * RingSlot payload accessed via &r->slots[...] because the _Atomic head
+ * field confuses GCC's offset analysis (GCC Bug #101836).              */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+
 static inline bool ring_push(MsgRing *r, uint32_t type, uint32_t id,
                              uint8_t *payload, uint32_t len) {
     uint32_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
@@ -157,6 +163,7 @@ static inline bool ring_push(MsgRing *r, uint32_t type, uint32_t id,
     atomic_store_explicit(&r->head, h + 1, memory_order_release);
     return true;
 }
+#pragma GCC diagnostic pop
 
 /* Pop one message, copying it out of the ring before releasing the slot.
  * Returns false when the ring is empty. */
