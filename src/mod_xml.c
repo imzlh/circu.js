@@ -107,13 +107,13 @@ XML_CALLBACK(comment, const XML_Char *data) {
 XML_CALLBACK(start_cdata) {
     TJSXMLParser *state = (TJSXMLParser *)userData;
     if (state->stopped) return;
-    INVOKE_HANDLER(state, "startCDATA", 0);
+    INVOKE_HANDLER(state, "startCDATA", 0, JS_UNDEFINED);
 }
 
 XML_CALLBACK(end_cdata) {
     TJSXMLParser *state = (TJSXMLParser *)userData;
     if (state->stopped) return;
-    INVOKE_HANDLER(state, "endCDATA", 0);
+    INVOKE_HANDLER(state, "endCDATA", 0, JS_UNDEFINED);
 }
 
 XML_CALLBACK(processing_instruction, const XML_Char *target, const XML_Char *data) {
