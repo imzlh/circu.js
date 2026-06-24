@@ -852,13 +852,9 @@ static JSValue tjs_debug_set_step_mode(JSContext *ctx, JSValue this_val, int arg
 static thread_local JSClassID tjs_dc_main_class_id;
 
 #ifdef _WIN32
-/* Active stop_event for the current debug session. Set before WaitForMultiple-
- * Objects and cleared after, so the console control handler (which fires on a
- * system thread) can wake waitRequest on Ctrl+C / console close without going
- * through the libuv signal path (which needs the event loop to be running). */
 static HANDLE tjs_dc_active_stop_event = NULL;
 
-static bool WINAPI tjs_dc_ctrl_handler(DWORD type) {
+static BOOL WINAPI tjs_dc_ctrl_handler(DWORD type) {
     (void)type;
     if (tjs_dc_active_stop_event)
         SetEvent(tjs_dc_active_stop_event);
