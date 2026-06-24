@@ -60,6 +60,22 @@
    static inline int  tjs_sem_timedwait(tjs_sem_t *s, uint32_t ms) {
        return WaitForSingleObject(*s, ms) == WAIT_OBJECT_0 ? 0 : -1;
    }
+#elif defined(__APPLE__)
+#  include <dispatch/dispatch.h>
+#  include <errno.h>
+   typedef dispatch_semaphore_t tjs_sem_t;
+   static inline void tjs_sem_init(tjs_sem_t *s)   { *s = dispatch_semaphore_create(0); }
+   static inline void tjs_sem_destroy(tjs_sem_t *s){ dispatch_release(*s); }
+   static inline void tjs_sem_post(tjs_sem_t *s)   { dispatch_semaphore_signal(*s); }
+   static inline void tjs_sem_wait(tjs_sem_t *s)   { dispatch_semaphore_wait(*s, DISPATCH_TIME_FOREVER); }
+   static inline int  tjs_sem_trywait(tjs_sem_t *s){
+       return dispatch_semaphore_wait(*s, DISPATCH_TIME_NOW) == 0 ? 0 : (errno = EAGAIN, -1);
+   }
+   static inline int  tjs_sem_timedwait(tjs_sem_t *s, uint32_t ms) {
+       dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)ms * (int64_t)1000000);
+       return dispatch_semaphore_wait(*s, deadline) == 0 ? 0 : (errno = ETIMEDOUT, -1);
+   }
 #else
 #  include <semaphore.h>
 #  include <time.h>
@@ -90,7 +106,10 @@ typedef struct {
     uint32_t type;
     uint32_t id;
     uint32_t len;
-    char     payload[MSG_INLINE_MAX];
+    union {
+        char     payload[MSG_INLINE_MAX];
+        uint8_t *heap_ptr;              /* valid when RING_FLAG_HEAP is set */
+    };
 } RingSlot;
 
 /* Large payloads (> MSG_INLINE_MAX) live in a malloc'd buffer whose pointer is
@@ -132,7 +151,7 @@ static inline bool ring_push(MsgRing *r, uint32_t type, uint32_t id,
         uint8_t *buf = tjs__malloc(len);
         if (!buf) return false;
         memcpy(buf, payload, len);
-        memcpy(s->payload, &buf, sizeof(uint8_t *));
+        s->heap_ptr = buf;
         s->type = type | RING_FLAG_HEAP;
     }
     atomic_store_explicit(&r->head, h + 1, memory_order_release);
@@ -151,7 +170,7 @@ static inline bool ring_pop(MsgRing *r, RingMsg *out) {
     if (s->type & RING_FLAG_HEAP) {
         out->type    = s->type & ~RING_FLAG_HEAP;
         out->is_heap = true;
-        memcpy(&out->data, s->payload, sizeof(uint8_t *));   /* take ownership */
+        out->data = s->heap_ptr;   /* take ownership */
     } else {
         out->type    = s->type;
         out->is_heap = false;

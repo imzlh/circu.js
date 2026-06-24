@@ -45,7 +45,7 @@ typedef struct {
 /* Macro for invoking JS handler */
 #define INVOKE_HANDLER(state, handler_name, argc, ...) do { \
     JSValue handler = JS_GetPropertyStr((state)->ctx, (state)->handlers, handler_name); \
-    JSValue args[] = { __VA_ARGS__ }; \
+    JSValue args[4] = { __VA_ARGS__ }; \
     if (JS_IsFunction((state)->ctx, handler)) { \
         JSValue ret = JS_Call((state)->ctx, handler, JS_UNDEFINED, argc, args); \
         if (JS_IsException(ret)) { \
