@@ -157,7 +157,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake -B build -G "Visual Studio 17 2022" ^
+          cmake -B build -G "Visual Studio 18 2026" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
             -DBUILD_WITH_CURL=ON

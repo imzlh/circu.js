@@ -886,7 +886,7 @@ static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSVa
 #ifdef _WIN32
     strerror_s(buf, sizeof(buf), err);
 #else
-    strerror_r(err, buf, sizeof(buf));
+    (void)strerror_r(err, buf, sizeof(buf));
 #endif
     return JS_NewString(ctx, buf);
 }
