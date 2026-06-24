@@ -221,7 +221,7 @@ endif()
 
 if (Iconv_FOUND)
     add_compile_definitions(CJS__HAS_ICONV)
-    target_sources(libcjs PUBLIC src/mod_text.c)
+    target_sources(libcjs PRIVATE src/mod_text.c)
     target_link_libraries(libcjs PRIVATE Iconv::Iconv)
 else()
     message(NOTICE "build without iconv")
@@ -229,7 +229,7 @@ endif()
 
 if (BUILD_WITH_WASM)
     add_compile_definitions(CJS__HAS_WASM)
-    target_sources(libcjs PUBLIC src/mod_wasm.c)
+    target_sources(libcjs PRIVATE src/mod_wasm.c)
 
     set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/wamr)
 
