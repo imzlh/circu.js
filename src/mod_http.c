@@ -73,6 +73,7 @@ typedef struct {
 
 	bool initialized;
 	bool running;
+	bool pause_requested;
 } TJSLlhttpParser;
 
 static thread_local JSClassID tjs_llhttp_parser_class_id;
@@ -176,6 +177,10 @@ static int tjs_llhttp_emit(TJSLlhttpParser* p, TJSLlhttpEvent ev, const char* at
 	}
 
 	JS_FreeValue(ctx, ret);
+	if (p->pause_requested) {
+		p->pause_requested = false;
+		return HPE_PAUSED;
+	}
 	return 0;
 }
 
@@ -312,6 +317,7 @@ static JSValue tjs_llhttp_parser_ctor(JSContext* ctx, JSValueConst new_target,
 	p->cur_base = NULL;
 	p->cur_len = 0;
 	p->running = false;
+	p->pause_requested = false;
 
 	tjs_llhttp_parser_init_llhttp(p, type32);
 
@@ -378,6 +384,7 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 	p->cur_base = (const uint8_t*) parse_data;
 	p->cur_len = len;
 	p->running = true;
+	p->pause_requested = false;
 
 	llhttp_errno_t err = llhttp_execute(&p->parser, (const char*) parse_data, len);
 
@@ -426,7 +433,10 @@ static JSValue tjs_llhttp_pause(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
-	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
+	if (p->running) {
+		p->pause_requested = true;
+		return JS_UNDEFINED;
+	}
 	llhttp_pause(&p->parser);
 	return JS_UNDEFINED;
 }

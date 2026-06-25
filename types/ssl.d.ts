@@ -13,8 +13,8 @@
  *
  * const Context = new Context({
  *     mode: "server",
- *     cert: "/path/to/cert.pem",
- *     key: "/path/to/key.pem",
+ *     cert: certPem,
+ *     key: keyPem,
  *     alpn: ["h2", "http/1.1"]
  * });
  *
@@ -41,7 +41,7 @@
  * const Context2 = new Context({
  *     mode: "client",
  *     verify: true,
- *     ca: "/etc/ssl/certs/ca-bundle.crt"
+ *     ca: caPem
  * });
  *
  * const conn2 = new TCP();
@@ -79,13 +79,10 @@
  *     days: 365
  * });
  *
- * await writeFile("cert.pem", cert);
- * await writeFile("key.pem", key);
- *
  * const context3 = new Context({
  *     mode: "server",
- *     cert: "cert.pem",
- *     key: "key.pem"
+ *     cert,
+ *     key
  * });
  *
  * // Example 4: Inspect Peer Certificate
@@ -100,7 +97,7 @@
  *     console.log("SANs:", cert4.subjectAltNames);
  *     console.log("Fingerprint:", cert4.fingerprint256);
  *
- *     const verify4 = pipe4.verifyResult();
+ *     const verify4 = pipe4.verifyResult;
  *     if (!verify4.ok) {
  *         console.error("Certificate verification failed:", verify4.error);
  *     }
@@ -111,8 +108,8 @@
  *
  * const context5 = new Context({
  *     mode: "server",
- *     cert: "cert.pem",
- *     key: "key.pem",
+ *     cert: certPem,
+ *     key: keyPem,
  *     minVersion: "TLSv1.2",
  *     maxVersion: "TLSv1.3",
  *     ciphers: "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384",
@@ -142,13 +139,13 @@ declare namespace CModuleSSL {
         /** Maximum TLS version */
         maxVersion?: "TLSv1.0" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3";
 
-        /** Path to certificate file (PEM format) */
+        /** Certificate PEM data */
         cert?: string;
 
-        /** Path to private key file (PEM format) */
+        /** Private key PEM data */
         key?: string;
 
-        /** Path to CA certificate file for verification */
+        /** CA certificate PEM data for verification */
         ca?: string;
 
         /** Cipher list string */
@@ -156,6 +153,9 @@ declare namespace CModuleSSL {
 
         /** Enable peer certificate verification */
         verify?: boolean;
+
+        /** Check the peer certificate name against the pipe servername */
+        verifyHostname?: boolean;
 
         /** Enable session tickets */
         sessionTickets?: boolean;
@@ -324,19 +324,19 @@ declare namespace CModuleSSL {
          * Get current cipher information
          * @returns Cipher info or null if not established
          */
-        cipher(): CipherInfo | null;
+        readonly cipher: CipherInfo | null;
 
         /**
          * Get negotiated ALPN protocol
          * @returns Protocol name or null if not negotiated
          */
-        alpnProtocol(): string | null;
+        readonly alpnProtocol: string | null;
 
         /**
          * Get peer certificate verification result
          * @returns Verification result
          */
-        verifyResult(): VerifyResult;
+        readonly verifyResult: VerifyResult;
 
         /** Whether SSL handshake is complete */
         readonly handshakeComplete: boolean;

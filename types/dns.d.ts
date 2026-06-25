@@ -208,13 +208,13 @@ declare namespace CModuleDNS {
      * @param hostname - Domain to query
      * @param type - Record type (default DNS.A)
      * @param server - DNS server address (default "8.8.8.8")
-     * @param timeout - Timeout in milliseconds (default 5000)
+     * @param port - DNS server port (default 53)
      * @returns DNS answer array
      */
     function query(
         hostname: string,
         type?: number,
         server?: string,
-        timeout?: number
-    ): Promise<DNSAnswer[]>;
+        port?: number
+    ): Promise<DNSAnswer[]> & { abort?: () => void };
 }

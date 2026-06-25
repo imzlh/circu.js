@@ -201,6 +201,35 @@ add_library(libcjs STATIC
     src/mod_debug.c
 )
 
+if(CJS_EXTRA_MODULE_NAMES)
+    list(LENGTH CJS_EXTRA_MODULE_NAMES _cjs_extra_name_count)
+    list(LENGTH CJS_EXTRA_MODULE_INITS _cjs_extra_init_count)
+    list(LENGTH CJS_EXTRA_MODULE_WORKER_SAFE _cjs_extra_safe_count)
+    if(NOT _cjs_extra_name_count EQUAL _cjs_extra_init_count OR
+       NOT _cjs_extra_name_count EQUAL _cjs_extra_safe_count)
+        message(FATAL_ERROR "CJS_EXTRA_MODULE_NAMES, CJS_EXTRA_MODULE_INITS, and CJS_EXTRA_MODULE_WORKER_SAFE must have the same length")
+    endif()
+
+    set(_cjs_extra_externs "")
+    set(_cjs_extra_entries "")
+    math(EXPR _cjs_extra_last "${_cjs_extra_name_count} - 1")
+    foreach(_i RANGE 0 ${_cjs_extra_last})
+        list(GET CJS_EXTRA_MODULE_NAMES ${_i} _cjs_extra_name)
+        list(GET CJS_EXTRA_MODULE_INITS ${_i} _cjs_extra_init)
+        list(GET CJS_EXTRA_MODULE_WORKER_SAFE ${_i} _cjs_extra_safe)
+        string(APPEND _cjs_extra_externs "void ${_cjs_extra_init}(JSContext *ctx, JSValue ns);\n")
+        string(APPEND _cjs_extra_entries "    { \"${_cjs_extra_name}\", ${_cjs_extra_init}, ${_cjs_extra_safe} },\n")
+    endforeach()
+
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extra_externs.h" "${_cjs_extra_externs}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extra_entries.h" "${_cjs_extra_entries}")
+
+    target_compile_definitions(libcjs PRIVATE CJS_HAS_EXTRA_MODULES ${CJS_EXTRA_DEFINES})
+    target_include_directories(libcjs PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" ${CJS_EXTRA_INCLUDE_DIRS})
+    target_sources(libcjs PRIVATE ${CJS_EXTRA_SOURCES})
+    target_link_libraries(libcjs PRIVATE ${CJS_EXTRA_LIBS})
+endif()
+
 if (WIN32)
     target_sources(libcjs PRIVATE src/mod_win32.c)
 endif()

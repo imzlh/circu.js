@@ -10,6 +10,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -70,11 +71,12 @@ typedef struct {
     JSContext *ctx;
     SSL_CTX *ssl_ctx;
     TJSSSLMode mode;
-    char *cert_file;
-    char *key_file;
-    char *ca_file;
+    char *cert_pem;
+    char *key_pem;
+    char *ca_pem;
     char *ciphers;
     int verify_mode;
+    bool verify_hostname;
     bool session_tickets;
     /* ALPN protocol list (heap-allocated; referenced by SSL_CTX callback for
      * server mode, which doesn't copy the buffer). Owned by this context. */
@@ -90,9 +92,9 @@ static void tjs_ssl_context_finalizer(JSRuntime *rt, JSValue val) {
         if (ssl_ctx->ssl_ctx) {
             SSL_CTX_free(ssl_ctx->ssl_ctx);
         }
-        if (ssl_ctx->cert_file) js_free_rt(rt, ssl_ctx->cert_file);
-        if (ssl_ctx->key_file) js_free_rt(rt, ssl_ctx->key_file);
-        if (ssl_ctx->ca_file) js_free_rt(rt, ssl_ctx->ca_file);
+        if (ssl_ctx->cert_pem) js_free_rt(rt, ssl_ctx->cert_pem);
+        if (ssl_ctx->key_pem) js_free_rt(rt, ssl_ctx->key_pem);
+        if (ssl_ctx->ca_pem) js_free_rt(rt, ssl_ctx->ca_pem);
         if (ssl_ctx->ciphers) js_free_rt(rt, ssl_ctx->ciphers);
         if (ssl_ctx->alpn_list) js_free_rt(rt, ssl_ctx->alpn_list);
         js_free_rt(rt, ssl_ctx);
@@ -103,6 +105,75 @@ static JSClassDef tjs_ssl_context_class = {
     "SSLContext",
     .finalizer = tjs_ssl_context_finalizer,
 };
+
+static int ssl_ctx_use_certificate_chain_pem(SSL_CTX *ctx, const char *pem) {
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    if (!bio) return 0;
+
+    X509 *cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
+    if (!cert) {
+        BIO_free(bio);
+        return 0;
+    }
+
+    int ok = SSL_CTX_use_certificate(ctx, cert) == 1;
+    X509_free(cert);
+    if (!ok) {
+        BIO_free(bio);
+        return 0;
+    }
+
+    while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        if (SSL_CTX_add_extra_chain_cert(ctx, cert) != 1) {
+            X509_free(cert);
+            BIO_free(bio);
+            return 0;
+        }
+    }
+
+    ERR_clear_error();
+    BIO_free(bio);
+    return 1;
+}
+
+static int ssl_ctx_use_private_key_pem(SSL_CTX *ctx, const char *pem) {
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    if (!bio) return 0;
+
+    EVP_PKEY *key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!key) return 0;
+
+    int ok = SSL_CTX_use_PrivateKey(ctx, key) == 1;
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+static int ssl_ctx_load_ca_pem(SSL_CTX *ctx, const char *pem) {
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    if (!bio) return 0;
+
+    X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+    int count = 0;
+    X509 *cert;
+    while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        if (X509_STORE_add_cert(store, cert) != 1) {
+            unsigned long err = ERR_peek_last_error();
+            if (ERR_GET_REASON(err) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+                X509_free(cert);
+                BIO_free(bio);
+                return 0;
+            }
+            ERR_clear_error();
+        }
+        X509_free(cert);
+        count++;
+    }
+
+    ERR_clear_error();
+    BIO_free(bio);
+    return count > 0;
+}
 
 /* Helper: Get SSL method based on version */
 static const SSL_METHOD *get_ssl_method(const char *version, TJSSSLMode mode) {
@@ -191,6 +262,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     
     ssl_ctx->ctx = ctx;
     ssl_ctx->verify_mode = SSL_VERIFY_NONE;
+    ssl_ctx->verify_hostname = true;
     ssl_ctx->session_tickets = true;
     
     JSValue options = argc > 0 ? argv[0] : JS_UNDEFINED;
@@ -244,54 +316,54 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     const char *key = cstr(ctx, key_val);
     
     if (cert) {
-        ssl_ctx->cert_file = js_strdup(ctx, cert);
-        int ret = SSL_CTX_use_certificate_chain_file(ssl_ctx->ssl_ctx, cert);
+        ssl_ctx->cert_pem = js_strdup(ctx, cert);
+        int ret = ssl_ctx_use_certificate_chain_pem(ssl_ctx->ssl_ctx, cert);
         JS_FreeCString(ctx, cert);
         if (ret != 1) {
             JS_FreeValue(ctx, cert_val);
             JS_FreeValue(ctx, key_val);
             if (key) JS_FreeCString(ctx, key);
-            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
+            if (ssl_ctx->cert_pem) js_free(ctx, ssl_ctx->cert_pem);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
-            SSL_THROW_ERROR(ctx, "SSL_CTX_use_certificate_chain_file");
+            SSL_THROW_ERROR(ctx, "SSL_CTX_use_certificate_chain_pem");
         }
     }
     JS_FreeValue(ctx, cert_val);
 
     if (key) {
-        ssl_ctx->key_file = js_strdup(ctx, key);
-        int ret = SSL_CTX_use_PrivateKey_file(ssl_ctx->ssl_ctx, key, SSL_FILETYPE_PEM);
+        ssl_ctx->key_pem = js_strdup(ctx, key);
+        int ret = ssl_ctx_use_private_key_pem(ssl_ctx->ssl_ctx, key);
         JS_FreeCString(ctx, key);
         if (ret != 1) {
             JS_FreeValue(ctx, key_val);
-            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
-            if (ssl_ctx->key_file) js_free(ctx, ssl_ctx->key_file);
+            if (ssl_ctx->cert_pem) js_free(ctx, ssl_ctx->cert_pem);
+            if (ssl_ctx->key_pem) js_free(ctx, ssl_ctx->key_pem);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
-            SSL_THROW_ERROR(ctx, "SSL_CTX_use_PrivateKey_file");
+            SSL_THROW_ERROR(ctx, "SSL_CTX_use_PrivateKey_pem");
         }
     }
     JS_FreeValue(ctx, key_val);
     
-    /* CA file */
+    /* CA certificates */
     JSValue ca_val = JS_GetPropertyStr(ctx, options, "ca");
     const char *ca = cstr(ctx, ca_val);
     if (ca) {
-        ssl_ctx->ca_file = js_strdup(ctx, ca);
-        int ret = SSL_CTX_load_verify_locations(ssl_ctx->ssl_ctx, ca, NULL);
+        ssl_ctx->ca_pem = js_strdup(ctx, ca);
+        int ret = ssl_ctx_load_ca_pem(ssl_ctx->ssl_ctx, ca);
         JS_FreeCString(ctx, ca);
         if (ret != 1) {
             JS_FreeValue(ctx, ca_val);
-            if (ssl_ctx->cert_file) js_free(ctx, ssl_ctx->cert_file);
-            if (ssl_ctx->key_file)  js_free(ctx, ssl_ctx->key_file);
-            if (ssl_ctx->ca_file)   js_free(ctx, ssl_ctx->ca_file);
+            if (ssl_ctx->cert_pem) js_free(ctx, ssl_ctx->cert_pem);
+            if (ssl_ctx->key_pem)  js_free(ctx, ssl_ctx->key_pem);
+            if (ssl_ctx->ca_pem)   js_free(ctx, ssl_ctx->ca_pem);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
             js_free(ctx, ssl_ctx);
             JS_FreeValue(ctx, obj);
-            SSL_THROW_ERROR(ctx, "SSL_CTX_load_verify_locations");
+            SSL_THROW_ERROR(ctx, "SSL_CTX_load_verify_locations_pem");
         }
     }
     JS_FreeValue(ctx, ca_val);
@@ -311,8 +383,17 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     if (JS_ToBool(ctx, verify_val)) {
         ssl_ctx->verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
         SSL_CTX_set_verify(ssl_ctx->ssl_ctx, ssl_ctx->verify_mode, NULL);
+        if (SSL_CTX_set_default_verify_paths(ssl_ctx->ssl_ctx) != 1) {
+            ERR_clear_error();
+        }
     }
     JS_FreeValue(ctx, verify_val);
+
+    JSValue verify_hostname_val = JS_GetPropertyStr(ctx, options, "verifyHostname");
+    if (!JS_IsUndefined(verify_hostname_val)) {
+        ssl_ctx->verify_hostname = JS_ToBool(ctx, verify_hostname_val);
+    }
+    JS_FreeValue(ctx, verify_hostname_val);
     
     /* Session tickets */
     JSValue tickets_val = JS_GetPropertyStr(ctx, options, "sessionTickets");
@@ -551,6 +632,11 @@ static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
             if (hostname) {
                 pipe->hostname = js_strdup(ctx, hostname);
                 SSL_set_tlsext_host_name(pipe->ssl, hostname);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+                if (ssl_context->verify_hostname) {
+                    SSL_set1_host(pipe->ssl, hostname);
+                }
+#endif
                 JS_FreeCString(ctx, hostname);
             }
             JS_FreeValue(ctx, hostname_val);
@@ -605,7 +691,10 @@ static JSValue tjs_ssl_pipe_read(JSContext *ctx, JSValueConst this_val,
         return result;
     } else {
         js_free(ctx, buf);
-		CHECK_SSL_ERR(pipe->ssl, ret);
+        int err = SSL_get_error(pipe->ssl, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_ZERO_RETURN) {
+            return JS_NULL;
+        }
         SSL_THROW_ERROR(ctx, "SSL_read");
     }
 }
