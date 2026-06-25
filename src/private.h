@@ -89,7 +89,8 @@ struct TJSRuntime {
         int64_t next_timer;
     } timers;
     struct {
-        JSValue dispatch_event_func;
+        JSValue dispatch_event_fn;
+        JSValue promise_hook_fn;
 		JSValue message_pipe;	// for worker messaging
 		JSValue worker_udata;	// user-data passed from parent
     } builtins;
@@ -149,8 +150,7 @@ typedef struct {
 } TJSWorker;
 
 typedef enum {
-	EV_PROMISE = 0,
-	EV_UNHANDLED_REJECTION,
+	EV_UNHANDLED_REJECTION = 0,
 	EV_JOB_EXCEPTION,
 	EV_EXIT,
 	EV_LOAD

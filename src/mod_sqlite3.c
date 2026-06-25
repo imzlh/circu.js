@@ -318,6 +318,57 @@ static JSValue tjs_sqlite3_in_transaction(JSContext *ctx, JSValue this_val, int 
     return JS_NewBool(ctx, sqlite3_get_autocommit(h->handle) == 0);
 }
 
+static JSValue tjs_sqlite3_changes(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    return JS_NewInt32(ctx, sqlite3_changes(h->handle));
+}
+
+static JSValue tjs_sqlite3_last_insert_rowid(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    return JS_NewInt64(ctx, sqlite3_last_insert_rowid(h->handle));
+}
+
+static JSValue tjs_sqlite3_interrupt(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    sqlite3_interrupt(h->handle);
+    return JS_UNDEFINED;
+}
+
+static JSValue tjs_sqlite3_busy_timeout(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    int ms;
+    if (JS_ToInt32(ctx, &ms, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    int r = sqlite3_busy_timeout(h->handle, ms);
+    if (r != SQLITE_OK) {
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_sqlite3_stmt_finalize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
@@ -575,6 +626,52 @@ static JSValue tjs__sqlite3_bind_params(JSContext *ctx, sqlite3_stmt *stmt, JSVa
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_sqlite3_stmt_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    if (!h->stmt) {
+        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    }
+
+    int r = sqlite3_reset(h->stmt);
+    if (r != SQLITE_OK) {
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+
+    if (argc == 0 || JS_IsUndefined(argv[0])) {
+        r = sqlite3_clear_bindings(h->stmt);
+        if (r != SQLITE_OK) {
+            return tjs_throw_sqlite3_errno(ctx, r);
+        }
+        return JS_UNDEFINED;
+    }
+
+    return tjs__sqlite3_bind_params(ctx, h->stmt, argv[0]);
+}
+
+static JSValue tjs_sqlite3_stmt_reset(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+
+    if (!h->stmt) {
+        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    }
+
+    int r = sqlite3_reset(h->stmt);
+    if (r != SQLITE_OK) {
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
@@ -667,11 +764,17 @@ static const JSCFunctionListEntry tjs_sqlite3_proto_funcs[] = {
     TJS_CFUNC_DEF("exec", 1, tjs_sqlite3_exec),
     TJS_CFUNC_DEF("prepare", 1, tjs_sqlite3_prepare),
     TJS_CFUNC_DEF("inTransaction", 0, tjs_sqlite3_in_transaction),
+    TJS_CFUNC_DEF("changes", 0, tjs_sqlite3_changes),
+    TJS_CFUNC_DEF("lastInsertRowid", 0, tjs_sqlite3_last_insert_rowid),
+    TJS_CFUNC_DEF("interrupt", 0, tjs_sqlite3_interrupt),
+    TJS_CFUNC_DEF("busyTimeout", 1, tjs_sqlite3_busy_timeout),
 };
 
 static const JSCFunctionListEntry tjs_sqlite3_stmt_proto_funcs[] = {
     TJS_CFUNC_DEF("finalize", 0, tjs_sqlite3_stmt_finalize),
     TJS_CFUNC_DEF("expand", 0, tjs_sqlite3_stmt_expand),
+    TJS_CFUNC_DEF("bind", 1, tjs_sqlite3_stmt_bind),
+    TJS_CFUNC_DEF("reset", 0, tjs_sqlite3_stmt_reset),
     TJS_CFUNC_DEF("all", 1, tjs_sqlite3_stmt_all),
     TJS_CFUNC_DEF("run", 1, tjs_sqlite3_stmt_run),
 };
@@ -682,6 +785,7 @@ static const JSCFunctionListEntry tjs_sqlite3_funcs[] = {
     TJS_CONST2("O_READONLY", SQLITE_OPEN_READONLY),
     TJS_CONST2("O_READWRITE", SQLITE_OPEN_READWRITE),
 	TJS_CONST2("O_MEMORY", SQLITE_OPEN_MEMORY),
+	TJS_CONST2("O_URI", SQLITE_OPEN_URI),
 	TJS_CONST2("O_URL", SQLITE_OPEN_URI),
 	TJS_CONST2("O_NOMUTEX", SQLITE_OPEN_NOMUTEX),
     TJS_CONST2("O_FULLMUTEX", SQLITE_OPEN_FULLMUTEX),

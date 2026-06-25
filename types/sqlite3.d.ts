@@ -44,6 +44,26 @@ declare namespace CModuleSQLite3 {
          * @returns True if a transaction is active
          */
         inTransaction(): boolean;
+
+        /**
+         * Number of rows changed by the most recent INSERT, UPDATE, or DELETE.
+         */
+        changes(): number;
+
+        /**
+         * Rowid of the most recent successful INSERT.
+         */
+        lastInsertRowid(): number;
+
+        /**
+         * Interrupt a pending SQLite operation on this connection.
+         */
+        interrupt(): void;
+
+        /**
+         * Set SQLite busy timeout in milliseconds.
+         */
+        busyTimeout(ms: number): void;
     }
 
     /**
@@ -60,6 +80,17 @@ declare namespace CModuleSQLite3 {
          * @returns The expanded SQL string
          */
         expand(): string;
+
+        /**
+         * Bind parameters without executing the statement.
+         * @param params Parameters to bind
+         */
+        bind(params?: any): void;
+
+        /**
+         * Reset the statement cursor while preserving bindings.
+         */
+        reset(): void;
 
         /**
          * Execute the prepared statement and return all rows
@@ -92,6 +123,7 @@ declare namespace CModuleSQLite3 {
     export const O_READWRITE: number;
     export const O_MEMORY: number;
     export const O_URI: number;
+    export const O_URL: number;
     export const O_NOMUTEX: number;
     export const O_FULLMUTEX: number;
     export const O_SHAREDCACHE: number;

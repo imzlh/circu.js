@@ -13,6 +13,7 @@
 declare namespace CModuleEngine {
     type Promise = globalThis.Promise<any>;
     type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
+    type PromiseHookFn = (state: PromiseState, promise: Promise, parent?: Promise) => void;
 
     /**
      * dump function opcode
@@ -73,15 +74,13 @@ declare namespace CModuleEngine {
     }
 
     export enum EventType {
-        PROMISE = 0,
-        UNHANDLED_REJECTION,
+        UNHANDLED_REJECTION = 0,
         JOB_EXCEPTION,
         EXIT,
         LOAD
     }
 
     interface GlobalEvents {
-        [EventType.PROMISE]: [this: Promise, error: Error | any],
         [EventType.EXIT]: number,
         [EventType.UNHANDLED_REJECTION]: [this: Promise, reason: Error | any],
         [EventType.JOB_EXCEPTION]: Error | unknown,
@@ -325,6 +324,12 @@ declare namespace CModuleEngine {
     export function onEvent(cb:
         <T extends EventType>(eventName: T, eventData: GlobalEvents[T]) => boolean
     ): void;
+
+    /**
+     * Get/Set Promise hook
+     */
+    export function promiseHook(): PromiseHookFn;
+    export function promiseHook(hook: PromiseHookFn): void;
 
     /**
      * Get Promise result directly. Returns null if Promise not settled

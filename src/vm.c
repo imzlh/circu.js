@@ -145,39 +145,6 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
     }
 }
 
-__maybe_unused static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
-    (void) argc;
-    JSValue args = JS_NewArrayFrom(ctx, 3, (JSValueConst[]) {
-        JS_NewUint32(ctx, JS_VALUE_GET_INT(argv[0])),
-        JS_DupValue(ctx, argv[1]),
-        JS_DupValue(ctx, argv[2]),
-    });
-    tjs__dispatch_event2(ctx, EV_PROMISE, args);
-    JS_FreeValue(ctx, args);
-
-    return JS_UNDEFINED;
-}
-
-__maybe_unused static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
-    JSValueConst promise, JSValueConst parent_promise, void* opaque) {
-    (void) opaque;
-
-    JSValue argv[3] = {
-        JS_NewUint32(ctx, type),
-        JS_DupValue(ctx, promise),
-        JS_DupValue(ctx, parent_promise),
-    };
-
-    int ret = JS_EnqueueJob(ctx, tjs__promise_hook_dispatch, 3, (JSValueConst*) argv);
-    for (int i = 0; i < 3; i++) {
-        JS_FreeValue(ctx, argv[i]);
-    }
-
-    if (ret < 0) {
-        TJS_DumpException(ctx);
-    }
-}
-
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
     JSValue promise = argv[0], reason = argv[1];
     if (JS_PromiseIsHandled(ctx, promise)) return JS_UNDEFINED;
@@ -347,10 +314,6 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     /* unhandled promise rejection tracker */
     JS_SetHostPromiseRejectionTracker(rt, tjs__promise_rejection_tracker, NULL);
 
-    #ifdef DEBUG
-    JS_SetPromiseHook(rt, tjs__promise_hook, NULL);
-#endif
-
     /* debug hook */
     qrt->module.mapctx = js_create_mapping_context();
     JS_SetBacktraceHook(rt, tjs__use_sourcemap, NULL);
@@ -360,12 +323,10 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     CHECK_EQ(JS_DefinePropertyValueStr(ctx, global_obj, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_ENUMERABLE), true);
 
     /* Load some builtin references for easy access */
-    // note: unused, will use setOption instead
-    // qrt->builtins.dispatch_event_func = JS_GetPropertyStr(ctx, global_obj, "dispatchEvent");
-    // CHECK_EQ(JS_IsUndefined(qrt->builtins.dispatch_event_func), 0);
-    qrt->builtins.dispatch_event_func =
-        qrt->builtins.worker_udata =
-        qrt->builtins.message_pipe = JS_UNDEFINED;
+    qrt->builtins.dispatch_event_fn =
+    qrt->builtins.dispatch_event_fn =
+    qrt->builtins.worker_udata =
+    qrt->builtins.message_pipe = JS_UNDEFINED;
 
     /* debug */
     qrt->debug.onBreak = JS_UNDEFINED;
@@ -492,8 +453,10 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* remove built-in data */
     JS_FreeValue(ctx, qrt->builtins.worker_udata);
     qrt->builtins.worker_udata = JS_UNDEFINED;
-    JS_FreeValue(ctx, qrt->builtins.dispatch_event_func);
-    qrt->builtins.dispatch_event_func = JS_UNDEFINED;
+    JS_FreeValue(ctx, qrt->builtins.dispatch_event_fn);
+    qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
+    JS_FreeValue(ctx, qrt->builtins.promise_hook_fn);
+    qrt->builtins.promise_hook_fn = JS_UNDEFINED;
     JS_FreeValue(ctx, qrt->builtins.message_pipe);
     qrt->builtins.message_pipe = JS_UNDEFINED;
 

@@ -60,6 +60,35 @@
 	} \
 } while(0)
 
+static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
+    (void) argc;
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	JSValue ret = JS_Call(ctx, trt->builtins.promise_hook_fn, JS_UNDEFINED, argc, argv);
+    JS_FreeValue(ctx, ret);
+
+    return JS_UNDEFINED;
+}
+
+static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
+    JSValueConst promise, JSValueConst parent_promise, void* opaque) {
+    (void) opaque;
+
+    JSValue argv[3] = {
+        JS_NewUint32(ctx, type),
+        JS_DupValue(ctx, promise),
+        JS_DupValue(ctx, parent_promise),
+    };
+
+    int ret = JS_EnqueueJob(ctx, tjs__promise_hook_dispatch, 3, (JSValueConst*) argv);
+    for (int i = 0; i < 3; i++) {
+        JS_FreeValue(ctx, argv[i]);
+    }
+
+    if (ret < 0) {
+        TJS_DumpException(ctx);
+    }
+}
+
 static JSValue tjs_gc_run(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JS_RunGC(JS_GetRuntime(ctx));
     return JS_UNDEFINED;
@@ -708,8 +737,29 @@ static JSValue tjs__set_event_receiver(JSContext *ctx, JSValue this_val, int arg
 	}
 
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
-	JS_FreeValue(ctx, trt->builtins.dispatch_event_func);
-	trt->builtins.dispatch_event_func = JS_DupValue(ctx, argv[0]);
+	JS_FreeValue(ctx, trt->builtins.dispatch_event_fn);
+	trt->builtins.dispatch_event_fn = JS_DupValue(ctx, argv[0]);
+	return JS_UNDEFINED;
+}
+
+static JSValue tjs__getset_promise_hook(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	CHECK_IF_IN_SANDBOX();
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+
+	if (argc == 0) return JS_DupValue(ctx, trt->builtins.promise_hook_fn);
+
+	if (JS_IsUndefined(trt->builtins.promise_hook_fn)) {
+		JS_SetPromiseHook(JS_GetRuntime(ctx), tjs__promise_hook, trt);
+	} else {
+		JS_FreeValue(ctx, trt->builtins.promise_hook_fn);
+	}
+
+	if (JS_IsFunction(ctx, argv[0])) {
+		trt->builtins.promise_hook_fn = JS_DupValue(ctx, argv[0]);
+	} else {
+		JS_SetPromiseHook(JS_GetRuntime(ctx), NULL, NULL);
+		trt->builtins.promise_hook_fn = JS_UNDEFINED;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -950,6 +1000,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
 	TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
 	TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
+	TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
 	TJS_CFUNC_DEF("encodeU16String", 1, tjs_encodeU16String),
 	TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
@@ -994,7 +1045,6 @@ static const JSCFunctionListEntry tjs_event_enum[] = {
 	TJS_CONST2("EXIT", EV_EXIT),
 	TJS_CONST2("UNHANDLED_REJECTION", EV_UNHANDLED_REJECTION),
 	TJS_CONST2("JOB_EXCEPTION", EV_JOB_EXCEPTION),
-	TJS_CONST2("PROMISE", EV_PROMISE),
 };
 
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {

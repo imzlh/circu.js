@@ -136,11 +136,11 @@ JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents ev, JSValue data) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
-    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_func)) {
+    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_fn)) {
         return JS_UNDEFINED;
     }
 
-    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_func, JS_NULL, 2, (JSValueConst[]){
+    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_fn, JS_NULL, 2, (JSValueConst[]){
 		JS_NewInt32(ctx, ev), data
 	});
     return ret;
