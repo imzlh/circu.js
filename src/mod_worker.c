@@ -176,6 +176,7 @@ static void uv__alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *b
 static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSMessagePipe *p = handle->data;
     CHECK_NOT_NULL(p);
+    if (p->finalized) return;
 
     JSContext *ctx = p->ctx;
 
@@ -574,6 +575,16 @@ static void worker_entry(void *arg) {
     if (owner) worker_mark_exited(owner);
 
     TJS_FreeRuntime(wrt);
+
+    /* If the parent GC already ran tjs_worker_finalizer while we were
+     * still alive, the finalizer deferred freeing the TJSWorker struct
+     * to us.  The finalizer already closed the parent-side message_pipe
+     * TCP handle; TJS_FreeRuntime pumped the loop so the close callback
+     * has fired and freed the TJSMessagePipe C struct.  Now free w. */
+    if (owner && owner->finalized_by_gc) {
+        uv_mutex_destroy(&owner->lock);
+        tjs__free(owner);
+    }
 }
 
 static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
@@ -595,6 +606,19 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
         worker_release_self_rt(rt, w);
         JS_FreeValueRT(rt, w->message_pipe);
         w->message_pipe = JS_UNDEFINED;
+    } else {
+        /* Thread still alive — we cannot block here (may deadlock).
+         * Close the parent-side TCP handle now so the socket does not
+         * leak.  TJS_FreeRuntime will pump the loop and fire the close
+         * callback, freeing the TJSMessagePipe C struct.
+         * The thread will free w itself when it exits. */
+        TJSMessagePipe *mp = JS_GetOpaque(w->message_pipe, tjs_msgpipe_class_id);
+        if (mp && !uv_is_closing(&mp->h.handle)) {
+            uv_read_stop(&mp->h.stream);
+            uv_close(&mp->h.handle, uv__close_cb);
+        }
+        w->message_pipe = JS_UNDEFINED;
+        w->finalized_by_gc = true;
     }
 
     if (w->link.next) list_del(&w->link);

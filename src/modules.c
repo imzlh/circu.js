@@ -60,6 +60,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "fs", tjs__mod_fs_init, true },
 	{ "fswatch", tjs__mod_fswatch_init, true },
 	{ "http", tjs__mod_http_init, true },
+	{ "nodeapi", tjs__mod_nodeapi_init, false },
 	{ "os", tjs__mod_os_init, true },
 	{ "process", tjs__mod_process_init, true },
 	/* pty merged into process module */

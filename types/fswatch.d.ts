@@ -4,7 +4,7 @@
  * @example
  * const fswatch = import.meta.use('fswatch');
  * 
- * const watcher = await fswatch.watch('./src', (filename, event) => {
+ * const watcher = fswatch.watch('./src', (filename, event) => {
  *   console.log(`${filename}: ${event}`);
  * });
  */
@@ -21,7 +21,7 @@ declare namespace CModuleFSWatch {
         /**
          * Close file system watcher
          */
-        close(): Promise<void>;
+        close(): void;
 
         /**
          * Watched file or directory path
@@ -37,5 +37,5 @@ declare namespace CModuleFSWatch {
      * @param callback Event handler callback
      * @returns FsWatcher object
      */
-    export function watch(path: string, callback: (filename: string, event: FsEvent) => void): Promise<FsWatcher>;
+    export function watch(path: string, callback: (filename: string, event: FsEvent) => void): FsWatcher;
 }

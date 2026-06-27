@@ -439,6 +439,10 @@ static int crt2uv(int crt_err) {
 #define THROW2(msg) abort();    // windows only, should never happen
 #endif
 
+#define THROW_PATH() return JS_ThrowTypeError(ctx, "path is not a string");
+#define THROW_FD() return JS_ThrowTypeError(ctx, "fd is not a number");
+#define THROW_MODE() return JS_ThrowTypeError(ctx, "mode is not a number");
+
 static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st) {
     JSValue obj = JS_NewObject(ctx);
 
@@ -542,9 +546,7 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path)  THROW_PATH();
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -594,9 +596,7 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
 #ifdef _WIN32
     /* Windows doesn't have lstat, use stat */
@@ -628,9 +628,7 @@ static JSValue tjs_syncfs_exists(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path)  THROW_PATH();
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -657,9 +655,7 @@ static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, 
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     flags = parse_open_flags(ctx, argv[1]);
     if (flags < 0) {
@@ -670,7 +666,7 @@ static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, 
     if (argc >= 3 && !JS_IsUndefined(argv[2])) {
         if (JS_ToInt32(ctx, &mode, argv[2]) < 0) {
             JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
+            THROW_MODE();
         }
     }
 
@@ -702,9 +698,7 @@ static JSValue tjs_syncfs_close(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "close() requires 1 argument: fd");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     if (close(fd) < 0) {
         THROW("close");
@@ -723,9 +717,7 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_ThrowTypeError(ctx, "read() requires 2 arguments: fd and buffer");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
     if (!buffer) {
@@ -775,9 +767,7 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "write() requires 2 arguments: fd and buffer");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
     if (!buffer) {
@@ -827,9 +817,7 @@ static JSValue tjs_syncfs_pread(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "pread() requires 3 arguments: fd, buffer, and offset");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     // Convert offset BEFORE getting buffer pointer (offset conversion can detach buffer)
     if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
@@ -861,13 +849,11 @@ static JSValue tjs_syncfs_pwrite(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "pwrite() requires 3 arguments: fd, buffer, and offset");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     // Convert offset BEFORE getting buffer pointer (offset conversion can detach buffer)
     if (JS_ToInt64(ctx, &offset, argv[2]) < 0) {
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "invaild offset: expect number or bigint");
     }
 
     buffer = JS_GetAnyBuffer(ctx, &buf_size, argv[1]);
@@ -893,9 +879,7 @@ static JSValue tjs_syncfs_set_blocking(JSContext* ctx, JSValueConst this_val, in
         return JS_ThrowTypeError(ctx, "setBlocking() requires 2 arguments: fd and blocking");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
     blocking = JS_ToBool(ctx, argv[1]);
 
@@ -930,9 +914,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     int fd;
 #ifdef _WIN32
@@ -1047,15 +1029,13 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     // Convert mode BEFORE getting data buffer (mode conversion can detach buffer)
     if (argc >= 3 && !JS_IsUndefined(argv[2])) {
         if (JS_ToInt32(ctx, &mode, argv[2]) < 0) {
             JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
+            return JS_ThrowTypeError(ctx, "mode must be a number");
         }
     }
 
@@ -1110,14 +1090,12 @@ static JSValue tjs_syncfs_mkdir(JSContext* ctx, JSValueConst this_val, int argc,
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     if (argc >= 2 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
             JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
+            return JS_ThrowTypeError(ctx, "mode must be a number");
         }
     }
 
@@ -1149,9 +1127,7 @@ static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc,
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -1181,9 +1157,7 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -1215,12 +1189,12 @@ static JSValue tjs_syncfs_link(JSContext* ctx, JSValueConst this_val,
     }
 
     existing_path = JS_ToCString(ctx, argv[0]);
-    if (!existing_path) return JS_EXCEPTION;
+    if (!existing_path) THROW_PATH();
 
     new_path = JS_ToCString(ctx, argv[1]);
     if (!new_path) {
         JS_FreeCString(ctx, existing_path);
-        return JS_EXCEPTION;
+        THROW_PATH();
     }
 
     if (strlen(existing_path) == 0 || strlen(new_path) == 0) {
@@ -1813,14 +1787,11 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     oldpath = JS_ToCString(ctx, argv[0]);
-    if (!oldpath) {
-        return JS_EXCEPTION;
-    }
+    if (!oldpath) THROW_PATH();
 
     newpath = JS_ToCString(ctx, argv[1]);
     if (!newpath) {
-        JS_FreeCString(ctx, oldpath);
-        return JS_EXCEPTION;
+        JS_FreeCString(ctx, oldpath); THROW_PATH();
     }
 
 #ifdef _WIN32
@@ -1861,14 +1832,12 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
     if (argc >= 2) {
         int32_t types_flag;
         if (JS_ToInt32(ctx, &types_flag, argv[1]) < 0) {
             JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
+            THROW_MODE();
         }
         with_types = types_flag != 0;
     }
@@ -1986,7 +1955,7 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
         return JS_ThrowTypeError(ctx, "realpath() requires 1 argument: path");
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    if (!path) THROW_PATH();
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -2065,13 +2034,9 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "flock() requires 2 arguments: fd and operation");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt32(ctx, &operation, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
+    if (JS_ToInt32(ctx, &operation, argv[1]) < 0)
+        return JS_ThrowTypeError(ctx, "invaild operation: expect a number");
 
 #ifdef _WIN32
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
@@ -2120,9 +2085,7 @@ static JSValue tjs_syncfs_fsync(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "fsync() requires 1 argument: fd");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
 #ifdef _WIN32
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
@@ -2150,9 +2113,7 @@ static JSValue tjs_syncfs_fdatasync(JSContext* ctx, JSValueConst this_val, int a
         return JS_ThrowTypeError(ctx, "fdatasync() requires 1 argument: fd");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
 #ifdef _WIN32
     // Windows doesn't distinguish between fsync and fdatasync
@@ -2190,13 +2151,11 @@ static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int ar
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     if (JS_ToInt64(ctx, &length, argv[1]) < 0) {
         JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "length should be a number");
     }
 
 #ifdef _WIN32
@@ -2247,13 +2206,9 @@ static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int a
         return JS_ThrowTypeError(ctx, "ftruncate() requires 2 arguments: fd and length");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt64(ctx, &length, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
+    if (JS_ToInt64(ctx, &length, argv[1]) < 0)
+        return JS_ThrowTypeError(ctx, "length should be a number");
 
 #ifdef _WIN32
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
@@ -2286,13 +2241,11 @@ static JSValue tjs_syncfs_chmod(JSContext* ctx, JSValueConst this_val, int argc,
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
         JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+        THROW_MODE();
     }
 
 #ifdef _WIN32
@@ -2320,13 +2273,8 @@ static JSValue tjs_syncfs_fchmod(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "fchmod() requires 2 arguments: fd and mode");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
+    if (JS_ToInt32(ctx, &mode, argv[1]) < 0) THROW_MODE();
 
 #ifdef _WIN32
     // Windows doesn't support fchmod directly, limited support
@@ -2350,18 +2298,11 @@ static JSValue tjs_syncfs_chown(JSContext* ctx, JSValueConst this_val, int argc,
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
-    if (JS_ToInt32(ctx, &uid, argv[1]) < 0) {
+    if (JS_ToInt32(ctx, &uid, argv[1]) < 0 || JS_ToInt32(ctx, &gid, argv[2]) < 0) {
         JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt32(ctx, &gid, argv[2]) < 0) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "uid and gid should be positive numbers");
     }
 
 #ifdef _WIN32
@@ -2389,16 +2330,10 @@ static JSValue tjs_syncfs_fchown(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "fchown() requires 3 arguments: fd, uid, gid");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
-    if (JS_ToInt32(ctx, &uid, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToInt32(ctx, &gid, argv[2]) < 0) {
-        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &uid, argv[1]) < 0 || JS_ToInt32(ctx, &gid, argv[2]) < 0) {
+        return JS_ThrowTypeError(ctx, "uid and gid should be positive numbers");
     }
 
 #ifdef _WIN32
@@ -2422,18 +2357,11 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
-    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0) {
+    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0 || JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
         JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+        return JS_ThrowTypeError(ctx, "atime and mtime should be positive numbers");
     }
 
 #ifdef _WIN32
@@ -2501,16 +2429,10 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
         return JS_ThrowTypeError(ctx, "futimes() requires 3 arguments: fd, atime, mtime");
     }
 
-    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) {
-        return JS_EXCEPTION;
-    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
-    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
-        return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &atime, argv[1]) < 0 || JS_ToFloat64(ctx, &mtime, argv[2]) < 0) {
+        return JS_ThrowTypeError(ctx, "atime and mtime should be positive numbers");
     }
 
 #ifdef _WIN32
@@ -2558,14 +2480,12 @@ static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc
     }
 
     path = JS_ToCString(ctx, argv[0]);
-    if (!path) {
-        return JS_EXCEPTION;
-    }
+    if (!path) THROW_PATH();
 
     if (argc >= 2 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
             JS_FreeCString(ctx, path);
-            return JS_EXCEPTION;
+            THROW_MODE();
         }
     }
 

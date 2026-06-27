@@ -438,6 +438,8 @@ static JSValue js_sandbox_ctor(JSContext *ctx, JSValueConst new_target, int argc
     App *app = TJS_NewAppInternal(trt, true);
     if (!app)
         return JS_ThrowOutOfMemory(ctx);
+	JS_AddIntrinsicBaseObjects(app->ctx);	// should before any intrinsic
+	JS_AddIntrinsicEval(app->ctx);
 
     /* Create the Sandbox JS object */
     JSValue obj = JS_NewObjectClass(ctx, js_sandbox_class_id);
@@ -458,6 +460,7 @@ static JSValue js_sandbox_ctor(JSContext *ctx, JSValueConst new_target, int argc
     }
     sb->app = app;
     sb->global = JS_GetGlobalObject(app->ctx);
+	sb->trt = trt;
 
     JS_SetOpaque(obj, sb);
     return obj;
@@ -470,19 +473,19 @@ static void js_sandbox_finalizer(JSRuntime *rt, JSValueConst val) {
     JS_FreeValueRT(rt, sb->global);
     sb->global = JS_UNDEFINED;
 
-    /* During JS_FreeRuntime shutdown, TJS_FreeRuntime already frees all
-     * contexts (including sandbox ones).  So we only free the context
-     * here during normal GC (not shutdown). */
-    App *app = sb->app;
-    if (app) {
-        TJSRuntime *trt = app->trt;
-        if (!trt->freeing) {
-            JS_FreeContext(app->ctx);
-            list_del(&app->link);
-            tjs__free(app);
-        }
-        sb->app = NULL;
-    }
+	if (!sb->trt->freeing){
+		/* Only when JS_FreeRuntime not running, we free it manually */
+		App *app = sb->app;
+		if (app) {
+			TJSRuntime *trt = app->trt;
+			if (!trt->freeing) {
+				JS_FreeContext(app->ctx);
+				list_del(&app->link);
+				tjs__free(app);
+			}
+			sb->app = NULL;
+		}
+	}
 
     tjs__free(sb);
 }
@@ -498,6 +501,75 @@ static JSClassDef js_sandbox_class = {
     .finalizer = js_sandbox_finalizer,
     .gc_mark = js_sandbox_mark,
 };
+
+int add_intrinsic(JSContext *ctx, const char *name, size_t len) {
+#pragma warning(push)
+#pragma warning(disable: 4232)
+    static const struct {
+        const char *name;
+        int (*add_func)(JSContext *);
+    } intrinsics[] = {
+        {"date",         JS_AddIntrinsicDate},
+        {"regexp",       JS_AddIntrinsicRegExp},
+        {"json",         JS_AddIntrinsicJSON},
+        {"proxy",        JS_AddIntrinsicProxy},
+        {"map",          JS_AddIntrinsicMapSet},
+        {"typedarrays",  JS_AddIntrinsicTypedArrays},
+        {"promise",      JS_AddIntrinsicPromise},
+        {"bigint",       JS_AddIntrinsicBigInt},
+        {"weakref",      JS_AddIntrinsicWeakRef},
+        {"atob",         JS_AddIntrinsicAToB},
+        {"domexception", JS_AddIntrinsicDOMException},
+        {"performance",  JS_AddPerformance},
+    };
+#pragma warning(pop)
+
+        for (size_t i = 0; i < sizeof(intrinsics) / sizeof(intrinsics[0]); i++) {
+            if (strlen(intrinsics[i].name) == len && 
+                strncmp(name, intrinsics[i].name, len) == 0) {
+                return intrinsics[i].add_func(ctx);
+            }
+        }
+        return 0;
+    }
+
+static JSValue js_sandbox_init_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
+	if (!sb) return JS_EXCEPTION;
+	if (sb->g_inited) return JS_ThrowTypeError(ctx, "global already initialized");
+
+	if (argc != 0 && JS_IsArray(argv[0])) {
+		int64_t arrlen;
+		if (JS_GetLength(ctx, argv[0], &arrlen) != -1){
+			for (int64_t i = 0; i < arrlen; i++) {
+				JSValue obj = JS_GetPropertyUint32(ctx, argv[0], i);
+				const char* name = JS_ToCString(ctx, obj);
+				int ret = add_intrinsic(ctx, name, strlen(name));
+				JS_FreeCString(ctx, name);
+				JS_FreeValue(ctx, obj);
+				return ret == 0 ? JS_UNDEFINED : JS_EXCEPTION;
+			}
+		}
+	}
+
+	if (
+        JS_AddIntrinsicDate(ctx) ||
+        JS_AddIntrinsicEval(ctx) ||
+        JS_AddIntrinsicRegExp(ctx) ||
+        JS_AddIntrinsicJSON(ctx) ||
+        JS_AddIntrinsicProxy(ctx) ||
+        JS_AddIntrinsicMapSet(ctx) ||
+        JS_AddIntrinsicTypedArrays(ctx) ||
+        JS_AddIntrinsicPromise(ctx) ||
+        JS_AddIntrinsicWeakRef(ctx) ||
+        JS_AddIntrinsicAToB(ctx) ||
+        JS_AddPerformance(ctx)
+	) {
+			return JS_EXCEPTION;
+	}
+
+	return JS_UNDEFINED;
+}
 
 static JSValue js_sandbox_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
@@ -587,6 +659,7 @@ static JSValue js_sandbox_loadModule(JSContext *ctx, JSValueConst this_val, int 
 static const JSCFunctionListEntry js_sandbox_proto_funcs[] = {
     JS_CFUNC_DEF("call", 2, js_sandbox_call),
     JS_CFUNC_DEF("loadModule", 2, js_sandbox_loadModule),
+	JS_CFUNC_DEF("initGlobal", 1, js_sandbox_init_global),
     JS_CGETSET_DEF("global", js_sandbox_get_global, NULL),
 };
 
@@ -1020,6 +1093,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
 	TJS_CONST2("DUMP_DEFAULT", JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE),
 
 	TJS_CONST2("EVAL_MODULE", JS_EVAL_TYPE_MODULE),
+	TJS_CONST2("EVAL_GLOBAL", JS_EVAL_TYPE_GLOBAL),
 	TJS_CONST2("EVAL_ASYNC", JS_EVAL_FLAG_ASYNC),
 	TJS_CONST2("EVAL_STRICT", JS_EVAL_FLAG_STRICT),
 	TJS_CONST2("EVAL_NEW_BACKTRACE", JS_EVAL_FLAG_BACKTRACE_BARRIER),

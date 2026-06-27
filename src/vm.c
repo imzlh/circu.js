@@ -228,7 +228,7 @@ TJSRuntime* TJS_NewRuntimeWorker(void) {
 }
 
 App* TJS_NewAppInternal(TJSRuntime* trt, bool is_sandbox) {
-    JSContext* ctx = JS_NewContext(trt->rt);
+    JSContext* ctx = is_sandbox ? JS_NewContextRaw(trt->rt) : JS_NewContext(trt->rt);
     App* app = tjs__mallocz(sizeof(App));
     app->ctx = ctx;
     app->is_sandbox = is_sandbox;
@@ -280,7 +280,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* Worker support */
     qrt->is_worker = is_worker;
-    JS_SetCanBlock(rt, is_worker);
+    JS_SetCanBlock(rt, true);
     init_list_head(&qrt->workers);
     init_list_head(&qrt->streams);
 
@@ -487,6 +487,20 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0) {
         /* drain */
     }
+
+    /* Release Node-API persistent JS references before QuickJS leak checking.
+     * The env structs remain alive until JS_FreeRuntime finalizers, so JS object
+     * finalizers can still call native addon finalizers with a valid env. */
+    tjs__nodeapi_cleanup_runtime(qrt);
+    for (int i = 0; i < 5; i++) {
+        uv_run(&qrt->loop, UV_RUN_NOWAIT);
+    }
+    JS_RunGC(qrt->rt);
+    tjs__nodeapi_cleanup_runtime(qrt);
+    for (int i = 0; i < 5; i++) {
+        uv_run(&qrt->loop, UV_RUN_NOWAIT);
+    }
+    JS_RunGC(qrt->rt);
 
     /* Cleanup all contexts: main app first, then sandbox apps.
      * The list is headed by &main_app->link (created in

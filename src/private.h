@@ -129,7 +129,9 @@ struct TJSApp {
 
 typedef struct {
     App *app;
+    TJSRuntime *trt; // app maybe freed when trt->freeing
     JSValue global;
+    bool g_inited;
 } TJSSandbox;
 
 typedef struct TJSDynLib {
@@ -146,6 +148,7 @@ typedef struct {
     TJSRuntime *wrt;
     bool terminated;
     bool joined;
+    bool finalized_by_gc;
 	struct list_head link;
 } TJSWorker;
 
@@ -177,6 +180,8 @@ void tjs__mod_http_init(JSContext *ctx, JSValue ns);
 void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
 void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
+void tjs__mod_nodeapi_init(JSContext *ctx, JSValue ns);
+void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);

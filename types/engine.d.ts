@@ -14,6 +14,19 @@ declare namespace CModuleEngine {
     type Promise = globalThis.Promise<any>;
     type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
     type PromiseHookFn = (state: PromiseState, promise: Promise, parent?: Promise) => void;
+    type IntrinsicFeature =
+        | "date"
+        | "regexp"
+        | "json"
+        | "proxy"
+        | "map"
+        | "typedarrays"
+        | "promise"
+        | "bigint"
+        | "weakref"
+        | "atob"
+        | "domexception"
+        | "performance";
 
     /**
      * dump function opcode
@@ -65,6 +78,11 @@ declare namespace CModuleEngine {
      * eval code as module
      */
     export const EVAL_MODULE: number;
+
+    /**
+     * eval code as global script (CJS-style, synchronous throw)
+     */
+    export const EVAL_GLOBAL: number;
 
     export enum PromiseState {
         CONSTRUCT,
@@ -402,6 +420,14 @@ declare namespace CModuleEngine {
          * @returns Module namespace object
          */
         loadModule<T = Record<string, any>>(code: string, name: string): T;
+
+        /**
+         * Initialize global object for Sandbox.
+         * By default, there is nothing in Sandbox global.
+         * 
+         * @throws {TypeError} Throw an error if already initialized
+         */
+        initGlobal(types?: IntrinsicFeature[]): void;
 
         /**
          * The sandbox's global object

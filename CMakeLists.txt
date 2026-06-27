@@ -199,6 +199,7 @@ add_library(libcjs STATIC
     src/mod_socket.c
     src/mod_curl.c
     src/mod_debug.c
+    src/mod_nodeapi.c
 )
 
 if(CJS_EXTRA_MODULE_NAMES)
@@ -327,6 +328,7 @@ target_compile_options(libcjs PRIVATE ${cjs_cflags})
 target_link_options(libcjs PRIVATE ${cjs_ldflags})
 target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
 target_include_directories(libcjs PUBLIC src)
+target_include_directories(libcjs PRIVATE deps/nodeapi)
 # qjs is PRIVATE so USING_QJS_SHARED doesn't propagate automatically on Windows
 if(WIN32)
     target_compile_definitions(libcjs PRIVATE USING_QJS_SHARED)
@@ -350,6 +352,7 @@ target_link_libraries(cjs-cli PRIVATE libcjs uv_a)
 target_link_options(cjs-cli PRIVATE ${cjs_ldflags})
 set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
+               ENABLE_EXPORTS ON
 )
 # cjs-cli includes tjs.h which needs uv.h and iconv.h
 if(Iconv_FOUND)

@@ -21,6 +21,7 @@ interface TjsModules {
     crypto: typeof CModuleCrypto,
     console: typeof CModuleConsole,
     debug: typeof CModuleDebug,
+    nodeapi: typeof CModuleNodeApi,
     zlib: typeof CModuleZLib,
     sourcemap: typeof CModuleSourceMap,
     ssl: typeof CModuleSSL,
@@ -30,7 +31,9 @@ interface TjsModules {
     text: typeof CModuleText,
     http: typeof CModuleHTTP,
     socket: typeof CModuleSocket,
-    'curl': typeof CModuleCURL,
+    curl: typeof CModuleCURL,
+    nodeapi: typeof CModuleNodeApi
+
 }
 
 interface TJSOptionalModules {
