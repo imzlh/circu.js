@@ -828,12 +828,12 @@ static void tjs_connpool_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *m
     if (!pool) return;
 
     JS_MarkValue(rt, pool->err_cb, mark_func);
-    struct list_head *el;
-    list_for_each(el, &pool->curls) {
-        TJSCURL *c = list_entry(el, TJSCURL, link);
-        if (c->in_flight && !JS_IsUndefined(c->self_obj))
-            JS_MarkValue(rt, c->self_obj, mark_func);
-    }
+    /* Do NOT mark in-flight curls' self_obj here. self_obj is the curl wrapper's
+     * own C-held strong ref (refcount keeps it alive while in-flight); the curl
+     * in turn holds pool_obj, keeping the pool alive. Marking self_obj from the
+     * pool created a pool<->curl reference cycle with no external root, which the
+     * QuickJS cycle collector would reclaim while uv timer/socket handles were
+     * still live -> SEGV. Each curl's own gc_mark already marks its callbacks. */
 }
 
 #pragma endregion

@@ -177,10 +177,43 @@ static JSValue tjs_clearTimeout(JSContext *ctx, JSValue this_val, int argc, JSVa
     return JS_UNDEFINED;
 }
 
-static const JSCFunctionListEntry tjs_timer_funcs[] = { JS_CFUNC_MAGIC_DEF("setTimeout", 2, tjs_setTimeout, 0),
-                                                        TJS_CFUNC_DEF("clearTimeout", 1, tjs_clearTimeout),
-                                                        JS_CFUNC_MAGIC_DEF("setInterval", 2, tjs_setTimeout, 1),
-                                                        TJS_CFUNC_DEF("clearInterval", 1, tjs_clearTimeout) };
+static JSValue tjs_timer_ref(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    CHECK_NOT_NULL(qrt);
+    int64_t timer_id;
+    TJSTimer *th = NULL;
+
+    if (JS_ToInt64(ctx, &timer_id, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    HASH_FIND_INT64(qrt->timers.timers, &timer_id, th);
+
+    if (th == NULL) return JS_ThrowTypeError(ctx, "timer not found");
+
+    switch (magic) {
+        case 0:
+            uv_ref((uv_handle_t *)&th->handle);
+            break;
+        case 1:
+            uv_unref((uv_handle_t *)&th->handle);
+            break;
+        case 2:
+            return JS_NewBool(ctx, uv_has_ref((uv_handle_t *)&th->handle));
+    }
+
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry tjs_timer_funcs[] = {
+    JS_CFUNC_MAGIC_DEF("setTimeout", 2, tjs_setTimeout, 0),
+    TJS_CFUNC_DEF("clearTimeout", 1, tjs_clearTimeout),
+    JS_CFUNC_MAGIC_DEF("setInterval", 2, tjs_setTimeout, 1),
+    TJS_CFUNC_DEF("clearInterval", 1, tjs_clearTimeout),
+    JS_CFUNC_MAGIC_DEF("refTimer", 1, tjs_timer_ref, 0),
+    JS_CFUNC_MAGIC_DEF("unrefTimer", 1, tjs_timer_ref, 1),
+    JS_CFUNC_MAGIC_DEF("hasRef", 1, tjs_timer_ref, 2),
+};
 
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, tjs_timer_funcs, countof(tjs_timer_funcs));

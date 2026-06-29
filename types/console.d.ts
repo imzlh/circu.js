@@ -16,6 +16,12 @@ declare namespace CModuleConsole {
     export function inspect(data: any, options?: InspectOption): string;
 
     /**
+     * non-standard console.format() method, accept arguments and returns a string like `inspect`
+     * but also accept multiple arguments to provide full `console.log` behavior. 
+     */
+    export function format(...data: any[]): string;
+
+    /**
      * The **`console.assert()`** static method writes an error message to the console if the assertion is false.
      *
      * [MDN Reference](https://developer.mozilla.org/docs/Web/API/console/assert_static)

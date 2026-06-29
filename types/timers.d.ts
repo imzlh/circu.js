@@ -40,4 +40,23 @@ declare namespace CModuleTimers {
      * @param timerId Interval timer ID
      */
     export function clearInterval(timerId: number): void;
+
+    /**
+     * Reference timer
+     * @param timerId Timer ID
+     */
+    export function refTimer(timerId: number): void;
+
+    /**
+     * Unreference timer
+     * @param timerId Timer ID
+     */
+    export function unrefTimer(timerId: number): void;
+
+    /**
+     * Check if timer is referenced
+     * @param timerId Timer ID
+     * @returns True if timer is referenced
+     */
+    export function hasRef(timerId: number): boolean;
 }

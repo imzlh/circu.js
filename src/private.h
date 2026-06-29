@@ -82,6 +82,7 @@ struct TJSRuntime {
     int8_t exit_code;
     struct list_head workers;
     struct list_head streams;
+    struct list_head msgpipes;
 
 	bool freeing;
     struct {
@@ -227,6 +228,7 @@ JSValue tjs__get_args(JSContext *ctx);
 void tjs__run_main(TJSRuntime* qrt);
 void tjs__destroy_timers(TJSRuntime *qrt);
 void tjs__close_all_streams(TJSRuntime *qrt);
+void tjs__close_all_msgpipes(TJSRuntime *qrt);
 
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);

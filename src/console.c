@@ -252,7 +252,7 @@ static void format_value_with_depth(JSContext* ctx, JSValueConst val, DynBuf* bu
     InspectOptions opts = {
         .depth = depth,
         .break_length = DEFAULT_BREAK_LENGTH,
-        .colors = isatty(fileno(stream)),
+        .colors = stream && isatty(fileno(stream)),
         .show_hidden = false,
         .max_array_length = MAX_ARRAY_LENGTH,
         .max_string_length = MAX_STRING_LENGTH,
@@ -1397,6 +1397,22 @@ static JSValue js_console_inspect(JSContext* ctx, JSValueConst this_val, int arg
     return ret;
 }
 
+static JSValue js_console_format(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (argc == 0) return JS_NewString(ctx, "undefined");
+    
+    DynBuf buf;
+    dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
+
+    if (!format_args_node(ctx, argc, argv, &buf, NULL)) {
+        dbuf_free(&buf);
+        return JS_ThrowPlainError(ctx, "Failed to format arguments");
+    }
+
+    JSValue ret = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
+    dbuf_free(&buf);
+    return ret;
+}
+
 static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
                                 FILE* stream, int default_depth, bool show_hidden) {
     (void)default_depth;
@@ -1764,6 +1780,7 @@ static const JSCFunctionListEntry console_funcs[] = {
     JS_CFUNC_DEF("groupCollapsed", 0, js_console_group),
     JS_CFUNC_DEF("groupEnd", 0, js_console_group_end),
     JS_CFUNC_DEF("inspect", 1, js_console_inspect),
+    JS_CFUNC_DEF("format", 0, js_console_format)
 };
 
 void tjs__mod_console_init(JSContext* ctx, JSValue ns) {

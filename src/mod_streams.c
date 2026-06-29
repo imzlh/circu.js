@@ -152,6 +152,11 @@ static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
     return true;
 }
 
+static inline void stream_maybe_free(TJSStream *s) {
+    if (s->closed && s->finalized)
+        tjs__free(s);
+}
+
 /* Pin the JS object to prevent GC while async work is in flight. Idempotent. */
 static inline void stream_pin(JSContext *ctx, TJSStream *s, JSValue obj) {
     if (s->pin_count++ == 0)
@@ -161,10 +166,18 @@ static inline void stream_pin(JSContext *ctx, TJSStream *s, JSValue obj) {
 /* Release the GC pin. */
 static inline void stream_unpin(TJSStream *s) {
     if (s->pin_count > 0 && --s->pin_count == 0 && !JS_IsUndefined(s->obj)) {
-        JS_FreeValue(s->ctx, s->obj);
+        JSValue obj = s->obj;
         s->obj = JS_UNDEFINED;
+        JS_FreeValue(s->ctx, obj);
+        /* Do NOT touch s after this point — it may have been freed above. */
     }
 }
+
+#ifndef NDEBUG
+#define STREAM_UNPIN_FINAL(s) do { stream_unpin(s); (s) = (void *)0xdead; } while (0)
+#else
+#define STREAM_UNPIN_FINAL(s) stream_unpin(s)
+#endif
 
 /* Get the OS file descriptor, -1 on error. */
 static inline int stream_get_fd(TJSStream *s) {
@@ -185,8 +198,10 @@ static void uv__close_cb(uv_handle_t *handle) {
     s->closed = 1;
     stream_unlink(s);
 
+    /* If the finalizer already ran, the JS wrapper is gone and this close is
+     * the second (final) flag. Hand off to the arbiter and stop. */
     if (s->finalized) {
-        tjs__free(s);
+        stream_maybe_free(s);
         return;
     }
 
@@ -200,17 +215,7 @@ static void uv__close_cb(uv_handle_t *handle) {
     if (!s->closing_for_runtime && JS_IsFunction(s->ctx, fn)) {
         tjs_call_handler(s->ctx, fn, 0, NULL);
     }
-
-    /* Save finalized flag BEFORE stream_unpin: if stream_unpin drops the JS
-     * object refcount to zero, the finalizer runs synchronously inside
-     * JS_FreeValue, sees closed==1, and calls tjs__free(s) immediately.
-     * Accessing s->finalized after that point is a use-after-free. */
-    int finalized = s->finalized;
-    stream_unpin(s);
-    /* Do NOT touch s after this point — it may have been freed by the finalizer
-     * triggered inside stream_unpin above. */
-    if (finalized)
-        tjs__free(s);
+    STREAM_UNPIN_FINAL(s);
 }
 
 static void maybe_close(TJSStream *s) {
@@ -423,11 +428,18 @@ static void uv__read_once_alloc_cb(uv_handle_t *handle, size_t suggested_size, u
 static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-    uv_read_stop(&s->h.stream);
 
     JSContext *ctx = s->ctx;
     TJSReadReq *rr = s->read_req;
-    s->read_req    = NULL;
+
+    /* libuv uses nread == 0 for "would block / try again later", not EOF.
+     * Do not stop the one-shot read or settle the promise in that case,
+     * otherwise transient wakeups become false EOFs in JS. */
+    if (nread == 0)
+        return;
+
+    uv_read_stop(&s->h.stream);
+    s->read_req = NULL;
     stream_unpin(s);
 
     /* close() can race with a pending one-shot read. If the request was
@@ -456,8 +468,8 @@ static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t 
         arg = JS_NewInt32(ctx, (int32_t)nread);
         rr->settled = 1;
         TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
-    } else if (nread == 0 || nread == UV_EOF) {
-        /* EAGAIN or EOF: resolve with 0 */
+    } else if (nread == UV_EOF) {
+        /* EOF: resolve with 0 */
         arg = JS_NewInt32(ctx, 0);
         rr->settled = 1;
         TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
@@ -781,9 +793,11 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     if (!JS_IsUndefined(s->connect_promise.p))
         TJS_FreePromiseRT(rt, &s->connect_promise);
 
+    /* Second flag. If the handle is already closed, the arbiter frees s here;
+     * otherwise start the close and let uv__close_cb complete the rendezvous. */
     s->finalized = 1;
     if (s->closed)
-        tjs__free(s);
+        stream_maybe_free(s);
     else
         maybe_close(s);
 }
@@ -810,10 +824,8 @@ void tjs__close_all_streams(TJSRuntime *qrt) {
         s->closing_for_runtime = 1;
         stream_unlink(s);
 
-        if (s->read_req) {
+        if (s->read_req)
             s->read_req->canceled = 1;
-            uv_read_stop(&s->h.stream);
-        }
         uv_read_stop(&s->h.stream);
         js_free(s->ctx, s->read_buf);
         s->read_buf = NULL;
@@ -821,6 +833,7 @@ void tjs__close_all_streams(TJSRuntime *qrt) {
         if (!uv_is_closing(&s->h.handle)) {
             uv_close(&s->h.handle, uv__close_cb);
         }
+        /* Drop all pins */
         while (s->pin_count > 0) {
             stream_unpin(s);
         }

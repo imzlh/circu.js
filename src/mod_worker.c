@@ -46,8 +46,11 @@ static thread_local JSClassID tjs_msgpipe_class_id;
 
 typedef struct {
     JSContext *ctx;
+    TJSRuntime *trt;
     int closed;
     int finalized;
+    int closing_for_runtime;
+    struct list_head link;
     union {
         uv_handle_t handle;
         uv_stream_t stream;
@@ -76,6 +79,50 @@ typedef struct {
     size_t sab_count;
 } TJSMessagePipeWriteReq;
 
+static void uv__close_cb(uv_handle_t *handle);
+
+static void msgpipe_unlink(TJSMessagePipe *p) {
+    if (p && p->link.next) {
+        list_del(&p->link);
+        p->link.next = NULL;
+        p->link.prev = NULL;
+    }
+}
+
+static void msgpipe_clear_js_rt(JSRuntime *rt, TJSMessagePipe *p) {
+    for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
+        JS_FreeValueRT(rt, p->events[i]);
+        p->events[i] = JS_UNDEFINED;
+    }
+    js_free_rt(rt, p->reading.data);
+    memset(&p->reading, 0, sizeof(p->reading));
+}
+
+static void msgpipe_clear_js(TJSMessagePipe *p) {
+    for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
+        JS_FreeValue(p->ctx, p->events[i]);
+        p->events[i] = JS_UNDEFINED;
+    }
+    js_free(p->ctx, p->reading.data);
+    memset(&p->reading, 0, sizeof(p->reading));
+}
+
+static void msgpipe_close_handle(TJSMessagePipe *p) {
+    if (!uv_is_closing(&p->h.handle)) {
+        uv_read_stop(&p->h.stream);
+        uv_close(&p->h.handle, uv__close_cb);
+    }
+}
+
+static bool msgpipes_all_closed(TJSRuntime *qrt) {
+    struct list_head *el;
+    list_for_each(el, &qrt->msgpipes) {
+        TJSMessagePipe *p = list_entry(el, TJSMessagePipe, link);
+        if (!p->closed) return false;
+    }
+    return true;
+}
+
 static void uv__close_cb(uv_handle_t *handle) {
     TJSMessagePipe *p = handle->data;
     CHECK_NOT_NULL(p);
@@ -88,18 +135,13 @@ static void uv__close_cb(uv_handle_t *handle) {
 static void tjs_msgpipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSMessagePipe *p = JS_GetOpaque(val, tjs_msgpipe_class_id);
     if (p) {
+        msgpipe_unlink(p);
         /* Free JS resources now while rt is still alive. */
-        for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-            JS_FreeValueRT(rt, p->events[i]);
-            p->events[i] = JS_UNDEFINED;
-        }
-        js_free_rt(rt, p->reading.data);
-        p->reading.data = NULL;
+        msgpipe_clear_js_rt(rt, p);
 
         p->finalized = 1;
         if (!uv_is_closing(&p->h.handle)) {
-            uv_read_stop(&p->h.stream);
-            uv_close(&p->h.handle, uv__close_cb);
+            msgpipe_close_handle(p);
             return;
         }
         if (!p->closed) {
@@ -177,6 +219,7 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     TJSMessagePipe *p = handle->data;
     CHECK_NOT_NULL(p);
     if (p->finalized) return;
+    if (p->closing_for_runtime) return;
 
     JSContext *ctx = p->ctx;
 
@@ -186,7 +229,7 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
             js_free(ctx, p->reading.data);
         }
         memset(&p->reading, 0, sizeof(p->reading));
-        if (nread != UV_EOF) {
+        if (nread != UV_EOF && !p->closing_for_runtime) {
             JSValue error = tjs_new_error(ctx, nread);
             emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, error);
             JS_FreeValue(ctx, error);
@@ -282,9 +325,12 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
     }
 
     p->ctx = ctx;
+    p->trt = TJS_GetRuntime(ctx);
     p->h.handle.data = p;
     p->events[0] = JS_UNDEFINED;
     p->events[1] = JS_UNDEFINED;
+    init_list_head(&p->link);
+    list_add_tail(&p->link, &p->trt->msgpipes);
 
     CHECK_EQ(uv_tcp_init(tjs_get_loop(ctx), &p->h.tcp), 0);
     CHECK_EQ(uv_tcp_open(&p->h.tcp, fd), 0);
@@ -295,6 +341,21 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
     return obj;
 }
 
+void tjs__close_all_msgpipes(TJSRuntime *qrt) {
+    struct list_head *el, *tmp;
+    list_for_each_safe(el, tmp, &qrt->msgpipes) {
+        TJSMessagePipe *p = list_entry(el, TJSMessagePipe, link);
+        p->closing_for_runtime = 1;
+        msgpipe_clear_js(p);
+        msgpipe_close_handle(p);
+    }
+
+    for (int i = 0; i < 32; i++) {
+        if (msgpipes_all_closed(qrt)) break;
+        uv_run(&qrt->loop, UV_RUN_NOWAIT);
+    }
+}
+
 static void uv__write_cb(uv_write_t *req, int status) {
     TJSMessagePipeWriteReq *wr = req->data;
     CHECK_NOT_NULL(wr);
@@ -302,7 +363,7 @@ static void uv__write_cb(uv_write_t *req, int status) {
     TJSMessagePipe *p = req->handle->data;
     CHECK_NOT_NULL(p);
 
-    if (status < 0 && !p->finalized) {
+    if (status < 0 && !p->finalized && !p->closing_for_runtime) {
         JSContext *ctx = p->ctx;
         JSValue error = tjs_new_error(ctx, status);
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, error);
@@ -327,45 +388,44 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
         return JS_EXCEPTION;
     }
 
-    TJSMessagePipeWriteReq *wr = js_malloc(ctx, sizeof(*wr));
+    TJSMessagePipeWriteReq *wr = tjs__mallocz(sizeof(*wr));
     if (!wr) {
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     }
-    memset(wr, 0, sizeof(*wr));
 
     size_t len;
     int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE;
     JSSABTab sab_tab;
     uint8_t *buf = JS_WriteObject2(ctx, &len, argv[0], flags, &sab_tab);
     if (!buf) {
-        js_free(ctx, wr);
+        tjs__free(wr);
         return JS_EXCEPTION;
     }
 
     wr->req.data = wr;
-    wr->data = buf;
     wr->data_size.u64 = len;
 
-    uv_buf_t bufs[2] = { uv_buf_init((char *) wr->data_size.u8, sizeof(wr->data_size.u8)),
-                         uv_buf_init((char *) buf, len) };
-    int r = uv_write(&wr->req, &p->h.stream, bufs, 2, uv__write_cb);
-    if (r != 0) {
+    /* JS_WriteObject2() returns QuickJS-owned memory.  The uv_write callback can
+     * run during runtime shutdown, so copy the payload into neutral memory now
+     * and release the QuickJS allocation while ctx is still valid. */
+    wr->data = tjs__malloc(len ? len : 1);
+    if (!wr->data) {
         js_free(ctx, buf);
-        js_free(ctx, wr);
         js_free(ctx, sab_tab.tab);
-
-        return tjs_throw_errno(ctx, r);
+        tjs__free(wr);
+        return JS_ThrowOutOfMemory(ctx);
     }
+    if (len) memcpy(wr->data, buf, len);
+    js_free(ctx, buf);
 
-    /* Increment the SAB reference counts and track them for cleanup */
+    /* Increment SAB reference counts before scheduling the async write. */
     if (sab_tab.len > 0) {
-        wr->sab_list = js_malloc(ctx, sizeof(void*) * sab_tab.len);
+        wr->sab_list = tjs__malloc(sizeof(void*) * sab_tab.len);
         if (!wr->sab_list) {
-            // Cleanup on allocation failure
-            js_free(ctx, buf);
-            js_free(ctx, wr);
+            tjs__free(wr->data);
             js_free(ctx, sab_tab.tab);
-            return JS_EXCEPTION;
+            tjs__free(wr);
+            return JS_ThrowOutOfMemory(ctx);
         }
         wr->sab_count = sab_tab.len;
         for (size_t i = 0; i < sab_tab.len; i++) {
@@ -373,8 +433,21 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
             wr->sab_list[i] = sab_tab.tab[i];
         }
     }
-
     js_free(ctx, sab_tab.tab);
+
+    uv_buf_t bufs[2] = { uv_buf_init((char *) wr->data_size.u8, sizeof(wr->data_size.u8)),
+                         uv_buf_init((char *) wr->data, len) };
+    int r = uv_write(&wr->req, &p->h.stream, bufs, 2, uv__write_cb);
+    if (r != 0) {
+        tjs__free(wr->data);
+        for (size_t i = 0; i < wr->sab_count; i++) {
+            tjs__sab_free(NULL, wr->sab_list[i]);
+        }
+        tjs__free(wr->sab_list);
+        tjs__free(wr);
+
+        return tjs_throw_errno(ctx, r);
+    }
 
     return JS_UNDEFINED;
 }

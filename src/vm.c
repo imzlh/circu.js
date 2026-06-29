@@ -275,7 +275,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* Debug */
 #ifdef DEBUG
-    JS_SetDumpFlags(rt, JS_DUMP_LEAKS /* | JS_DUMP_FREE | JS_DUMP_GC_FREE | JS_DUMP_GC */);
+    JS_SetDumpFlags(rt, JS_DUMP_LEAKS);
 #endif
 
     /* Worker support */
@@ -283,6 +283,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     JS_SetCanBlock(rt, true);
     init_list_head(&qrt->workers);
     init_list_head(&qrt->streams);
+    init_list_head(&qrt->msgpipes);
 
     CHECK_EQ(uv_loop_init(&qrt->loop), 0);
 
@@ -323,9 +324,9 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     CHECK_EQ(JS_DefinePropertyValueStr(ctx, global_obj, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_ENUMERABLE), true);
 
     /* Load some builtin references for easy access */
-    qrt->builtins.dispatch_event_fn =
-    qrt->builtins.dispatch_event_fn =
-    qrt->builtins.worker_udata =
+    qrt->builtins.promise_hook_fn = JS_UNDEFINED;
+    qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
+    qrt->builtins.worker_udata = JS_UNDEFINED;
     qrt->builtins.message_pipe = JS_UNDEFINED;
 
     /* debug */
@@ -425,6 +426,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* Close stream handles before freeing JS so stream_pin() self-references
      * don't survive into QuickJS leak checking as TCP/Pipe/TTY objects. */
     tjs__close_all_streams(qrt);
+    tjs__close_all_msgpipes(qrt);
 
     /* Close all core loop handles. */
     uv_close((uv_handle_t*) &qrt->jobs.prepare, NULL);
