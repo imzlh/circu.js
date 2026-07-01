@@ -65,6 +65,9 @@ typedef struct {
         uint64_t nread;
     } reading;
     JSValue events[MSGPIPE_EVENT_MAX];
+    JSValue *pending;
+    size_t pending_count;
+    size_t pending_cap;
 } TJSMessagePipe;
 
 typedef struct {
@@ -91,20 +94,38 @@ static void msgpipe_unlink(TJSMessagePipe *p) {
 
 static void msgpipe_clear_js_rt(JSRuntime *rt, TJSMessagePipe *p) {
     for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-        JS_FreeValueRT(rt, p->events[i]);
+        JSValue event = p->events[i];
         p->events[i] = JS_UNDEFINED;
+        JS_FreeValueRT(rt, event);
     }
-    js_free_rt(rt, p->reading.data);
+    uint8_t *data = p->reading.data;
     memset(&p->reading, 0, sizeof(p->reading));
+    js_free_rt(rt, data);
+    for (size_t i = 0; i < p->pending_count; i++) {
+        JS_FreeValueRT(rt, p->pending[i]);
+    }
+    p->pending_count = 0;
+    js_free_rt(rt, p->pending);
+    p->pending = NULL;
+    p->pending_cap = 0;
 }
 
 static void msgpipe_clear_js(TJSMessagePipe *p) {
     for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-        JS_FreeValue(p->ctx, p->events[i]);
+        JSValue event = p->events[i];
         p->events[i] = JS_UNDEFINED;
+        JS_FreeValue(p->ctx, event);
     }
-    js_free(p->ctx, p->reading.data);
+    uint8_t *data = p->reading.data;
     memset(&p->reading, 0, sizeof(p->reading));
+    js_free(p->ctx, data);
+    for (size_t i = 0; i < p->pending_count; i++) {
+        JS_FreeValue(p->ctx, p->pending[i]);
+    }
+    p->pending_count = 0;
+    js_free(p->ctx, p->pending);
+    p->pending = NULL;
+    p->pending_cap = 0;
 }
 
 static void msgpipe_close_handle(TJSMessagePipe *p) {
@@ -114,14 +135,6 @@ static void msgpipe_close_handle(TJSMessagePipe *p) {
     }
 }
 
-static bool msgpipes_all_closed(TJSRuntime *qrt) {
-    struct list_head *el;
-    list_for_each(el, &qrt->msgpipes) {
-        TJSMessagePipe *p = list_entry(el, TJSMessagePipe, link);
-        if (!p->closed) return false;
-    }
-    return true;
-}
 
 static void uv__close_cb(uv_handle_t *handle) {
     TJSMessagePipe *p = handle->data;
@@ -190,6 +203,13 @@ static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg) {
     JSContext *ctx = p->ctx;
     JSValue event_func = p->events[event];
     if (!JS_IsFunction(ctx, event_func)) {
+        if (event == MSGPIPE_EVENT_MESSAGE) {
+            if (p->pending_count >= p->pending_cap) {
+                p->pending_cap = p->pending_cap ? p->pending_cap * 2 : 8;
+                p->pending = js_realloc(ctx, p->pending, p->pending_cap * sizeof(JSValue));
+            }
+            if (p->pending) p->pending[p->pending_count++] = JS_DupValue(ctx, arg);
+        }
         return;
     }
 
@@ -229,7 +249,9 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
             js_free(ctx, p->reading.data);
         }
         memset(&p->reading, 0, sizeof(p->reading));
-        if (nread != UV_EOF && !p->closing_for_runtime) {
+        if (!p->closing_for_runtime) {
+            /* Treat peer shutdown as a transport error too. Otherwise the
+             * owner only notices a vanished worker after its own task timeout. */
             JSValue error = tjs_new_error(ctx, nread);
             emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, error);
             JS_FreeValue(ctx, error);
@@ -290,7 +312,7 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     CHECK_EQ(p->reading.nread, total_size);
 
     /* We have a complete buffer now. */
-    JSSABTab sab_tab;
+    JSSABTab sab_tab = { .tab = NULL, .len = 0 };
     int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_BYTECODE;
     JSValue obj = JS_ReadObject2(ctx, (const uint8_t *) p->reading.data, total_size, flags, &sab_tab);
     if (JS_IsException(obj)) {
@@ -349,11 +371,6 @@ void tjs__close_all_msgpipes(TJSRuntime *qrt) {
         msgpipe_clear_js(p);
         msgpipe_close_handle(p);
     }
-
-    for (int i = 0; i < 32; i++) {
-        if (msgpipes_all_closed(qrt)) break;
-        uv_run(&qrt->loop, UV_RUN_NOWAIT);
-    }
 }
 
 static void uv__write_cb(uv_write_t *req, int status) {
@@ -395,7 +412,7 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
 
     size_t len;
     int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_BYTECODE;
-    JSSABTab sab_tab;
+    JSSABTab sab_tab = { .tab = NULL, .len = 0 };
     uint8_t *buf = JS_WriteObject2(ctx, &len, argv[0], flags, &sab_tab);
     if (!buf) {
         tjs__free(wr);
@@ -488,8 +505,21 @@ static JSValue tjs_msgpipe_event_set(JSContext *ctx, JSValue this_val, JSValue v
         return JS_EXCEPTION;
     }
     if (JS_IsFunction(ctx, value) || JS_IsUndefined(value) || JS_IsNull(value)) {
-        JS_FreeValue(ctx, p->events[magic]);
+        JSValue prev = p->events[magic];
         p->events[magic] = JS_DupValue(ctx, value);
+        JS_FreeValue(ctx, prev);
+
+        if (magic == MSGPIPE_EVENT_MESSAGE && JS_IsFunction(ctx, value) && p->pending_count > 0) {
+            for (size_t i = 0; i < p->pending_count; i++) {
+                JSValue args[2];
+                args[0] = JS_DupValue(ctx, value);
+                args[1] = p->pending[i];
+                CHECK_EQ(JS_EnqueueJob(ctx, emit_event, 2, (JSValue *) args), 0);
+                JS_FreeValue(ctx, args[0]);
+                JS_FreeValue(ctx, p->pending[i]);
+            }
+            p->pending_count = 0;
+        }
     }
     return JS_UNDEFINED;
 }
@@ -536,12 +566,8 @@ static void worker_release_self(JSContext *ctx, TJSWorker *w) {
     }
 }
 
-static void worker_release_self_rt(JSRuntime *rt, TJSWorker *w) {
-    if (!JS_IsUndefined(w->self_obj)) {
-        JSValue self = w->self_obj;
-        w->self_obj = JS_UNDEFINED;
-        JS_FreeValueRT(rt, self);
-    }
+static void worker_detach_self(TJSWorker *w) {
+    w->self_obj = JS_UNDEFINED;
 }
 
 static void worker_mark_exited(TJSWorker *w) {
@@ -664,6 +690,11 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     TJSWorker *w = JS_GetOpaque(val, tjs_worker_class_id);
     if (!w) return;
 
+    /* self_obj is always a dup of this Worker wrapper.  Once QuickJS is
+     * finalizing the wrapper, dropping that self-reference must not recurse
+     * into JS_FreeValueRT() on the same JSObject. */
+    worker_detach_self(w);
+
     /* Signal the worker thread to stop, but don't block in finalizer.
      * Blocking here can cause hangs if the worker thread is stuck in a
      * synchronous operation (deadloop, blocking syscall).
@@ -676,9 +707,9 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     }
 
     if (worker_is_done(w)) {
-        worker_release_self_rt(rt, w);
-        JS_FreeValueRT(rt, w->message_pipe);
+        JSValue message_pipe = w->message_pipe;
         w->message_pipe = JS_UNDEFINED;
+        JS_FreeValueRT(rt, message_pipe);
     } else {
         /* Thread still alive — we cannot block here (may deadlock).
          * Close the parent-side TCP handle now so the socket does not

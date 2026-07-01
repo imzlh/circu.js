@@ -94,7 +94,10 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
     if (JS_IsException(obj))
         return obj;
 
-    tjs_sock_t *s = js_mallocz(ctx, sizeof(*s));
+    /* The socket wrapper can outlive JS finalization while libuv finishes
+     * closing the poll handle, so keep the host object on neutral heap
+     * memory and only route embedded JSValues through QuickJS. */
+    tjs_sock_t *s = tjs__mallocz(sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
         sock_close(fd);
@@ -162,12 +165,12 @@ static void tjs_sock_finalizer(JSRuntime *rt, JSValue val) {
         s->finalized = true;
         JS_FreeValueRT(rt, s->callback);
         s->callback = JS_UNDEFINED;
-        JS_FreeValueRT(rt, s->this_obj);
+        /* this_obj is a self-pin of the socket wrapper being finalized. */
         s->this_obj = JS_UNDEFINED;
         close_sock(s);
         // Only free if close_cb won't (i.e., handle not pending close)
         if (!uv_is_closing((uv_handle_t *) &s->poll)) {
-            js_free_rt(rt, s);
+            tjs__free(s);
         }
         // If handle is closing, close_cb will free s
     }

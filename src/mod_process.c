@@ -267,7 +267,9 @@ static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
     TJSProcess *p = JS_GetOpaque(val, tjs_process_class_id);
     if (!p) return;
 
-    JS_FreeValueRT(rt, p->obj);
+    /* p->obj pins this same Process wrapper while the child is alive. Once
+     * QuickJS is finalizing the wrapper, only detach the pin. */
+    p->obj = JS_UNDEFINED;
     TJS_FreePromiseRT(rt, &p->status.result);
     for (int i = 0; i < 3; i++) JS_FreeValueRT(rt, p->stdio[i]);
     JS_FreeValueRT(rt, p->ipc_pipe);
@@ -1539,14 +1541,14 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
         DWORD ws; GetExitCodeProcess(p->process.process_handle, &ws);
         es = (int64_t)ws; ts = 0;
 #else
-        // Normal mode: process is managed by libuv (uv__exit_cb handles waitpid).
-        // Don't call waitpid here - it would steal the exit status from libuv.
-        // Instead, drive the event loop until the process exits.
-        while (!p->status.exited) {
-            uv_run(TJS_GetLoop(TJS_GetRuntime(ctx)), UV_RUN_ONCE);
-        }
-        es = p->status.exit_status;
-        ts = p->status.term_signal;
+        pid_t pid = uv_process_get_pid(&p->process);
+        int stat;
+        if (waitpid(pid, &stat, 0) < 0)
+            return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+        if (WIFEXITED(stat))        { es = WEXITSTATUS(stat); ts = 0; }
+        else if (WIFSIGNALED(stat)) { es = 128 + WTERMSIG(stat); ts = WTERMSIG(stat); }
+        else return JS_ThrowInternalError(ctx, "unexpected waitpid status");
+        maybe_close(p);
 #endif
     }
 

@@ -993,7 +993,7 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
     while (JS_PromiseState(ctx, argv[0]) == JS_PROMISE_PENDING) {
         // Safety: prevent infinite loops
         if (++loop_iterations > MAX_ITERATIONS) {
-            abort_exception = JS_ThrowInternalError(ctx, "waitPromise: too many iterations");
+            abort_exception = JS_ThrowInternalError(ctx, "waitIO: too many iterations");
             aborted = true;
             break;
         }
@@ -1055,9 +1055,9 @@ static JSValue tjs_waitIO(JSContext* ctx, JSValue this_val, int argc, JSValue *a
         }
         case JS_PROMISE_PENDING:
             if (aborted) {
-                return JS_ThrowInternalError(ctx, "waitPromise aborted");
+                return JS_ThrowInternalError(ctx, "waitIO aborted");
             }
-            return JS_ThrowInternalError(ctx, "waitPromise: promise did not settle");
+            return JS_ThrowInternalError(ctx, "waitIO: promise did not settle");
         default:
             abort();
     }

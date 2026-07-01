@@ -113,6 +113,32 @@ static const JSSharedArrayBufferFunctions tjs_sf = {
     .sab_opaque = NULL,
 };
 
+typedef struct {
+    uint32_t count;
+} TJSClosingHandleCount;
+
+static void tjs__count_closing_handles_walk_cb(uv_handle_t *handle, void *opaque) {
+    TJSClosingHandleCount *state = opaque;
+    if (uv_is_closing(handle)) {
+        state->count++;
+    }
+}
+
+static uint32_t tjs__count_closing_handles(TJSRuntime *qrt) {
+    TJSClosingHandleCount state = { 0 };
+    uv_walk(&qrt->loop, tjs__count_closing_handles_walk_cb, &state);
+    return state.count;
+}
+
+static void tjs__drain_closing_handles(TJSRuntime *qrt, int max_ticks) {
+    for (int i = 0; i < max_ticks; i++) {
+        if (tjs__count_closing_handles(qrt) == 0) {
+            return;
+        }
+        uv_run(&qrt->loop, UV_RUN_NOWAIT);
+    }
+}
+
 // utils
 
 JSContext* TJS_GetJSContext(App* app) {
@@ -427,12 +453,14 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
      * don't survive into QuickJS leak checking as TCP/Pipe/TTY objects. */
     tjs__close_all_streams(qrt);
     tjs__close_all_msgpipes(qrt);
+    tjs__drain_closing_handles(qrt, 64);
 
     /* Close all core loop handles. */
     uv_close((uv_handle_t*) &qrt->jobs.prepare, NULL);
     uv_close((uv_handle_t*) &qrt->jobs.idle, NULL);
     uv_close((uv_handle_t*) &qrt->jobs.check, NULL);
     uv_close((uv_handle_t*) &qrt->stop, NULL);
+    tjs__drain_closing_handles(qrt, 64);
 
     /* Poison module hooks so that any subsequent access from C closures
      * (e.g. enqueue/tryDone) triggers an immediate ASan report instead of
@@ -498,11 +526,13 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
         uv_run(&qrt->loop, UV_RUN_NOWAIT);
     }
     JS_RunGC(qrt->rt);
+    tjs__drain_closing_handles(qrt, 64);
     tjs__nodeapi_cleanup_runtime(qrt);
     for (int i = 0; i < 5; i++) {
         uv_run(&qrt->loop, UV_RUN_NOWAIT);
     }
     JS_RunGC(qrt->rt);
+    tjs__drain_closing_handles(qrt, 64);
 
     /* Cleanup all contexts: main app first, then sandbox apps.
      * The list is headed by &main_app->link (created in
@@ -523,6 +553,8 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
 
     /* Destroy the JS engine. */
     JS_FreeRuntime(qrt->rt);
+    tjs__drain_closing_handles(qrt, 64);
+    tjs__free_orphaned_streams(qrt);
 
 
     {

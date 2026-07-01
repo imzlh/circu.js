@@ -177,12 +177,8 @@ static void curl_release_self(JSContext *ctx, TJSCURL *curl) {
     }
 }
 
-static void curl_release_self_rt(JSRuntime *rt, TJSCURL *curl) {
-    if (!JS_IsUndefined(curl->self_obj)) {
-        JSValue self = curl->self_obj;
-        curl->self_obj = JS_UNDEFINED;
-        JS_FreeValueRT(rt, self);
-    }
+static void curl_detach_self(TJSCURL *curl) {
+    curl->self_obj = JS_UNDEFINED;
 }
 
 static int connpool_require_open(JSContext *ctx, TJSConnPool *pool) {
@@ -419,7 +415,12 @@ static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
             TJS_FreePromiseRT(rt, &c->promise);
             TJS_ClearPromise(NULL, &c->promise);
         }
-        curl_release_self_rt(rt, c);
+        /* c->self_obj is a dup of the CURL wrapper kept only to pin it while
+         * the request is in flight. Releasing it here can recurse into
+         * tjs_curl_finalizer() while we are still iterating pool->curls and
+         * touching `c`, which risks UAF/double-free. Detach the self-pin and
+         * let normal GC collect the wrapper later if no JS refs remain. */
+        curl_detach_self(c);
         c->pool = NULL; /* detach: c's finalizer must not touch the multi handle */
         list_del(&c->link);
         init_list_head(&c->link);
@@ -748,6 +749,10 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     TJSCURL *curl = JS_GetOpaque(val, tjs_curl_class_id);
     if (!curl) return;
 
+    /* self_obj is a dup of this CURL wrapper kept only to pin it while a
+     * request is in flight. The wrapper is already being finalized here. */
+    curl_detach_self(curl);
+
     /* unlink from the pool's live list if still attached */
     if (curl->pool && !list_empty(&curl->link)) {
         if (curl->pool->multi_handle && curl->in_flight) {
@@ -766,7 +771,6 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     dbuf_free(&curl->response_headers);
 
     TJS_FreePromiseRT(rt, &curl->promise);
-    curl_release_self_rt(rt, curl);
     JS_FreeValueRT(rt, curl->on_headers_complete);
     JS_FreeValueRT(rt, curl->on_progress);
     JS_FreeValueRT(rt, curl->on_header);

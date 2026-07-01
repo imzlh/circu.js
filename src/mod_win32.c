@@ -276,15 +276,44 @@ static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue
     HANDLE event = CreateEventW(NULL, false, false, NULL);
     if (!event) { RegCloseKey(hk); return THROW_WIN32(); }
 
-    tjs_regwatch_t *w = js_mallocz(ctx, sizeof(*w));
+    tjs_regwatch_t *w = tjs__mallocz(sizeof(*w));
+    if (!w) {
+        CloseHandle(event);
+        RegCloseKey(hk);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     w->hkey = hk; w->event = event; w->jsctx = ctx; w->stopped = 0;
     w->callback = JS_DupValue(ctx, argv[2]);
 
-    uv_async_init(tjs_get_loop(ctx), &w->async, reg_watch_async_cb);
+    int r = uv_async_init(tjs_get_loop(ctx), &w->async, reg_watch_async_cb);
+    if (r != 0) {
+        JS_FreeValue(ctx, w->callback);
+        CloseHandle(event);
+        RegCloseKey(hk);
+        tjs__free(w);
+        return tjs_throw_errno(ctx, r);
+    }
     uv_handle_set_data((uv_handle_t *)&w->async, w);
-    uv_thread_create(&w->thread, reg_watch_thread, w);
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_regwatch_classid);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, w->callback);
+        CloseHandle(event);
+        RegCloseKey(hk);
+        uv_close((uv_handle_t *)&w->async, regwatch_close_cb);
+        return obj;
+    }
+
+    r = uv_thread_create(&w->thread, reg_watch_thread, w);
+    if (r != 0) {
+        JS_FreeValue(ctx, w->callback);
+        JS_FreeValue(ctx, obj);
+        CloseHandle(event);
+        RegCloseKey(hk);
+        uv_close((uv_handle_t *)&w->async, regwatch_close_cb);
+        return tjs_throw_errno(ctx, r);
+    }
+
     JS_SetOpaque(obj, w);
     return obj;
 }

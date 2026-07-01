@@ -118,7 +118,7 @@ static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
     if (!wr) return;
     js_free(ctx, wr->data);
     JS_FreeValue(ctx, wr->buf);
-    js_free(ctx, wr);
+    tjs__free(wr);
 }
 
 static void stream_unlink(TJSStream *s) {
@@ -153,6 +153,7 @@ static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
 }
 
 static inline void stream_maybe_free(TJSStream *s) {
+    /* uv__close_cb may fire after JS ctx/rt is gone — use tjs__ allocator. */
     if (s->closed && s->finalized)
         tjs__free(s);
 }
@@ -196,7 +197,8 @@ static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
     s->closed = 1;
-    stream_unlink(s);
+    if (!s->closing_for_runtime)
+        stream_unlink(s);
 
     /* If the finalizer already ran, the JS wrapper is gone and this close is
      * the second (final) flag. Hand off to the arbiter and stop. */
@@ -387,16 +389,15 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     buf += sync;
     sz  -= sync;
 
-    TJSWriteReq *wr = js_malloc(ctx, sizeof(*wr));
+    TJSWriteReq *wr = tjs__mallocz(sizeof(*wr));
     if (!wr) return JS_EXCEPTION;
-    memset(wr, 0, sizeof(*wr));
     wr->req.data = wr;
     wr->buf      = JS_DupValue(ctx, argv[0]); /* pin: buf pointer must stay valid */
     wr->total    = (int)(sync + sz);          /* == original sz */
     wr->data     = js_malloc(ctx, sz);
     if (!wr->data) {
         JS_FreeValue(ctx, wr->buf);
-        js_free(ctx, wr);
+        tjs__free(wr);
         return JS_ThrowOutOfMemory(ctx);
     }
     memcpy(wr->data, buf, sz);
@@ -555,13 +556,13 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
     if (!JS_IsUndefined(s->shutdown_promise.p))
         return JS_ThrowInternalError(ctx, "shutdown already in progress");
 
-    uv_shutdown_t *req = js_malloc(ctx, sizeof(*req));
+    uv_shutdown_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
     req->data = s;
 
     int r = uv_shutdown(req, &s->h.stream, uv__shutdown_cb);
     if (r != 0) {
-        js_free(ctx, req);
+        tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
@@ -573,6 +574,12 @@ static void uv__connect_cb(uv_connect_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
     JSContext *ctx = s->ctx;
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+
+    if (s->finalized || !qrt || qrt->freeing) {
+        tjs__free(req);
+        return;
+    }
 
     if (status == 0) {
         TJS_ResolvePromise(ctx, &s->connect_promise, 0, NULL);
@@ -585,7 +592,7 @@ static void uv__connect_cb(uv_connect_t *req, int status) {
     if (!uv_is_active(&s->h.handle))
         stream_unpin(s);
 
-    js_free(ctx, req);
+    tjs__free(req);
 }
 
 static void uv__connection_cb(uv_stream_t *handle, int status) {
@@ -694,7 +701,7 @@ static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSVa
 /* readSync(buf) → number of bytes read, or null on EOF */
 static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitPromise() instead");
+    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitIO() instead");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
@@ -716,7 +723,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
 /* writeSync(buf) → number of bytes written */
 static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitPromise() instead");
+    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitIO() instead");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
@@ -771,7 +778,8 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     if (!s) return;
     stream_unlink(s);
 
-    JS_FreeValueRT(rt, s->obj);
+    /* s->obj is a self-pin of the wrapper being finalized, so just detach it
+     * here instead of recursively freeing the same JS object. */
     s->obj = JS_UNDEFINED;
     s->pin_count = 0;
     for (int i = 0; i < STREAM_CB_MAX; i++)
@@ -822,7 +830,6 @@ void tjs__close_all_streams(TJSRuntime *qrt) {
     list_for_each_safe(p, tmp, &qrt->streams) {
         TJSStream *s = list_entry(p, TJSStream, link);
         s->closing_for_runtime = 1;
-        stream_unlink(s);
 
         if (s->read_req)
             s->read_req->canceled = 1;
@@ -833,12 +840,26 @@ void tjs__close_all_streams(TJSRuntime *qrt) {
         if (!uv_is_closing(&s->h.handle)) {
             uv_close(&s->h.handle, uv__close_cb);
         }
-        /* Drop all pins */
         while (s->pin_count > 0) {
             stream_unpin(s);
         }
     }
-    uv_run(&qrt->loop, UV_RUN_NOWAIT);
+}
+
+void tjs__free_orphaned_streams(TJSRuntime *qrt) {
+    struct list_head *p, *tmp;
+    list_for_each_safe(p, tmp, &qrt->streams) {
+        TJSStream *s = list_entry(p, TJSStream, link);
+        if (!s->closing_for_runtime || !s->closed || s->finalized)
+            continue;
+
+        /* Some runtime-owned globals can survive until JS_FreeRuntime without
+         * their class finalizer running. At that point no JS callback can run,
+         * but the libuv close callback has completed, so release the native
+         * stream object from the runtime-owned list. */
+        stream_unlink(s);
+        tjs__free(s);
+    }
 }
 
 
@@ -911,12 +932,12 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
 
-    uv_connect_t *req = js_malloc(ctx, sizeof(*req));
+    uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
 
     int r = uv_tcp_connect(req, &t->h.tcp, (struct sockaddr *)&ss, uv__connect_cb);
     if (r != 0) {
-        js_free(ctx, req);
+        tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
@@ -1255,13 +1276,13 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) return JS_EXCEPTION;
 
-    uv_connect_t *req = js_malloc(ctx, sizeof(*req));
+    uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
 
     int r = uv_pipe_connect2(req, &t->h.pipe, name, len, 0, uv__connect_cb);
     JS_FreeCString(ctx, name);
     if (r != 0) {
-        js_free(ctx, req);
+        tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
