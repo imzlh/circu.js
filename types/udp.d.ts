@@ -4,7 +4,7 @@
  * @example
  * const udp = import.meta.use('udp');
  * 
- * const sock = await udp.create();
+ * const sock = new udp.UDP();
  * sock.bind({ ip: '0.0.0.0', port: 12345 });
  * 
  * const buffer = new Uint8Array(1024);
@@ -77,11 +77,13 @@ declare namespace CModuleUDP {
     }
 
     /**
-     * Create UDP socket
+     * UDP socket constructor
      * @param af Address family (e.g., AF_UNSPEC, AF_INET, AF_INET6)
-     * @returns UDP socket object
      */
-    export function create(af?: number): Promise<UDP>;
+    export const UDP: {
+        new (af?: number): UDP;
+        prototype: UDP;
+    };
 
     /** Listen on IPv6 only, reject mapped IPv4 addresses */
     export const UDP_IPV6ONLY: number;

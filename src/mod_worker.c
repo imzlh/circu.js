@@ -577,8 +577,15 @@ static void worker_mark_exited(TJSWorker *w) {
     uv_mutex_unlock(&w->lock);
 }
 
+static void worker_mark_returned(TJSWorker *w) {
+    uv_mutex_lock(&w->lock);
+    w->exited = true;
+    uv_mutex_unlock(&w->lock);
+}
+
 static void worker_mark_started(TJSWorker *w, TJSRuntime *wrt) {
     uv_mutex_lock(&w->lock);
+    w->exited = false;
     w->wrt = wrt;
     uv_mutex_unlock(&w->lock);
 }
@@ -620,7 +627,10 @@ static void worker_mark_joined(TJSWorker *w) {
 static bool worker_is_done(TJSWorker *w) {
     bool done;
     uv_mutex_lock(&w->lock);
-    done = w->joined || w->wrt == NULL;
+    /* wrt can be cleared before the worker thread fully returns because the
+     * thread still runs TJS_FreeRuntime() after dropping the runtime pointer.
+     * Only treat the worker as done once it has actually exited or been joined. */
+    done = w->joined || w->exited;
     uv_mutex_unlock(&w->lock);
     return done;
 }
@@ -674,6 +684,8 @@ static void worker_entry(void *arg) {
     if (owner) worker_mark_exited(owner);
 
     TJS_FreeRuntime(wrt);
+
+    if (owner) worker_mark_returned(owner);
 
     /* If the parent GC already ran tjs_worker_finalizer while we were
      * still alive, the finalizer deferred freeing the TJSWorker struct
@@ -765,6 +777,7 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
 
     w->ctx = ctx;
     w->terminated = false;
+    w->exited = false;
     w->joined = false;
     CHECK_EQ(uv_mutex_init(&w->lock), 0);
     w->self_obj = JS_UNDEFINED;

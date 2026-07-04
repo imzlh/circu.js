@@ -154,6 +154,154 @@ static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
 }
 #define js_fastab(ctx, buf, len) JS_NewArrayBuffer(ctx, buf, len, free_js_malloc, NULL, false)
 
+static EVP_PKEY* tjs_crypto_load_private_key(const uint8_t* key_data, size_t key_len) {
+    EVP_PKEY* pkey = NULL;
+    BIO* bio = BIO_new_mem_buf(key_data, key_len);
+    if (bio) {
+        pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+    }
+    if (pkey) {
+        return pkey;
+    }
+
+    ERR_clear_error();
+    const unsigned char* p = key_data;
+    return d2i_AutoPrivateKey(NULL, &p, (long)key_len);
+}
+
+static EVP_PKEY* tjs_crypto_load_public_key(const uint8_t* key_data, size_t key_len) {
+    EVP_PKEY* pkey = NULL;
+    BIO* bio = BIO_new_mem_buf(key_data, key_len);
+    if (bio) {
+        pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+    }
+    if (pkey) {
+        return pkey;
+    }
+
+    ERR_clear_error();
+    const unsigned char* p = key_data;
+    return d2i_PUBKEY(NULL, &p, (long)key_len);
+}
+
+static int tjs_crypto_detect_raw_ec_private_nid(size_t key_len) {
+    switch (key_len) {
+        case 32: return NID_X9_62_prime256v1;
+        case 48: return NID_secp384r1;
+        case 66: return NID_secp521r1;
+        default: return NID_undef;
+    }
+}
+
+static int tjs_crypto_detect_raw_ec_public_nid(const uint8_t* key_data, size_t key_len) {
+    if (!key_data || key_len == 0 || key_data[0] != 0x04) {
+        return NID_undef;
+    }
+
+    switch (key_len) {
+        case 65: return NID_X9_62_prime256v1;
+        case 97: return NID_secp384r1;
+        case 133: return NID_secp521r1;
+        default: return NID_undef;
+    }
+}
+
+static EVP_PKEY* tjs_crypto_load_raw_ec_private_key(const uint8_t* key_data, size_t key_len) {
+    int nid = tjs_crypto_detect_raw_ec_private_nid(key_len);
+    if (nid == NID_undef) {
+        return NULL;
+    }
+
+    EVP_PKEY* pkey = NULL;
+    EC_KEY* eckey = EC_KEY_new_by_curve_name(nid);
+    BIGNUM* priv_bn = NULL;
+
+    if (!eckey) {
+        return NULL;
+    }
+
+    priv_bn = BN_bin2bn(key_data, key_len, NULL);
+    if (!priv_bn || EC_KEY_set_private_key(eckey, priv_bn) != 1) {
+        BN_free(priv_bn);
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
+        EVP_PKEY_free(pkey);
+        BN_free(priv_bn);
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    BN_free(priv_bn);
+    return pkey;
+}
+
+static EVP_PKEY* tjs_crypto_load_raw_ec_public_key(const uint8_t* key_data, size_t key_len) {
+    int nid = tjs_crypto_detect_raw_ec_public_nid(key_data, key_len);
+    if (nid == NID_undef) {
+        return NULL;
+    }
+
+    EVP_PKEY* pkey = NULL;
+    EC_KEY* eckey = EC_KEY_new_by_curve_name(nid);
+    EC_POINT* pub_point = NULL;
+    const EC_GROUP* group = NULL;
+
+    if (!eckey) {
+        return NULL;
+    }
+
+    group = EC_KEY_get0_group(eckey);
+    if (!group) {
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    pub_point = EC_POINT_new(group);
+    if (!pub_point || EC_POINT_oct2point(group, pub_point, key_data, key_len, NULL) != 1 ||
+        EC_KEY_set_public_key(eckey, pub_point) != 1) {
+        EC_POINT_free(pub_point);
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
+        EVP_PKEY_free(pkey);
+        EC_POINT_free(pub_point);
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    EC_POINT_free(pub_point);
+    return pkey;
+}
+
+static EVP_PKEY* tjs_crypto_load_private_key_auto(const uint8_t* key_data, size_t key_len) {
+    EVP_PKEY* pkey = tjs_crypto_load_private_key(key_data, key_len);
+    if (pkey) {
+        return pkey;
+    }
+
+    ERR_clear_error();
+    return tjs_crypto_load_raw_ec_private_key(key_data, key_len);
+}
+
+static EVP_PKEY* tjs_crypto_load_public_key_auto(const uint8_t* key_data, size_t key_len) {
+    EVP_PKEY* pkey = tjs_crypto_load_public_key(key_data, key_len);
+    if (pkey) {
+        return pkey;
+    }
+
+    ERR_clear_error();
+    return tjs_crypto_load_raw_ec_public_key(key_data, key_len);
+}
+
 /* Generate ECC key pair */
 /* Generate ECC key pair */
 static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
@@ -607,9 +755,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
         label = JS_GetAnyBuffer(ctx, &label_len, argv[2]);
     }
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_public_key(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse public key");
@@ -688,9 +834,7 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
         label = JS_GetAnyBuffer(ctx, &label_len, argv[2]);
     }
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse private key");
@@ -775,9 +919,7 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
     
     const EVP_MD* md = get_md_from_magic(magic);
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse private key");
@@ -849,9 +991,7 @@ static JSValue tjs_crypto_rsa_pss_verify(JSContext* ctx, JSValueConst this_val, 
     
     const EVP_MD* md = get_md_from_magic(magic);
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse public key");
@@ -1516,6 +1656,75 @@ static JSValue tjs_crypto_pbkdf2(JSContext* ctx, JSValueConst this_val, int argc
     return result;
 }
 
+/* scrypt key derivation */
+static JSValue tjs_crypto_scrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    size_t password_len, salt_len;
+    const uint8_t *password, *salt;
+    int32_t keylen, N, r, p;
+    int64_t maxmem;
+
+    if (argc < 7) {
+        return JS_ThrowTypeError(ctx, "scrypt() requires 7 arguments: password, salt, keylen, N, r, p, maxmem");
+    }
+
+    if (JS_ToInt32(ctx, &keylen, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt32(ctx, &N, argv[3]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt32(ctx, &r, argv[4]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt32(ctx, &p, argv[5]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt64(ctx, &maxmem, argv[6]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    password = JS_GetAnyBuffer(ctx, &password_len, argv[0]);
+    if (!password) {
+        return JS_EXCEPTION;
+    }
+
+    salt = JS_GetAnyBuffer(ctx, &salt_len, argv[1]);
+    if (!salt) {
+        return JS_EXCEPTION;
+    }
+
+    if (keylen < 0 || N <= 1 || (N & (N - 1)) != 0 || r <= 0 || p <= 0 || maxmem < 0) {
+        return JS_ThrowRangeError(ctx, "Invalid scrypt params");
+    }
+
+    size_t alloc_len = keylen > 0 ? (size_t)keylen : 1;
+    uint8_t* key = js_malloc(ctx, alloc_len);
+    if (!key) {
+        return JS_EXCEPTION;
+    }
+
+    ERR_clear_error();
+    if (EVP_PBE_scrypt((const char*)password, password_len,
+                       salt, salt_len,
+                       (uint64_t)N, (uint64_t)r, (uint64_t)p, (uint64_t)maxmem,
+                       key, (size_t)keylen) != 1) {
+        unsigned long err = ERR_peek_last_error();
+        js_free(ctx, key);
+        if (err != 0) {
+            char errbuf[256];
+            ERR_error_string_n(err, errbuf, sizeof(errbuf));
+            return JS_ThrowRangeError(ctx, "Invalid scrypt params: %s", errbuf);
+        }
+        return JS_ThrowRangeError(ctx, "Invalid scrypt params");
+    }
+
+    return js_fastab(ctx, key, keylen);
+}
+
 /* RSA key generation */
 static JSValue tjs_crypto_generate_rsa_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     int32_t bits = 2048;
@@ -1595,9 +1804,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_EXCEPTION;
     }
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse private key");
@@ -1664,9 +1871,7 @@ static JSValue tjs_crypto_verify(JSContext* ctx, JSValueConst this_val, int argc
         return JS_EXCEPTION;
     }
     
-    BIO* bio = BIO_new_mem_buf(key_data, key_len);
-    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY* pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
     
     if (!pkey) {
         return JS_ThrowInternalError(ctx, "Failed to parse public key");
@@ -2613,6 +2818,7 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     /* PBKDF2 */
     JS_CFUNC_MAGIC_DEF("pbkdf2Sha256", 4, tjs_crypto_pbkdf2, HASH_SHA256),
     JS_CFUNC_MAGIC_DEF("pbkdf2Sha512", 4, tjs_crypto_pbkdf2, HASH_SHA512),
+    JS_CFUNC_DEF("scrypt", 7, tjs_crypto_scrypt),
     
     /* RSA */
     JS_CFUNC_DEF("generateRsaKey", 1, tjs_crypto_generate_rsa_key),

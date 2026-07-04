@@ -25,11 +25,22 @@
 
 #include "private.h"
 #include "utils.h"
+#include "mem.h"
 
 #include <string.h>
 #include <uv.h>
 
 static thread_local JSClassID tjs_file_class_id;
+
+static void tjs__buf_free_untracked(JSRuntime *rt, void *opaque, void *ptr) {
+    (void) rt; (void) opaque;
+    tjs__free(ptr);
+}
+
+static void *tjs__dbuf_realloc(void *opaque, void *ptr, size_t size) {
+    (void) opaque;
+    return tjs__realloc(ptr, size);
+}
 
 typedef struct {
     JSContext *ctx;
@@ -1403,7 +1414,8 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
         is_reject = true;
         dbuf_free(&fr->dbuf);
     } else {
-        arg = TJS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size);
+        
+        arg = JS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size, tjs__buf_free_untracked, NULL, false);
         if (JS_IsException(arg)) {
             dbuf_free(&fr->dbuf);
         }
@@ -1428,7 +1440,8 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     fr->ctx = ctx;
-    tjs_dbuf_init(ctx, &fr->dbuf);
+    
+    dbuf_init2(&fr->dbuf, NULL, tjs__dbuf_realloc);
     fr->r = -1;
     fr->filename = js_strdup(ctx, path);
     fr->req.data = fr;

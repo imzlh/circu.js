@@ -97,6 +97,12 @@ if (WIN32)
 endif()
 set(QJS_ENABLE_ASAN ${ENABLE_ASAN} CACHE BOOL "Enable AddressSanitizer (ASan)" FORCE)
 add_subdirectory(deps/quickjs EXCLUDE_FROM_ALL)
+if(NOT WIN32)
+    # qjs is linked statically into cjs-cli, but loadable native modules still
+    # resolve JS_* from the host executable. Mark the QuickJS C API with default
+    # visibility so ENABLE_EXPORTS/-rdynamic can place it in the dynamic table.
+    target_compile_definitions(qjs PRIVATE BUILDING_QJS_SHARED)
+endif()
 
 if(BUILD_WITH_MIMALLOC)
     option(MI_OVERRIDE "" OFF)

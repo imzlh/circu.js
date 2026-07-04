@@ -148,6 +148,7 @@ typedef struct {
     JSValue message_pipe;
     TJSRuntime *wrt;
     bool terminated;
+    bool exited;
     bool joined;
     bool finalized_by_gc;
 	struct list_head link;

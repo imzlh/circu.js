@@ -116,7 +116,7 @@ static void tjs_read_req_free_rt(JSRuntime *rt, TJSReadReq *rr) {
 
 static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
     if (!wr) return;
-    js_free(ctx, wr->data);
+    tjs__free(wr->data);
     JS_FreeValue(ctx, wr->buf);
     tjs__free(wr);
 }
@@ -394,7 +394,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     wr->req.data = wr;
     wr->buf      = JS_DupValue(ctx, argv[0]); /* pin: buf pointer must stay valid */
     wr->total    = (int)(sync + sz);          /* == original sz */
-    wr->data     = js_malloc(ctx, sz);
+    wr->data     = tjs__malloc(sz ? sz : 1);
     if (!wr->data) {
         JS_FreeValue(ctx, wr->buf);
         tjs__free(wr);
@@ -701,7 +701,7 @@ static JSValue tjs_stream_unref(JSContext *ctx, JSValue this_val, int argc, JSVa
 /* readSync(buf) → number of bytes read, or null on EOF */
 static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows. use waitIO() instead");
+    return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
@@ -723,7 +723,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
 /* writeSync(buf) → number of bytes written */
 static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows. use waitIO() instead");
+    return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows.");
 #else
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;

@@ -573,7 +573,9 @@ do_break:;
     };
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
+    if (cb) atomic_store(&cb->state, DCB_STATE_PAUSED);
     JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
+    if (cb) atomic_store(&cb->state, DCB_STATE_RUNNING);
     tjs__in_debug_break = prev_in_break;
     for (int i = 0; i < 6; i++) JS_FreeValue(ctx, argv[i]);
 
@@ -646,7 +648,10 @@ static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, int throw
     };
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
+    DebugControlBlock *cb = trt->debug.channel;
+    if (cb) atomic_store(&cb->state, DCB_STATE_PAUSED);
     JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
+    if (cb) atomic_store(&cb->state, DCB_STATE_RUNNING);
     if (JS_IsException(ret)) {
         JSValue cb_exception = JS_GetException(ctx);
         JS_FreeValue(ctx, cb_exception);

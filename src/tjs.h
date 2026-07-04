@@ -65,7 +65,7 @@ typedef struct TJSModuleInfo {
 } TJSModuleInfo;
 
 #define DEF_MODULE(_name, _entry, _worker_safe)                            \
-    TJS_EXPORT const TJSModuleInfo *tjs_module_info(void) {                \
+    EXPORT const TJSModuleInfo *tjs_module_info(void) {                \
         static const TJSModuleInfo _tjs_module_info_inst = {               \
             .abi_version = TJS_ABI_VERSION,                                \
             .name = (_name),                                               \

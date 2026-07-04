@@ -601,6 +601,20 @@ declare namespace CModuleCrypto {
         keylen: number
     ): ArrayBuffer;
 
+    /**
+     * Derive key using scrypt.
+     * Internal low-level entry point used by the Node compatibility layer.
+     */
+    export function scrypt(
+        password: ArrayBuffer | Uint8Array,
+        salt: ArrayBuffer | Uint8Array,
+        keylen: number,
+        N: number,
+        r: number,
+        p: number,
+        maxmem: number
+    ): ArrayBuffer;
+
     // ============================================================================
     // Asymmetric Cryptography (RSA)
     // ============================================================================
