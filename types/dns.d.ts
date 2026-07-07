@@ -1,16 +1,17 @@
 /**
-* DNS resolution module - Supports system resolution and raw UDP queries
-* 
-* @example
-* const dns = import.meta.use('dns');
-* 
-* // Basic resolution
-* const addresses = await dns.resolve('example.com', { family: 4 });
-* 
-* // Raw DNS query
-* const answers = await dns.query('example.com', dns.CNAME, '8.8.8.8');
-*/
+ * DNS resolution module - supports system resolution and raw UDP queries.
+ *
+ * @example
+ * ```ts
+ * const dns = import.meta.use('dns');
+ *
+ * const addresses = await dns.resolve('example.com', { family: 4 });
+ * const answers = await dns.query('example.com', dns.CNAME, '8.8.8.8');
+ * ```
+ */
 declare namespace CModuleDNS {
+    export type ResolvedAddress = Omit<CModuleStreams.AddressInfo, 'port'>;
+
     /**
      * DNS resolution options
      */
@@ -38,7 +39,7 @@ declare namespace CModuleDNS {
     export function resolve(
         hostname: string,
         options: GetAddrInfoOptions
-    ): Promise<CModuleStreams.AddressInfo[]>;
+    ): Promise<ResolvedAddress[]>;
 
     /**
      * Synchronous resolution using getaddrinfo (may garble on Windows)
@@ -48,31 +49,31 @@ declare namespace CModuleDNS {
     export function resolveSync(
         hostname: string,
         options: GetAddrInfoOptions
-    ): CModuleStreams.AddressInfo[];
+    ): ResolvedAddress[];
 
     /** A record (IPv4 address) = 1 */
-    const A: 1;
+    export const A: 1;
     /** NS record (name server) = 2 */
-    const NS: 2;
+    export const NS: 2;
     /** CNAME record (canonical name) = 5 */
-    const CNAME: 5;
+    export const CNAME: 5;
     /** SOA record (start of authority) = 6 */
-    const SOA: 6;
+    export const SOA: 6;
     /** PTR record (pointer record) = 12 */
-    const PTR: 12;
+    export const PTR: 12;
     /** MX record (mail exchange) = 15 */
-    const MX: 15;
+    export const MX: 15;
     /** TXT record (text information) = 16 */
-    const TXT: 16;
+    export const TXT: 16;
     /** AAAA record (IPv6 address) = 28 */
-    const AAAA: 28;
+    export const AAAA: 28;
     /** SRV record (service location) = 33 */
-    const SRV: 33;
-    const NAPTR: 35;    // Naming Authority Pointer
-    const CAA: 257;     // Certification Authority Authorization
+    export const SRV: 33;
+    export const NAPTR: 35;    // Naming Authority Pointer
+    export const CAA: 257;     // Certification Authority Authorization
 
     /** Base DNS answer record (shared fields) */
-    interface BaseAnswer {
+    export interface BaseAnswer {
         /** Queried domain name */
         name: string;
         /** Record type (1=A, 5=CNAME, 15=MX, etc.) */
@@ -84,35 +85,35 @@ declare namespace CModuleDNS {
     }
 
     /** A/AAAA record */
-    interface AddressAnswer extends BaseAnswer {
+    export interface AddressAnswer extends BaseAnswer {
         type: typeof A | typeof AAAA;
         /** IP address string */
         address: string;
     }
 
     /** CNAME record */
-    interface CNameAnswer extends BaseAnswer {
+    export interface CNameAnswer extends BaseAnswer {
         type: typeof CNAME;
         /** Target domain name */
         cname: string;
     }
 
     /** NS record */
-    interface NsAnswer extends BaseAnswer {
+    export interface NsAnswer extends BaseAnswer {
         type: typeof NS;
         /** Name server */
         ns: string;
     }
 
     /** PTR record */
-    interface PtrAnswer extends BaseAnswer {
+    export interface PtrAnswer extends BaseAnswer {
         type: typeof PTR;
         /** Reverse resolution result */
         ptr: string;
     }
 
     /** MX record */
-    interface MxAnswer extends BaseAnswer {
+    export interface MxAnswer extends BaseAnswer {
         type: typeof MX;
         /** Priority */
         priority: number;
@@ -121,7 +122,7 @@ declare namespace CModuleDNS {
     }
 
     /** SOA record */
-    interface SoaAnswer extends BaseAnswer {
+    export interface SoaAnswer extends BaseAnswer {
         type: typeof SOA;
         /** Primary name server */
         primary: string;
@@ -140,14 +141,14 @@ declare namespace CModuleDNS {
     }
 
     /** TXT record */
-    interface TxtAnswer extends BaseAnswer {
+    export interface TxtAnswer extends BaseAnswer {
         type: typeof TXT;
         /** Text content */
         txt: string;
     }
 
     /** SRV record */
-    interface SrvAnswer extends BaseAnswer {
+    export interface SrvAnswer extends BaseAnswer {
         type: typeof SRV;
         /** Priority */
         priority: number;
@@ -160,7 +161,7 @@ declare namespace CModuleDNS {
     }
 
     /** NAPTR record */
-    interface NaptrAnswer extends BaseAnswer {
+    export interface NaptrAnswer extends BaseAnswer {
         type: typeof NAPTR;
         order: number;
         preference: number;
@@ -171,7 +172,7 @@ declare namespace CModuleDNS {
     }
 
     /** CAA record */
-    interface CaaAnswer extends BaseAnswer {
+    export interface CaaAnswer extends BaseAnswer {
         type: typeof CAA;
         flags: number;
         tag: string;
@@ -179,16 +180,16 @@ declare namespace CModuleDNS {
     }
 
     /** Unknown or unresolved record type */
-    interface RawAnswer extends BaseAnswer {
+    export interface RawAnswer extends BaseAnswer {
         type: number;
         /** rdata length */
         rdlength: number;
         /** Raw rdata */
-        data: ArrayBuffer;
+        data: Uint8Array;
     }
 
     /** DNS answer record union type */
-    type DNSAnswer =
+    export type DNSAnswer =
         | AddressAnswer
         | CNameAnswer
         | NsAnswer
@@ -202,16 +203,28 @@ declare namespace CModuleDNS {
         | RawAnswer;
 
     /**
-     * Send raw UDP DNS query
-     * Use `engine.waitIO()` for sync behavior
-     * 
+     * Send a raw UDP DNS query.
+     *
+     * @warning Avoid wrapping this with `engine.waitIO()` in normal code.
+     * `query()` owns a live UDP handle until the promise settles or is aborted,
+     * so blocking the runtime can delay other I/O and make cancellation harder.
+     *
+     * @example
+     * ```ts
+     * const dns = import.meta.use('dns');
+     *
+     * const pending = dns.query('example.com', dns.A);
+     * // pending.abort?.();
+     * const answers = await pending;
+     * ```
+     *
      * @param hostname - Domain to query
      * @param type - Record type (default DNS.A)
      * @param server - DNS server address (default "8.8.8.8")
      * @param port - DNS server port (default 53)
      * @returns DNS answer array
      */
-    function query(
+    export function query(
         hostname: string,
         type?: number,
         server?: string,

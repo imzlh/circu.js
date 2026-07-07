@@ -450,6 +450,20 @@ static JSValue tjs_udp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_udp_disconnect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    if (!u) {
+        return JS_EXCEPTION;
+    }
+
+    int r = uv_udp_connect(&u->udp, NULL);
+    if (r != 0) {
+        return tjs_throw_errno(ctx, r);
+    }
+
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_udp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
@@ -484,6 +498,7 @@ static const JSCFunctionListEntry tjs_udp_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getsockname", 0, tjs_udp_getsockpeername, 0),
     JS_CFUNC_MAGIC_DEF("getpeername", 0, tjs_udp_getsockpeername, 1),
     TJS_CFUNC_DEF("connect", 1, tjs_udp_connect),
+    TJS_CFUNC_DEF("disconnect", 0, tjs_udp_disconnect),
     TJS_CFUNC_DEF("bind", 2, tjs_udp_bind),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "UDP", JS_PROP_CONFIGURABLE),
 };

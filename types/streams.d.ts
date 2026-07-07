@@ -12,6 +12,8 @@
  * };
  */
 declare namespace CModuleStreams {
+    export type BufferSource = ArrayBuffer | ArrayBufferView;
+
     /**
      * Base Stream interface
      */
@@ -49,6 +51,11 @@ declare namespace CModuleStreams {
         onconnection(error: CModuleError.Error, client: undefined): void;
 
         /**
+         * Close callback, called with no arguments after the native handle closes.
+         */
+        onclose: (() => void) | undefined;
+
+        /**
          * Start listening for incoming connections (server mode only)
          * @param backlog Maximum pending connection queue length, default 511
          * @throws Synchronous throw on error (already listening, invalid handle, etc.)
@@ -56,9 +63,9 @@ declare namespace CModuleStreams {
         listen(backlog?: number): void;
 
         /**
-         * Shutdown write/read direction (synchronous, wraps uv_shutdown)
+         * Shutdown the write side and wait for libuv completion.
          */
-        shutdown(): void;
+        shutdown(): Promise<void>;
 
         /**
          * Set stream to blocking or non-blocking mode
@@ -85,17 +92,17 @@ declare namespace CModuleStreams {
 
         /**
          * Write data to stream
-         * @param buffer Uint8Array containing data to write
+         * @param buffer Data to write
          * @returns Promise resolves to bytes written, rejects on failure
          */
-        write(buffer: Uint8Array): Promise<number>;
+        write(buffer: BufferSource): Promise<number>;
 
         /**
          * Async read data into user buffer (zero-copy)
-         * @param buffer Uint8Array to store read data
+         * @param buffer Buffer to store read data
          * @returns Promise resolves to bytes read (0 = EOF), rejects on failure
          */
-        read(buffer: Uint8Array): Promise<number>;
+        read(buffer: BufferSource): Promise<number>;
 
         /**
          * Sync read using OS-level blocking read()/recv()
@@ -103,7 +110,7 @@ declare namespace CModuleStreams {
          * @returns Bytes read, null indicates EOF
          * @throws Synchronous throw on error
          */
-        readSync(buffer: Uint8Array): number | null;
+        readSync(buffer: BufferSource): number | null;
 
         /**
          * Sync write using OS-level blocking write()/send()
@@ -111,7 +118,7 @@ declare namespace CModuleStreams {
          * @returns Bytes written
          * @throws Synchronous throw on error
          */
-        writeSync(buffer: Uint8Array): number;
+        writeSync(buffer: BufferSource): number;
 
         /**
          * Get underlying file descriptor
@@ -131,6 +138,27 @@ declare namespace CModuleStreams {
 
         readonly [Symbol.toStringTag]: 'Stream';
     }
+
+    /**
+     * Runtime stdio singleton injected by cno's stdio facade.
+     */
+    export interface StdioStream {
+        readonly fd: number;
+        readonly isTTY: boolean;
+        readonly size: { width: number; height: number };
+        write(data: Uint8Array): Promise<number>;
+        writeSync(data: Uint8Array): number;
+        read(buf: Uint8Array<ArrayBuffer>): Promise<number | null>;
+        readSync(buf: Uint8Array): number | null;
+        createReadStream(): ReadableStream;
+        createWriteStream(): WritableStream;
+        close(): void;
+        setRaw(mode: boolean): void;
+    }
+
+    export const stdin: StdioStream;
+    export const stdout: StdioStream;
+    export const stderr: StdioStream;
 
     export type AddressInfo = {
         /**
@@ -193,12 +221,13 @@ declare namespace CModuleStreams {
         /**
          * Sync connect using OS-level blocking connect()
          * @param addr Address object (e.g., {ip: '127.0.0.1', port: 8080})
+         * @param timeout Timeout in milliseconds (default 30000)
          * @throws Synchronous throw on error
          */
         connectSync(addr: {
             ip: string;
             port: number;
-        }): void;
+        }, timeout?: number): void;
 
         /**
          * Bind to local address
@@ -214,7 +243,7 @@ declare namespace CModuleStreams {
         /**
          * Set TCP keepalive option
          * @param enable Enable or disable
-         * @param delay Probe interval (milliseconds)
+         * @param delay Initial delay in seconds, matching libuv `uv_tcp_keepalive`
          * @throws Synchronous throw on error
          */
         setKeepAlive(enable: boolean, delay: number): void;
@@ -267,13 +296,13 @@ declare namespace CModuleStreams {
          * Get local Pipe name/path
          * @returns Name string
          */
-        get sockname(): string;
+        getsockname(): string;
 
         /**
          * Get remote Pipe name/path
          * @returns Name string
          */
-        get peername(): string;
+        getpeername(): string;
 
         /**
          * Connect to specified Pipe

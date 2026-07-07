@@ -54,6 +54,7 @@ typedef struct {
     union {
         uv_handle_t handle;
         uv_stream_t stream;
+        uv_pipe_t pipe;
         uv_tcp_t tcp;
     } h;
     struct {
@@ -348,15 +349,20 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
 
     p->ctx = ctx;
     p->trt = TJS_GetRuntime(ctx);
-    p->h.handle.data = p;
     p->events[0] = JS_UNDEFINED;
     p->events[1] = JS_UNDEFINED;
     init_list_head(&p->link);
     list_add_tail(&p->link, &p->trt->msgpipes);
 
+#ifndef _WIN32
+    CHECK_EQ(uv_pipe_init(tjs_get_loop(ctx), &p->h.pipe, 0), 0);
+    CHECK_EQ(uv_pipe_open(&p->h.pipe, fd), 0);
+#else
     CHECK_EQ(uv_tcp_init(tjs_get_loop(ctx), &p->h.tcp), 0);
     CHECK_EQ(uv_tcp_open(&p->h.tcp, fd), 0);
     uv_tcp_nodelay(&p->h.tcp, 1);  // Disable Nagle — small events must flush immediately.
+#endif
+    p->h.handle.data = p;
     CHECK_EQ(uv_read_start(&p->h.stream, uv__alloc_cb, uv__read_cb), 0);
 
     JS_SetOpaque(obj, p);
@@ -880,6 +886,15 @@ static JSValue tjs_worker_terminate(JSContext *ctx, JSValue this_val, int argc, 
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_worker_close_current(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt->is_worker) {
+        return JS_ThrowTypeError(ctx, "worker.close() is only available inside a worker");
+    }
+    TJS_Stop(trt);
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_worker_get_msgpipe(JSContext *ctx, JSValue this_val) {
     TJSWorker *w = tjs_worker_get(ctx, this_val);
     if (!w) {
@@ -920,5 +935,6 @@ void tjs__mod_worker_init(JSContext *ctx, JSValue ns) {
 		trt->builtins.message_pipe = JS_UNDEFINED;	// avoid double free
 		JS_SetPropertyStr(ctx, ns, "workerData", trt->builtins.worker_udata);
 		trt->builtins.worker_udata = JS_UNDEFINED;
+        JS_SetPropertyStr(ctx, ns, "close", JS_NewCFunction(ctx, tjs_worker_close_current, "close", 0));
 	}
 }

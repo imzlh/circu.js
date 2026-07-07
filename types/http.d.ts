@@ -9,6 +9,9 @@
  * @example
  * ```typescript
  * const { Parser, RESPONSE } = import.meta.use('http');
+ * const { Encoder, Decoder } = import.meta.use('text');
+ * const encoder = new Encoder();
+ * const decoder = new Decoder();
  * 
  * const parser = new Parser(RESPONSE);
  * const chunks: string[] = [];
@@ -16,13 +19,13 @@
  * let currentHeader = '';
  * 
  * parser.onHeaderField = (buf, off, len) => {
- *   currentHeader = new TextDecoder().decode(
+ *   currentHeader = decoder.decode(
  *     buf.slice(off, off + len)
  *   ).toLowerCase();
  * };
  * 
  * parser.onHeaderValue = (buf, off, len) => {
- *   headers[currentHeader] = new TextDecoder().decode(
+ *   headers[currentHeader] = decoder.decode(
  *     buf.slice(off, off + len)
  *   );
  * };
@@ -32,7 +35,7 @@
  * };
  * 
  * parser.onBody = (buf, off, len) => {
- *   chunks.push(new TextDecoder().decode(
+ *   chunks.push(decoder.decode(
  *     buf.slice(off, off + len)
  *   ));
  * };
@@ -42,7 +45,7 @@
  * };
  * 
  * // Simulated chunked HTTP response
- * const data = new TextEncoder().encode(
+ * const data = encoder.encode(
  *   'HTTP/1.1 200 OK\r\n' +
  *   'Transfer-Encoding: chunked\r\n' +
  *   'Content-Type: text/plain\r\n' +
@@ -65,6 +68,8 @@
 declare namespace CModuleHTTP {
     export const REQUEST: 0;
     export const RESPONSE: 1;
+    /** Parser mode accepted by the constructor. `2` is llhttp HTTP_BOTH. */
+    export type ParserType = typeof REQUEST | typeof RESPONSE | 2;
 
     /**
      * Result from {@link Parser.execute}
@@ -93,8 +98,8 @@ declare namespace CModuleHTTP {
      * Current parser state snapshot
      */
     export interface ParserState {
-        /** Parser type: 0=REQUEST, 1=RESPONSE */
-        type: 0 | 1;
+        /** Parser type: 0=REQUEST, 1=RESPONSE, 2=BOTH */
+        type: ParserType;
         /** HTTP major version (e.g., 1 for HTTP/1.1) */
         httpMajor: number;
         /** HTTP minor version (e.g., 1 for HTTP/1.1) */
@@ -152,10 +157,12 @@ declare namespace CModuleHTTP {
      * @example
      * ```typescript
      * const { Parser, REQUEST } = import.meta.use('http');
+     * const { Encoder } = import.meta.use('text');
+     * const encoder = new Encoder();
      * 
      * // Parse a simple HTTP request
      * const parser = new Parser(REQUEST);
-     * const buf = new TextEncoder().encode(
+     * const buf = encoder.encode(
      *   'GET /api/data HTTP/1.1\r\n' +
      *   'Host: example.com\r\n' +
      *   '\r\n'
@@ -167,9 +174,9 @@ declare namespace CModuleHTTP {
      */
     export class Parser {
         /**
-         * @param type - Parser type: REQUEST (0) or RESPONSE (1). Defaults to RESPONSE.
+         * @param type - Parser type: REQUEST (0), RESPONSE (1), or BOTH (2). Defaults to BOTH.
          */
-        constructor(type?: typeof REQUEST | typeof RESPONSE);
+        constructor(type?: ParserType);
 
         /**
          * Process a buffer of HTTP data
@@ -177,17 +184,20 @@ declare namespace CModuleHTTP {
          * @example
          * ```typescript
          * const { Parser, RESPONSE } = import.meta.use('http');
+         * const { Encoder, Decoder } = import.meta.use('text');
+         * const encoder = new Encoder();
+         * const decoder = new Decoder();
          * 
          * const parser = new Parser(RESPONSE);
          * let body = '';
          * 
          * parser.onBody = (buf, off, len) => {
-         *   body += new TextDecoder().decode(
+         *   body += decoder.decode(
          *     buf.slice(off, off + len)
          *   );
          * };
          * 
-         * const data = new TextEncoder().encode(
+         * const data = encoder.encode(
          *   'HTTP/1.1 200 OK\r\n' +
          *   'Content-Length: 5\r\n\r\n' +
          *   'hello'
@@ -209,7 +219,7 @@ declare namespace CModuleHTTP {
          * Reset parser state for a new message
          * @param type - Optionally change parser type
          */
-        reset(type?: typeof REQUEST | typeof RESPONSE): void;
+        reset(type?: ParserType): void;
 
         /** Signal EOF to the parser */
         finish(): ParserFinishResult;

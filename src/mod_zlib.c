@@ -637,14 +637,17 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         return JS_ThrowInternalError(ctx, "Inflate stream already finished");
     }
     
-    if (argc < 1) {
+    if (argc < 1 && magic == Z_NO_FLUSH) {
         return JS_ThrowTypeError(ctx, "inflate() requires 1 argument: data");
     }
     
-    size_t data_len;
-    const uint8_t* data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
-    if (!data) {
-        return JS_EXCEPTION;
+    size_t data_len = 0;
+    const uint8_t* data = NULL;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
+        if (!data) {
+            return JS_EXCEPTION;
+        }
     }
     
     int flush = magic;  /* Flush mode from magic */
@@ -661,7 +664,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         return JS_EXCEPTION;
     }
     
-    i->strm.next_in = (Bytef*)data;
+    i->strm.next_in = (Bytef*)(data ? data : (const uint8_t*)"");
     i->strm.avail_in = data_len;
     i->strm.next_out = out;
     i->strm.avail_out = out_size;
@@ -699,6 +702,11 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         } else {
             break;
         }
+    }
+
+    if (magic == Z_FINISH && ret != Z_STREAM_END) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "Inflate failed");
     }
     
     size_t produced = out_size - i->strm.avail_out;
@@ -754,6 +762,7 @@ static JSValue tjs_inflate_total_out(JSContext* ctx, JSValueConst this_val, int 
 static const JSCFunctionListEntry tjs_inflate_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("inflate", 1, tjs_inflate_process, Z_NO_FLUSH),
     JS_CFUNC_MAGIC_DEF("flush", 0, tjs_inflate_process, Z_SYNC_FLUSH),
+    JS_CFUNC_MAGIC_DEF("finish", 0, tjs_inflate_process, Z_FINISH),
     JS_CFUNC_DEF("reset", 0, tjs_inflate_reset),
     JS_CFUNC_DEF("getTotalIn", 0, tjs_inflate_total_in),
     JS_CFUNC_DEF("getTotalOut", 0, tjs_inflate_total_out),

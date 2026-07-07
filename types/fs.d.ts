@@ -6,9 +6,10 @@
  * @example Read and write files
  * ```typescript
  * const fs = import.meta.use('fs')
+ * const { Encoder, Decoder } = import.meta.use('text');
  * const content = fs.readFile('input.txt');
- * const text = new TextDecoder().decode(content);
- * fs.writeFile('output.txt', new TextEncoder().encode('Hello'));
+ * const text = new Decoder().decode(content);
+ * fs.writeFile('output.txt', new Encoder().encode('Hello'));
  * ```
  * @example Check file stats
  * ```typescript
@@ -35,6 +36,8 @@
  * ```
  */
 declare namespace CModuleFS {
+    export type BufferSource = ArrayBuffer | ArrayBufferView;
+
     // ============================================================================
     // File Open Flags
     // ============================================================================
@@ -119,10 +122,42 @@ declare namespace CModuleFS {
     // Types
     // ============================================================================
 
-    /**
-     * File statistics information
-     */
-    type Stats = CModuleAsyncFS.StatResult;
+    /** File statistics information. */
+    export interface Stats {
+        readonly isBlockDevice: boolean;
+        readonly isCharacterDevice: boolean;
+        readonly isDirectory: boolean;
+        readonly isFIFO: boolean;
+        readonly isFile: boolean;
+        readonly isSocket: boolean;
+        readonly isSymbolicLink: boolean;
+        readonly dev: number;
+        readonly mode: number;
+        readonly nlink: number;
+        readonly uid: number;
+        readonly gid: number;
+        readonly rdev: number;
+        readonly ino: number;
+        readonly size: number;
+        readonly blksize: number;
+        readonly blocks: number;
+        readonly atim: Date;
+        readonly mtim: Date;
+        readonly ctim: Date;
+        /** macOS only in the sync implementation. */
+        readonly birthtim?: Date;
+    }
+
+    /** Filesystem statistics information. */
+    export interface StatFsResult {
+        readonly type: number;
+        readonly bsize: number;
+        readonly blocks: number;
+        readonly bfree: number;
+        readonly bavail: number;
+        readonly files: number;
+        readonly ffree: number;
+    }
 
     /**
      * File open flags - string shortcuts
@@ -167,6 +202,14 @@ declare namespace CModuleFS {
     export function lstat(path: string): Stats;
 
     /**
+     * Get filesystem status.
+     * @param path - File path
+     * @returns Filesystem statistics
+     * @throws Error if statfs fails
+     */
+    export function statFs(path: string): StatFsResult;
+
+    /**
      * Check if file or directory exists
      * @param path - File path
      * @returns true if exists, false otherwise
@@ -203,7 +246,7 @@ declare namespace CModuleFS {
      */
     export function read(
         fd: number,
-        buffer: ArrayBuffer | Uint8Array,
+        buffer: BufferSource,
     ): number;
 
     /**
@@ -216,7 +259,7 @@ declare namespace CModuleFS {
      */
     export function pread(
         fd: number,
-        buffer: ArrayBuffer | Uint8Array,
+        buffer: BufferSource,
         offset: number
     ): number;
 
@@ -229,7 +272,7 @@ declare namespace CModuleFS {
      */
     export function write(
         fd: number,
-        buffer: ArrayBuffer | Uint8Array
+        buffer: BufferSource
     ): number;
 
     /**
@@ -242,7 +285,7 @@ declare namespace CModuleFS {
      */
     export function pwrite(
         fd: number,
-        buffer: ArrayBuffer | Uint8Array,
+        buffer: BufferSource,
         offset: number
     ): number;
 
@@ -276,7 +319,7 @@ declare namespace CModuleFS {
      */
     export function writeFile(
         path: string,
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         mode?: number
     ): void;
 
@@ -311,9 +354,10 @@ declare namespace CModuleFS {
     export function rmdir(path: string): void;
 
     /**
-     * Read directory contents
+     * Read directory contents.
      * @param path - Directory path
-     * @returns Array of filenames (excluding '.' and '..')
+     * @param withFileTypes - Return stat-like entry objects instead of names
+     * @returns Array of filenames or entry objects (excluding '.' and '..')
      * @throws Error if directory doesn't exist or read fails
      */
     export interface DirEnt {
@@ -327,20 +371,7 @@ declare namespace CModuleFS {
         readonly isSymbolicLink: boolean;
     }
 
-    export interface DirEnt {
-        readonly name: string;
-        readonly isBlockDevice: boolean;
-        readonly isCharacterDevice: boolean;
-        readonly isDirectory: boolean;
-        readonly isFIFO: boolean;
-        readonly isFile: boolean;
-        readonly isSocket: boolean;
-        readonly isSymbolicLink: boolean;
-    }
-
     export function readdir(path: string): string[];
-    export function readdir(path: string, withFileTypes: false): string[];
-    export function readdir(path: string, withFileTypes: true): DirEnt[];
     export function readdir(path: string, withFileTypes: false): string[];
     export function readdir(path: string, withFileTypes: true): DirEnt[];
 
@@ -375,9 +406,10 @@ declare namespace CModuleFS {
      * Create a symbolic link
      * @param targetPath - Target file/directory path
      * @param linkPath - Symlink path
+     * @param type - Windows-only hint: 'file', 'dir', or 'directory'
      * @throws Error if operation fails
      */
-    export function symlink(targetPath: string, linkPath: string): void;
+    export function symlink(targetPath: string, linkPath: string, type?: 'file' | 'dir' | 'directory'): void;
 
     // ============================================================================
     // File Locking and Synchronization
@@ -470,8 +502,8 @@ declare namespace CModuleFS {
     /**
      * Change file access and modification times
      * @param path - File path
-     * @param atime - Access time (seconds since epoch)
-     * @param mtime - Modification time (seconds since epoch)
+     * @param atime - Access time in seconds since epoch
+     * @param mtime - Modification time in seconds since epoch
      * @throws Error if utimes fails
      */
     export function utimes(path: string, atime: number, mtime: number): void;
@@ -479,8 +511,8 @@ declare namespace CModuleFS {
     /**
      * Change file access and modification times by fd
      * @param fd - File descriptor
-     * @param atime - Access time (seconds since epoch)
-     * @param mtime - Modification time (seconds since epoch)
+     * @param atime - Access time in seconds since epoch
+     * @param mtime - Modification time in seconds since epoch
      * @throws Error if utimes fails
      */
     export function futimes(fd: number, atime: number, mtime: number): void;

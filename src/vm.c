@@ -335,6 +335,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* loader for ES modules */
     JS_SetModuleLoaderFunc2(rt, tjs__module_normalizer, tjs__module_loader, tjs__module_checkattr, qrt);
+    JS_SetModuleNormalizeFunc2(rt, tjs__module_normalizer_attr);
     qrt->module.resolver = qrt->module.loader =
         qrt->module.metaloader = qrt->module.attrchecker = JS_UNDEFINED;
 
@@ -639,6 +640,11 @@ void tjs__execute_jobs(TJSRuntime* trt) {
         if (err <= 0) {
             if (err < 0) {
                 JSValue js_err = JS_GetException(ctx1);
+                if (JS_IsUncatchableError(js_err)) {
+                    TJS_Stop(trt);
+                    JS_FreeValue(ctx1, js_err);
+                    break;
+                }
                 JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
                 if (JS_IsEqual(ctx1, retv, JS_FALSE)) {
 #ifdef DEBUG
@@ -764,10 +770,8 @@ int TJS_Run(TJSRuntime* qrt) {
     CHECK_EQ(uv_check_start(&qrt->jobs.check, uv__check_cb), 0);
     uv_unref((uv_handle_t*) &qrt->jobs.check);
 
-    /* Use the async handle to keep the worker alive even when there is nothing to do. */
+    uv_unref((uv_handle_t*) &qrt->stop);
     if (!qrt->is_worker) {
-        uv_unref((uv_handle_t*) &qrt->stop);
-
         tjs__run_main(qrt);
     }
 

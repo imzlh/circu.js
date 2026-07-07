@@ -518,6 +518,26 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st) {
     return obj;
 }
 
+static JSValue build_statfs_obj(JSContext* ctx, const uv_statfs_t* st) {
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(obj)) {
+        return obj;
+    }
+
+#define SET_STATFS_FIELD(x) \
+    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, (int64_t) st->f_##x), JS_PROP_C_W_E);
+    SET_STATFS_FIELD(type);
+    SET_STATFS_FIELD(bsize);
+    SET_STATFS_FIELD(blocks);
+    SET_STATFS_FIELD(bfree);
+    SET_STATFS_FIELD(bavail);
+    SET_STATFS_FIELD(files);
+    SET_STATFS_FIELD(ffree);
+#undef SET_STATFS_FIELD
+
+    return obj;
+}
+
 static JSValue build_dirent_obj(JSContext* ctx, const char* name, int kind) {
     JSValue obj = JS_NewObject(ctx);
     if (JS_IsException(obj)) {
@@ -616,6 +636,32 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
     JS_FreeCString(ctx, path);
 
     return build_stat_obj(ctx, &st);
+}
+
+/* statFs() - get filesystem status */
+static JSValue tjs_syncfs_statfs(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    const char* path;
+    uv_fs_t req;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "statFs() requires 1 argument: path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path) THROW_PATH();
+
+    int ret = uv_fs_statfs(NULL, &req, path, NULL);
+    if (ret < 0) {
+        JSValue err = tjs_throw_errno_path(ctx, ret, path);
+        JS_FreeCString(ctx, path);
+        uv_fs_req_cleanup(&req);
+        return err;
+    }
+
+    JSValue result = build_statfs_obj(ctx, (const uv_statfs_t*) req.ptr);
+    JS_FreeCString(ctx, path);
+    uv_fs_req_cleanup(&req);
+    return result;
 }
 
 /* exists() - check if file exists */
@@ -2511,6 +2557,7 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     JS_CFUNC_DEF("stat", 1, tjs_syncfs_stat),
     JS_CFUNC_DEF("fstat", 1, tjs_syncfs_fstat),
     JS_CFUNC_DEF("lstat", 1, tjs_syncfs_lstat),
+    JS_CFUNC_DEF("statFs", 1, tjs_syncfs_statfs),
     JS_CFUNC_DEF("exists", 1, tjs_syncfs_exists),
 
     /* File operations */

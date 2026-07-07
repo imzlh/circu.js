@@ -70,10 +70,15 @@ static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     TJSRuntime *trt = TJS_GetRuntime(ctx);
 
     if (trt && trt->is_worker) {
-        // In a worker: stop only this worker's event loop
-        tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, status));
+        // In a worker: stop only this worker and unwind JS without user catch.
+        trt->exit_code = status;
         TJS_Stop(trt);
-        return JS_UNDEFINED;
+        JSValue err = JS_NewInternalError(ctx, "worker exit");
+        if (JS_IsException(err)) {
+            return err;
+        }
+        JS_SetUncatchableError(ctx, err);
+        return JS_Throw(ctx, err);
     }
 
     // Main thread: exit entire process

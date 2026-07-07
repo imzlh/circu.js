@@ -100,10 +100,10 @@
  * deflate.deflate(new Uint8Array(100));
  * const result = deflate.finish();
  * ```
- * @example File compression (with hypothetical file API)
+ * @example File compression
  * ```typescript
  * const zlib = import.meta.use('zlib')
- * import * as fs from '@tjs/fs';
+ * const fs = import.meta.use('asyncfs')
  * 
  * // Read file
  * const data = await fs.readFile('input.txt');
@@ -193,6 +193,8 @@
  * ```
  */
 declare namespace CModuleZLib {
+    export type BufferSource = ArrayBuffer | ArrayBufferView;
+
     // ============================================================================
     // Compression Levels
     // ============================================================================
@@ -261,7 +263,7 @@ declare namespace CModuleZLib {
      * @returns Compressed data
      */
     export function deflate(
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         level?: number
     ): ArrayBuffer;
 
@@ -272,7 +274,7 @@ declare namespace CModuleZLib {
      * @returns Compressed data with gzip header/footer
      */
     export function gzip(
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         level?: number
     ): ArrayBuffer;
 
@@ -283,7 +285,7 @@ declare namespace CModuleZLib {
      * @returns Compressed data without headers
      */
     export function deflateRaw(
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         level?: number
     ): ArrayBuffer;
 
@@ -296,21 +298,21 @@ declare namespace CModuleZLib {
      * @param data - Compressed data
      * @returns Decompressed data
      */
-    export function inflate(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function inflate(data: BufferSource): ArrayBuffer;
 
     /**
      * Decompress GZIP compressed data
      * @param data - Compressed data with gzip header/footer
      * @returns Decompressed data
      */
-    export function gunzip(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function gunzip(data: BufferSource): ArrayBuffer;
 
     /**
      * Decompress raw DEFLATE compressed data (no zlib header)
      * @param data - Compressed data without headers
      * @returns Decompressed data
      */
-    export function inflateRaw(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function inflateRaw(data: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // Streaming Compression
@@ -326,7 +328,7 @@ declare namespace CModuleZLib {
          * @param flush - Flush mode (optional)
          * @returns Compressed output chunk
          */
-        deflate(data: ArrayBuffer | Uint8Array, flush?: number): ArrayBuffer;
+        deflate(data: BufferSource, flush?: number): ArrayBuffer;
 
         /**
          * Flush pending output
@@ -340,7 +342,7 @@ declare namespace CModuleZLib {
          * @param data - Final input data (optional)
          * @returns Final compressed output
          */
-        finish(data?: ArrayBuffer | Uint8Array): ArrayBuffer;
+        finish(data?: BufferSource): ArrayBuffer;
 
         /**
          * Reset compression state for reuse
@@ -419,13 +421,19 @@ declare namespace CModuleZLib {
          * @param data - Compressed input chunk
          * @returns Decompressed output chunk
          */
-        inflate(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+        inflate(data: BufferSource): ArrayBuffer;
 
         /**
          * Flush pending output
          * @returns Flushed decompressed data
          */
         flush(): ArrayBuffer;
+
+        /**
+         * Finish decompression and validate the compressed stream trailer.
+         * @returns Final decompressed output
+         */
+        finish(): ArrayBuffer;
 
         /**
          * Reset decompression state for reuse
@@ -474,7 +482,7 @@ declare namespace CModuleZLib {
      * @returns CRC32 checksum as 32-bit unsigned integer
      */
     export function crc32(
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         crc?: number
     ): number;
 
@@ -485,7 +493,7 @@ declare namespace CModuleZLib {
      * @returns Adler-32 checksum as 32-bit unsigned integer
      */
     export function adler32(
-        data: ArrayBuffer | Uint8Array,
+        data: BufferSource,
         adler?: number
     ): number;
 }

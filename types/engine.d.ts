@@ -11,10 +11,13 @@
  * const obj = engine.deserialize(bytecode);
  */
 declare namespace CModuleEngine {
-    type Promise = globalThis.Promise<any>;
-    type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
-    type PromiseHookFn = (state: PromiseState, promise: Promise, parent?: Promise) => void;
-    type IntrinsicFeature =
+    export type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;   // not shared
+    export type PromiseHookFn = (
+        state: PromiseState,
+        promise: globalThis.Promise<unknown>,
+        parent?: globalThis.Promise<unknown>
+    ) => void;
+    export type IntrinsicFeature =
         | "date"
         | "regexp"
         | "json"
@@ -98,9 +101,9 @@ declare namespace CModuleEngine {
         LOAD
     }
 
-    interface GlobalEvents {
+    export interface GlobalEvents {
         [EventType.EXIT]: number,
-        [EventType.UNHANDLED_REJECTION]: [this: Promise, reason: Error | any],
+        [EventType.UNHANDLED_REJECTION]: [this: Promise<unknown>, reason: unknown],
         [EventType.JOB_EXCEPTION]: Error | unknown,
         [EventType.LOAD]: undefined
     }
@@ -108,7 +111,7 @@ declare namespace CModuleEngine {
     /**
      * Garbage collector module
      */
-    interface GarbageCollector {
+    export interface GarbageCollector {
         /**
          * Manually trigger garbage collection
          */
@@ -130,27 +133,27 @@ declare namespace CModuleEngine {
     /**
      * Engine version info
      */
-    interface EngineVersions {
+    export interface EngineVersions {
         /** QuickJS engine version */
         quickjs: string;
         /** txiki.js version */
         tjs: string;
         /** libuv version */
         uv: string;
-        /** libcurl version */
-        curl: string;
         /** SQLite3 version */
         sqlite3: string;
         /** zlib version */
         zlib: string;
         /** OpenSSL version */
         openssl: string;
+        /** libcurl version */
+        curl: string;
         /** Expat XML parser version */
         expat: string;
+        /** llhttp parser version */
+        llhttp: string;
 
-        /** If compiled with llhttp */
-        llhttp?: string;
-        /** If compiled with wasm3 */
+        /** If compiled with WAMR */
         wasm3?: string;
         /** If compiled with mimalloc (number) */
         mimalloc?: number;
@@ -158,6 +161,13 @@ declare namespace CModuleEngine {
         /** Core circu.js version */
         core: string;
     }
+
+    /**
+     * Expat XML parser version string.
+     *
+     * Exported directly on the engine module, not inside `versions`.
+     */
+    export const EXPAT_VERSION: string;
 
     /**
      * Set engine memory limit
@@ -184,22 +194,32 @@ declare namespace CModuleEngine {
      * @param flags Compile options, default `EVAL_MODULE`
      * @returns Compiled bytecode
      */
-    export function eval<T = any>(code: string, moduleName: string, flags?: number): T | globalThis.Promise<T>;
+    export function eval<T = unknown>(code: string, moduleName: string, flags?: number): T | globalThis.Promise<T>;
 
     /**
-     * Serialize JavaScript object to bytecode
+     * Serialize a QuickJS object or bytecode-bearing value with `JS_WriteObject`.
+     *
+     * The default flag is `DUMP_DEFAULT` (`DUMP_BYTECODE | DUMP_DEEP`).
+     * `DUMP_LOCAL` permits SharedArrayBuffer serialization and should only be
+     * used when the deserializer runs in the same trusted runtime lifetime.
+     *
      * @param obj Object to serialize
      * @param flag Serialize options, default `DUMP_DEFAULT`
      * @returns Serialized bytecode
      */
-    export function serialize(obj: any, flag?: number): Uint8Array;
+    export function serialize(obj: unknown, flag?: number): Uint8Array;
 
     /**
-     * Deserialize bytecode to JavaScript object
+     * Deserialize data produced by `serialize()` or `Module.dump()`.
+     *
+     * If the bytecode contains a module, the native result is wrapped as a
+     * `Module` instance. Function bytecode and ordinary objects are returned as
+     * their native QuickJS values.
+     *
      * @param bytecode Serialized bytecode
      * @returns Deserialized object
      */
-    export function deserialize<T = any>(bytecode: Uint8Array): T;
+    export function deserialize<T = unknown>(bytecode: Uint8Array): T;
 
     /**
      * Garbage collector control module
@@ -213,29 +233,25 @@ declare namespace CModuleEngine {
 
 
     /**
-     * Like `new TextEncoder().encode(str)`
-     * Encode to buffer
+     * Encode a string as UTF-8 using the engine's native helper.
      * @param str Text
      */
     export function encodeString(str: string): Uint8Array;
 
     /**
-     * Like `new TextDecoder().decode(buffer)` 
-     * Decode to text
+     * Decode UTF-8 bytes using the engine's native helper.
      * @param buffer Buffer containing text
      */
     export function decodeString(buffer: globalThis.Uint8Array | ArrayBufferLike): string;
 
     /**
-     * Like `new TextEncoder('utf-16').encode(str)`
-     * Encode to buffer (Uint16Array, 2 bytes per char)
+     * Encode a string as native UTF-16 code units.
      * @param str Text
      */
     export function encodeU16String(str: string): Uint16Array;
 
     /**
-     * Like `new TextDecoder('utf-16').decode(buffer)` 
-     * Decode to text
+     * Decode native UTF-16 code units.
      * 
      * **Note** circu.js supports Uint8Array but not recommended
      * @param buffer Buffer containing text
@@ -243,7 +259,11 @@ declare namespace CModuleEngine {
     export function decodeU16String(buffer: Uint16Array | ArrayBuffer): string;
 
     /**
-     * (Unsafe, use with caution) Module class
+     * Low-level QuickJS module wrapper.
+     *
+     * `Module` exposes native `JSModuleDef` behavior directly. Keep instances
+     * alive while using `namespace`, `meta`, or dumped bytecode derived from
+     * them.
      */
     export class Module {
         /**
@@ -258,7 +278,10 @@ declare namespace CModuleEngine {
         static from(name: string, object: Record<string, any>): Module;
 
         /**
-         * Compile module content
+         * Compile module source as an ES module.
+         *
+         * The module is compiled only. Call `resolve()` to link dependencies or
+         * `eval()` to resolve and evaluate it.
          */
         constructor(content: string, filename: string);
 
@@ -273,9 +296,12 @@ declare namespace CModuleEngine {
         get meta(): ImportMeta;
 
         /**
-         * Get module exports. Equivalent to `await import(mod.name)`
+         * Get the live module namespace object.
+         *
+         * This is a native namespace reference. Do not shallow-copy it to keep a
+         * module alive; keep the `Module` instance reachable instead.
          */
-        get namespace(): Record<string, any>;
+        get namespace(): Record<string, unknown>;
 
         /**
          * Export module as bytecode
@@ -284,7 +310,8 @@ declare namespace CModuleEngine {
         dump(flag?: number): ArrayBuffer;
 
         /**
-         * Execute as module
+         * Resolve dependencies, initialize `import.meta`, and evaluate as a
+         * module.
          */
         eval(): Promise;
 
@@ -298,7 +325,7 @@ declare namespace CModuleEngine {
          * @param name Export member name
          * @param value Export member value
          */
-        export(name: string, value: any): void;
+        export(name: string, value: unknown): void;
 
         /**
          * (For `from` created modules and `export` added members) Remove export member
@@ -309,12 +336,18 @@ declare namespace CModuleEngine {
     }
 
     /**
-     * Set VM module options
+     * Replace VM module hooks for this runtime.
+     *
+     * These hooks are replacement hooks, not append-only listeners. Installing
+     * a new loader/resolver/init/attr checker overwrites the previous one.
+     *
      * @param options Options object
      */
     export function onModule(options: {
         /**
-         * Module loader function
+         * Module loader function.
+         *
+         * Return source text or a native `Module` instance.
          */
         load?: (resolvedName: string) => Module | string;
 
@@ -322,22 +355,25 @@ declare namespace CModuleEngine {
          * Module resolver function
          * NOTE: qjs-ng supports import attributes, get from `attr` parameter
          */
-        resolve?: (name: string, parent: string, attr: Record<string, any>) => string;
+        resolve?: (name: string, parent: string, attr: Record<string, unknown>) => string;
 
         /**
          * Module initialization function
          */
-        init?: (name: string, importMeta: Record<string, any>) => void;
+        init?: (name: string, importMeta: Record<string, unknown>) => void;
 
         /**
          * Import attribute check function
          * Only checks support, full validation should be in `resolve`
          */
-        attrchk?: (attr: Record<string, any>) => void;
+        attrchk?: (attr: Record<string, unknown>) => void;
     }): void;
 
     /**
-     * Event handler. Return true to mark handled, otherwise runtime may process (e.g. exit)
+     * Replace the runtime event handler.
+     *
+     * Return true to mark handled, otherwise runtime may process the event
+     * itself (for example, exit behavior). Only one handler is active.
      */
     export function onEvent(cb:
         <T extends EventType>(eventName: T, eventData: GlobalEvents[T]) => boolean
@@ -350,7 +386,11 @@ declare namespace CModuleEngine {
     export function promiseHook(hook: PromiseHookFn): void;
 
     /**
-     * Get Promise result directly. Returns null if Promise not settled
+     * Inspect a Promise without awaiting it.
+     *
+     * Returns `null` for pending promises, returns the fulfillment value for
+     * fulfilled promises, and throws the rejection reason for rejected promises.
+     *
      * @param promise Promise to inspect
      */
     export function promiseResult<T>(promise: globalThis.Promise<T>): T | null;
@@ -360,17 +400,38 @@ declare namespace CModuleEngine {
      * @param value Value to check
      * @returns true if value is ArrayBuffer
      */
-    export function isArrayBuffer(value: any): boolean;
+    export function isArrayBuffer(value: unknown): boolean;
 
     /**
-     * Detach ArrayBuffer
+     * Detach an ArrayBuffer synchronously.
+     *
+     * The native function returns `undefined`; it does not create or await a
+     * Promise.
+     *
      * @param buffer ArrayBuffer to detach
-     * @returns Promise that resolves when detached
      */
-    export function detachArrayBuffer(buffer: ArrayBuffer): globalThis.Promise<void>;
+    export function detachArrayBuffer(buffer: ArrayBuffer): void;
 
     /**
-     * **DANGEROUS** Pseudo-sync wait for Promise. Converts async IO to sync IO, may have mutex issues
+     * **DANGEROUS** pseudo-sync wait for a Promise.
+     *
+     * This repeatedly enters the libuv loop (`UV_RUN_ONCE`) until the Promise
+     * settles, `abortCheck` returns true, the loop is exhausted, or the native
+     * iteration guard trips. It can re-enter I/O callbacks and jobs while the
+     * current JavaScript stack is still active, so it is only appropriate for
+     * carefully controlled bootstrap/debug paths.
+     *
+     * Rejected promises throw their rejection reason. If `abortCheck` throws,
+     * that exception is rethrown. If `abortCheck` returns true before
+     * settlement, `waitIO aborted` is thrown.
+     *
+     * @example
+     * const engine = import.meta.use('engine');
+     * const fs = import.meta.use('asyncfs');
+     *
+     * // Bootstrap-only bridge from async native I/O to sync setup code.
+     * const data = engine.waitIO(fs.readFile('/etc/hosts'));
+     *
      * @param prom Promise with any IO behavior
      * @param abortCheck Optional function called each iteration; return true to abort
      */
@@ -390,7 +451,7 @@ declare namespace CModuleEngine {
 
     /**
      * Isolated JavaScript context within the same runtime.
-     * Each Sandbox has its own global scope — variables and modules
+     * Each Sandbox has its own global scope; variables and modules
      * in one sandbox cannot pollute another or the main context.
      *
      * @example

@@ -52,6 +52,9 @@ interface CompletionResult {
     context: unknown;
 }
 
+type EvalResult = { value: unknown };
+type ReplGlobal = typeof globalThis & Record<string, unknown>;
+
 interface KeyCommand {
     (input: string): Promise<CommandResult | void> | CommandResult | void;
 }
@@ -973,8 +976,7 @@ class CJSRepl {
                 return false;
             case 'u':
                 rest = rest.trim();
-                // @ts-ignore
-                globalThis[rest] = import.meta.use(rest);
+                Reflect.set(globalThis, rest, import.meta.use(rest));
                 return false;
             default:
                 await this.#print(`Unknown directive: .${cmd}\n`);
@@ -985,7 +987,7 @@ class CJSRepl {
     async #evaluate(expr: string): Promise<void> {
         try {
             this.#evalStartTime = Date.now();
-            const result = (await engine.eval<any>(expr, '<eval>', engine.EVAL_ASYNC | engine.EVAL_NEW_BACKTRACE)).value;
+            const result = (await engine.eval<EvalResult>(expr, '<eval>', engine.EVAL_ASYNC | engine.EVAL_NEW_BACKTRACE)).value;
 
             const time = Date.now() - this.#evalStartTime;
             if (this.#config.showTime) {
@@ -1003,8 +1005,7 @@ class CJSRepl {
             }
             await this.#print(COLOR.reset + '\n');
 
-            // @ts-ignore
-            globalThis._ = result;
+            (globalThis as ReplGlobal)._ = result;
         } catch (e) {
             await this.#printError(e);
         } finally {

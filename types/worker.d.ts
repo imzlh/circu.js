@@ -19,12 +19,22 @@ declare namespace CModuleWorker {
          * Send message
          * @param data Data to send
          */
-        postMessage(data: any): void;
+        postMessage(data: unknown): void;
+
+        /**
+         * Keep this pipe's underlying libuv handle referenced.
+         */
+        ref(): void;
+
+        /**
+         * Allow the runtime to exit even if this pipe is the only active handle.
+         */
+        unref(): void;
 
         /**
          * Message event handler
          */
-        onmessage: ((data: any) => void) | undefined;
+        onmessage: ((data: unknown) => void) | undefined;
 
         /**
          * Message error event handler
@@ -42,7 +52,7 @@ declare namespace CModuleWorker {
          * Create a Worker
          * @param user_data Any object (including functions, but dangerous!)
          */
-        constructor(user_data: any);
+        constructor(user_data: unknown);
 
         /**
          * Terminate Worker
@@ -64,5 +74,8 @@ declare namespace CModuleWorker {
     export const pipe: MessagePipe | undefined;
 
     /** Get current Worker's user data (passed in constructor) */
-    export const workerData: any;
+    export const workerData: unknown;
+
+    /** Stop the current worker runtime. Only available inside Worker. */
+    export function close(): void;
 }

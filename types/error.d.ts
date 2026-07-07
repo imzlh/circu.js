@@ -97,9 +97,13 @@ declare namespace CModuleError {
     }
 
     /**
-     * Returns a string describing the given error code (uv errno)
+     * Returns a string describing a uv errno code.
+     *
+     * With no argument, or when the argument cannot be converted to an int32,
+     * the native implementation falls back to the current C `errno`.
+     *
      * @param errno The error code to describe.
      * @throws {TypeError} if the given error code is not a system error code.
      */
-    export function strerror(errno: number): string;
+    export function strerror(errno?: number): string;
 }

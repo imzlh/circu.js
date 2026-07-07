@@ -1,5 +1,5 @@
 /**
- * Native `debug` module — QuickJS debugger primitives + cross-thread DebugChannel.
+ * Native `debug` module - QuickJS debugger primitives and cross-thread DebugChannel.
  *
  * Reviewed final definitions. Notes vs. the previous draft:
  *  - `getFrameInfo` is now declared (was missing).
@@ -53,7 +53,7 @@ declare namespace CModuleDebug {
 	 *   - negative -> abort execution (exception)
 	 * Called synchronously on the executing (main) thread at a safepoint.
 	 */
-	type BreakCallback = (
+	export type BreakCallback = (
 		reason: number,
 		file: string | undefined,
 		func: string | undefined,
@@ -71,7 +71,7 @@ declare namespace CModuleDebug {
 
 	export function getStackDepth(): number;
 
-	/** Stack frame info for `level` (0 = top). Returns null if out of range. */
+	/** Stack frame info for `level` (0 = top). Throws TypeError if the frame is not JS. */
 	export function getFrameInfo(level: number): {
 		line: number;
 		column: number;
@@ -86,6 +86,7 @@ declare namespace CModuleDebug {
 		value: unknown;
 		isArg: boolean;
 		isClosure: boolean;
+		isUninitialized: boolean;
 		scopeLevel: number;
 	}>;
 
@@ -107,7 +108,7 @@ declare namespace CModuleDebug {
 	/** Main-thread channel handle. Owns one ref; call stop() before dropping. */
 	export interface DebugChannelMain {
 		/** Send an event (e.g. EV_PAUSED/EV_RESUMED) to the worker. */
-		notify(evType: number, payload: any): boolean;
+		notify(evType: number, payload: unknown): boolean;
 		/**
 		 * Block until the worker sends an inspect request or a resume signal.
 		 * Control messages (breakpoints/step) are applied in C and never returned.
@@ -117,7 +118,7 @@ declare namespace CModuleDebug {
 			| { kind: typeof REQ_INSPECT; id: number; method: string; params: unknown }
 			| { kind: typeof REQ_RESUME; step: number };
 		/** Reply to an inspect request previously returned by waitRequest(). */
-		reply(id: number, result: any): boolean;
+		reply(id: number, result: unknown): boolean;
 		/** Detach the weak trace pointer (if ours) and release this ref. */
 		stop(): void;
 	}
@@ -129,7 +130,7 @@ declare namespace CModuleDebug {
 		/** Read the current DebugControlBlock.state (STATE_*). */
 		state(): number;
 
-		/* Control-class methods — applied in C, never enter JS on main. */
+		/* Control-class methods are applied in C and never enter JS on main. */
 		addBreakpoint(file: string, line: number, column?: number): void;
 		removeBreakpoint(file: string, line: number): void;
 		clearBreakpoints(): void;
@@ -138,10 +139,10 @@ declare namespace CModuleDebug {
 		setStep(mode: number): void;
 
 		/** Send an inspect request; the reply arrives via recv() with the same id. */
-		send(id: number, method: string, params: any): boolean;
+		send(id: number, method: string, params: unknown): boolean;
 		/** Non-blocking pop from the main->worker queue. */
 		recv():
-			| { kind: typeof RES_EVENT | typeof RES_REPLY; type: number; id: number; payload?: any }
+			| { kind: typeof RES_EVENT | typeof RES_REPLY; type: number; id: number; payload?: unknown }
 			| null;
 		/** Timed-wait until a main->worker message arrives (default 1ms). */
 		waitRecv(timeoutMs?: number): boolean;

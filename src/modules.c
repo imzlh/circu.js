@@ -49,6 +49,7 @@ static const struct TJSModule tjs_modules[] = {
 	// name init_fn allow_in_worker
 	{ "algorithm", tjs__mod_algorithm_init, true },
 	{ "asyncfs", tjs__mod_asyncfs_init, true },
+	{ "bjson", tjs__mod_bjson_init, true },
 	{ "curl", tjs__mod_curl_init, true },
 	{ "crypto", tjs__mod_crypto_init, true },
 	{ "console", tjs__mod_console_init, true },
@@ -75,7 +76,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "timers", tjs__mod_timers_init, true },
 	{ "udp", tjs__mod_udp_init, true },
 #ifdef CJS__HAS_WASM
-	{ "wasm", tjs__mod_wasm_init, false },
+	{ "wasm", tjs__mod_wasm_init, true },
 #endif
 	{ "worker", tjs__mod_worker_init, true },
 	{ "xml", tjs__mod_xml_init, true },
@@ -499,15 +500,15 @@ static inline void tjs__normalize_pathsep(char *name) {
 #endif
 }
 
-char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
+static char *tjs__module_normalizer_impl(JSContext *ctx, const char *base_name, const char *name, JSValueConst attributes, bool pass_attributes) {
 #if 0
     printf("normalize: %s %s\n", base_name, name);
 #endif
 
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	if (!JS_IsUndefined(trt->module.resolver)){
-		JSValueConst args[] = { JS_NewString(ctx, name), JS_NewString(ctx, base_name) };
-		JSValue ret = JS_Call(ctx, trt->module.resolver, JS_NULL, 2, args);
+		JSValueConst args[] = { JS_NewString(ctx, name), JS_NewString(ctx, base_name), attributes };
+		JSValue ret = JS_Call(ctx, trt->module.resolver, JS_NULL, pass_attributes ? 3 : 2, args);
 		for(int i = 0; i < 2; i++) JS_FreeValue(ctx, args[i]);
 
 		if(JS_IsString(ret)){
@@ -600,6 +601,14 @@ char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *
     tjs__normalize_pathsep(filename);
 
     return filename;
+}
+
+char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
+    return tjs__module_normalizer_impl(ctx, base_name, name, JS_UNDEFINED, false);
+}
+
+char *tjs__module_normalizer_attr(JSContext *ctx, const char *base_name, const char *name, JSValueConst attributes, void *opaque) {
+    return tjs__module_normalizer_impl(ctx, base_name, name, attributes, true);
 }
 
 #undef TJS__PATHSEP

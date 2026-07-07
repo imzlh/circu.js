@@ -5,7 +5,7 @@
  * const fswatch = import.meta.use('fswatch');
  * 
  * const watcher = fswatch.watch('./src', (filename, event) => {
- *   console.log(`${filename}: ${event}`);
+ *   console.log(`${filename ?? '<unknown>'}: ${event}`);
  * });
  */
 declare namespace CModuleFSWatch {
@@ -35,7 +35,8 @@ declare namespace CModuleFSWatch {
      * Start file system watcher
      * @param path File or directory path to watch
      * @param callback Event handler callback
+     * @param recursive Whether to request platform recursive watching
      * @returns FsWatcher object
      */
-    export function watch(path: string, callback: (filename: string, event: FsEvent) => void): FsWatcher;
+    export function watch(path: string, callback: (filename: string | null, event: FsEvent) => void, recursive?: boolean): FsWatcher;
 }

@@ -150,6 +150,7 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
         th->argv[i] = JS_DupValue(ctx, argv[i + 2]);
     }
 
+    uv_update_time(tjs_get_loop(ctx));
     CHECK_EQ(uv_timer_start(&th->handle, uv__timer_cb, delay, magic ? delay : 0 /* repeat */), 0);
 
     HASH_ADD_INT64(qrt->timers.timers, id, th);

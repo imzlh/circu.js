@@ -2,156 +2,146 @@
  * FFI (Foreign Function Interface) module - Call C functions from JavaScript
  * 
  * @example
+ * ```typescript
  * const ffi = import.meta.use('ffi');
+ * const { Encoder } = import.meta.use('text');
  * 
- * // Load libc and call printf
+ * // Load libc and call puts(char*)
  * const libc = new ffi.UvLib(ffi.LIBC_NAME);
- * const printf = libc.symbol('printf');
+ * const puts = libc.symbol('puts');
  * 
- * const cif = new ffi.FfiCif(ffi.type_void, [ffi.type_pointer]);
- * const msg = ffi.getCString(ffi.getArrayBufPtr(new TextEncoder().encode('Hello!\0')));
- * cif.call(printf, msg);
+ * const cif = new ffi.FfiCif(ffi.type_sint, ffi.type_pointer);
+ * const msg = new Encoder().encode('Hello!\0');
+ * cif.call(puts, ffi.getArrayBufPtr(msg));
+ * ```
  */
 declare namespace CModuleFFI {
+    export type Pointer = bigint;
+    export type FfiPrimitiveValue = number | bigint | null;
+    export type FfiValue = FfiPrimitiveValue | FfiValue[];
+
     /**
-     * FFI 类型对象 - 表示 C 语言中的类型
+     * FFI type descriptor for a C type.
      */
     export class FfiType {
         /**
-         * 创建结构体类型
-         * @param types 成员类型数组
-         * @example new FfiType(type_uint32, type_pointer) // 创建包含 uint32 和 pointer 的结构体
+         * Create a struct type.
+         * @param types Field type descriptors
+         * @example new FfiType(type_uint32, type_pointer) // struct { uint32_t; void*; }
          */
         constructor(...types: FfiType[]);
 
         /**
-         * 创建数组类型
-         * @param count 数组元素数量
-         * @param type 元素类型
-         * @example new FfiType(10, type_uint8) // 创建 10 个 uint8 的数组
+         * Create an array type.
+         * @param count Element count
+         * @param type Element type descriptor
+         * @example new FfiType(10, type_uint8) // uint8_t[10]
          */
         constructor(count: number, type: FfiType);
 
         /**
-         * 将 JavaScript 值转换为 C 语言缓冲区
-         * @param value 要转换的 JS 值（数字、bigint 或数组）
-         * @returns 包含转换后数据的 Uint8Array
+         * Pack a JavaScript value into a C value buffer.
+         * @param value JS value to pack: number, bigint, null pointer, or nested array
+         * @returns Bytes with exactly this FFI type's size
          */
-        toBuffer(value: any): Uint8Array;
+        toBuffer(value: FfiValue): Uint8Array;
 
         /**
-         * 从 C 语言缓冲区读取 JavaScript 值
-         * @param buffer 包含数据的 Uint8Array
-         * @returns 转换后的 JS 值
+         * Unpack a C value buffer into a JavaScript value.
+         *
+         * Struct and array types cannot currently be unpacked and throw.
+         * @param buffer Bytes containing one value of this type
+         * @returns Unpacked JS value
          */
-        fromBuffer(buffer: Uint8Array): any;
+        fromBuffer(buffer: Uint8Array): FfiPrimitiveValue | undefined;
 
-        /** 类型名称（如 "uint32", "pointer"） */
+        /** Type name, such as "uint32" or "pointer". */
         readonly name: string;
 
-        /** 类型大小（字节） */
+        /** Type size in bytes. */
         readonly size: number;
 
-        // 预定义的类型实例（静态属性）
-        static type_void: FfiType;
-        static type_uint8: FfiType;
-        static type_sint8: FfiType;
-        static type_uint16: FfiType;
-        static type_sint16: FfiType;
-        static type_uint32: FfiType;
-        static type_sint32: FfiType;
-        static type_uint64: FfiType;
-        static type_sint64: FfiType;
-        static type_float: FfiType;
-        static type_double: FfiType;
-        static type_pointer: FfiType;
-        static type_longdouble: FfiType;
-        static type_uchar: FfiType;
-        static type_schar: FfiType;
-        static type_ushort: FfiType;
-        static type_sshort: FfiType;
-        static type_uint: FfiType;
-        static type_sint: FfiType;
-        static type_ulong: FfiType;
-        static type_slong: FfiType;
-        static type_size: FfiType;
-        static type_ssize: FfiType;
-        static type_ull: FfiType;
-        static type_sll: FfiType;
+        /** Struct field offsets. Present only on dynamic struct types. */
+        readonly offsets?: number[];
+
     }
 
     /**
-     * 符号指针对象 - 包装函数或变量地址
+     * Symbol pointer returned from a dynamic library lookup.
      */
     export class UvDlSym {
-        /** 获取原始指针地址（bigint） */
-        readonly addr: bigint;
+        /** Raw symbol address. */
+        readonly addr: Pointer;
     }
 
     /**
-     * FFI 调用接口对象 - 描述函数签名
+     * Prepared FFI call interface.
      */
     export class FfiCif {
         /**
-         * 创建函数调用接口
-         * @param retType 返回类型对象
-         * @param argTypes 参数类型对象数组
-         * @param fixedArgs 可变参数函数的固定参数数量（可选）
-         * @example new FfiCif(type_void, [type_uint32, type_pointer]) // void func(int, void*)
-         * @example new FfiCif(type_int, [type_int], 1) // int printf(const char*, ...)
+         * Create a function call interface.
+         * @param retType Return type descriptor
+         * @param argTypes Argument type descriptors
+         * @param fixedArgs Fixed argument count for variadic functions
+         * @example new FfiCif(type_void, type_uint32, type_pointer) // void func(int, void*)
+         * @example new FfiCif(type_int, type_int, 1) // int printf(const char*, ...)
          */
-        constructor(retType: FfiType, argTypes: FfiType[], fixedArgs?: number);
+        constructor(retType: FfiType, ...argTypes: FfiType[]);
+        constructor(retType: FfiType, ...argTypesAndFixed: [...FfiType[], number | undefined]);
 
         /**
-         * 调用外部函数
-         * @param func 要调用的函数（UvDlSym 对象，包含函数地址）
-         * @param args 参数数组，可以是原始指针（bigint）或类型化缓冲区（Uint8Array）
-         * @returns 包含返回值的 Uint8Array
-         * @throws {TypeError} func 不是 UvDlSym 对象或参数数量不匹配
-         * @throws {RangeError} 参数数组长度与函数签名不匹配
+         * Call an external function.
+         * @param func Function symbol to call
+         * @param args Raw pointer values or Uint8Array buffers packed for each argument type
+         * @returns Raw return bytes; decode with the return type's fromBuffer()
+         * @throws {TypeError} `func` is not a UvDlSym object or the argument count is wrong
+         * @throws {RangeError} Argument buffer size does not match the function signature
          */
-        call(func: UvDlSym, ...args: (Uint8Array | bigint)[]): Uint8Array;
+        call(func: UvDlSym, ...args: (Uint8Array | Pointer)[]): Uint8Array;
     }
 
     /**
-     * 动态库对象 - 表示已加载的共享库
+     * Loaded shared library.
      */
     export class UvLib {
         /**
-         * 打开动态库
-         * @param path 库文件路径（如 "libc.so.6", "libm.so"）
-         * @returns 动态库对象
-         * @throws {InternalError} 加载失败（文件不存在或格式错误）
+         * Open a shared library.
+         * @param path Library path or loader name, such as "libc.so.6" or "libm.so"
+         * @throws {InternalError} Loading failed
          */
         constructor(path: string);
 
         /**
-         * 获取符号（函数或变量）地址
-         * @param name 符号名称（如 "printf", "sin"）
-         * @returns 符号对象（包含地址信息）
-         * @throws {InternalError} 符号查找失败
+         * Look up a function or variable symbol.
+         * @param name Symbol name, such as "puts" or "sin"
+         * @returns Symbol address wrapper
+         * @throws {InternalError} Symbol lookup failed
          */
         symbol(name: string): UvDlSym;
     }
 
     /** 
-     * FFI 闭包对象 - 用于将 JS 函数暴露给 C 代码
-     * @warning 闭包回调的参数 Buffer 仅在回调期间有效，禁止在回调外持有引用
+     * FFI closure that exposes a JavaScript callback to C code.
+     *
+     * Callback arguments are copied ArrayBuffers. The return value must be a
+     * Uint8Array whose length exactly matches the configured return type size.
+     * Keep the FfiClosure object alive for as long as C may call `addr`; when
+     * this object is collected, the closure address is released too.
      */
     export class FfiClosure {
         /**
-         * 创建可调用闭包（将 JS 函数暴露给 C 代码）
-         * @param cif 函数接口描述
-         * @param func JS 回调函数，接收 Uint8Array 参数，返回 Uint8Array
-         * @warning 闭包创建后需手动管理生命周期，避免内存泄漏
+         * Create a callable closure.
+         * @param cif Function interface descriptor
+         * @param func JS callback; receives copied ArrayBuffer arguments and returns raw return bytes
+         * @warning Manage the closure lifetime manually. C must not call `addr` after this object is collected.
          */
-        constructor(cif: FfiCif, func: (...args: Uint8Array[]) => Uint8Array);
+        constructor(cif: FfiCif, func: (...args: ArrayBuffer[]) => Uint8Array);
 
-        /** 获取闭包的可调用地址 */
-        readonly addr: bigint;
+        /** Callable closure address. */
+        readonly addr: Pointer;
     }
 
-    // 基本类型实例
+    // Primitive type descriptors.
     export const type_void: FfiType;
     export const type_uint8: FfiType;
     export const type_sint8: FfiType;
@@ -178,50 +168,51 @@ declare namespace CModuleFFI {
     export const type_ull: FfiType;
     export const type_sll: FfiType;
 
-    /** 获取当前线程的错误码（errno） */
+    /** Get the current thread errno. */
     export function errno(): number;
 
     /**
-     * 获取错误码描述字符串
-     * @param errnum 错误码（如 errno() 的返回值）
+     * Convert an errno value to a platform error message.
+     * @param errnum Error number, such as the value returned by errno()
      */
     export function strerror(errnum: number): string;
 
     /**
-     * 获取 ArrayBuffer/Uint8Array 的内存指针
-     * @param buffer 类型化数组
-     * @returns 指向数组底层内存的指针
+     * Get a pointer to a Uint8Array's backing memory.
+     * @param buffer Typed array whose backing memory must stay alive
+     * @returns Pointer to the typed array data
      */
-    export function getArrayBufPtr(buffer: ArrayBuffer | Uint8Array): bigint;
+    export function getArrayBufPtr(buffer: Uint8Array): Pointer;
 
     /**
-     * 从 C 字符串指针读取字符串
-     * @param ptr 指向 C 字符串的指针
-     * @param maxLen 最大读取长度（防止读取超长字符串）
+     * Read a NUL-terminated C string.
+     * @param ptr Pointer to a C string
+     * @param maxLen Maximum number of bytes to scan
      */
-    export function getCString(ptr: bigint, maxLen?: number): string;
+    export function getCString(ptr: Pointer, maxLen?: number): string;
 
     /**
-     * 解引用指针（获取指针指向的地址）
-     * @param ptr 指针地址
-     * @param times 解引用次数（默认 1）
+     * Dereference a pointer value one or more times.
+     * @param ptr Pointer address
+     * @param times Dereference count, defaults to 1
      */
-    export function derefPtr(ptr: bigint, times?: number): bigint;
+    export function derefPtr(ptr: Pointer, times?: number): Pointer;
 
     /**
-     * 将指针转换为 Uint8Array 视图
-     * @warning ⚠️ **内存安全警告**：
-     * - 返回的 Buffer 是**视图**，不拥有内存所有权
-     * - 若指针指向的内存被释放，Buffer 将变为野指针
-     * - **禁止**在指针所有者生命周期外持有此 Buffer
-     * @param ptr 内存地址
-     * @param size 缓冲区大小（字节）
+     * Create a Uint8Array view over foreign memory.
+     *
+     * @warning The returned Uint8Array does not own the memory. If the pointed
+     * memory is freed or mutated by C, the view immediately reflects that
+     * state. Do not keep this view beyond the owner's lifetime.
+     *
+     * @param ptr Memory address
+     * @param size Buffer size in bytes
      */
-    export function ptrToBuffer(ptr: bigint, size: number): Uint8Array;
+    export function ptrToBuffer(ptr: Pointer, size: number): Uint8Array;
 
-    /** 当前平台 C 标准库名称 */
+    /** Platform C standard library name. */
     export const LIBC_NAME: string;
 
-    /** 当前平台数学库名称 */
+    /** Platform math library name. */
     export const LIBM_NAME: string;
 }

@@ -1,36 +1,45 @@
 /**
  * Windows-only bindings: Registry + System Certificates
  *
- * On non-Windows platforms the module is a no-op stub.
+ * This module is Windows-only. On non-Windows platforms `import.meta.use('win32')`
+ * may return null because the native module is optional.
  *
  * @example Get system HTTP proxy
  * ```ts
- * const { HKCU, readRegistry } = import.meta.use('win32');
- * const proxy = readRegistry(HKCU,
+ * const win32 = import.meta.use('win32');
+ * if (!win32) throw new Error('win32 module is unavailable');
+ *
+ * const proxy = win32.readRegistry(win32.HKCU,
  *     'Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
  *     'ProxyServer');
- * // → "host:port" or "http=host:port;https=host:port"
+ * // -> "host:port" or "http=host:port;https=host:port"
  * ```
  *
  * @example Get system DNS servers (per adapter, from DHCP)
  * ```ts
+ * const win32 = import.meta.use('win32');
+ * if (!win32) throw new Error('win32 module is unavailable');
+ *
  * // Enumerate under HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces
- * const dns = readRegistry(HKLM,
+ * const dns = win32.readRegistry(win32.HKLM,
  *     'SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters',
  *     'DhcpNameServer');
- * // → "8.8.8.8 8.8.4.4" (space-separated)
+ * // -> "8.8.8.8 8.8.4.4" (space-separated)
  * ```
  *
  * @example Load system root CAs into OpenSSL / TLS context
  * ```ts
- * const pems = exportCerts('ROOT');  // array of PEM strings
+ * const win32 = import.meta.use('win32');
+ * if (!win32) throw new Error('win32 module is unavailable');
+ *
+ * const pems = win32.exportCerts('ROOT');  // array of PEM strings
  * const caBundle = pems.join('\n');
  * // write caBundle to a temp file and pass to tls.createContext / curl / etc.
  * ```
  */
 declare namespace CModuleWin32 {
     /** Handle returned by {@link Win32Module.watchRegistry}. */
-    interface RegWatch {
+    export interface RegWatch {
         /**
          * Stop watching and release all resources.
          * Safe to call multiple times. Must NOT be called from within the callback.
@@ -44,13 +53,13 @@ declare namespace CModuleWin32 {
     }
 
     /** Registry value types that can be read and written. */
-    type RegValue =
+    export type RegValue =
         | string       // REG_SZ / REG_EXPAND_SZ
         | number       // REG_DWORD (uint32)
         | Uint8Array   // REG_BINARY
         | string[];    // REG_MULTI_SZ
 
-    // ── HKEY predefined root handles ─────────────────────────────────────────
+    // HKEY predefined root handles
     /** HKEY_CLASSES_ROOT */
     export const HKCR: number;
     /** HKEY_CURRENT_USER */
@@ -62,17 +71,17 @@ declare namespace CModuleWin32 {
     /** HKEY_CURRENT_CONFIG */
     export const HKCC: number;
 
-    // ── Registry ──────────────────────────────────────────────────────────────
+    // Registry
 
     /**
      * Read a single registry value.
      *
      * Return type mirrors the registry type:
-     * - `REG_SZ` / `REG_EXPAND_SZ` → `string`
-     * - `REG_DWORD` → `number`
-     * - `REG_QWORD` → `number` (JS float64; exact up to 2^53)
-     * - `REG_MULTI_SZ` → `string[]`
-     * - `REG_BINARY` / other → `Uint8Array`
+     * - `REG_SZ` / `REG_EXPAND_SZ` -> `string`
+     * - `REG_DWORD` -> `number`
+     * - `REG_QWORD` -> `number` (JS float64; exact up to 2^53)
+     * - `REG_MULTI_SZ` -> `string[]`
+     * - `REG_BINARY` / other -> `Uint8Array`
      *
      * @param hive  Root handle, e.g. `HKCU`
      * @param key   Subkey path, e.g. `'Software\\MyApp'`
@@ -89,9 +98,9 @@ declare namespace CModuleWin32 {
 
     /**
      * Write a registry value. The registry type is inferred from the JS type:
-     * - `string` → `REG_SZ`
-     * - `number` → `REG_DWORD`
-     * - `Uint8Array` → `REG_BINARY`
+     * - `string` -> `REG_SZ`
+     * - `number` -> `REG_DWORD`
+     * - `Uint8Array` -> `REG_BINARY`
      *
      * The key must already exist; this does not create subkeys.
      *
@@ -120,22 +129,22 @@ declare namespace CModuleWin32 {
      *     'Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
      *     () => { console.log('Proxy settings changed'); });
      *
-     * // later…
+     * // later
      * watcher.close();
      * ```
      */
     export function watchRegistry(hive: number, key: string, callback: () => void): RegWatch;
 
-    // ── Certificates ──────────────────────────────────────────────────────────
+    // Certificates
 
     /**
      * Enumerate certificates from a Windows system store and return them as
-     * PEM strings (`-----BEGIN CERTIFICATE-----` … `-----END CERTIFICATE-----`).
+     * PEM strings (`-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----`).
      *
      * Common store names:
-     * - `"ROOT"` — Trusted Root CAs (default)
-     * - `"CA"`   — Intermediate CAs
-     * - `"MY"`   — Personal certificates (with private keys)
+     * - `"ROOT"` - Trusted Root CAs (default)
+     * - `"CA"` - Intermediate CAs
+     * - `"MY"` - Personal certificates (with private keys)
      *
      * @example Feed into a TLS context
      * ```ts

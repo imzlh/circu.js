@@ -55,7 +55,7 @@ declare namespace CModuleCURL {
      * @param header Single HTTP header line (includes trailing CRLF)
      * @returns Bytes processed, return 0 to abort
      */
-    export type HeaderCallback = (header: string) => number;
+    export type HeaderCallback = (header: string) => number | void;
 
     /**
      * Connection pool configuration options
@@ -388,21 +388,21 @@ declare namespace CModuleCURL {
          * @param callback Progress callback function
          * @returns Current CURL instance (supports chaining)
          */
-        onProgress(callback: ProgressCallback): this;
+        onProgress(callback: ProgressCallback | null | undefined): this;
 
         /**
          * Set header callback function
          * @param callback Header callback function
          * @returns Current CURL instance (supports chaining)
          */
-        onHeader(callback: HeaderCallback): this;
+        onHeader(callback: HeaderCallback | null | undefined): this;
 
         /**
          * Set callback fired once when response headers are complete.
          * Receives (status: number, headersRaw: string).
          * Enables streaming: set this + onData to get body chunks before perform() resolves.
          */
-        onHeadersComplete(callback: (status: number, headers: string) => void): this;
+        onHeadersComplete(callback: ((status: number, headers: string) => void) | null | undefined): this;
 
         /**
          * Execute HTTP request asynchronously
@@ -449,12 +449,12 @@ declare namespace CModuleCURL {
          * Set streaming mode. Don't save body, trigger `ondata` instead
          * @param mode Streaming mode
          */
-        setStreamMode(mode: boolean): void;
+        setStreamMode(mode: boolean): this;
 
         /**
          * Stream callback. Return `true` to abort reading.
          */
-        onData(cb: (buf: ArrayBuffer) => boolean): void;
+        onData(cb: ((buf: ArrayBuffer) => boolean) | null | undefined): this;
 
         /**
          * Upload raw data using libcurl's read callback.

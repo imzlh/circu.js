@@ -290,7 +290,7 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
     tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
     if(!mt) return JS_EXCEPTION;
     if(argc < 2 || !JS_IsString(argv[0])){
-        return JS_ThrowTypeError(ctx, "export() requires 2 argument: export_name: string, value: any");
+        return JS_ThrowTypeError(ctx, "export() requires 2 arguments: export_name string and value");
     }
 
     const char *export_name = JS_ToCString(ctx, argv[0]);
@@ -1138,6 +1138,7 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, versions, "sqlite3", JS_NewString(ctx, sqlite3_libversion()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "zlib", JS_NewString(ctx, zlibVersion()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "openssl", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, versions, "curl", JS_NewString(ctx, curl_version()), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, versions, "core", JS_NewString(ctx, tjs_version()), JS_PROP_C_W_E);
 
     JS_DefinePropertyValueStr(ctx, versions, "llhttp", JS_NewString(ctx, LLHTTP_VERSION), JS_PROP_C_W_E);
@@ -1150,15 +1151,17 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, versions, "mimalloc", JS_NewInt32(ctx, mi_version()), JS_PROP_C_W_E);
 #endif
 
-    
-    /* Export version info */
-    JS_SetPropertyStr(ctx, ns, "EXPAT_VERSION", JS_NewString(ctx,
+    const char* expat_version =
 #ifdef HAVE_XML_EXPAT_VERSION
-    XML_ExpatVersion()
+        XML_ExpatVersion()
 #else
-    STRINGIFY(XML_MAJOR_VERSION) "." STRINGIFY(XML_MINOR_VERSION) "." STRINGIFY(XML_MICRO_VERSION)
+        STRINGIFY(XML_MAJOR_VERSION) "." STRINGIFY(XML_MINOR_VERSION) "." STRINGIFY(XML_MICRO_VERSION)
 #endif
-    ));
+    ;
+    JS_DefinePropertyValueStr(ctx, versions, "expat", JS_NewString(ctx, expat_version), JS_PROP_C_W_E);
+
+    /* Export version info */
+    JS_SetPropertyStr(ctx, ns, "EXPAT_VERSION", JS_NewString(ctx, expat_version));
 
     JSValue gc = JS_NewObjectProto(ctx, JS_NULL);
     JS_SetPropertyFunctionList(ctx, gc, tjs_gc_funcs, countof(tjs_gc_funcs));

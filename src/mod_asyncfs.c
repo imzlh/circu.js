@@ -312,7 +312,7 @@ static JSValue tjs_new_statfs(JSContext *ctx, uv_statfs_t *st) {
         return obj;
     }
 
-#define DEF_FIELD(x) JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->f_##x), JS_PROP_C_W_E);
+#define DEF_FIELD(x) JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, (int64_t) st->f_##x), JS_PROP_C_W_E);
     DEF_FIELD(type);
     DEF_FIELD(bsize);
     DEF_FIELD(blocks);

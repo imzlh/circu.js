@@ -11,6 +11,9 @@
  * const { nread, addr } = await sock.recv(buffer);
  */
 declare namespace CModuleUDP {
+    export type AddressInfo = CModuleStreams.AddressInfo;
+    export type Address = { ip: string; port: number };
+
     /**
      * UDP socket object
      */
@@ -31,7 +34,7 @@ declare namespace CModuleUDP {
             /** Partial data flag */
             readonly partial: boolean;
             /** Sender address info */
-            readonly addr: Record<string, any>;
+            readonly addr: AddressInfo;
         }>;
 
         /**
@@ -40,7 +43,7 @@ declare namespace CModuleUDP {
          * @param addr Target address object
          * @returns Sent data length
          */
-        send(buffer: Uint8Array, addr?: Record<string, any>): Promise<number>;
+        send(buffer: Uint8Array, addr?: Address): Promise<number>;
 
         /**
          * Get file descriptor (synchronous)
@@ -52,26 +55,31 @@ declare namespace CModuleUDP {
          * Get socket name (synchronous, wraps uv_udp_getsockname)
          * @returns Socket name object
          */
-        getsockname(): Record<string, any>;
+        getsockname(): AddressInfo;
 
         /**
          * Get peer name (synchronous, wraps uv_udp_getpeername)
          * @returns Peer name object
          */
-        getpeername(): Record<string, any>;
+        getpeername(): AddressInfo;
 
         /**
          * Connect to address (synchronous, wraps uv_udp_connect)
          * @param addr Address object
          */
-        connect(addr: Record<string, any>): void;
+        connect(addr: Address): void;
+
+        /**
+         * Disconnect the default UDP peer (synchronous, wraps uv_udp_connect(NULL))
+         */
+        disconnect(): void;
 
         /**
          * Bind to address (synchronous, wraps uv_udp_bind)
          * @param addr Address object
          * @param flags Bind flags (optional)
          */
-        bind(addr: Record<string, any>, flags?: number): void;
+        bind(addr: Address, flags?: number): void;
 
         readonly [Symbol.toStringTag]: 'UDP';
     }

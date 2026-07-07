@@ -7,6 +7,7 @@
  *
  * @example
  * const wasm = import.meta.use('wasm');
+ * if (!wasm) throw new Error('wasm module is unavailable');
  *
  * // Parse module
  * const module = wasm.parseModule(bytes);
@@ -33,13 +34,13 @@
  */
 declare namespace CModuleWASM {
     // Error types
-    type WasmErrorName = 'CompileError' | 'LinkError' | 'RuntimeError' | 'RangeError';
+    export type WasmErrorName = 'CompileError' | 'LinkError' | 'RuntimeError' | 'RangeError';
 
     /**
      * Module object - represents a parsed WebAssembly module
      * Created via parseModule(), not a constructor
      */
-    interface Module {
+    export interface Module {
         /** Opaque handle - do not access directly */
         readonly _opaque: unique symbol;
     }
@@ -48,44 +49,49 @@ declare namespace CModuleWASM {
      * Instance object - represents a WebAssembly instance
      * Created via buildInstance(), not a constructor
      */
-    interface Instance {
+    export interface Instance {
         /**
          * Call an exported function by name
          * @param name The exported function name
          * @param args Arguments to pass to the function
          * @returns The function result (or array of results for multi-return)
          */
-        callFunction(name: string, ...args: WasmValue[]): WasmValue | WasmValue[];
+        callFunction(name: string, ...args: WasmFunctionArgument[]): WasmFunctionResult;
 
         /** Opaque handle - do not access directly */
         readonly _opaque: unique symbol;
     }
 
     // WebAssembly value types
-    type WasmValue = number | bigint;
+    export type WasmValue = number | bigint;
+    export type WasmExternRef = null | undefined | object | string | number | boolean | bigint | symbol;
+    export type WasmFunctionArgument = WasmValue | WasmExternRef;
+    export type WasmFunctionResult = WasmValue | WasmExternRef | WasmFunctionResult[] | undefined;
+    export type WasmGlobalValue = WasmValue | WasmExternRef | ArrayBuffer | ArrayBufferView;
+    export type WasmTableValue = number | null | WasmExternRef;
 
     // Export descriptor from moduleExports()
-    interface ModuleExportDescriptor {
+    export interface ModuleExportDescriptor {
         name: string;
         kind: 'function' | 'table' | 'memory' | 'global';
     }
 
     // Import descriptor from moduleImports()
-    interface ModuleImportDescriptor {
+    export interface ModuleImportDescriptor {
         module: string;
         name: string;
         kind: 'function' | 'table' | 'memory' | 'global';
     }
 
     // Import function descriptor for resolveImports()
-    interface ImportFunctionDescriptor {
+    export interface ImportFunctionDescriptor {
         module: string;
         name: string;
         func: (...args: WasmValue[]) => WasmValue | void;
     }
 
     // Global import descriptor for resolveGlobalImports()
-    interface GlobalImportDescriptor {
+    export interface GlobalImportDescriptor {
         module: string;
         name: string;
         value: number | bigint;
@@ -94,7 +100,7 @@ declare namespace CModuleWASM {
     }
 
     // Table import descriptor for resolveTableImports()
-    interface TableImportDescriptor {
+    export interface TableImportDescriptor {
         module: string;
         name: string;
         element: 'funcref' | 'externref';
@@ -103,7 +109,7 @@ declare namespace CModuleWASM {
     }
 
     // Memory import descriptor for resolveMemoryImports()
-    interface MemoryImportDescriptor {
+    export interface MemoryImportDescriptor {
         module: string;
         name: string;
         initial: number;
@@ -111,25 +117,25 @@ declare namespace CModuleWASM {
     }
 
     // Global info from getGlobalInfo()
-    interface GlobalInfo {
+    export interface GlobalInfo {
         type: 'i32' | 'i64' | 'f32' | 'f64' | 'externref' | 'funcref' | 'unknown';
         mutable: boolean;
     }
 
     // Table info from getTableInfo()
-    interface TableInfo {
+    export interface TableInfo {
         element: 'funcref' | 'externref' | 'unknown';
         cur_size: number;
         max_size: number;
     }
 
     // WASI environment variables
-    interface WasiEnv {
+    export interface WasiEnv {
         [key: string]: string;
     }
 
     // WASI preopens (directory mappings)
-    interface WasiPreopens {
+    export interface WasiPreopens {
         [guestPath: string]: string;
     }
 
@@ -143,29 +149,29 @@ declare namespace CModuleWASM {
      * @returns Parsed Module object
      * @throws CompileError if parsing fails
      */
-    function parseModule(buffer: ArrayBuffer | ArrayBufferView): Module;
+    export function parseModule(buffer: ArrayBuffer | ArrayBufferView): Module;
 
     /**
      * Get the content of a custom section by name
      * @param module The Module to inspect
      * @param sectionName The name of the custom section
-     * @returns ArrayBuffer containing the section content, or null if not found
+     * @returns First matching section content, or null if not found
      */
-    function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer | null;
+    export function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer | null;
 
     /**
      * Get list of exports from a Module
      * @param module The Module to inspect
      * @returns Array of export descriptors
      */
-    function moduleExports(module: Module): ModuleExportDescriptor[];
+    export function moduleExports(module: Module): ModuleExportDescriptor[];
 
     /**
      * Get list of imports from a Module
      * @param module The Module to inspect
      * @returns Array of import descriptors
      */
-    function moduleImports(module: Module): ModuleImportDescriptor[];
+    export function moduleImports(module: Module): ModuleImportDescriptor[];
 
     /**
      * Resolve function imports for a Module
@@ -174,7 +180,7 @@ declare namespace CModuleWASM {
      * @param importDescs Array of import function descriptors
      * @throws LinkError if resolution fails
      */
-    function resolveImports(module: Module, importDescs: ImportFunctionDescriptor[]): void;
+    export function resolveImports(module: Module, importDescs: ImportFunctionDescriptor[]): void;
 
     /**
      * Resolve global imports for a Module
@@ -183,7 +189,7 @@ declare namespace CModuleWASM {
      * @param globalDescs Array of global import descriptors
      * @throws LinkError if resolution fails
      */
-    function resolveGlobalImports(module: Module, globalDescs: GlobalImportDescriptor[]): void;
+    export function resolveGlobalImports(module: Module, globalDescs: GlobalImportDescriptor[]): void;
 
     /**
      * Resolve table imports for a Module
@@ -194,7 +200,7 @@ declare namespace CModuleWASM {
      * @throws TypeError if element type is invalid
      * @throws RangeError if size constraints are invalid
      */
-    function resolveTableImports(module: Module, tableDescs: TableImportDescriptor[]): void;
+    export function resolveTableImports(module: Module, tableDescs: TableImportDescriptor[]): void;
 
     /**
      * Resolve memory imports for a Module
@@ -204,7 +210,7 @@ declare namespace CModuleWASM {
      * @throws LinkError if resolution fails
      * @throws RangeError if size constraints are invalid
      */
-    function resolveMemoryImports(module: Module, memoryDescs: MemoryImportDescriptor[]): void;
+    export function resolveMemoryImports(module: Module, memoryDescs: MemoryImportDescriptor[]): void;
 
     /**
      * Set WASI options for a Module
@@ -214,9 +220,9 @@ declare namespace CModuleWASM {
      * @param env Environment variables
      * @param preopens Directory mappings { guestPath: hostPath }
      */
-    function setWasiOptions(
+    export function setWasiOptions(
         module: Module,
-        args: string[],
+        args: string[] | null,
         env: WasiEnv | null,
         preopens: WasiPreopens | null
     ): void;
@@ -228,23 +234,24 @@ declare namespace CModuleWASM {
      * @returns New Instance object
      * @throws LinkError if instantiation fails
      */
-    function buildInstance(module: Module): Instance;
+    export function buildInstance(module: Module): Instance;
 
     /**
      * Validate a WebAssembly binary
-     * @param buffer ArrayBuffer or TypedArray containing WASM binary
+     * @param buffer Uint8Array containing WASM binary
      * @returns true if valid, false otherwise
      */
-    function validate(buffer: ArrayBuffer | ArrayBufferView): boolean;
+    export function validate(buffer: Uint8Array): boolean;
 
     /**
      * Set the WAMR execution stack size used by subsequently created instances.
      * Existing instances keep their original stack size.
+     * Valid range is 16 KiB through 64 MiB.
      */
-    function setStackSize(bytes: number): void;
+    export function setStackSize(bytes: number): void;
 
     /** Get the WAMR execution stack size used for new instances. */
-    function getStackSize(): number;
+    export function getStackSize(): number;
 
     // ============================================
     // Instance functions
@@ -252,29 +259,35 @@ declare namespace CModuleWASM {
 
     /**
      * Get the memory buffer from an Instance
+     *
+     * The returned ArrayBuffer is a live view over WAMR linear memory. It is
+     * detached when growMemory() or an internal memory.grow moves the memory.
+     * Request a fresh buffer after any call that may grow memory.
+     *
      * @param instance The Instance to get memory from
      * @returns ArrayBuffer backed by WASM linear memory
      * @throws RuntimeError if no memory instance
      */
-    function getMemoryBuffer(instance: Instance): ArrayBuffer;
+    export function getMemoryBuffer(instance: Instance): ArrayBuffer;
 
     /**
      * Grow the memory of an Instance
      * @param instance The Instance to grow memory for
      * @param delta Number of pages to grow (65536 bytes per page)
-     * @returns Previous page count, or -1 on failure
+     * @returns Previous page count
      * @throws RuntimeError if no memory instance
+     * @throws RangeError if memory cannot grow
      */
-    function growMemory(instance: Instance, delta: number): number;
+    export function growMemory(instance: Instance, delta: number): number;
 
     /**
      * Get a global value from an Instance
      * @param instance The Instance to get global from
      * @param name The exported global name
-     * @returns The global value
+     * @returns The global value; externref can be any JS value, v128 is a copied 16-byte Uint8Array
      * @throws RuntimeError if global not found
      */
-    function getGlobal(instance: Instance, name: string): WasmValue;
+    export function getGlobal(instance: Instance, name: string): WasmGlobalValue;
 
     /**
      * Set a global value on an Instance
@@ -284,7 +297,7 @@ declare namespace CModuleWASM {
      * @throws RuntimeError if global not found
      * @throws TypeError if global is immutable
      */
-    function setGlobal(instance: Instance, name: string, value: WasmValue): void;
+    export function setGlobal(instance: Instance, name: string, value: WasmGlobalValue): void;
 
     /**
      * Get info about a global in an Instance
@@ -293,7 +306,7 @@ declare namespace CModuleWASM {
      * @returns Global info object
      * @throws RuntimeError if global not found
      */
-    function getGlobalInfo(instance: Instance, name: string): GlobalInfo;
+    export function getGlobalInfo(instance: Instance, name: string): GlobalInfo;
 
     // ============================================
     // Table functions
@@ -306,7 +319,7 @@ declare namespace CModuleWASM {
      * @returns Table info object
      * @throws RuntimeError if table not found
      */
-    function getTableInfo(instance: Instance, name: string): TableInfo;
+    export function getTableInfo(instance: Instance, name: string): TableInfo;
 
     /**
      * Get the size of a table
@@ -315,7 +328,7 @@ declare namespace CModuleWASM {
      * @returns Current table size
      * @throws RuntimeError if table not found
      */
-    function tableSize(instance: Instance, name: string): number;
+    export function tableSize(instance: Instance, name: string): number;
 
     /**
      * Get an element from a table
@@ -326,7 +339,7 @@ declare namespace CModuleWASM {
      * @throws RuntimeError if table not found
      * @throws RangeError if index out of bounds
      */
-    function tableGet(instance: Instance, name: string, index: number): number | null | unknown;
+    export function tableGet(instance: Instance, name: string, index: number): WasmTableValue;
 
     /**
      * Set an element in a table
@@ -337,7 +350,7 @@ declare namespace CModuleWASM {
      * @throws RuntimeError if table not found
      * @throws RangeError if index out of bounds
      */
-    function tableSet(instance: Instance, name: string, index: number, value: number | null | unknown): void;
+    export function tableSet(instance: Instance, name: string, index: number, value: WasmTableValue): void;
 
     /**
      * Grow a table
@@ -347,7 +360,7 @@ declare namespace CModuleWASM {
      * @returns Previous table size, or -1 on failure
      * @throws RuntimeError if table not found
      */
-    function tableGrow(instance: Instance, name: string, delta: number): number;
+    export function tableGrow(instance: Instance, name: string, delta: number): number;
 
     // ============================================
     // Function index functions (for funcref tables)
@@ -359,7 +372,7 @@ declare namespace CModuleWASM {
      * @param name The exported function name
      * @returns Function index, or -1 if not found
      */
-    function getFuncIndex(instance: Instance, name: string): number;
+    export function getFuncIndex(instance: Instance, name: string): number;
 
     /**
      * Call a function by index (for funcref table entries)
@@ -369,5 +382,5 @@ declare namespace CModuleWASM {
      * @returns Function result
      * @throws RuntimeError if function index out of bounds
      */
-    function callFuncByIndex(instance: Instance, funcIndex: number, ...args: WasmValue[]): WasmValue | WasmValue[];
+    export function callFuncByIndex(instance: Instance, funcIndex: number, ...args: WasmFunctionArgument[]): WasmFunctionResult;
 }

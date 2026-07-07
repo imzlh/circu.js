@@ -62,6 +62,7 @@
     #else
     #include <pty.h>
     #endif
+    extern char **environ;
 #endif
 
 
@@ -108,6 +109,7 @@ typedef struct {
     bool finalized;
     uv_process_t process;  /* normal mode only */
     JSValue stdio[3];      /* normal mode: stdin/stdout/stderr Pipe objects */
+    JSValue stdio_extra;   /* normal mode: extra fd pipes, indexed by fd */
     JSValue ipc_pipe;      /* IPC channel pipe (fd 3) */
     struct {
         bool    exited;
@@ -189,10 +191,114 @@ static char **parse_env_obj(JSContext *ctx, JSValue js_env) {
     return env;
 }
 
+static char **empty_env(JSContext *ctx) {
+    return js_mallocz(ctx, sizeof(char *));
+}
+
 static void free_env(JSContext *ctx, char **env) {
     if (!env) return;
     for (int i = 0; env[i]; i++) js_free(ctx, env[i]);
     js_free(ctx, env);
+}
+
+static __maybe_unused int ensure_stdio_capacity(JSContext *ctx, uv_process_options_t *options, uv_stdio_container_t stdio[3], uv_stdio_container_t **stdio_heap, int count) {
+    if ((int)options->stdio_count >= count) return 0;
+    uv_stdio_container_t *new_stdio = js_malloc(ctx, sizeof(*new_stdio) * count);
+    if (!new_stdio) return -1;
+    memcpy(new_stdio, options->stdio, sizeof(*new_stdio) * options->stdio_count);
+    for (int i = (int)options->stdio_count; i < count; i++) {
+        new_stdio[i].flags = UV_IGNORE;
+    }
+    if (*stdio_heap) js_free(ctx, *stdio_heap);
+    *stdio_heap = new_stdio;
+    options->stdio = new_stdio;
+    options->stdio_count = count;
+    (void)stdio;
+    return 0;
+}
+
+static int setup_extra_stdio(JSContext *ctx, TJSProcess *p, uv_process_options_t *options, uv_stdio_container_t stdio[3], uv_stdio_container_t **stdio_heap, JSValue js_extra) {
+    if (!JS_IsArray(js_extra)) return 0;
+
+    JSValue js_len = JS_GetPropertyStr(ctx, js_extra, "length");
+    uint64_t extra_len;
+    if (JS_ToIndex(ctx, &extra_len, js_len)) {
+        JS_FreeValue(ctx, js_len);
+        return -1;
+    }
+    JS_FreeValue(ctx, js_len);
+    if (extra_len == 0) return 0;
+    if (extra_len > 253) {
+        JS_ThrowRangeError(ctx, "stdioExtra cannot contain more than 253 entries");
+        return -1;
+    }
+
+    int stdio_count = (int)extra_len + 3;
+    if (ensure_stdio_capacity(ctx, options, stdio, stdio_heap, stdio_count) < 0) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+
+    p->stdio_extra = JS_NewArray(ctx);
+    if (JS_IsException(p->stdio_extra)) return -1;
+    for (int fd = 0; fd < stdio_count; fd++) {
+        JS_SetPropertyUint32(ctx, p->stdio_extra, (uint32_t)fd, JS_NULL);
+    }
+
+    for (uint64_t i = 0; i < extra_len; i++) {
+        uint32_t fd = (uint32_t)i + 3;
+        JSValue item = JS_GetPropertyUint32(ctx, js_extra, (uint32_t)i);
+        if (JS_IsException(item)) return -1;
+        if (JS_IsUndefined(item) || JS_IsNull(item)) {
+            JS_FreeValue(ctx, item);
+            continue;
+        }
+
+        if (JS_IsNumber(item)) {
+            int32_t inherited_fd;
+            if (JS_ToInt32(ctx, &inherited_fd, item)) {
+                JS_FreeValue(ctx, item);
+                return -1;
+            }
+            options->stdio[fd].flags = UV_INHERIT_FD;
+            options->stdio[fd].data.fd = inherited_fd;
+            JS_FreeValue(ctx, item);
+            continue;
+        }
+
+        const char *mode = JS_ToCString(ctx, item);
+        JS_FreeValue(ctx, item);
+        if (!mode) return -1;
+
+        if (strcmp(mode, "pipe") == 0) {
+            JSValue pipe_obj = tjs_new_pipe(ctx);
+            if (JS_IsException(pipe_obj)) {
+                JS_FreeCString(ctx, mode);
+                return -1;
+            }
+            options->stdio[fd].flags = UV_CREATE_PIPE | UV_READABLE_PIPE | UV_WRITABLE_PIPE;
+            options->stdio[fd].data.stream = tjs_pipe_get_stream(ctx, pipe_obj);
+            if (!options->stdio[fd].data.stream) {
+                JS_FreeValue(ctx, pipe_obj);
+                JS_FreeCString(ctx, mode);
+                JS_ThrowInternalError(ctx, "failed to create extra stdio pipe");
+                return -1;
+            }
+            JS_SetPropertyUint32(ctx, p->stdio_extra, fd, pipe_obj);
+        } else if (strcmp(mode, "ignore") == 0) {
+            options->stdio[fd].flags = UV_IGNORE;
+        } else if (strcmp(mode, "inherit") == 0) {
+            options->stdio[fd].flags = UV_INHERIT_FD;
+            options->stdio[fd].data.fd = (int)fd;
+        } else {
+            JS_ThrowRangeError(ctx, "unsupported stdioExtra entry: %s", mode);
+            JS_FreeCString(ctx, mode);
+            return -1;
+        }
+        JS_FreeCString(ctx, mode);
+    }
+
+    return 0;
 }
 
 /* Build a NULL-terminated argv array from a JS array.  Uses js_malloc / js_strdup. */
@@ -216,6 +322,14 @@ static char **parse_argv_arr(JSContext *ctx, JSValue js_arr, int *len_out) {
     }
     *len_out = n;
     return arr;
+}
+
+static bool bool_prop(JSContext *ctx, JSValue obj, const char *name) {
+    if (!JS_IsObject(obj)) return false;
+    JSValue val = JS_GetPropertyStr(ctx, obj, name);
+    bool ret = JS_ToBool(ctx, val) == 1;
+    JS_FreeValue(ctx, val);
+    return ret;
 }
 
 static void free_str_arr(JSContext *ctx, char **arr, int len) {
@@ -272,6 +386,7 @@ static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
     p->obj = JS_UNDEFINED;
     TJS_FreePromiseRT(rt, &p->status.result);
     for (int i = 0; i < 3; i++) JS_FreeValueRT(rt, p->stdio[i]);
+    JS_FreeValueRT(rt, p->stdio_extra);
     JS_FreeValueRT(rt, p->ipc_pipe);
 
     if (p->pty_mode) {
@@ -297,6 +412,7 @@ static void tjs_process_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func)
     JS_MarkValue(rt, p->obj, mark_func);
     TJS_MarkPromise(rt, &p->status.result, mark_func);
     for (int i = 0; i < 3; i++) JS_MarkValue(rt, p->stdio[i], mark_func);
+    JS_MarkValue(rt, p->stdio_extra, mark_func);
     JS_MarkValue(rt, p->ipc_pipe, mark_func);
     if (p->pty_mode) {
         JS_MarkValue(rt, p->pty_readable, mark_func);
@@ -323,7 +439,7 @@ static JSClassDef tjs_process_class = {
 static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
                                const char *name, const char *cwd,
                                char **env_arr, char **argv_arr, int argc_val,
-                               int cols, int rows) {
+                               int cols, int rows, bool clear_env) {
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_col = (unsigned short)cols;
@@ -356,6 +472,7 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
         if (dup2(slave_fd, STDERR_FILENO) < 0) _exit(1);
         if (slave_fd > STDERR_FILENO) close(slave_fd);
         if (cwd && chdir(cwd) < 0) _exit(1);
+        if (clear_env) environ = NULL;
         if (env_arr) {
             for (int i = 0; env_arr[i]; i++) {
                 char *eq = strchr(env_arr[i], '=');
@@ -784,6 +901,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     TJSSpawnSyncBuf out = { 0 }, err = { 0 };
     char **env_arr = NULL;
     char *cwd = NULL;
+    bool clear_env = bool_prop(ctx, opts, "clearEnv");
 
     if (pipe_in && pipe(in_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
     if (cap_out && pipe(out_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
@@ -799,6 +917,10 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         JSValue v = JS_GetPropertyStr(ctx, opts, "env");
         if (JS_IsObject(v)) env_arr = parse_env_obj(ctx, v);
         JS_FreeValue(ctx, v);
+        if (clear_env && !env_arr) {
+            env_arr = empty_env(ctx);
+            if (!env_arr) goto cleanup;
+        }
         v = JS_GetPropertyStr(ctx, opts, "cwd");
         if (JS_IsString(v)) {
             const char *s = JS_ToCString(ctx, v);
@@ -832,6 +954,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         if (err_pipe[0] != -1) close(err_pipe[0]);
         if (err_pipe[1] != -1) close(err_pipe[1]);
         if (cwd && chdir(cwd) < 0) _exit(127);
+        if (clear_env) environ = NULL;
         if (env_arr) {
             for (int i = 0; env_arr[i]; i++) {
                 char *eq = strchr(env_arr[i], '=');
@@ -1019,14 +1142,14 @@ fail:
 
 static WCHAR *spawn_sync_build_win_env(JSContext *ctx, char **env) {
     if (!env) return NULL;
-    int total = 1;
+    int total = 2;
     for (int i = 0; env[i]; i++) {
         int len = MultiByteToWideChar(CP_UTF8, 0, env[i], -1, NULL, 0);
         if (len <= 0) return NULL;
         if (total > INT_MAX - len) return NULL;
         total += len;
     }
-    WCHAR *wenv = js_malloc(ctx, sizeof(WCHAR) * total);
+    WCHAR *wenv = js_mallocz(ctx, sizeof(WCHAR) * total);
     if (!wenv) return NULL;
     WCHAR *p = wenv;
     for (int i = 0; env[i]; i++) {
@@ -1072,6 +1195,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     char **env_arr = NULL;
     JSValue ret = JS_EXCEPTION;
     bool spawned = false;
+    bool clear_env = bool_prop(ctx, opts, "clearEnv");
 
     if (pipe_in && !CreatePipe(&in_r, &in_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdin) failed: %lu", GetLastError()); goto cleanup; }
     if (cap_out && !CreatePipe(&out_r, &out_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdout) failed: %lu", GetLastError()); goto cleanup; }
@@ -1100,6 +1224,12 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
             if (env_arr && !wenv) { JS_FreeValue(ctx, v); JS_ThrowOutOfMemory(ctx); goto cleanup; }
         }
         JS_FreeValue(ctx, v);
+        if (clear_env && !env_arr) {
+            env_arr = empty_env(ctx);
+            if (!env_arr) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
+            wenv = spawn_sync_build_win_env(ctx, env_arr);
+            if (!wenv) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
+        }
     }
 
     si.cb = sizeof(si);
@@ -1222,6 +1352,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     p->stdio[0]      = JS_UNDEFINED;
     p->stdio[1]      = JS_UNDEFINED;
     p->stdio[2]      = JS_UNDEFINED;
+    p->stdio_extra   = JS_UNDEFINED;
     p->ipc_pipe      = JS_UNDEFINED;
     p->pty_readable  = JS_UNDEFINED;
     p->pty_writable  = JS_UNDEFINED;
@@ -1249,6 +1380,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         char **env_arr = NULL, **argv_arr = NULL;
         int argv_len = 0;
         int cols, rows;
+        bool clear_env = bool_prop(ctx, opts, "clearEnv");
         parse_winsize(ctx, opts, &cols, &rows);
         p->pty_cols = cols; p->pty_rows = rows;
 
@@ -1275,7 +1407,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 #ifdef _WIN32
         err = pty_win_spawn(p, ctx, name, cwd, env_arr, cols, rows);
 #else
-        err = pty_unix_spawn(p, ctx, name, cwd, env_arr, argv_arr, argv_len, cols, rows);
+        err = pty_unix_spawn(p, ctx, name, cwd, env_arr, argv_arr, argv_len, cols, rows, clear_env);
 #endif
         if (name) JS_FreeCString(ctx, name);
         if (cwd)  JS_FreeCString(ctx, cwd);
@@ -1296,7 +1428,8 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     JSValue ret = JS_EXCEPTION;
     uv_process_options_t options;
     memset(&options, 0, sizeof(options));
-    uv_stdio_container_t *ipc_stdio = NULL;
+    uv_stdio_container_t *stdio_heap = NULL;
+    int ipc_child_fd = -1;
 #ifdef _WIN32
     options.flags = UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME;
 #endif
@@ -1317,6 +1450,10 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         JSValue js_env = JS_GetPropertyStr(ctx, arg1, "env");
         if (JS_IsObject(js_env)) options.env = parse_env_obj(ctx, js_env);
         JS_FreeValue(ctx, js_env);
+        if (bool_prop(ctx, arg1, "clearEnv") && !options.env) {
+            options.env = empty_env(ctx);
+            if (!options.env) goto fail;
+        }
 
         JSValue js_cwd = JS_GetPropertyStr(ctx, arg1, "cwd");
         if (!JS_IsUndefined(js_cwd) && !JS_IsException(js_cwd)) {
@@ -1347,9 +1484,30 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         SETUP_STDIO(stdout, 1, UV_WRITABLE_PIPE, STDOUT_FILENO);
         SETUP_STDIO(stderr, 2, UV_WRITABLE_PIPE, STDERR_FILENO);
 
+        JSValue js_stdio_extra = JS_GetPropertyStr(ctx, arg1, "stdioExtra");
+        if (!JS_IsException(js_stdio_extra) && !JS_IsUndefined(js_stdio_extra)) {
+            if (setup_extra_stdio(ctx, p, &options, stdio, &stdio_heap, js_stdio_extra) < 0) {
+                JS_FreeValue(ctx, js_stdio_extra);
+                goto fail;
+            }
+        }
+        JS_FreeValue(ctx, js_stdio_extra);
+
         // Check for IPC option
         JSValue js_ipc = JS_GetPropertyStr(ctx, arg1, "ipc");
         if (JS_ToBool(ctx, js_ipc) || (JS_IsNumber(js_ipc) && JS_ToBool(ctx, js_ipc))) {
+            uint32_t ipc_fd = 3;
+            JSValue js_ipc_fd = JS_GetPropertyStr(ctx, arg1, "ipcFd");
+            if (!JS_IsUndefined(js_ipc_fd) && !JS_IsException(js_ipc_fd)) {
+                if (JS_ToUint32(ctx, &ipc_fd, js_ipc_fd) || ipc_fd > 255) {
+                    JS_FreeValue(ctx, js_ipc_fd);
+                    JS_FreeValue(ctx, js_ipc);
+                    JS_ThrowRangeError(ctx, "ipcFd must be an integer between 0 and 255");
+                    goto fail;
+                }
+            }
+            JS_FreeValue(ctx, js_ipc_fd);
+
             // Create IPC pipe pair
             int ipc_fds[2];
 #ifdef _WIN32
@@ -1379,20 +1537,28 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
                 uv_pipe_open(pipe, ipc_fds[0]);
             }
 
-            // Add the write end to the child's stdio as fd 3
-            uv_stdio_container_t *new_stdio = js_malloc(ctx, sizeof(uv_stdio_container_t) * 4);
-            if (!new_stdio) {
-                close(ipc_fds[1]);
-                JS_ThrowOutOfMemory(ctx);
-                JS_FreeValue(ctx, js_ipc);
-                goto fail;
+            // Add the peer endpoint to the child's requested stdio fd. Node's
+            // child_process allows "ipc" at any stdio array index.
+            ipc_child_fd = ipc_fds[1];
+            if (ipc_fd < 3) {
+                JS_FreeValue(ctx, p->stdio[ipc_fd]);
+                p->stdio[ipc_fd] = JS_UNDEFINED;
+                stdio[ipc_fd].flags = UV_INHERIT_FD;
+                stdio[ipc_fd].data.fd = ipc_child_fd;
+            } else {
+                if (ensure_stdio_capacity(ctx, &options, stdio, &stdio_heap, (int)ipc_fd + 1) < 0) {
+                    close(ipc_fds[1]);
+                    ipc_child_fd = -1;
+                    JS_ThrowOutOfMemory(ctx);
+                    JS_FreeValue(ctx, js_ipc);
+                    goto fail;
+                }
+                if (!JS_IsUndefined(p->stdio_extra)) {
+                    JS_SetPropertyUint32(ctx, p->stdio_extra, ipc_fd, JS_NULL);
+                }
+                options.stdio[ipc_fd].flags = UV_INHERIT_FD;
+                options.stdio[ipc_fd].data.fd = ipc_child_fd;
             }
-            memcpy(new_stdio, stdio, sizeof(uv_stdio_container_t) * 3);
-            new_stdio[3].flags = UV_INHERIT_FD;
-            new_stdio[3].data.fd = ipc_fds[1];
-            options.stdio = new_stdio;
-            options.stdio_count = 4;
-            ipc_stdio = new_stdio;
 
             // Store write fd info for cleanup
             // Note: we'll close it after spawn
@@ -1413,9 +1579,10 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     int r = uv_spawn(tjs_get_loop(ctx), &p->process, &options);
     if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
 
-    // Close write end of IPC pipe in parent (child owns it now)
-    if (options.stdio_count > 3) {
-        close(options.stdio[3].data.fd);
+    // Close child endpoint of IPC pipe in parent (child owns it now)
+    if (ipc_child_fd >= 0) {
+        close(ipc_child_fd);
+        ipc_child_fd = -1;
     }
 
     JS_SetOpaque(obj, p);
@@ -1424,7 +1591,10 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     goto cleanup;
 
 fail:
+    if (ipc_child_fd >= 0) close(ipc_child_fd);
     for (int i = 0; i < 3; i++) { JS_FreeValue(ctx, p->stdio[i]); p->stdio[i] = JS_UNDEFINED; }
+    JS_FreeValue(ctx, p->stdio_extra);
+    p->stdio_extra = JS_UNDEFINED;
     JS_FreeValue(ctx, p->ipc_pipe);
     p->ipc_pipe = JS_UNDEFINED;
     tjs__free(p);
@@ -1433,7 +1603,7 @@ cleanup:
     tjs__free_args(ctx, options.args);
     free_env(ctx, (char **)options.env);
     if (options.cwd) js_free(ctx, (void *)options.cwd);
-    if (ipc_stdio) js_free(ctx, ipc_stdio);
+    if (stdio_heap) js_free(ctx, stdio_heap);
     return ret;
 }
 #undef SETUP_STDIO
@@ -1456,6 +1626,13 @@ static JSValue tjs_process_stdio_get(JSContext *ctx, JSValue this_val, int magic
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p) return JS_EXCEPTION;
     return JS_DupValue(ctx, p->stdio[magic]);
+}
+
+static JSValue tjs_process_stdio_extra_get(JSContext *ctx, JSValue this_val) {
+    TJSProcess *p = tjs_process_get(ctx, this_val);
+    if (!p) return JS_EXCEPTION;
+    if (JS_IsUndefined(p->stdio_extra)) return JS_NULL;
+    return JS_DupValue(ctx, p->stdio_extra);
 }
 
 /* IPC pipe getter */
@@ -1673,6 +1850,7 @@ static const JSCFunctionListEntry tjs_process_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("stdin",  tjs_process_stdio_get,   NULL, 0),
     JS_CGETSET_MAGIC_DEF("stdout", tjs_process_stdio_get,   NULL, 1),
     JS_CGETSET_MAGIC_DEF("stderr", tjs_process_stdio_get,   NULL, 2),
+    JS_CGETSET_DEF("stdioExtra",   tjs_process_stdio_extra_get, NULL),
     JS_CGETSET_DEF("ipc",         tjs_process_ipc_get,      NULL),
     JS_CGETSET_DEF("readable",    tjs_process_readable_get, NULL),
     JS_CGETSET_DEF("writable",    tjs_process_writable_get, NULL),

@@ -206,7 +206,12 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     fw->handle.data = fw;
 
-    r = uv_fs_event_start(&fw->handle, uv__fs_event_cb, path, UV_FS_EVENT_RECURSIVE);
+    int recursive = 0;
+    if (argc > 2) {
+        recursive = JS_ToBool(ctx, argv[2]);
+    }
+
+    r = uv_fs_event_start(&fw->handle, uv__fs_event_cb, path, recursive ? UV_FS_EVENT_RECURSIVE : 0);
     if (r != 0) {
         JS_FreeCString(ctx, path);
         /* handle is registered with the loop; close before freeing memory. */
@@ -237,7 +242,7 @@ static const JSCFunctionListEntry tjs_fswatch_proto_funcs[] = {
 };
 
 static const JSCFunctionListEntry tjs_fswatch_funcs[] = {
-    TJS_CFUNC_DEF("watch", 2, tjs_fs_watch),
+    TJS_CFUNC_DEF("watch", 3, tjs_fs_watch),
 };
 
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns) {

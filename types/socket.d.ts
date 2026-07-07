@@ -9,9 +9,9 @@
  */
 
 declare namespace CModuleSocket {
-    // ── Defines ───────────────────────────────────────────────────────────────────
+    // Defines
 
-    interface SocketDefines {
+    export interface SocketDefines {
         // Address families
         readonly AF_INET: number;
         readonly AF_INET6: number;
@@ -51,28 +51,28 @@ declare namespace CModuleSocket {
         readonly IPPROTO_UDP: number;
     }
 
-    interface UvPollEventBits {
+    export interface UvPollEventBits {
         readonly READABLE: number;
         readonly WRITABLE: number;
         readonly DISCONNECT: number;
         readonly PRIORITIZED: number;
     }
 
-    // ── Socket info ───────────────────────────────────────────────────────────────
+    // Socket info
 
-    interface SocketSockInfo {
+    export interface SocketSockInfo {
         type?: number;
         domain?: number;
         protocol?: number;
     }
 
-    interface SocketInfo {
+    export interface SocketInfo {
         socket?: SocketSockInfo;
     }
 
-    // ── recvmsg result ────────────────────────────────────────────────────────────
+    // recvmsg result
 
-    interface RecvMsgResult {
+    export interface RecvMsgResult {
         /** Sender address as raw sockaddr bytes */
         addr: Uint8Array;
         /** Received payload */
@@ -81,7 +81,7 @@ declare namespace CModuleSocket {
         control?: Uint8Array;
     }
 
-    // ── PosixSocket ───────────────────────────────────────────────────────────────
+    // PosixSocket
 
     /**
      * Thin wrapper around a POSIX/Winsock socket file descriptor.
@@ -123,7 +123,7 @@ declare namespace CModuleSocket {
          */
         constructor(domain: number, type: number, protocol: number);
 
-        // ── Connection lifecycle ──────────────────────────────────────────────────
+        // Connection lifecycle
 
         /** Bind to a local address (use {@link create_sockaddr_inet} to build the buffer). */
         bind(addr: Uint8Array): void;
@@ -131,7 +131,7 @@ declare namespace CModuleSocket {
         /**
          * Connect to a remote address.
          * On UDP sockets this only sets the default destination (no handshake),
-         * enabling {@link send} to work without an explicit address — a portable
+         * enabling {@link send} to work without an explicit address; a portable
          * alternative to `sendto`.
          */
         connect(addr: Uint8Array): void;
@@ -154,7 +154,7 @@ declare namespace CModuleSocket {
         /** Close the socket. Cannot be called from within a poll callback. */
         close(): void;
 
-        // ── I/O ──────────────────────────────────────────────────────────────────
+        // I/O
 
         /**
          * Receive up to `count` bytes.
@@ -191,7 +191,7 @@ declare namespace CModuleSocket {
             ...data: Uint8Array[]
         ): number;
 
-        // ── Options ───────────────────────────────────────────────────────────────
+        // Options
 
         /**
          * Set a socket option.
@@ -210,7 +210,7 @@ declare namespace CModuleSocket {
          */
         getopt(level: number, optname: number, optlen?: number): Uint8Array;
 
-        // ── Poll / event loop ─────────────────────────────────────────────────────
+        // Poll / event loop
 
         /**
          * Start polling for I/O readiness via libuv.
@@ -231,7 +231,7 @@ declare namespace CModuleSocket {
         /** Stop polling. Cannot be called from within the poll callback. */
         pollStop(): void;
 
-        // ── Getters ───────────────────────────────────────────────────────────────
+        // Getters
 
         /** `true` while a poll is active. */
         readonly polling: boolean;
@@ -249,11 +249,11 @@ declare namespace CModuleSocket {
      * Accepts IPv4 and IPv6 addresses.
      * @example
      * ```ts
-     * const addr = create_sockaddr_inet({ host: '127.0.0.1', port: 3000 });
+     * const addr = create_sockaddr_inet({ ip: '127.0.0.1', port: 3000 });
      * sock.connect(addr);
      * ```
      */
-    export function create_sockaddr_inet(addr: { host: string; port: number }): Uint8Array;
+    export function create_sockaddr_inet(addr: { ip: string; port: number }): Uint8Array;
 
     /**
      * Wrap an existing socket file descriptor.
@@ -276,7 +276,7 @@ declare namespace CModuleSocket {
     /** Size of `struct sockaddr` on this platform. */
     export const sizeof_struct_sockaddr: number;
 
-    /** Socket-related constants (`AF_*`, `SOCK_*`, `SO_*`, `IPPROTO_*`, …). */
+    /** Socket-related constants (`AF_*`, `SOCK_*`, `SO_*`, `IPPROTO_*`, etc.). */
     export const defines: SocketDefines;
 
     /** libuv poll event bit flags (`READABLE`, `WRITABLE`, `DISCONNECT`, `PRIORITIZED`). */

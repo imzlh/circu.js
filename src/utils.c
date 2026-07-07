@@ -170,6 +170,13 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
     if (JS_IsException(ret)) {
 		// alias to jobexception
 		JSValue err = JS_GetException(ctx);
+        if (JS_IsUncatchableError(err)) {
+            CHECK_NOT_NULL(trt);
+            TJS_Stop(trt);
+            JS_FreeValue(ctx, err);
+            JS_FreeValue(ctx, ret);
+            return;
+        }
 		JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
 		if (JS_IsEqual(ctx, retv, JS_FALSE)) {
 			CHECK_NOT_NULL(trt);

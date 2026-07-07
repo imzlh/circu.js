@@ -2,14 +2,20 @@
  * SQLite3 module - SQLite database operations
  * 
  * @example
+ * ```typescript
  * const sqlite3 = import.meta.use('sqlite3');
  * 
- * const db = sqlite3.open('test.db');
+ * const db = sqlite3.open('test.db', sqlite3.O_CREATE | sqlite3.O_READWRITE);
  * const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
  * const rows = stmt.all([1]);
  * db.close();
+ * ```
  */
 declare namespace CModuleSQLite3 {
+    export type SqliteValue = null | number | bigint | string | boolean | Uint8Array;
+    export type SqliteParams = SqliteValue[] | Record<string, SqliteValue>;
+    export type SqliteRow = Record<string, null | number | string | Uint8Array>;
+
     /**
      * SQLite3 database connection handle
      */
@@ -83,9 +89,13 @@ declare namespace CModuleSQLite3 {
 
         /**
          * Bind parameters without executing the statement.
+         *
+         * Passing no argument or undefined clears all bindings. Array parameters
+         * bind positionally from 1; object keys must match named parameters.
+         *
          * @param params Parameters to bind
          */
-        bind(params?: any): void;
+        bind(params?: SqliteParams): void;
 
         /**
          * Reset the statement cursor while preserving bindings.
@@ -95,25 +105,30 @@ declare namespace CModuleSQLite3 {
         /**
          * Execute the prepared statement and return all rows
          * @param params Optional parameters to bind
-         * @returns Array of rows
+         * If params is omitted, existing bindings are preserved.
+         *
+         * @returns Array of rows with a null prototype
          */
-        all(params?: any): any[];
+        all(params?: SqliteParams): SqliteRow[];
 
         /**
-         * Execute the prepared statement and return the result
+         * Execute one step of the prepared statement.
+         *
+         * If params is omitted, existing bindings are preserved. SELECT rows are
+         * not returned; use all() for queries.
+         *
          * @param params Optional parameters to bind
-         * @returns The result of the statement
          */
-        run(params?: any): any;
+        run(params?: SqliteParams): void;
     }
 
     /**
      * Open a SQLite3 database
      * @param filename Path to the database file
-     * @param flags Open flags
+     * @param flags Open flags. The native binding passes this directly to sqlite3_open_v2().
      * @returns A database connection handle
      */
-    export function open(filename: string, flags?: number): Sqlite3Handle;
+    export function open(filename: string, flags: number): Sqlite3Handle;
 
     /**
      * Open flags

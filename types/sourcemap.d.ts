@@ -5,12 +5,12 @@
  * const sourcemap = import.meta.use('sourcemap');
  * 
  * if (sourcemap.has('bundle.js')) {
- *   const result = sourcemap.get('bundle.js', 10, 5);
+ *   const result = sourcemap.getMapping('bundle.js', 10, 5);
  *   console.log(result.original_file, result.original_line);
  * }
  */
 declare namespace CModuleSourceMap {
-    interface MappingResult {
+    export interface MappingResult {
         /** Original file name */
         original_file: string;
         /** Original line number */
@@ -36,7 +36,7 @@ declare namespace CModuleSourceMap {
      * @param sourcemap_obj SourceMap object
      * @returns Operation result code
      */
-    export function load(file_path: string, sourcemap_obj: any): number;
+    export function load(file_path: string, sourcemap_obj: unknown): number;
 
     /**
      * Load SourceMap from JSON string
@@ -53,7 +53,7 @@ declare namespace CModuleSourceMap {
      * @param column Compiled code column number
      * @returns Mapping result object
      */
-    export function get(file_path: string, line: number, column: number): MappingResult;
+    export function getMapping(file_path: string, line: number, column: number): MappingResult;
 
     /**
      * Remove SourceMap for specified file

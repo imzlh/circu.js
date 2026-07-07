@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 /*
  * circu.js
  *
@@ -26,6 +30,9 @@
 #include "private.h"
 
 #include <ffi.h>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include <stdint.h>
 
 #define TJS_CONST_STRING_DEF(x) JS_PROP_STRING_DEF(#x, x, JS_PROP_ENUMERABLE)
@@ -793,6 +800,54 @@ static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
 #pragma region "UvLib class definition"
 
 static thread_local JSClassID js_uv_lib_classid;
+
+#if defined(__linux__)
+static uv_once_t js_ffi_loader_once = UV_ONCE_INIT;
+static uv_mutex_t js_ffi_loader_mutex;
+static bool js_ffi_loader_has_lmid;
+static Lmid_t js_ffi_loader_lmid;
+
+static void js_ffi_loader_init_once(void) {
+    uv_mutex_init(&js_ffi_loader_mutex);
+}
+
+static int js_ffi_dlopen_locked(const char *filename, uv_lib_t *lib, const char **errmsg) {
+    dlerror();
+    lib->errmsg = NULL;
+    Lmid_t lmid = js_ffi_loader_has_lmid ? js_ffi_loader_lmid : LM_ID_NEWLM;
+    lib->handle = dlmopen(lmid, filename, RTLD_LAZY | RTLD_LOCAL);
+    if (!lib->handle) {
+        *errmsg = dlerror();
+        return -1;
+    }
+    if (js_ffi_loader_has_lmid) {
+        return 0;
+    }
+    if (dlinfo(lib->handle, RTLD_DI_LMID, &js_ffi_loader_lmid) != 0) {
+        *errmsg = dlerror();
+        dlclose(lib->handle);
+        lib->handle = NULL;
+        return -1;
+    }
+    js_ffi_loader_has_lmid = true;
+    return 0;
+}
+
+static int js_ffi_dlopen(const char *filename, uv_lib_t *lib, const char **errmsg) {
+    uv_once(&js_ffi_loader_once, js_ffi_loader_init_once);
+    uv_mutex_lock(&js_ffi_loader_mutex);
+    int ret = js_ffi_dlopen_locked(filename, lib, errmsg);
+    uv_mutex_unlock(&js_ffi_loader_mutex);
+    return ret;
+}
+#else
+static int js_ffi_dlopen(const char *filename, uv_lib_t *lib, const char **errmsg) {
+    int ret = uv_dlopen(filename, lib);
+    *errmsg = ret == 0 ? NULL : uv_dlerror(lib);
+    return ret;
+}
+#endif
+
 static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJS_CHECK_ARG_RET(ctx, JS_IsString(argv[0]), 0, "string");
     JSValue obj = JS_NewObjectClass(ctx, js_uv_lib_classid);
@@ -810,10 +865,11 @@ static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSVa
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
-    int ret = uv_dlopen(dlname, lib);
+    const char *errmsg = NULL;
+    int ret = js_ffi_dlopen(dlname, lib, &errmsg);
     JS_FreeCString(ctx, dlname);
     if (ret != 0) {
-        JS_ThrowInternalError(ctx, "uv_dlopen failed: %s", uv_dlerror(lib));
+        JS_ThrowInternalError(ctx, "Deno.dlopen failed: %s", errmsg ? errmsg : uv_dlerror(lib));
         js_free(ctx, lib);
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;

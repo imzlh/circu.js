@@ -79,7 +79,7 @@ struct TJSRuntime {
     uv_async_t stop;
 
     bool is_worker;
-    int8_t exit_code;
+    int exit_code;
     struct list_head workers;
     struct list_head streams;
     struct list_head msgpipes;
@@ -162,6 +162,7 @@ typedef enum {
 } TJSEvents;
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
+void tjs__mod_bjson_init(JSContext *ctx, JSValue ns);
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
@@ -221,6 +222,7 @@ JSValue tjs__mod_list_init(JSContext* ctx);
 
 JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *opaque, JSValueConst attributes);
 char *tjs__module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque);
+char *tjs__module_normalizer_attr(JSContext *ctx, const char *base_name, const char *name, JSValueConst attributes, void *opaque);
 int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes);
 
 int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpath, bool is_main);

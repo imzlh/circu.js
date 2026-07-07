@@ -7,119 +7,22 @@
  * USAGE EXAMPLES
  * @example
  * ```ts
- * // Example 1: HTTPS Server with Pipe
- * const { Context, Pipe } = import.meta.use('ssl');
- * const { TCP } = import.meta.use('streams');
+ * const ssl = import.meta.use('ssl');
+ * const streams = import.meta.use('streams');
  *
- * const Context = new Context({
- *     mode: "server",
- *     cert: certPem,
- *     key: keyPem,
- *     alpn: ["h2", "http/1.1"]
- * });
+ * const ctx = new ssl.Context({ mode: 'client', verify: true });
+ * const tcp = new streams.TCP();
+ * await tcp.connect({ ip: '93.184.216.34', port: 443 });
  *
- * const server = new TCP();
- * server.bind("0.0.0.0", 8443);
- * server.listen(128);
+ * const pipe = new ssl.Pipe(ctx, { servername: 'example.com' });
+ * pipe.handshake();
+ * const hello = pipe.getOutput();
+ * if (hello) await tcp.write(hello);
  *
- * server.accept().then(conn => {
- *     const pipe = new Pipe(Context);
- *
- *     conn.read().then(data => {
- *         pipe.feed(data);
- *         pipe.handshake();
- *
- *         const output = pipe.getOutput();
- *         if (output) conn.write(output);
- *     });
- * });
- *
- * // Example 2: HTTPS Client
- * const { Context, Pipe } = import.meta.use('ssl');
- * const { TCP } = import.meta.use('streams');
- *
- * const Context2 = new Context({
- *     mode: "client",
- *     verify: true,
- *     ca: caPem
- * });
- *
- * const conn2 = new TCP();
- * await conn2.connect("example.com", 443);
- *
- * const pipe2 = new Pipe(Context2, { servername: "example.com" });
- *
- * // Start handshake
- * pipe2.handshake();
- * const handshake2 = pipe2.getOutput();
- * if (handshake2) await conn2.write(handshake2);
- *
- * // Complete handshake
- * while (!pipe2.handshakeComplete) {
- *     const response2 = await conn2.read();
- *     pipe2.feed(response2);
- *     pipe2.handshake();
- *
- *     const output2 = pipe2.getOutput();
- *     if (output2) await conn2.write(output2);
- * }
- *
- * // Send HTTP request
- * const request2 = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
- * pipe2.write(request2);
- * const encrypted2 = pipe2.getOutput();
- * await conn2.write(encrypted2);
- *
- * // Example 3: Generate Self-Signed Certificate
- * const { Context, Pipe } = import.meta.use('ssl');
- * const { TCP } = import.meta.use('streams');
- *
- * const { cert, key } = createSelfSignedCert({
- *     commonName: "localhost",
- *     days: 365
- * });
- *
- * const context3 = new Context({
- *     mode: "server",
- *     cert,
- *     key
- * });
- *
- * // Example 4: Inspect Peer Certificate
- * const pipe4 = new Pipe(clientContext, { servername: "example.com" });
- * // ... perform handshake ...
- *
- * if (pipe4.handshakeComplete) {
- *     const cert4 = pipe4.certificate;
- *     console.log("Subject:", cert4.subject);
- *     console.log("Issuer:", cert4.issuer);
- *     console.log("Valid:", cert4.validFrom, "to", cert4.validTo);
- *     console.log("SANs:", cert4.subjectAltNames);
- *     console.log("Fingerprint:", cert4.fingerprint256);
- *
- *     const verify4 = pipe4.verifyResult;
- *     if (!verify4.ok) {
- *         console.error("Certificate verification failed:", verify4.error);
- *     }
- * }
- *
- * // Example 5: Advanced SSL Context Configuration
- * import { Context } from "@tjs/ssl";
- *
- * const context5 = new Context({
- *     mode: "server",
- *     cert: certPem,
- *     key: keyPem,
- *     minVersion: "TLSv1.2",
- *     maxVersion: "TLSv1.3",
- *     ciphers: "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384",
- *     alpn: ["h2", "http/1.1"],
- *     sessionTickets: true,
- *     sessionCache: true,
- *     compression: false,
- *     dhparam: "dhparam.pem",
- *     ecdhCurve: "prime256v1"
- * });
+ * const incoming = new Uint8Array(16384);
+ * const nread = await tcp.read(incoming);
+ * pipe.feed(incoming.subarray(0, nread));
+ * pipe.handshake();
  * ```
  */
 declare namespace CModuleSSL {
@@ -130,8 +33,8 @@ declare namespace CModuleSSL {
         /** Operation mode: "server" or "client" */
         mode?: "server" | "client";
 
-        /** SSL/TLS version: "TLS", "TLSv1.2", "TLSv1.3" */
-        version?: string;
+        /** SSL/TLS method */
+        version?: "TLS" | "TLSv1.2" | "TLSv1.3";
 
         /** Minimum TLS version */
         minVersion?: "TLSv1.0" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3";

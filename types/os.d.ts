@@ -18,21 +18,21 @@ declare namespace CModuleOS {
      * Address family constants (from libuv)
      * @remarks Actual values defined by libuv, may vary by platform.
      */
-    const AF_INET: number;
-    const AF_INET6: number;
-    const AF_UNSPEC: number;
+    export const AF_INET: number;
+    export const AF_INET6: number;
+    export const AF_UNSPEC: number;
 
     /**
      * Standard file descriptor constants
      */
-    const STDIN_FILENO: 0;
-    const STDOUT_FILENO: 1;
-    const STDERR_FILENO: 2;
+    export const STDIN_FILENO: 0;
+    export const STDOUT_FILENO: 1;
+    export const STDERR_FILENO: 2;
 
     /**
      * Current process user info
      */
-    interface UserInfo {
+    export interface UserInfo {
         /** Username (e.g., 'root') */
         readonly userName: string;
         /** User ID (uid) */
@@ -48,7 +48,7 @@ declare namespace CModuleOS {
     /**
      * System info (uname result)
      */
-    interface SystemInfo {
+    export interface SystemInfo {
         /**
          * OS name
          * - Windows (MSVC): `'Windows_NT'`
@@ -83,7 +83,7 @@ declare namespace CModuleOS {
     /**
      * Network interface info
      */
-    interface NetworkInterface {
+    export interface NetworkInterface {
         /** Interface name (e.g., 'eth0', 'lo') */
         readonly name: string;
         /** MAC address (e.g., '00:11:22:33:44:55') */
@@ -102,7 +102,7 @@ declare namespace CModuleOS {
      * Memory usage info
      * All values in bytes
      */
-    interface MemoryUsage {
+    export interface MemoryUsage {
         /** OS available memory (uv_get_available_memory) */
         "os.free": number;
         /** OS total memory (uv_get_total_memory) */
@@ -141,7 +141,7 @@ declare namespace CModuleOS {
     /**
      * CPU core info
      */
-    interface CpuInfo {
+    export interface CpuInfo {
         /** CPU model (e.g., 'AMD Ryzen 9 5950X 16-Core Processor') */
         readonly model: string;
         /** Clock speed (MHz) */
@@ -166,12 +166,12 @@ declare namespace CModuleOS {
      * @example [1.5, 1.2, 0.8] // 1min, 5min, 15min average
      * @remarks Always returns [0, 0, 0] on Windows
      */
-    type LoadAverage = [number, number, number];
+    export type LoadAverage = [number, number, number];
 
     /**
      * File descriptor type from guessHandle
      */
-    type HandleType = 'tty' | 'pipe' | 'file' | 'tcp' | 'udp' | 'unknown';
+    export type HandleType = 'tty' | 'pipe' | 'file' | 'tcp' | 'udp' | 'unknown';
 
     /**
      * Platform identifier string
@@ -181,16 +181,17 @@ declare namespace CModuleOS {
      * - FreeBSD: `'freebsd'`
      * - Others: Lowercase CMAKE_SYSTEM_NAME
      */
-    const platform: string;
+    export const platform: string;
 
     // ==================== Process Control ====================
 
     /**
-     * **Immediately exit** current process (sync)
+     * Exit the main process, or stop only the current worker runtime when
+     * called inside a worker.
      * @param status Exit code (0 = success)
-     * @warning **Dangerous**: Cannot be undone, terminates all execution immediately
+     * @warning In the main thread this terminates the process immediately.
      */
-    function exit(status: number): never;
+    export function exit(status?: number): void;
 
     // ==================== System Info ====================
 
@@ -198,13 +199,13 @@ declare namespace CModuleOS {
      * Get system info (sync)
      * @returns Detailed system info
      */
-    function uname(): SystemInfo;
+    export function uname(): SystemInfo;
 
     /**
      * Get system uptime (seconds) (sync)
      * @returns Seconds since boot (float)
      */
-    function uptime(): number;
+    export function uptime(): number;
 
     // ==================== File Descriptors ====================
 
@@ -213,7 +214,7 @@ declare namespace CModuleOS {
      * @param fd File descriptor (e.g., 0, 1, 2)
      * @returns Descriptor type
      */
-    function guessHandle(fd: number): HandleType;
+    export function guessHandle(fd: number): HandleType;
 
     // ==================== Environment Variables ====================
 
@@ -225,7 +226,7 @@ declare namespace CModuleOS {
      * @returns Variable value
      * @throws {Error} Throws errno exception if variable doesn't exist
      */
-    function getenv(name: string): string;
+    export function getenv(name: string): string;
 
     /**
      * Set environment variable (sync)
@@ -233,26 +234,26 @@ declare namespace CModuleOS {
      * @param value Variable value
      * @throws {Error} Throws on failure (e.g., out of memory)
      */
-    function setenv(name: string, value: string): void;
+    export function setenv(name: string, value: string): void;
 
     /**
      * Delete environment variable (sync)
      * @param name Variable name
      * @throws {Error} Throws on failure
      */
-    function unsetenv(name: string): void;
+    export function unsetenv(name: string): void;
 
     /**
      * Get all environment variables (sync)
      * @returns Key-value object
      */
-    function environ(): Record<string, string>;
+    export function environ(): Record<string, string>;
 
     /**
      * Get all environment variable names (sync)
      * @returns Variable name array
      */
-    function envKeys(): string[];
+    export function envKeys(): string[];
 
     // ==================== Directory Operations ====================
 
@@ -261,18 +262,18 @@ declare namespace CModuleOS {
      * @param dir New directory path
      * @throws {Error} Throws if directory doesn't exist or no permission
      */
-    function chdir(dir: string): void;
+    export function chdir(dir: string): void;
 
     /** Current working directory (getter property) */
-    const cwd: string;
+    export const cwd: string;
 
     // ==================== Path Info ====================
 
     /** User home directory path (getter property) */
-    const homeDir: string;
+    export const homeDir: string;
 
     /** System temp directory path (getter property) */
-    const tmpDir: string;
+    export const tmpDir: string;
 
     // ==================== Random ====================
 
@@ -283,7 +284,7 @@ declare namespace CModuleOS {
      * @param length Generate length (default buffer length - offset)
      * @throws {RangeError} offset+length out of bounds
      */
-    function random(
+    export function random(
         buffer: ArrayBuffer | Uint8Array,
         offset?: number,
         length?: number
@@ -295,65 +296,65 @@ declare namespace CModuleOS {
      * Get CPU info (sync)
      * @returns Info for each CPU core
      */
-    function cpuInfo(): CpuInfo[];
+    export function cpuInfo(): CpuInfo[];
 
     /**
      * Get JS/OS memory info (sync)
      * @returns Memory usage details, all values in bytes
      */
-    function memoryUsage(): MemoryUsage;
+    export function memoryUsage(): MemoryUsage;
 
     /**
      * Get system load average (sync)
      * @returns [1min, 5min, 15min] average
      * @remarks Always returns [0, 0, 0] on Windows
      */
-    function loadavg(): LoadAverage;
+    export function loadavg(): LoadAverage;
 
     /**
      * Get all network interfaces (sync)
      * @returns Interface array
      */
-    function networkInterfaces(): NetworkInterface[];
+    export function networkInterfaces(): NetworkInterface[];
 
     /**
      * Get available parallelism (logical CPU count) (sync)
      * @returns CPU cores available for parallel execution
      */
-    function availableParallelism(): number;
+    export function availableParallelism(): number;
 
     /**
      * Sleep for specified time. Thread-level sleep, jobs won't run
      */
-    function sleep(ms: number): void;
+    export function sleep(ms: number): void;
 
     /**
      * Count active referenced libuv handles in the current runtime loop.
      * Handles that were unref()'d are intentionally excluded.
      */
-    function refHandleCount(): number;
+    export function refHandleCount(): number;
 
     // ==================== Network Info ====================
 
     /** Hostname (getter property) */
-    const hostName: string;
+    export const hostName: string;
 
     // ==================== Process Info ====================
 
     /** Current process ID (getter property) */
-    const pid: number;
+    export const pid: number;
 
     /** Parent process ID (getter property) */
-    const ppid: number;
+    export const ppid: number;
 
     /** Current process user info (getter property) */
-    const userInfo: UserInfo;
+    export const userInfo: UserInfo;
 
     /** Current executable file path (getter property) */
-    const exePath: string;
+    export const exePath: string;
 
     /** Current command line arguments array */
-    const args: string[];
+    export const args: string[];
 
     // ==================== IPC Helpers ====================
 
@@ -364,7 +365,7 @@ declare namespace CModuleOS {
      * @example
      * const [readFd, writeFd] = os.ipcPipe();
      */
-    function ipcPipe(): [number, number];
+    export function ipcPipe(): [number, number];
 
     /**
      * Send a file descriptor over a Unix domain socket.
@@ -375,7 +376,7 @@ declare namespace CModuleOS {
      * @param fdToSend - File descriptor to send
      * @returns bytes sent (>= 0) on success
      */
-    function sendfd(socketFd: number, fdToSend: number): number;
+    export function sendfd(socketFd: number, fdToSend: number): number;
 
     /**
      * Receive a file descriptor from a Unix domain socket.
@@ -385,5 +386,5 @@ declare namespace CModuleOS {
      * @param socketFd - Unix domain socket file descriptor
      * @returns received file descriptor (>= 0) on success
      */
-    function recvfd(socketFd: number): number;
+    export function recvfd(socketFd: number): number;
 }

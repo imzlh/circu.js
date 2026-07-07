@@ -18,7 +18,11 @@ declare namespace CModuleTimers {
      * @param args Callback arguments (optional)
      * @returns Timer ID
      */
-    export function setTimeout(func: () => any, delay: number, ...args: any[]): number;
+    export function setTimeout<TArgs extends any[]>(
+        func: (...args: TArgs) => any,
+        delay?: number,
+        ...args: TArgs
+    ): number;
 
     /**
      * Clear timeout timer
@@ -33,7 +37,11 @@ declare namespace CModuleTimers {
      * @param args Callback arguments (optional)
      * @returns Interval timer ID
      */
-    export function setInterval(func: () => any, interval: number, ...args: any[]): number;
+    export function setInterval<TArgs extends any[]>(
+        func: (...args: TArgs) => any,
+        interval?: number,
+        ...args: TArgs
+    ): number;
 
     /**
      * Clear interval timer

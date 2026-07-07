@@ -78,6 +78,9 @@
  * ```
  */
 declare namespace CModuleCrypto {
+    /** Any ArrayBuffer-backed byte range accepted by the native crypto module. */
+    export type BufferSource = ArrayBuffer | ArrayBufferView;
+
     // ============================================================================
     // Hash Functions (One-shot)
     // ============================================================================
@@ -87,70 +90,84 @@ declare namespace CModuleCrypto {
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function md5(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function md5(data: BufferSource): ArrayBuffer;
+
+    export function ripemd160(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA-1 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha1(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha1(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA-224 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha224(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha224(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA-256 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha256(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha256(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA-384 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha384(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha384(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA-512 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha512(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha512(data: BufferSource): ArrayBuffer;
+
+    export function sha512_224(data: BufferSource): ArrayBuffer;
+
+    export function sha512_256(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA3-224 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha3_224(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha3_224(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA3-256 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha3_256(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha3_256(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA3-384 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha3_384(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha3_384(data: BufferSource): ArrayBuffer;
 
     /**
      * Compute SHA3-512 hash of data
      * @param data - Input data
      * @returns Hash digest as ArrayBuffer
      */
-    export function sha3_512(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function sha3_512(data: BufferSource): ArrayBuffer;
+
+    export function blake2b512(data: BufferSource): ArrayBuffer;
+
+    export function blake2s256(data: BufferSource): ArrayBuffer;
+
+    export function shake128(data: BufferSource): ArrayBuffer;
+
+    export function shake256(data: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // HMAC Functions (One-shot)
@@ -163,8 +180,13 @@ declare namespace CModuleCrypto {
      * @returns HMAC digest as ArrayBuffer
      */
     export function hmacMd5(
-        key: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacRipemd160(
+        key: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -174,8 +196,13 @@ declare namespace CModuleCrypto {
      * @returns HMAC digest as ArrayBuffer
      */
     export function hmacSha1(
-        key: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha224(
+        key: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -185,8 +212,13 @@ declare namespace CModuleCrypto {
      * @returns HMAC digest as ArrayBuffer
      */
     export function hmacSha256(
-        key: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha384(
+        key: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -196,8 +228,48 @@ declare namespace CModuleCrypto {
      * @returns HMAC digest as ArrayBuffer
      */
     export function hmacSha512(
-        key: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha512_224(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha512_256(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha3_224(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha3_256(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha3_384(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacSha3_512(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacBlake2b512(
+        key: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    export function hmacBlake2s256(
+        key: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     // ============================================================================
@@ -213,10 +285,14 @@ declare namespace CModuleCrypto {
          * @param data - Data to hash
          * @returns this for chaining
          */
-        update(data: ArrayBuffer | Uint8Array): this;
+        update(data: BufferSource): this;
 
         /**
          * Finalize hash and return digest
+         *
+         * The native context is reinitialized after digest(), so the same Hash
+         * object can be reused for a new digest with the same algorithm.
+         *
          * @returns Hash digest as ArrayBuffer
          */
         digest(): ArrayBuffer;
@@ -235,16 +311,48 @@ declare namespace CModuleCrypto {
     export function createSha1(): Hash;
 
     /**
+     * Create SHA-224 hash object for streaming
+     * @returns Hash object
+     */
+    export function createSha224(): Hash;
+
+    /**
      * Create SHA-256 hash object for streaming
      * @returns Hash object
      */
     export function createSha256(): Hash;
 
     /**
+     * Create SHA-384 hash object for streaming
+     * @returns Hash object
+     */
+    export function createSha384(): Hash;
+
+    /**
      * Create SHA-512 hash object for streaming
      * @returns Hash object
      */
     export function createSha512(): Hash;
+
+    export function createSha512_224(): Hash;
+
+    export function createSha512_256(): Hash;
+
+    /** Create SHA3-224 hash object for streaming. */
+    export function createSha3_224(): Hash;
+
+    /** Create SHA3-256 hash object for streaming. */
+    export function createSha3_256(): Hash;
+
+    /** Create SHA3-384 hash object for streaming. */
+    export function createSha3_384(): Hash;
+
+    /** Create SHA3-512 hash object for streaming. */
+    export function createSha3_512(): Hash;
+
+    export function createBlake2b512(): Hash;
+
+    export function createBlake2s256(): Hash;
 
     // ============================================================================
     // Streaming HMAC
@@ -259,10 +367,14 @@ declare namespace CModuleCrypto {
          * @param data - Data to authenticate
          * @returns this for chaining
          */
-        update(data: ArrayBuffer | Uint8Array): this;
+        update(data: BufferSource): this;
 
         /**
          * Finalize HMAC and return digest
+         *
+         * The native context is reinitialized after digest(), so the same Hmac
+         * object can be reused for a new digest with the same key and algorithm.
+         *
          * @returns HMAC digest as ArrayBuffer
          */
         digest(): ArrayBuffer;
@@ -273,14 +385,14 @@ declare namespace CModuleCrypto {
      * @param key - Secret key
      * @returns HMAC object
      */
-    export function createHmacSha256(key: ArrayBuffer | Uint8Array): Hmac;
+    export function createHmacSha256(key: BufferSource): Hmac;
 
     /**
      * Create HMAC-SHA512 object for streaming
      * @param key - Secret key
      * @returns HMAC object
      */
-    export function createHmacSha512(key: ArrayBuffer | Uint8Array): Hmac;
+    export function createHmacSha512(key: BufferSource): Hmac;
 
     // ============================================================================
     // Symmetric Encryption (One-shot)
@@ -294,9 +406,9 @@ declare namespace CModuleCrypto {
      * @returns Encrypted ciphertext
      */
     export function aes128CbcEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -307,9 +419,9 @@ declare namespace CModuleCrypto {
      * @returns Decrypted plaintext
      */
     export function aes128CbcDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -320,9 +432,9 @@ declare namespace CModuleCrypto {
      * @returns Encrypted ciphertext
      */
     export function aes192CbcEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -333,9 +445,9 @@ declare namespace CModuleCrypto {
      * @returns Decrypted plaintext
      */
     export function aes192CbcDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -346,9 +458,9 @@ declare namespace CModuleCrypto {
      * @returns Encrypted ciphertext
      */
     export function aes256CbcEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
@@ -359,87 +471,105 @@ declare namespace CModuleCrypto {
      * @returns Decrypted plaintext
      */
     export function aes256CbcDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Encrypt data using AES-128-GCM
+     * Encrypt data using the legacy AES-128-GCM wrapper.
+     *
+     * This low-level wrapper does not expose an authentication tag. Prefer
+     * gcmEncrypt() for authenticated AES-GCM data.
      * @param key - Encryption key (16 bytes)
      * @param iv - Initialization vector
      * @param data - Plaintext data
-     * @returns Encrypted ciphertext with authentication tag
+     * @returns Encrypted ciphertext without an exposed authentication tag
      */
     export function aes128GcmEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Decrypt data using AES-128-GCM
+     * Decrypt data using the legacy AES-128-GCM wrapper.
+     *
+     * This low-level wrapper has no tag parameter. Prefer gcmDecrypt() for
+     * authenticated AES-GCM data.
      * @param key - Decryption key (16 bytes)
      * @param iv - Initialization vector
-     * @param data - Ciphertext data with authentication tag
-     * @returns Decrypted plaintext
+     * @param data - Ciphertext data
+     * @returns Decrypted plaintext if OpenSSL accepts the operation
      */
     export function aes128GcmDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Encrypt data using AES-192-GCM
+     * Encrypt data using the legacy AES-192-GCM wrapper.
+     *
+     * This low-level wrapper does not expose an authentication tag. Prefer
+     * gcmEncrypt() for authenticated AES-GCM data.
      * @param key - Encryption key (24 bytes)
      * @param iv - Initialization vector
      * @param data - Plaintext data
-     * @returns Encrypted ciphertext with authentication tag
+     * @returns Encrypted ciphertext without an exposed authentication tag
      */
     export function aes192GcmEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Decrypt data using AES-192-GCM
+     * Decrypt data using the legacy AES-192-GCM wrapper.
+     *
+     * This low-level wrapper has no tag parameter. Prefer gcmDecrypt() for
+     * authenticated AES-GCM data.
      * @param key - Decryption key (24 bytes)
      * @param iv - Initialization vector
-     * @param data - Ciphertext data with authentication tag
-     * @returns Decrypted plaintext
+     * @param data - Ciphertext data
+     * @returns Decrypted plaintext if OpenSSL accepts the operation
      */
     export function aes192GcmDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Encrypt data using AES-256-GCM
+     * Encrypt data using the legacy AES-256-GCM wrapper.
+     *
+     * This low-level wrapper does not expose an authentication tag. Prefer
+     * gcmEncrypt() for authenticated AES-GCM data.
      * @param key - Encryption key (32 bytes)
      * @param iv - Initialization vector
      * @param data - Plaintext data
-     * @returns Encrypted ciphertext with authentication tag
+     * @returns Encrypted ciphertext without an exposed authentication tag
      */
     export function aes256GcmEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     /**
-     * Decrypt data using AES-256-GCM
+     * Decrypt data using the legacy AES-256-GCM wrapper.
+     *
+     * This low-level wrapper has no tag parameter. Prefer gcmDecrypt() for
+     * authenticated AES-GCM data.
      * @param key - Decryption key (32 bytes)
      * @param iv - Initialization vector
-     * @param data - Ciphertext data with authentication tag
-     * @returns Decrypted plaintext
+     * @param data - Ciphertext data
+     * @returns Decrypted plaintext if OpenSSL accepts the operation
      */
     export function aes256GcmDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     // ============================================================================
@@ -455,7 +585,7 @@ declare namespace CModuleCrypto {
          * @param data - Data to encrypt/decrypt
          * @returns Processed data as ArrayBuffer
          */
-        update(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+        update(data: BufferSource): ArrayBuffer;
 
         /**
          * Finalize cipher and return remaining data
@@ -471,14 +601,14 @@ declare namespace CModuleCrypto {
      * @returns Cipher object
      */
     export function createCipherAes256Cbc(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /** AES-256-CBC streaming cipher, no PKCS7 padding (raw blocks). */
     export function createCipherAes256CbcRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /**
@@ -488,14 +618,14 @@ declare namespace CModuleCrypto {
      * @returns Cipher object
      */
     export function createCipherAes192Cbc(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /** AES-192-CBC streaming cipher, no PKCS7 padding (raw blocks). */
     export function createCipherAes192CbcRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /**
@@ -505,14 +635,14 @@ declare namespace CModuleCrypto {
      * @returns Cipher object
      */
     export function createDecipherAes256Cbc(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /** AES-256-CBC streaming decipher, no PKCS7 padding (raw blocks). */
     export function createDecipherAes256CbcRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /**
@@ -522,49 +652,56 @@ declare namespace CModuleCrypto {
      * @returns Cipher object
      */
     export function createDecipherAes192Cbc(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /** AES-192-CBC streaming decipher, no PKCS7 padding (raw blocks). */
     export function createDecipherAes192CbcRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource
     ): Cipher;
 
     /** AES-128-CBC one-shot encrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes128CbcEncryptRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /** AES-128-CBC one-shot decrypt, no PKCS7 padding. */
+    /** AES-128-CBC one-shot decrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes128CbcDecryptRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /** AES-192-CBC one-shot encrypt, no PKCS7 padding. */
+    /** AES-192-CBC one-shot encrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes192CbcEncryptRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /** AES-192-CBC one-shot decrypt, no PKCS7 padding. */
+    /** AES-192-CBC one-shot decrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes192CbcDecryptRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /** AES-256-CBC one-shot encrypt, no PKCS7 padding. */
+    /** AES-256-CBC one-shot encrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes256CbcEncryptRaw(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    /** AES-256-CBC one-shot decrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
+    export function aes256CbcDecryptRaw(
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
     // ============================================================================
@@ -580,8 +717,8 @@ declare namespace CModuleCrypto {
      * @returns Derived key as ArrayBuffer
      */
     export function pbkdf2Sha256(
-        password: ArrayBuffer | Uint8Array,
-        salt: ArrayBuffer | Uint8Array,
+        password: BufferSource,
+        salt: BufferSource,
         iterations: number,
         keylen: number
     ): ArrayBuffer;
@@ -595,8 +732,8 @@ declare namespace CModuleCrypto {
      * @returns Derived key as ArrayBuffer
      */
     export function pbkdf2Sha512(
-        password: ArrayBuffer | Uint8Array,
-        salt: ArrayBuffer | Uint8Array,
+        password: BufferSource,
+        salt: BufferSource,
         iterations: number,
         keylen: number
     ): ArrayBuffer;
@@ -606,8 +743,8 @@ declare namespace CModuleCrypto {
      * Internal low-level entry point used by the Node compatibility layer.
      */
     export function scrypt(
-        password: ArrayBuffer | Uint8Array,
-        salt: ArrayBuffer | Uint8Array,
+        password: BufferSource,
+        salt: BufferSource,
         keylen: number,
         N: number,
         r: number,
@@ -636,53 +773,103 @@ declare namespace CModuleCrypto {
      */
     export function generateRsaKey(bits?: number): RsaKeyPair;
 
-    /**
-     * Sign data with RSA private key using SHA-256
-     * @param privateKey - Private key in PEM format
-     * @param data - Data to sign
-     * @returns Signature as ArrayBuffer
-     */
+    /** Sign data with an asymmetric private key using SHA-224. */
+    export function signSha224(
+        privateKey: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    /** Sign data with an asymmetric private key using SHA-256. */
     export function signSha256(
-        privateKey: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        privateKey: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /**
-     * Sign data with RSA private key using SHA-512
-     * @param privateKey - Private key in PEM format
-     * @param data - Data to sign
-     * @returns Signature as ArrayBuffer
-     */
+    /** Sign data with an asymmetric private key using SHA-384. */
+    export function signSha384(
+        privateKey: BufferSource,
+        data: BufferSource
+    ): ArrayBuffer;
+
+    /** Sign data with an asymmetric private key using SHA-512. */
     export function signSha512(
-        privateKey: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array
+        privateKey: BufferSource,
+        data: BufferSource
     ): ArrayBuffer;
 
-    /**
-     * Verify signature with RSA public key using SHA-256
-     * @param publicKey - Public key in PEM format
-     * @param data - Original data
-     * @param signature - Signature to verify
-     * @returns true if signature is valid
-     */
+    /** Verify a SHA-224 asymmetric signature. */
+    export function verifySha224(
+        publicKey: BufferSource,
+        data: BufferSource,
+        signature: BufferSource
+    ): boolean;
+
+    /** Verify a SHA-256 asymmetric signature. */
     export function verifySha256(
-        publicKey: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array,
-        signature: ArrayBuffer | Uint8Array
+        publicKey: BufferSource,
+        data: BufferSource,
+        signature: BufferSource
+    ): boolean;
+
+    /** Verify a SHA-384 asymmetric signature. */
+    export function verifySha384(
+        publicKey: BufferSource,
+        data: BufferSource,
+        signature: BufferSource
+    ): boolean;
+
+    /** Verify a SHA-512 asymmetric signature. */
+    export function verifySha512(
+        publicKey: BufferSource,
+        data: BufferSource,
+        signature: BufferSource
     ): boolean;
 
     /**
-     * Verify signature with RSA public key using SHA-512
-     * @param publicKey - Public key in PEM format
-     * @param data - Original data
-     * @param signature - Signature to verify
-     * @returns true if signature is valid
+     * Inspect the asymmetric algorithm of a private key.
+     * Returns "rsa" or "ec".
      */
-    export function verifySha512(
-        publicKey: ArrayBuffer | Uint8Array,
-        data: ArrayBuffer | Uint8Array,
-        signature: ArrayBuffer | Uint8Array
-    ): boolean;
+    export function getPrivateKeyType(
+        privateKey: BufferSource
+    ): 'rsa' | 'ec';
+
+    /**
+     * Inspect the asymmetric algorithm of a public key.
+     * Returns "rsa" or "ec".
+     */
+    export function getPublicKeyType(
+        publicKey: BufferSource
+    ): 'rsa' | 'ec';
+
+    /** Export a private key as PEM bytes. */
+    export function exportPrivateKeyPem(
+        privateKey: BufferSource
+    ): ArrayBuffer;
+
+    /** Export a private key as DER bytes. */
+    export function exportPrivateKeyDer(
+        privateKey: BufferSource
+    ): ArrayBuffer;
+
+    /** Export a public key as PEM bytes. */
+    export function exportPublicKeyPem(
+        publicKey: BufferSource
+    ): ArrayBuffer;
+
+    /** Export a public key as DER bytes. */
+    export function exportPublicKeyDer(
+        publicKey: BufferSource
+    ): ArrayBuffer;
+
+    /** Derive and export the public key from a private key as PEM bytes. */
+    export function derivePublicKeyPem(
+        privateKey: BufferSource
+    ): ArrayBuffer;
+
+    /** Derive and export the public key from a private key as DER bytes. */
+    export function derivePublicKeyDer(
+        privateKey: BufferSource
+    ): ArrayBuffer;
 
     // ============================================================================
     // Utility Functions
@@ -693,7 +880,7 @@ declare namespace CModuleCrypto {
      * @param data - Input data
      * @returns CRC32 checksum as 32-bit unsigned integer
      */
-    export function crc32(data: ArrayBuffer | Uint8Array): number;
+    export function crc32(data: BufferSource): number;
 
     /**
      * Generate cryptographically secure random bytes
@@ -703,11 +890,20 @@ declare namespace CModuleCrypto {
     export function randomBytes(length: number): ArrayBuffer;
 
     /**
+     * Fill an existing buffer with cryptographically secure random bytes
+     * @param buffer - Target buffer or view
+     * @param offset - Byte offset within the target view
+     * @param size - Number of bytes to fill
+     * @returns The original target buffer or view
+     */
+    export function randomFill<T extends BufferSource>(buffer: T, offset?: number, size?: number): T;
+
+    /**
      * Encode data to Base64 string
      * @param data - Input data
      * @returns Base64 encoded string
      */
-    export function base64Encode(data: ArrayBuffer | Uint8Array): string;
+    export function base64Encode(data: BufferSource): string;
 
     /**
      * Decode Base64 string to data
@@ -721,7 +917,7 @@ declare namespace CModuleCrypto {
      * @param data - Input data
      * @returns Hex encoded string (lowercase)
      */
-    export function hexEncode(data: ArrayBuffer | Uint8Array): string;
+    export function hexEncode(data: BufferSource): string;
 
     /**
      * Decode hexadecimal string to data
@@ -745,56 +941,56 @@ declare namespace CModuleCrypto {
     export function generateEcKeyP521(): EcKeyPair;
 
     /** ECDSA sign with P-256 (uses SHA-256) */
-    export function ecdsaSignP256(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdsaSignP256(privateKey: BufferSource, data: BufferSource): ArrayBuffer;
     /** ECDSA sign with P-384 (uses SHA-384) */
-    export function ecdsaSignP384(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdsaSignP384(privateKey: BufferSource, data: BufferSource): ArrayBuffer;
     /** ECDSA sign with P-521 (uses SHA-512) */
-    export function ecdsaSignP521(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdsaSignP521(privateKey: BufferSource, data: BufferSource): ArrayBuffer;
 
     /** ECDSA verify with P-256 */
-    export function ecdsaVerifyP256(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array): boolean;
+    export function ecdsaVerifyP256(publicKey: BufferSource, data: BufferSource, signature: BufferSource): boolean;
     /** ECDSA verify with P-384 */
-    export function ecdsaVerifyP384(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array): boolean;
+    export function ecdsaVerifyP384(publicKey: BufferSource, data: BufferSource, signature: BufferSource): boolean;
     /** ECDSA verify with P-521 */
-    export function ecdsaVerifyP521(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array): boolean;
+    export function ecdsaVerifyP521(publicKey: BufferSource, data: BufferSource, signature: BufferSource): boolean;
 
     /** ECDH derive shared secret with P-256 */
-    export function ecdhDeriveP256(privateKey: ArrayBuffer | Uint8Array, publicKey: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdhDeriveP256(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
     /** ECDH derive shared secret with P-384 */
-    export function ecdhDeriveP384(privateKey: ArrayBuffer | Uint8Array, publicKey: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdhDeriveP384(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
     /** ECDH derive shared secret with P-521 */
-    export function ecdhDeriveP521(privateKey: ArrayBuffer | Uint8Array, publicKey: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function ecdhDeriveP521(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // RSA-OAEP - NEW
     // ============================================================================
 
     /** RSA-OAEP encrypt with SHA-256 */
-    export function rsaOaepSha256Encrypt(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function rsaOaepSha256Encrypt(publicKey: BufferSource, data: BufferSource, label?: BufferSource): ArrayBuffer;
     /** RSA-OAEP decrypt with SHA-256 */
-    export function rsaOaepSha256Decrypt(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function rsaOaepSha256Decrypt(privateKey: BufferSource, data: BufferSource, label?: BufferSource): ArrayBuffer;
     /** RSA-OAEP encrypt with SHA-512 */
-    export function rsaOaepSha512Encrypt(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function rsaOaepSha512Encrypt(publicKey: BufferSource, data: BufferSource, label?: BufferSource): ArrayBuffer;
     /** RSA-OAEP decrypt with SHA-512 */
-    export function rsaOaepSha512Decrypt(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function rsaOaepSha512Decrypt(privateKey: BufferSource, data: BufferSource, label?: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // RSA-PSS - NEW
     // ============================================================================
 
     /** RSA-PSS sign with SHA-256 */
-    export function rsaPssSha256Sign(privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, saltLength?: number): ArrayBuffer;
+    export function rsaPssSha256Sign(privateKey: BufferSource, data: BufferSource, saltLength?: number): ArrayBuffer;
     /** RSA-PSS verify with SHA-256 */
-    export function rsaPssSha256Verify(publicKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, saltLength?: number): boolean;
+    export function rsaPssSha256Verify(publicKey: BufferSource, data: BufferSource, signature: BufferSource, saltLength?: number): boolean;
 
     // ============================================================================
     // HKDF - NEW
     // ============================================================================
 
     /** HKDF key derivation with SHA-256 */
-    export function hkdfSha256(ikm: ArrayBuffer | Uint8Array, keylen: number, salt?: ArrayBuffer | Uint8Array, info?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function hkdfSha256(ikm: BufferSource, keylen: number, salt?: BufferSource, info?: BufferSource): ArrayBuffer;
     /** HKDF key derivation with SHA-512 */
-    export function hkdfSha512(ikm: ArrayBuffer | Uint8Array, keylen: number, salt?: ArrayBuffer | Uint8Array, info?: ArrayBuffer | Uint8Array): ArrayBuffer;
+    export function hkdfSha512(ikm: BufferSource, keylen: number, salt?: BufferSource, info?: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // GCM with AAD Support
@@ -833,11 +1029,13 @@ declare namespace CModuleCrypto {
      * @example
      * ```typescript
      * const crypto = import.meta.use('crypto');
+     * const { Encoder } = import.meta.use('text');
+     * const encoder = new Encoder();
      *
      * const key = crypto.randomBytes(32);  // AES-256
      * const iv = crypto.randomBytes(12);   // 12 bytes IV for GCM
-     * const plaintext = new TextEncoder().encode('Hello, World!');
-     * const aad = new TextEncoder().encode('Additional authenticated data');
+     * const plaintext = encoder.encode('Hello, World!');
+     * const aad = encoder.encode('Additional authenticated data');
      *
      * // Without AAD
      * const encrypted1 = crypto.gcmEncrypt(key, iv, plaintext);
@@ -850,10 +1048,10 @@ declare namespace CModuleCrypto {
      * ```
      */
     export function gcmEncrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        plaintext: ArrayBuffer | Uint8Array,
-        aad?: ArrayBuffer | Uint8Array,
+        key: BufferSource,
+        iv: BufferSource,
+        plaintext: BufferSource,
+        aad?: BufferSource,
         tagLength?: number
     ): GcmEncryptResult;
 
@@ -870,11 +1068,14 @@ declare namespace CModuleCrypto {
      * @example
      * ```typescript
      * const crypto = import.meta.use('crypto');
+     * const { Encoder, Decoder } = import.meta.use('text');
+     * const encoder = new Encoder();
+     * const decoder = new Decoder();
      *
      * const key = crypto.randomBytes(32);
      * const iv = crypto.randomBytes(12);
-     * const plaintext = new TextEncoder().encode('Hello, World!');
-     * const aad = new TextEncoder().encode('Additional authenticated data');
+     * const plaintext = encoder.encode('Hello, World!');
+     * const aad = encoder.encode('Additional authenticated data');
      *
      * // Encrypt
      * const encrypted = crypto.gcmEncrypt(key, iv, plaintext, aad);
@@ -883,18 +1084,18 @@ declare namespace CModuleCrypto {
      * const decrypted = crypto.gcmDecrypt(key, iv, encrypted.ciphertext, encrypted.tag, aad);
      *
      * if (decrypted.verified) {
-     *     console.log('Decryption successful:', new TextDecoder().decode(decrypted.plaintext));
+     *     console.log('Decryption successful:', decoder.decode(decrypted.plaintext));
      * } else {
      *     console.log('Authentication failed!');
      * }
      * ```
      */
     export function gcmDecrypt(
-        key: ArrayBuffer | Uint8Array,
-        iv: ArrayBuffer | Uint8Array,
-        ciphertext: ArrayBuffer | Uint8Array,
-        tag: ArrayBuffer | Uint8Array,
-        aad?: ArrayBuffer | Uint8Array
+        key: BufferSource,
+        iv: BufferSource,
+        ciphertext: BufferSource,
+        tag: BufferSource,
+        aad?: BufferSource
     ): GcmDecryptResult;
 
     /**
@@ -903,16 +1104,18 @@ declare namespace CModuleCrypto {
      * @example
      * ```typescript
      * const crypto = import.meta.use('crypto');
+     * const { Encoder } = import.meta.use('text');
+     * const encoder = new Encoder();
      *
      * const key = crypto.randomBytes(32);
      * const iv = crypto.randomBytes(12);
-     * const aad = new TextEncoder().encode('Additional authenticated data');
+     * const aad = encoder.encode('Additional authenticated data');
      *
      * // Encryption
      * const encryptor = new crypto.GCM('encrypt', key, iv);
      * encryptor.setAAD(aad);
-     * const ciphertext1 = encryptor.update(new TextEncoder().encode('Hello '));
-     * const ciphertext2 = encryptor.update(new TextEncoder().encode('World'));
+     * const ciphertext1 = encryptor.update(encoder.encode('Hello '));
+     * const ciphertext2 = encryptor.update(encoder.encode('World'));
      * const result = encryptor.final();
      * // result = { data: ArrayBuffer, tag: ArrayBuffer }
      *
@@ -932,21 +1135,22 @@ declare namespace CModuleCrypto {
          * @param key - Encryption/decryption key (16/24/32 bytes for AES-128/192/256)
          * @param iv - Initialization vector (recommended 12 bytes)
          */
-        constructor(mode: 'encrypt' | 'decrypt', key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array);
+        constructor(mode: 'encrypt' | 'decrypt', key: BufferSource, iv: BufferSource);
 
         /**
          * Set Additional Authenticated Data (AAD)
          * Must be called before update() for the data to be authenticated
          * @param aad - Additional authenticated data
+         * @returns true when OpenSSL accepted the AAD
          */
-        setAAD(aad: ArrayBuffer | Uint8Array): void;
+        setAAD(aad: BufferSource): boolean;
 
         /**
          * Process data (encrypt or decrypt)
          * @param data - Data to process
          * @returns Processed data
          */
-        update(data: ArrayBuffer | Uint8Array): ArrayBuffer;
+        update(data: BufferSource): ArrayBuffer;
 
         /**
          * Finalize encryption or decryption
@@ -955,13 +1159,14 @@ declare namespace CModuleCrypto {
          * For decryption: requires tag parameter, returns { data: ArrayBuffer, verified: boolean }
          *
          * @param tag - Authentication tag (required for decryption)
-         * @returns Result object with data and tag/verified status
+         * @returns Encryption result when called without a tag, decryption result when a tag is passed
          */
-        final(tag?: ArrayBuffer | Uint8Array): { data: ArrayBuffer; tag?: ArrayBuffer; verified?: boolean };
+        final(): { data: ArrayBuffer; tag: ArrayBuffer };
+        final(tag: BufferSource): { data: ArrayBuffer; verified: boolean };
     }
     
     /**
-     * Generate random UUID string
+     * Generate a random RFC 4122 version 4 UUID string synchronously.
      */
-    function randomUUID(): Promise<string>;
+    export function randomUUID(): `${string}-${string}-${string}-${string}-${string}`;
 }

@@ -546,7 +546,7 @@ static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
     }
 
     stream_unpin(s);
-    js_free(ctx, req);
+    tjs__free(req);
 }
 
 static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {

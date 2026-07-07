@@ -6,5 +6,5 @@ declare namespace CModuleNodeApi {
     /**
      * Load a Node-API `.node` addon and return its exports object.
      */
-    function dlopen(path: string): any;
+    export function dlopen(path: string): unknown;
 }

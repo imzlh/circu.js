@@ -263,6 +263,10 @@ static void format_value_with_depth(JSContext* ctx, JSValueConst val, DynBuf* bu
 }
 
 static void format_to_string(JSContext* ctx, JSValueConst val, DynBuf* buf) {
+    if (JS_IsSymbol(val)) {
+        format_value_with_depth(ctx, val, buf, 2, false, NULL);
+        return;
+    }
     const char* str = JS_ToCString(ctx, val);
     dbuf_putstr(buf, str ? str : "");
     if (str) JS_FreeCString(ctx, str);
@@ -277,7 +281,9 @@ static void format_to_number(JSContext* ctx, JSValueConst val, DynBuf* buf, bool
     if (JS_ToFloat64(ctx, &num, val) < 0 || isnan(num)) {
         dbuf_putstr(buf, "NaN");
     } else if (integer) {
-        dbuf_printf(buf, "%.0f", trunc(num));
+        double truncated = trunc(num);
+        if (truncated == 0) truncated = 0;
+        dbuf_printf(buf, "%.0f", truncated);
     } else if (isinf(num)) {
         dbuf_printf(buf, "%cInfinity", num < 0 ? '-' : '+');
     } else {
@@ -728,7 +734,7 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
         return;
     }
 
-    if (len == 0) {
+    if (len == 0 && !opts->show_hidden) {
         put_color(buf, opts, ANSI_CYAN);
         dbuf_putstr(buf, "[]");
         put_reset(buf, opts);
@@ -752,6 +758,7 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
     put_color(buf, opts, ANSI_CYAN);
     dbuf_putstr(buf, "[");
     put_reset(buf, opts);
+    if (inline_disp && opts->show_hidden) dbuf_putstr(buf, " ");
 
     int64_t show = len < opts->max_array_length ? len : opts->max_array_length;
     for (int64_t i = 0; i < show; i++) {
@@ -768,6 +775,8 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
         JS_FreeValue(ctx, elem);
     }
 
+    bool has_hidden_length = opts->show_hidden;
+
     if (len > show) {
         if (show > 0) {
             dbuf_putstr(buf, inline_disp ? ", " : ",\n");
@@ -778,12 +787,23 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
         put_reset(buf, opts);
     }
 
-    if (!inline_disp && len > 0) {
+    if (has_hidden_length) {
+        if (show > 0 || len > show) {
+            dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+            if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
+        }
+        put_color(buf, opts, ANSI_GRAY);
+        dbuf_printf(buf, "[length]: %lld", (long long)len);
+        put_reset(buf, opts);
+    }
+
+    if (!inline_disp && (len > 0 || has_hidden_length)) {
         dbuf_putstr(buf, "\n");
         dbuf_putstr(buf, get_indent(depth));
     }
 
     put_color(buf, opts, ANSI_CYAN);
+    if (inline_disp && opts->show_hidden) dbuf_putstr(buf, " ");
     dbuf_putstr(buf, "]");
     put_reset(buf, opts);
 

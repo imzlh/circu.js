@@ -11,7 +11,9 @@
  * const { exit_status } = await child.wait();
  */
 declare namespace CModuleProcess {
-    type Pipe = CModuleStreams.Pipe;
+    export type Pipe = CModuleStreams.Pipe;
+    export type BufferSource = ArrayBuffer | ArrayBufferView;
+    export type StdioOption = 'inherit' | 'pipe' | 'ignore' | number;
 
     /**
      * Process signals
@@ -28,33 +30,45 @@ declare namespace CModuleProcess {
     /**
      * Spawn options
      */
-    export interface SpawnOptions<T> {
-        /** Stdin file descriptor or mode */
-        stdin?: number | 'inherit' | 'pipe' | 'ignore';
-        /** Stdout file descriptor or mode */
-        stdout?: number | 'inherit' | 'pipe' | 'ignore';
-        /** Stderr file descriptor or mode */
-        stderr?: number | 'inherit' | 'pipe' | 'ignore';
+    export interface SpawnOptions<T extends boolean = false> {
+        /** Stdin mode */
+        stdin?: StdioOption;
+        /** Stdout mode */
+        stdout?: StdioOption;
+        /** Stderr mode */
+        stderr?: StdioOption;
+        /** Extra stdio modes, indexed from child fd 3 */
+        stdioExtra?: Array<StdioOption | null | undefined>;
         /** Working directory */
         cwd?: string;
         /** Environment variables */
         env?: Record<string, string>;
+        /** Clear inherited environment before applying env */
+        clearEnv?: boolean;
         /** User ID */
         uid?: number;
         /** Group ID */
         gid?: number;
         /** Detached mode */
         detached?: boolean;
+        /** Hide the process window on Windows */
+        background?: boolean;
         /** Use PTY mode (default false) */
         pty?: T;
+        /** PTY command; defaults to SHELL/COMSPEC when omitted */
+        name?: string;
+        /** PTY argv passed to the command on Unix */
+        argv?: string[];
         /** PTY columns (default 80) */
         cols?: number;
         /** PTY rows (default 24) */
         rows?: number;
         /** Data written to stdin then closed (spawnSync only) */
-        input?: string | ArrayBuffer | Uint8Array;
+        input?: string | BufferSource;
         /** Enable IPC channel */
         ipc?: boolean;
+        /** Child stdio fd used for IPC when ipc is enabled */
+        ipcFd?: number;
     }
 
     /**
@@ -100,6 +114,8 @@ declare namespace CModuleProcess {
         readonly stdout: PTY extends true ? undefined : Pipe;
         /** Stderr stream (non-PTY mode only, undefined in PTY mode) */
         readonly stderr: PTY extends true ? undefined : Pipe;
+        /** Extra stdio streams indexed by child fd; non-pipe entries are null. */
+        readonly stdioExtra: PTY extends true ? undefined : Array<Pipe | null>;
 
         /**
          * PTY readable stream (PTY mode only, undefined in non-PTY mode)
@@ -122,7 +138,7 @@ declare namespace CModuleProcess {
          * Wait for process exit
          * @returns Exit code and termination signal
          */
-        wait(): Promise<ExitInfo>;
+        wait(): PTY extends true ? never : Promise<ExitInfo>;
 
         /**
          * Block wait for process exit
@@ -144,10 +160,15 @@ declare namespace CModuleProcess {
         resize(cols: number, rows: number): PTY extends true ? void : never;
 
         /**
-         * Get PTY window size (PTY mode only)
+         * Get PTY window size (PTY mode only).
+         *
+         * Native property name is `getwinsize` for compatibility with the C
+         * module export table.
+         *
          * @returns Window size object with cols, rows, xpixel, ypixel
          */
-        get size():  PTY extends true ? WinSize : never;
+        readonly getwinsize: PTY extends true ? WinSize : never;
+
     }
 
     /**
@@ -155,7 +176,7 @@ declare namespace CModuleProcess {
      * @param args Command string or argument array (first element is command to execute)
      * @param options Optional configuration
      */
-    export function spawn<T>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
+    export function spawn<T extends boolean = false>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
 
     /**
      * Synchronously spawn a child process using platform-native process APIs.
@@ -170,11 +191,13 @@ declare namespace CModuleProcess {
     export function spawnSync(command: string, args?: string[], options?: SpawnOptions<false>): SpawnSyncResult;
 
     /**
-     * Execute command (shorthand for spawn + wait)
+     * Replace the current process image with a command using `execvp`.
+     *
+     * On success this function never returns. It returns only by throwing when
+     * `execvp` fails, and it is not supported on Windows.
      * @param args Command string or argument array
-     * @param options Optional configuration
      */
-    export function exec(args: string | string[], options?: SpawnOptions<false>): ChildProcess;
+    export function exec(args: string | string[]): never;
 
     /**
      * Send signal to specified process

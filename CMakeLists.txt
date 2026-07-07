@@ -61,8 +61,8 @@ if(ENABLE_ASAN)
 endif()
 
 set(CJS__VERSION_MAJOR 1)
-set(CJS__VERSION_MINOR 3)
-set(CJS__VERSION_PATCH 1)
+set(CJS__VERSION_MINOR 4)
+set(CJS__VERSION_PATCH 0)
 set(CJS__VERSION_SUFFIX "")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
@@ -186,6 +186,7 @@ add_library(libcjs STATIC
     src/console.c
     src/sourcemap.c
     src/mod_algorithm.c
+    src/mod_bjson.c
     src/mod_dns.c
     src/mod_engine.c
     src/mod_ffi.c
@@ -341,7 +342,7 @@ if(WIN32)
 endif()
 target_link_libraries(libcjs PRIVATE qjs uv_a OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB EXPAT::EXPAT)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(libcjs PRIVATE util)
+    target_link_libraries(libcjs PRIVATE util ${CMAKE_DL_LIBS})
 endif()
 if(TARGET SQLite3::SQLite3)
     target_link_libraries(libcjs PRIVATE SQLite3::SQLite3)

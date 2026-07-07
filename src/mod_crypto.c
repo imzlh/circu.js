@@ -37,21 +37,30 @@
 #include <openssl/ec.h>
 #include <openssl/kdf.h>
 
+#include <limits.h>
+
 /* OpenSSL 3.x has many deprecated functions, we ignore them for now */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 /* Magic values for hash algorithms */
 enum {
     HASH_MD5 = 0,
+    HASH_RIPEMD160,
     HASH_SHA1,
     HASH_SHA224,
     HASH_SHA256,
     HASH_SHA384,
     HASH_SHA512,
+    HASH_SHA512_224,
+    HASH_SHA512_256,
     HASH_SHA3_224,
     HASH_SHA3_256,
     HASH_SHA3_384,
     HASH_SHA3_512,
+    HASH_BLAKE2B512,
+    HASH_BLAKE2S256,
+    HASH_SHAKE128,
+    HASH_SHAKE256,
 
 	HASM_END
 };
@@ -88,15 +97,22 @@ enum {
 static const EVP_MD* get_md_from_magic(int magic) {
     switch (magic) {
         case HASH_MD5: return EVP_md5();
+        case HASH_RIPEMD160: return EVP_ripemd160();
         case HASH_SHA1: return EVP_sha1();
         case HASH_SHA224: return EVP_sha224();
         case HASH_SHA256: return EVP_sha256();
         case HASH_SHA384: return EVP_sha384();
         case HASH_SHA512: return EVP_sha512();
+        case HASH_SHA512_224: return EVP_get_digestbyname("sha512-224");
+        case HASH_SHA512_256: return EVP_get_digestbyname("sha512-256");
         case HASH_SHA3_224: return EVP_sha3_224();
         case HASH_SHA3_256: return EVP_sha3_256();
         case HASH_SHA3_384: return EVP_sha3_384();
         case HASH_SHA3_512: return EVP_sha3_512();
+        case HASH_BLAKE2B512: return EVP_get_digestbyname("blake2b512");
+        case HASH_BLAKE2S256: return EVP_get_digestbyname("blake2s256");
+        case HASH_SHAKE128: return EVP_shake128();
+        case HASH_SHAKE256: return EVP_shake256();
         default: return NULL;
     }
 }
@@ -216,6 +232,9 @@ static EVP_PKEY* tjs_crypto_load_raw_ec_private_key(const uint8_t* key_data, siz
 
     EVP_PKEY* pkey = NULL;
     EC_KEY* eckey = EC_KEY_new_by_curve_name(nid);
+    const EC_GROUP* group = NULL;
+    EC_POINT* pub_point = NULL;
+    BN_CTX* bn_ctx = NULL;
     BIGNUM* priv_bn = NULL;
 
     if (!eckey) {
@@ -229,14 +248,31 @@ static EVP_PKEY* tjs_crypto_load_raw_ec_private_key(const uint8_t* key_data, siz
         return NULL;
     }
 
-    pkey = EVP_PKEY_new();
-    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
-        EVP_PKEY_free(pkey);
+    group = EC_KEY_get0_group(eckey);
+    pub_point = group ? EC_POINT_new(group) : NULL;
+    bn_ctx = BN_CTX_new();
+    if (!group || !pub_point || !bn_ctx ||
+        EC_POINT_mul(group, pub_point, priv_bn, NULL, NULL, bn_ctx) != 1 ||
+        EC_KEY_set_public_key(eckey, pub_point) != 1) {
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(pub_point);
         BN_free(priv_bn);
         EC_KEY_free(eckey);
         return NULL;
     }
 
+    pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
+        EVP_PKEY_free(pkey);
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(pub_point);
+        BN_free(priv_bn);
+        EC_KEY_free(eckey);
+        return NULL;
+    }
+
+    BN_CTX_free(bn_ctx);
+    EC_POINT_free(pub_point);
     BN_free(priv_bn);
     return pkey;
 }
@@ -302,6 +338,148 @@ static EVP_PKEY* tjs_crypto_load_public_key_auto(const uint8_t* key_data, size_t
     return tjs_crypto_load_raw_ec_public_key(key_data, key_len);
 }
 
+static const char* tjs_crypto_key_type_name(EVP_PKEY* pkey) {
+    if (!pkey) {
+        return NULL;
+    }
+
+    switch (EVP_PKEY_base_id(pkey)) {
+        case EVP_PKEY_RSA:
+        case EVP_PKEY_RSA_PSS:
+            return "rsa";
+        case EVP_PKEY_EC:
+            return "ec";
+        default:
+            return NULL;
+    }
+}
+
+static JSValue tjs_crypto_bio_to_arraybuffer(JSContext* ctx, BIO* bio) {
+    char* data = NULL;
+    long len = BIO_get_mem_data(bio, &data);
+    if (len < 0 || !data) {
+        return JS_ThrowInternalError(ctx, "Failed to read key data");
+    }
+    return JS_NewArrayBufferCopy(ctx, (uint8_t*)data, (size_t)len);
+}
+
+enum {
+    KEY_KIND_PRIVATE = 0,
+    KEY_KIND_PUBLIC = 1,
+};
+
+enum {
+    KEY_OP_EXPORT_PRIVATE_PEM = 0,
+    KEY_OP_EXPORT_PRIVATE_DER,
+    KEY_OP_EXPORT_PUBLIC_PEM,
+    KEY_OP_EXPORT_PUBLIC_DER,
+    KEY_OP_DERIVE_PUBLIC_PEM,
+    KEY_OP_DERIVE_PUBLIC_DER,
+};
+
+static JSValue tjs_crypto_get_key_type(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+    size_t key_len;
+    const uint8_t* key_data;
+    EVP_PKEY* pkey;
+    const char* type_name;
+    JSValue result;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "getKeyType() requires 1 argument: key");
+    }
+
+    key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
+    if (!key_data) {
+        return JS_EXCEPTION;
+    }
+
+    pkey = magic == KEY_KIND_PRIVATE
+        ? tjs_crypto_load_private_key_auto(key_data, key_len)
+        : tjs_crypto_load_public_key_auto(key_data, key_len);
+    if (!pkey) {
+        return JS_ThrowInternalError(ctx, magic == KEY_KIND_PRIVATE ? "Failed to parse private key" : "Failed to parse public key");
+    }
+
+    type_name = tjs_crypto_key_type_name(pkey);
+    if (!type_name) {
+        EVP_PKEY_free(pkey);
+        return JS_ThrowInternalError(ctx, "Unsupported key type");
+    }
+
+    result = JS_NewString(ctx, type_name);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
+static JSValue tjs_crypto_export_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+    size_t key_len;
+    const uint8_t* key_data;
+    EVP_PKEY* pkey = NULL;
+    BIO* bio = NULL;
+    int ok = 0;
+    JSValue result;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "exportKey() requires 1 argument: key");
+    }
+
+    key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
+    if (!key_data) {
+        return JS_EXCEPTION;
+    }
+
+    if (magic == KEY_OP_EXPORT_PRIVATE_PEM || magic == KEY_OP_EXPORT_PRIVATE_DER ||
+        magic == KEY_OP_DERIVE_PUBLIC_PEM || magic == KEY_OP_DERIVE_PUBLIC_DER) {
+        pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
+    } else {
+        pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
+    }
+    if (!pkey) {
+        return JS_ThrowInternalError(ctx,
+            (magic == KEY_OP_EXPORT_PRIVATE_PEM || magic == KEY_OP_EXPORT_PRIVATE_DER ||
+             magic == KEY_OP_DERIVE_PUBLIC_PEM || magic == KEY_OP_DERIVE_PUBLIC_DER)
+                ? "Failed to parse private key"
+                : "Failed to parse public key");
+    }
+
+    bio = BIO_new(BIO_s_mem());
+    if (!bio) {
+        EVP_PKEY_free(pkey);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    switch (magic) {
+        case KEY_OP_EXPORT_PRIVATE_PEM:
+            ok = PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL);
+            break;
+        case KEY_OP_EXPORT_PRIVATE_DER:
+            ok = i2d_PrivateKey_bio(bio, pkey);
+            break;
+        case KEY_OP_EXPORT_PUBLIC_PEM:
+        case KEY_OP_DERIVE_PUBLIC_PEM:
+            ok = PEM_write_bio_PUBKEY(bio, pkey);
+            break;
+        case KEY_OP_EXPORT_PUBLIC_DER:
+        case KEY_OP_DERIVE_PUBLIC_DER:
+            ok = i2d_PUBKEY_bio(bio, pkey);
+            break;
+        default:
+            ok = 0;
+            break;
+    }
+
+    if (ok != 1) {
+        BIO_free(bio);
+        EVP_PKEY_free(pkey);
+        return JS_ThrowInternalError(ctx, "Key export failed");
+    }
+
+    result = tjs_crypto_bio_to_arraybuffer(ctx, bio);
+    BIO_free(bio);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
 /* Generate ECC key pair */
 /* Generate ECC key pair */
 static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
@@ -337,7 +515,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
         return JS_ThrowInternalError(ctx, "Failed to get key components");
     }
     
-    size_t priv_len = BN_num_bytes(priv_bn);
+    size_t priv_len = (EC_GROUP_get_degree(group) + 7) / 8;
     size_t pub_len = EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
     
     if (pub_len == 0) {
@@ -357,7 +535,13 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
     
-    BN_bn2bin(priv_bn, priv_buf);
+    if (BN_bn2binpad(priv_bn, priv_buf, priv_len) != (int)priv_len) {
+        js_free(ctx, priv_buf);
+        js_free(ctx, pub_buf);
+        EC_KEY_free(eckey);
+        EC_GROUP_free(group);
+        return JS_ThrowInternalError(ctx, "Failed to encode private key");
+    }
     EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED, pub_buf, pub_len, NULL);
     
     JSValue result = JS_NewObject(ctx);
@@ -1035,6 +1219,7 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
     
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int hash_len;
+    size_t xof_len = 0;
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
     if (!mdctx) {
@@ -1042,8 +1227,19 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
     }
     
     if (EVP_DigestInit_ex(mdctx, md, NULL) != 1 ||
-        EVP_DigestUpdate(mdctx, data, data_len) != 1 ||
-        EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
+        EVP_DigestUpdate(mdctx, data, data_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        return JS_ThrowInternalError(ctx, "Hash computation failed");
+    }
+
+    if (magic == HASH_SHAKE128 || magic == HASH_SHAKE256) {
+        xof_len = magic == HASH_SHAKE128 ? 16 : 32;
+        if (EVP_DigestFinalXOF(mdctx, hash, xof_len) != 1) {
+            EVP_MD_CTX_free(mdctx);
+            return JS_ThrowInternalError(ctx, "Hash computation failed");
+        }
+        hash_len = (unsigned int)xof_len;
+    } else if (EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         return JS_ThrowInternalError(ctx, "Hash computation failed");
     }
@@ -1289,6 +1485,52 @@ static JSValue tjs_crypto_random_bytes(JSContext* ctx, JSValueConst this_val, in
     
     JSValue result = js_fastab(ctx, buf, length);
     return result;
+}
+
+static JSValue tjs_crypto_random_fill(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    uint64_t offset64 = 0;
+    uint64_t size64 = 0;
+    bool has_size = argc >= 3 && !JS_IsUndefined(argv[2]);
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "randomFill() requires 1 argument: buffer");
+    }
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToIndex(ctx, &offset64, argv[1])) {
+        return JS_EXCEPTION;
+    }
+    if (has_size && JS_ToIndex(ctx, &size64, argv[2])) {
+        return JS_EXCEPTION;
+    }
+    if (offset64 > SIZE_MAX || size64 > SIZE_MAX) {
+        return JS_ThrowRangeError(ctx, "offset or size is too large");
+    }
+
+    size_t data_len;
+    uint8_t* data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+
+    size_t offset = (size_t)offset64;
+    if (offset > data_len) {
+        return JS_ThrowRangeError(ctx, "offset + size exceeds buffer length");
+    }
+    size_t size = has_size ? (size_t)size64 : data_len - offset;
+    if (size > data_len - offset) {
+        return JS_ThrowRangeError(ctx, "offset + size exceeds buffer length");
+    }
+
+    uint8_t* out = data + offset;
+    while (size > 0) {
+        int chunk = size > INT_MAX ? INT_MAX : (int)size;
+        if (RAND_bytes(out, chunk) != 1) {
+            return JS_ThrowInternalError(ctx, "Failed to generate random bytes");
+        }
+        out += chunk;
+        size -= (size_t)chunk;
+    }
+
+    return JS_DupValue(ctx, argv[0]);
 }
 
 /* Cipher encryption/decryption using magic */
@@ -2748,21 +2990,39 @@ static JSValue tjs_randomUUID(JSContext *ctx, JSValue this_val, int argc, JSValu
 static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     /* Hash functions */
     JS_CFUNC_MAGIC_DEF("md5", 1, tjs_crypto_hash, HASH_MD5),
+    JS_CFUNC_MAGIC_DEF("ripemd160", 1, tjs_crypto_hash, HASH_RIPEMD160),
     JS_CFUNC_MAGIC_DEF("sha1", 1, tjs_crypto_hash, HASH_SHA1),
     JS_CFUNC_MAGIC_DEF("sha224", 1, tjs_crypto_hash, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("sha256", 1, tjs_crypto_hash, HASH_SHA256),
     JS_CFUNC_MAGIC_DEF("sha384", 1, tjs_crypto_hash, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("sha512", 1, tjs_crypto_hash, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("sha512_224", 1, tjs_crypto_hash, HASH_SHA512_224),
+    JS_CFUNC_MAGIC_DEF("sha512_256", 1, tjs_crypto_hash, HASH_SHA512_256),
     JS_CFUNC_MAGIC_DEF("sha3_224", 1, tjs_crypto_hash, HASH_SHA3_224),
     JS_CFUNC_MAGIC_DEF("sha3_256", 1, tjs_crypto_hash, HASH_SHA3_256),
     JS_CFUNC_MAGIC_DEF("sha3_384", 1, tjs_crypto_hash, HASH_SHA3_384),
     JS_CFUNC_MAGIC_DEF("sha3_512", 1, tjs_crypto_hash, HASH_SHA3_512),
+    JS_CFUNC_MAGIC_DEF("blake2b512", 1, tjs_crypto_hash, HASH_BLAKE2B512),
+    JS_CFUNC_MAGIC_DEF("blake2s256", 1, tjs_crypto_hash, HASH_BLAKE2S256),
+    JS_CFUNC_MAGIC_DEF("shake128", 1, tjs_crypto_hash, HASH_SHAKE128),
+    JS_CFUNC_MAGIC_DEF("shake256", 1, tjs_crypto_hash, HASH_SHAKE256),
     
     /* HMAC functions */
     JS_CFUNC_MAGIC_DEF("hmacMd5", 2, tjs_crypto_hmac, HASH_MD5),
+    JS_CFUNC_MAGIC_DEF("hmacRipemd160", 2, tjs_crypto_hmac, HASH_RIPEMD160),
     JS_CFUNC_MAGIC_DEF("hmacSha1", 2, tjs_crypto_hmac, HASH_SHA1),
+    JS_CFUNC_MAGIC_DEF("hmacSha224", 2, tjs_crypto_hmac, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("hmacSha256", 2, tjs_crypto_hmac, HASH_SHA256),
+    JS_CFUNC_MAGIC_DEF("hmacSha384", 2, tjs_crypto_hmac, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("hmacSha512", 2, tjs_crypto_hmac, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("hmacSha512_224", 2, tjs_crypto_hmac, HASH_SHA512_224),
+    JS_CFUNC_MAGIC_DEF("hmacSha512_256", 2, tjs_crypto_hmac, HASH_SHA512_256),
+    JS_CFUNC_MAGIC_DEF("hmacSha3_224", 2, tjs_crypto_hmac, HASH_SHA3_224),
+    JS_CFUNC_MAGIC_DEF("hmacSha3_256", 2, tjs_crypto_hmac, HASH_SHA3_256),
+    JS_CFUNC_MAGIC_DEF("hmacSha3_384", 2, tjs_crypto_hmac, HASH_SHA3_384),
+    JS_CFUNC_MAGIC_DEF("hmacSha3_512", 2, tjs_crypto_hmac, HASH_SHA3_512),
+    JS_CFUNC_MAGIC_DEF("hmacBlake2b512", 2, tjs_crypto_hmac, HASH_BLAKE2B512),
+    JS_CFUNC_MAGIC_DEF("hmacBlake2s256", 2, tjs_crypto_hmac, HASH_BLAKE2S256),
     
     /* Streaming hash */
     JS_CFUNC_MAGIC_DEF("createMd5",    0, tjs_crypto_create_hash, HASH_MD5),
@@ -2771,10 +3031,14 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("createSha256", 0, tjs_crypto_create_hash, HASH_SHA256),
     JS_CFUNC_MAGIC_DEF("createSha384", 0, tjs_crypto_create_hash, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("createSha512", 0, tjs_crypto_create_hash, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("createSha512_224", 0, tjs_crypto_create_hash, HASH_SHA512_224),
+    JS_CFUNC_MAGIC_DEF("createSha512_256", 0, tjs_crypto_create_hash, HASH_SHA512_256),
     JS_CFUNC_MAGIC_DEF("createSha3_224", 0, tjs_crypto_create_hash, HASH_SHA3_224),
     JS_CFUNC_MAGIC_DEF("createSha3_256", 0, tjs_crypto_create_hash, HASH_SHA3_256),
     JS_CFUNC_MAGIC_DEF("createSha3_384", 0, tjs_crypto_create_hash, HASH_SHA3_384),
     JS_CFUNC_MAGIC_DEF("createSha3_512", 0, tjs_crypto_create_hash, HASH_SHA3_512),
+    JS_CFUNC_MAGIC_DEF("createBlake2b512", 0, tjs_crypto_create_hash, HASH_BLAKE2B512),
+    JS_CFUNC_MAGIC_DEF("createBlake2s256", 0, tjs_crypto_create_hash, HASH_BLAKE2S256),
     
     /* Streaming HMAC */
     JS_CFUNC_MAGIC_DEF("createHmacSha256", 1, tjs_crypto_create_hmac, HASH_SHA256),
@@ -2822,14 +3086,27 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     
     /* RSA */
     JS_CFUNC_DEF("generateRsaKey", 1, tjs_crypto_generate_rsa_key),
+    JS_CFUNC_MAGIC_DEF("signSha224", 2, tjs_crypto_sign, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("signSha256", 2, tjs_crypto_sign, HASH_SHA256),
+    JS_CFUNC_MAGIC_DEF("signSha384", 2, tjs_crypto_sign, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("signSha512", 2, tjs_crypto_sign, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("verifySha224", 3, tjs_crypto_verify, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("verifySha256", 3, tjs_crypto_verify, HASH_SHA256),
+    JS_CFUNC_MAGIC_DEF("verifySha384", 3, tjs_crypto_verify, HASH_SHA384),
     JS_CFUNC_MAGIC_DEF("verifySha512", 3, tjs_crypto_verify, HASH_SHA512),
+    JS_CFUNC_MAGIC_DEF("getPrivateKeyType", 1, tjs_crypto_get_key_type, KEY_KIND_PRIVATE),
+    JS_CFUNC_MAGIC_DEF("getPublicKeyType", 1, tjs_crypto_get_key_type, KEY_KIND_PUBLIC),
+    JS_CFUNC_MAGIC_DEF("exportPrivateKeyPem", 1, tjs_crypto_export_key, KEY_OP_EXPORT_PRIVATE_PEM),
+    JS_CFUNC_MAGIC_DEF("exportPrivateKeyDer", 1, tjs_crypto_export_key, KEY_OP_EXPORT_PRIVATE_DER),
+    JS_CFUNC_MAGIC_DEF("exportPublicKeyPem", 1, tjs_crypto_export_key, KEY_OP_EXPORT_PUBLIC_PEM),
+    JS_CFUNC_MAGIC_DEF("exportPublicKeyDer", 1, tjs_crypto_export_key, KEY_OP_EXPORT_PUBLIC_DER),
+    JS_CFUNC_MAGIC_DEF("derivePublicKeyPem", 1, tjs_crypto_export_key, KEY_OP_DERIVE_PUBLIC_PEM),
+    JS_CFUNC_MAGIC_DEF("derivePublicKeyDer", 1, tjs_crypto_export_key, KEY_OP_DERIVE_PUBLIC_DER),
     
     /* Utility functions */
     JS_CFUNC_DEF("crc32", 1, tjs_crypto_crc32),
     JS_CFUNC_DEF("randomBytes", 1, tjs_crypto_random_bytes),
+    JS_CFUNC_DEF("randomFill", 3, tjs_crypto_random_fill),
     JS_CFUNC_DEF("base64Encode", 1, tjs_crypto_base64_encode),
     JS_CFUNC_DEF("base64Decode", 1, tjs_crypto_base64_decode),
     JS_CFUNC_DEF("hexEncode", 1, tjs_crypto_hex_encode),
