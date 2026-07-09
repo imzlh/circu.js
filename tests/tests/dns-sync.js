@@ -2,7 +2,7 @@
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 
-// 测试 DNS 同步解析功能
+// Test DNS synchronous resolution functionality
 await test('DNS.resolveSync - IPv4 resolution', () => {
     const addresses = dns.resolveSync('example.com', {
         family: os.AF_INET, // IPv4
@@ -30,12 +30,12 @@ await test('DNS.resolveSync - IPv6 resolution', () => {
 });
 
 await test('DNS.query - CNAME record query', async () => {
-    // 测试一个可能有CNAME的域名
+    // Test a domain that may have CNAME
     const answers = await dns.query('www.github.com', dns.CNAME, '114.114.114.114', 3000);
 
     assert(Array.isArray(answers), 'Should return an array');
 
-    // 如果有CNAME记录
+    // If there are CNAME records
     const cnameAnswers = answers.filter(a => a.type === dns.CNAME);
 
     if (cnameAnswers.length > 0) {

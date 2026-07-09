@@ -202,7 +202,7 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
     structType->ffi_type->alignment = 0;
     structType->ffi_type->elements = elements;
 
-    // 数组类型：直接计算大小和对齐
+    // Array type: calculate size and alignment directly
     if (arrSz > 0) {
         structType->ffi_type->size = arrSz * ffi_type_get_sz(elements[0]);
         structType->ffi_type->alignment = elements[0]->alignment;

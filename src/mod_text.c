@@ -1,5 +1,5 @@
 /*
- * txiki.js Text Module - libiconv wrapper
+ * circu.js
  *
  * Copyright (c) 2025-2026 iz <himzlh@163.com>
  *

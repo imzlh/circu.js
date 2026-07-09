@@ -4,7 +4,7 @@ const { Parser, REQUEST, RESPONSE, strerr, strstatus } = import.meta.use('http')
 const { Encoder: TextEncoder, Decoder: TextDecoder } = import.meta.use('text');
 const { AF_INET } = import.meta.use('os');
 
-// 辅助函数：字符串转 Uint8Array
+// Helper function: convert string to Uint8Array
 function encode(str) {
     return new TextEncoder().encode(str);
 }
@@ -26,9 +26,9 @@ function initHandler(parser) {
     parser.onChunkComplete = () => void 0;
 }
 
-// ----------------------------- 单元测试 -----------------------------
+// ----------------------------- Unit Tests -----------------------------
 
-// 测试1: 基本请求解析
+// Test 1: Basic request parsing
 test(async () => {
     console.log('Running testBasicRequest...');
     const parser = new Parser(REQUEST);
@@ -49,7 +49,7 @@ test(async () => {
     console.log('✓ testBasicRequest passed');
 });
 
-// 测试2: 请求头解析
+// Test 2: Request header parsing
 test(async () => {
     console.log('Running testRequestHeaders...');
     const parser = new Parser(REQUEST);
@@ -81,7 +81,7 @@ test(async () => {
     console.log('✓ testRequestHeaders passed');
 });
 
-// 测试3: 响应解析
+// Test 3: Response parsing
 test(async () => {
     console.log('Running testBasicResponse...');
     const parser = new Parser(RESPONSE);
@@ -103,7 +103,7 @@ test(async () => {
     console.log('✓ testBasicResponse passed');
 });
 
-// 测试4: Chunked响应解析
+// Test 4: Chunked response parsing
 test(async () => {
     console.log('Running testChunkedResponse...');
     const parser = new Parser(RESPONSE);
@@ -144,7 +144,7 @@ test(async () => {
     console.log('✓ testChunkedResponse passed');
 });
 
-// 测试5: 请求体解析
+// Test 5: Request body parsing
 test(async () => {
     console.log('Running testRequestBody...');
     const parser = new Parser(REQUEST);
@@ -175,7 +175,7 @@ test(async () => {
     console.log('✓ testRequestBody passed');
 });
 
-// 测试6: 解析器重置
+// Test 6: Parser reset
 test(async () => {
     console.log('Running testParserReset...');
     const parser = new Parser(REQUEST);
@@ -191,7 +191,7 @@ test(async () => {
     console.log('✓ testParserReset passed');
 });
 
-// 测试7: 错误处理
+// Test 7: Error handling
 test(async () => {
     console.log('Running testErrorHandling...');
     const parser = new Parser(REQUEST);
@@ -206,7 +206,7 @@ test(async () => {
     console.log('✓ testErrorHandler passed');
 });
 
-// 测试8: 暂停/恢复
+// Test 8: Pause/Resume
 test(async () => {
     console.log('Running testPauseResume...');
     const parser = new Parser(REQUEST);
@@ -223,7 +223,7 @@ test(async () => {
 
     assertEquals(callCount, 1, 'Callback should be called once before pause');
 
-    // 恢复并继续
+    // Resume and continue
     parser.resume();
     parser.execute(request);
 
@@ -231,13 +231,13 @@ test(async () => {
     console.log('✓ testPauseResume passed');
 });
 
-// ----------------------------- TCP 集成测试 -----------------------------
+// ----------------------------- TCP Integration Tests -----------------------------
 
-// 测试9: 通过TCP发送和接收HTTP消息
+// Test 9: Send and receive HTTP messages over TCP
 await test(async () => {
     console.log('Running testHttpOverTcp...');
 
-    // 客户端发送请求
+    // Client sends request
     const client = new TCP();
     const ip = (await resolve('captive.apple.com', { family: AF_INET }))[0];
     assert(ip, "No IP found for captive.apple.com");
@@ -253,7 +253,7 @@ await test(async () => {
 
     await client.write(encode(request));
 
-    // 解析响应
+    // Parse the response
     const responseParser = new Parser(RESPONSE);
     const responseInfo = { status: null, body: '' };
     initHandler(responseParser);

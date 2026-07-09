@@ -2,7 +2,7 @@
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 
-// 测试 DNS 解析功能
+// Test DNS resolution functionality
 await test('DNS.resolve - IPv4 resolution', async () => {
     const addresses = await dns.resolve('example.com', {
         family: os.AF_INET, // IPv4
@@ -29,7 +29,7 @@ await test('DNS.resolve - IPv6 resolution', async () => {
     }
 });
 
-// 测试 DNS 查询功能
+// Test DNS query functionality
 await test('DNS.query - A record query', async () => {
     const answers = await dns.query('example.com', dns.A);
 
@@ -48,12 +48,12 @@ await test('DNS.query - A record query', async () => {
 });
 
 await test('DNS.query - CNAME record query', async () => {
-    // 测试一个可能有CNAME的域名
+    // Test a domain that may have CNAME
     const answers = await dns.query('www.github.com', dns.CNAME, '114.114.114.114', 3000);
 
     assert(Array.isArray(answers), 'Should return an array');
 
-    // 如果有CNAME记录
+    // If there are CNAME records
     const cnameAnswers = answers.filter(a => a.type === dns.CNAME);
 
     if (cnameAnswers.length > 0) {
@@ -139,32 +139,32 @@ await test('DNS.query - SOA record query', async () => {
     }
 });
 
-// 测试错误情况
+// Test error cases
 await test('DNS.query - Invalid domain should handle gracefully', async () => {
     try {
         const answers = await dns.query('this-domain-probably-does-not-exist-12345.com', dns.A);
 
-        // 可能返回空数组或包含错误信息的记录
+        // May return an empty array or records with error information
         assert(Array.isArray(answers), 'Should still return an array');
-        // 不期望找到记录，所以可能为空
+        // Don't expect to find records, so it may be empty
     } catch (error) {
-        // 如果抛出错误也是可以接受的
+        // Throwing an error is also acceptable
         assert(error instanceof Error, 'Should throw Error');
     }
 });
 
 await test('DNS.query - Invalid server timeout', async () => {
     try {
-        // 使用一个可能不响应的地址和超时时间
+        // Use an address that may not respond and a timeout value
         await dns.query('example.com', dns.A, '192.0.2.1', 100);
-        // 如果超时，可能会抛出错误
+        // If timeout occurs, it may throw an error
     } catch (error) {
-        // 超时错误是预期的
+        // Timeout error is expected
         assert(error instanceof Error, 'Should throw Error on timeout');
     }
 });
 
-// 测试常量
+// Test constants
 await test('DNS constants', () => {
     assertEquals(dns.A, 1, 'A record type should be 1');
     assertEquals(dns.NS, 2, 'NS record type should be 2');
@@ -179,16 +179,16 @@ await test('DNS constants', () => {
     assertEquals(dns.CAA, 257, 'CAA record type should be 257');
 });
 
-// 测试联合类型功能
+// Test union type functionality
 await test('DNSAnswer type discrimination', async () => {
     const answers = await dns.query('example.com', dns.A);
 
     if (answers.length > 0) {
         const answer = answers[0];
 
-        // 根据类型进行类型守卫检查
+        // Type guard check based on type
         if (answer.type === dns.A || answer.type === dns.AAAA) {
-            // TypeScript 现在应该知道这是 AddressAnswer
+            // TypeScript should now know this is an AddressAnswer
             const addrAnswer = answer;
             assert('address' in addrAnswer, 'AddressAnswer should have address');
         } else if (answer.type === dns.CNAME) {
@@ -202,6 +202,6 @@ await test('DNSAnswer type discrimination', async () => {
             const txtAnswer = answer;
             assert('txt' in txtAnswer, 'TxtAnswer should have txt');
         }
-        // ... 其他类型类似
+        // ... other types are similar
     }
 });

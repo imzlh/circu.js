@@ -6,15 +6,15 @@ const stream = import.meta.use('streams');
 const os = import.meta.use('os');
 const dns = import.meta.use('dns');
 
-// 测试同步读取流
+// Test synchronous read stream
 await test('Stream.readSync - Basic functionality', () => {
-    // 创建一个测试用的TCP连接
+    // Create a test TCP connection
     const client = new stream.TCP();
     
     try {
-        // 先解析域名获取IP地址
+        // Resolve domain name to get IP address first
         const addresses = dns.resolveSync('example.com', { family: 0 }); // 0 = AF_UNSPEC (both IPv4 and IPv6)
-        // 使用第一个IPv4地址
+        // Use the first IPv4 address
         const ipv4Address = addresses.find(addr => addr.family === 4);
         if (!ipv4Address) {
             throw new Error('No IPv4 address found for example.com');
@@ -22,23 +22,23 @@ await test('Stream.readSync - Basic functionality', () => {
         const ip = ipv4Address.ip;
         console.log(addresses)
         
-        // 尝试连接到一个公共服务器
+        // Try connecting to a public server
         client.connectSync({ ip, port: 80 });
         client.setBlocking(true);
         console.log('Connect OK')
         
-        // 尝试读取数据（可能会因为没有数据而返回null或空数组）
+        // Try reading data (may return null or empty array if no data available)
         client.writeSync(engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\n\r\n'))
         const buffer = new Uint8Array(1024);
         let bytesRead = client.readSync(buffer);
         console.log('read ok:', bytesRead, buffer.subarray(0, bytesRead), engine.decodeString(buffer.subarray(0, bytesRead)))
         
-        // 验证返回值是预期的类型
+        // Verify the return value is the expected type
         assert(typeof bytesRead === 'number' || bytesRead === null, 'Should return number of bytes read or null');
         
         if (bytesRead !== null) {
             assert(bytesRead <= 1024, 'Bytes read should not exceed buffer size');
-            // 获取实际读取的数据
+            // Get the actual data read
             const data = buffer.subarray(0, bytesRead);
             assert(data instanceof Uint8Array, 'Data should be a Uint8Array');
         }
@@ -47,32 +47,32 @@ await test('Stream.readSync - Basic functionality', () => {
     }
 });
 
-// 测试同步写入流
+// Test synchronous write stream
 await test('Stream.writeSync - Basic functionality', () => {
-    // 创建一个测试用的TCP连接
+    // Create a test TCP connection
     const client = new stream.TCP();
     
     try {
-        // 先解析域名获取IP地址
+        // Resolve domain name to get IP address first
         const addresses = dns.resolveSync('example.com', { family: 0 }); // 0 = AF_UNSPEC (both IPv4 and IPv6)
-        // 使用第一个IPv4地址
+        // Use the first IPv4 address
         const ipv4Address = addresses.find(addr => addr.family === 4);
         if (!ipv4Address) {
             throw new Error('No IPv4 address found for example.com');
         }
         const ip = ipv4Address.ip;
         
-        // 尝试连接到一个公共服务器
+        // Try connecting to a public server
         client.connectSync({ ip, port: 80 });
         client.setBlocking(true);
         
-        // 创建一个简单的HTTP请求
+        // Create a simple HTTP request
         const requestData = engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\n\r\n');
         
-        // 尝试写入数据
+        // Try writing data
         const bytesWritten = client.writeSync(requestData);
         
-        // 验证写入的字节数
+        // Verify the number of bytes written
         assert(typeof bytesWritten === 'number', 'Should return number of bytes written');
         assert(bytesWritten > 0, 'Should write at least one byte');
         assert(bytesWritten <= requestData.length, 'Should not write more than requested');
@@ -81,45 +81,45 @@ await test('Stream.writeSync - Basic functionality', () => {
     }
 });
 
-// 测试大文件同步操作
+// Test large file synchronous operations
 await test('Stream - Large file sync operations', () => {
-    // 创建一个测试用的TCP连接
+    // Create a test TCP connection
     const client = new stream.TCP();
     
     try {
-        // 先解析域名获取IP地址
+        // Resolve domain name to get IP address first
         const addresses = dns.resolveSync('example.com', { family: 0 }); // 0 = AF_UNSPEC (both IPv4 and IPv6)
-        // 使用第一个IPv4地址
+        // Use the first IPv4 address
         const ipv4Address = addresses.find(addr => addr.family === 4);
         if (!ipv4Address) {
             throw new Error('No IPv4 address found for example.com');
         }
         const ip = ipv4Address.ip;
         
-        // 尝试连接到一个公共服务器
+        // Try connecting to a public server
         client.connectSync({ ip, port: 80 });
         client.setBlocking(true);
         
-        // 发送一个简单的HTTP请求
+        // Send a simple HTTP request
         const requestData = engine.encodeString('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
         client.writeSync(requestData);
         
-        // 尝试读取大量数据
+        // Try reading large amounts of data
         let totalBytesRead = 0;
-        const maxReads = 10; // 限制读取次数以避免无限循环
+        const maxReads = 10; // Limit read count to avoid infinite loops
         
         for (let i = 0; i < maxReads; i++) {
-            const buffer = new Uint8Array(8192); // 8KB缓冲区
+            const buffer = new Uint8Array(8192); // 8KB buffer
             const bytesRead = client.readSync(buffer);
             
             if (bytesRead === null || bytesRead === 0) {
-                break; // 没有更多数据
+                break; // No more data
             }
             
             totalBytesRead += bytesRead;
         }
         
-        // 验证读取了一些数据
+        // Verify some data was read
         assert(totalBytesRead >= 0, 'Should read non-negative bytes');
         
         console.log(`Read ${totalBytesRead} bytes from server`);
@@ -128,13 +128,13 @@ await test('Stream - Large file sync operations', () => {
     }
 });
 
-// 测试错误处理
+// Test error handling
 await test('Stream - Error handling', () => {
-    // 创建一个测试用的TCP连接
+    // Create a test TCP connection
     const client = new stream.TCP();
     
     try {
-        // 尝试连接到一个不存在的服务器
+        // Try connecting to a non-existent server
         try {
             client.connectSync({ ip: 'this-domain-does-not-exist-12345.com', port: 80 });
             assert(false, 'Should throw an error for invalid domain');
@@ -143,7 +143,7 @@ await test('Stream - Error handling', () => {
             assert(error.message, 'Error should have a message');
         }
         
-        // 尝试向未连接的流写入数据
+        // Try writing data to an unconnected stream
         try {
             const textEncoder = new TextEncoder();
             const requestData = textEncoder.encode('test data');
@@ -154,7 +154,7 @@ await test('Stream - Error handling', () => {
             assert(error.message, 'Error should have a message');
         }
         
-        // 尝试从未连接的流读取数据
+        // Try reading data from an unconnected stream
         try {
             const buffer = new Uint8Array(1024);
             client.readSync(buffer);
@@ -168,7 +168,7 @@ await test('Stream - Error handling', () => {
     }
 });
 
-// 测试同步与异步结果一致性（仅同步部分）
+// Test sync and async result consistency (sync part only)
 await test('Stream - Sync read/write consistency', () => {
     const syncClient = new stream.TCP();
     
@@ -179,20 +179,20 @@ await test('Stream - Sync read/write consistency', () => {
         syncClient.connectSync({ ip, port: 80 });
         syncClient.setBlocking(true);
         
-        // 准备测试数据
+        // Prepare test data
         const requestData = engine.encodeString('GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\n\r\n');
         
-        // 同步写入
+        // Synchronous write
         const bytesWritten = syncClient.writeSync(requestData);
         assert(bytesWritten > 0, 'Should write data');
         
-        // 同步读取
+        // Synchronous read
         const syncData = new Uint8Array(1024);
         const bytesRead = syncClient.readSync(syncData);
         
         assert(bytesRead > 0, 'Should read data');
         
-        // 验证HTTP响应
+        // Verify HTTP response
         const response = engine.decodeString(syncData.subarray(0, bytesRead));
         assert(response.startsWith('HTTP/1.1'), 'Should get HTTP response');
         console.log('Sync read/write consistent, got', bytesRead, 'bytes');
