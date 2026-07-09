@@ -145,6 +145,7 @@ typedef struct {
 
 /* Forward declarations — used by the import trampoline before their definition. */
 static void tjs__wasm_invalidate_membuf(JSContext *ctx, TJSWasmInstance *inst);
+static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem);
 
 static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
     TJSWasmInstance *i = JS_GetOpaque(val, tjs_wasm_instance_class_id);
@@ -465,7 +466,13 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
      * WAMR may relocate linear memory during memory.grow, freeing the old
      * block.  If that happened earlier in the current WASM call, the cached
      * mem_buffer still points at freed memory, and any TypedArray views
-     * derived from it are dangling pointers.
+     * derived from it are dangling pointers. WAMR can also grow memory
+     * *in place* (base pointer unchanged, committed size larger) when the
+     * grow fits inside its pre-reserved region -- so byte length must be
+     * compared too, not just the base pointer, or an in-place grow leaves
+     * a wrong-sized-but-still-"live" (non-detached) buffer that JS-side
+     * staleness checks (e.g. wasm-bindgen's `byteLength === 0`) will never
+     * catch.
      *
      * Invalidate BEFORE the JS call so getMemoryBuffer() hands out a fresh
      * ArrayBuffer backed by the current memory base.
@@ -473,12 +480,15 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
     TJSWasmInstance *tjs__tramp_inst = wasm_runtime_get_user_data(exec_env);
     wasm_memory_inst_t tjs__tramp_mem = NULL;
     void *tjs__tramp_mem_base = NULL;
+    size_t tjs__tramp_mem_len = 0;
     if (tjs__tramp_inst && !JS_IsUndefined(tjs__tramp_inst->mem_buffer)) {
         wasm_module_inst_t tjs__mod = wasm_runtime_get_module_inst(exec_env);
         tjs__tramp_mem = tjs__mod ? wasm_runtime_get_default_memory(tjs__mod) : NULL;
         if (tjs__tramp_mem) {
             tjs__tramp_mem_base = wasm_memory_get_base_address(tjs__tramp_mem);
-            if (tjs__tramp_mem_base != tjs__tramp_inst->mem_base)
+            tjs__tramp_mem_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
+            if (tjs__tramp_mem_base != tjs__tramp_inst->mem_base ||
+                tjs__tramp_mem_len != tjs__tramp_inst->mem_byte_length)
                 tjs__wasm_invalidate_membuf(ctx, tjs__tramp_inst);
         }
     }
@@ -493,8 +503,9 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
      * Reuse the already-resolved memory instance to save API calls. */
     if (tjs__tramp_mem && tjs__tramp_inst &&
         !JS_IsUndefined(tjs__tramp_inst->mem_buffer)) {
-        void *tjs__after = wasm_memory_get_base_address(tjs__tramp_mem);
-        if (tjs__after != tjs__tramp_mem_base)
+        void *tjs__after_base = wasm_memory_get_base_address(tjs__tramp_mem);
+        size_t tjs__after_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
+        if (tjs__after_base != tjs__tramp_mem_base || tjs__after_len != tjs__tramp_mem_len)
             tjs__wasm_invalidate_membuf(ctx, tjs__tramp_inst);
     }
 
@@ -750,6 +761,16 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* Current committed size of a WAMR memory instance, in bytes. WAMR can grow
+ * linear memory in place (same base pointer, larger committed size) when the
+ * grow fits inside its pre-reserved region, so callers must not treat an
+ * unchanged base pointer alone as proof that memory didn't grow. */
+static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem) {
+    uint64_t page_count = wasm_memory_get_cur_page_count(mem);
+    uint64_t bytes_per_page = wasm_memory_get_bytes_per_page(mem);
+    return (size_t) (page_count * bytes_per_page);
+}
+
 /* Detach and release the cached linear-memory ArrayBuffer (if any).
  * WAMR may move the linear-memory base when it grows (explicit growMemory or
  * an internal memory.grow during a call), leaving any previously exposed
@@ -845,12 +866,18 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
 
     wasm_val_t results[TJS__WASM_MAX_ARGS];
 
-    /* Record linear-memory base to detect a move from an internal memory.grow. */
+    /* Record linear-memory base + committed size to detect an internal
+     * memory.grow -- WAMR can grow in place (base unchanged) when the grow
+     * fits its pre-reserved region, so the base pointer alone isn't enough
+     * (see the matching comment at the import trampoline above). */
     void *tjs__mem_base_before = NULL;
+    size_t tjs__mem_len_before = 0;
     {
         wasm_memory_inst_t tjs__mem = wasm_runtime_get_default_memory(inst->module_inst);
-        if (tjs__mem)
+        if (tjs__mem) {
             tjs__mem_base_before = wasm_memory_get_base_address(tjs__mem);
+            tjs__mem_len_before = tjs__wasm_mem_byte_length(tjs__mem);
+        }
     }
 
     if (!wasm_runtime_call_wasm_a(inst->exec_env, func, result_count, results, param_count, params)) {
@@ -869,11 +896,13 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         return err;
     }
 
-    /* If linear memory moved during the call, any exposed ArrayBuffer dangles. */
+    /* If linear memory moved or grew in place during the call, any exposed
+     * ArrayBuffer is stale. */
     {
         wasm_memory_inst_t tjs__mem = wasm_runtime_get_default_memory(inst->module_inst);
         void *tjs__mem_base_after = tjs__mem ? wasm_memory_get_base_address(tjs__mem) : NULL;
-        if (tjs__mem_base_after != tjs__mem_base_before)
+        size_t tjs__mem_len_after = tjs__mem ? tjs__wasm_mem_byte_length(tjs__mem) : 0;
+        if (tjs__mem_base_after != tjs__mem_base_before || tjs__mem_len_after != tjs__mem_len_before)
             tjs__wasm_invalidate_membuf(ctx, inst);
     }
 

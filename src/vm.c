@@ -161,7 +161,7 @@ JSValue tjs__get_args(JSContext* ctx) {
     return args;
 }
 
-static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col) {
+static int tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col) {
     TJSRuntime* qrt = TJS_GetRuntime(ctx);
 
     MappingResult res = js_get_source_mapping(qrt->module.mapctx, name, *line, *col);
@@ -169,6 +169,7 @@ static void tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int*
         *line = res.original_line;
         *col = res.original_column;
     }
+    return res.found;
 }
 
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
