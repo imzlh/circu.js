@@ -21,6 +21,21 @@ set(CMAKE_C_STANDARD 11)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Release builds: minimize size across every target configured from here
+# down (qjs, uv_a, vmlib, libcjs, cjs-cli) — dead-strip at the section
+# level, strip symbols/debug info at link time, and enable LTO.
+if(NOT MSVC AND NOT CMAKE_BUILD_TYPE MATCHES "Debug")
+    add_compile_options(-Os -ffunction-sections -fdata-sections)
+    add_link_options(-Wl,--gc-sections -s)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _cjs_ipo_supported OUTPUT _cjs_ipo_error LANGUAGES C)
+    if(_cjs_ipo_supported)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        message(STATUS "LTO not supported, skipping: ${_cjs_ipo_error}")
+    endif()
+endif()
+
 set(cjs_cflags "")
 set(cjs_ldflags "")
 
@@ -40,10 +55,10 @@ if(MSVC)
         add_compile_definitions(DEBUG)
     endif()
 else()
-    list(APPEND cjs_cflags -Wall -g -Wno-unknown-pragmas -Werror)
+    list(APPEND cjs_cflags -Wall -Wno-unknown-pragmas -Werror)
     list(APPEND cjs_ldflags -rdynamic)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
-        list(APPEND cjs_cflags -ggdb -O0 -fno-omit-frame-pointer)
+        list(APPEND cjs_cflags -g -ggdb -O0 -fno-omit-frame-pointer)
         add_compile_definitions(DEBUG)
     endif()
 endif()
