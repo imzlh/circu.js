@@ -87,6 +87,13 @@ declare namespace CModuleEngine {
      */
     export const EVAL_GLOBAL: number;
 
+    /**
+     * compile only — do not evaluate. The returned value is not directly
+     * usable from script code; pass it to `evalCompiled()` to run it, or
+     * `serialize()` to dump it for later `deserialize()` + `evalCompiled()`.
+     */
+    export const EVAL_COMPILE_ONLY: number;
+
     export enum PromiseState {
         CONSTRUCT,
         BEFORE_THEN,
@@ -220,6 +227,20 @@ declare namespace CModuleEngine {
      * @returns Deserialized object
      */
     export function deserialize<T = unknown>(bytecode: Uint8Array): T;
+
+    /**
+     * Run a value previously compiled with `eval(..., EVAL_COMPILE_ONLY)`
+     * (optionally round-tripped through `serialize()`/`deserialize()`).
+     * Works for both global/script and module compiled values — the module
+     * case is the same mechanism `Module.eval()` uses internally, exposed
+     * generically for plain (non-Module) compiled bytecode.
+     *
+     * The passed value is consumed; do not reuse it after calling this.
+     *
+     * @param compiled A compile-only result from `eval()` or `deserialize()`
+     * @returns The script's completion value, or a Promise for async/module code
+     */
+    export function evalCompiled<T = unknown>(compiled: unknown): T | globalThis.Promise<T>;
 
     /**
      * Garbage collector control module

@@ -805,6 +805,16 @@ static JSValue tjs_deserialize(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 }
 
+/* Run a value previously produced by JS_Eval(..., JS_EVAL_FLAG_COMPILE_ONLY)
+ * (either global/script or module code) — generic counterpart to
+ * js_module_eval, but not tied to the Module class wrapper. Needed to
+ * actually execute a plain compiled-script value round-tripped through
+ * tjs_serialize()/tjs_deserialize() (the JS_TAG_FUNCTION_BYTECODE case). */
+static JSValue tjs_eval_compiled(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "evalCompiled(compiledValue) requires 1 argument");
+    return JS_EvalFunction(ctx, JS_DupValue(ctx, argv[0]));
+}
+
 #define IFOPT(optname, optcheckfunc, then) \
     valtmp = JS_GetPropertyStr(ctx, argv[0], optname); \
     if (optcheckfunc(valtmp)) then \
@@ -1157,6 +1167,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("eval", 3, tjs_eval),
     TJS_CFUNC_DEF("serialize", 2, tjs_serialize),
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
+    TJS_CFUNC_DEF("evalCompiled", 1, tjs_eval_compiled),
     TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
     TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
@@ -1184,6 +1195,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CONST2("EVAL_ASYNC", JS_EVAL_FLAG_ASYNC),
     TJS_CONST2("EVAL_STRICT", JS_EVAL_FLAG_STRICT),
     TJS_CONST2("EVAL_NEW_BACKTRACE", JS_EVAL_FLAG_BACKTRACE_BARRIER),
+    TJS_CONST2("EVAL_COMPILE_ONLY", JS_EVAL_FLAG_COMPILE_ONLY),
 };
 
 /* clang-format off */
