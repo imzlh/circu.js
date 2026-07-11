@@ -239,6 +239,13 @@ declare namespace CModuleEngine {
     export function encodeString(str: string): Uint8Array;
 
     /**
+     * Copy UTF-8 text or bytes into a SharedArrayBuffer-backed Uint8Array.
+     * The returned view has a private trailing NUL guard and is safe to pass
+     * through MessagePipe without cloning its payload.
+     */
+    export function toSharedBytes(value: string | globalThis.Uint8Array | ArrayBuffer): globalThis.Uint8Array<SharedArrayBuffer>;
+
+    /**
      * Decode UTF-8 bytes using the engine's native helper.
      * @param buffer Buffer containing text
      */
@@ -283,7 +290,7 @@ declare namespace CModuleEngine {
          * The module is compiled only. Call `resolve()` to link dependencies or
          * `eval()` to resolve and evaluate it.
          */
-        constructor(content: string, filename: string);
+        constructor(content: string | globalThis.Uint8Array | ArrayBuffer, filename: string);
 
         /**
          * Get module (JSModuleDef) pointer address

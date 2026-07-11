@@ -47,6 +47,14 @@ declare namespace CModuleSourceMap {
     export function loadJSON(file_path: string, json_str: string): number;
 
     /**
+     * Load SourceMap from UTF-8 JSON bytes.
+     * @param file_path File path
+     * @param json_bytes SourceMap JSON bytes
+     * @returns Operation result code
+     */
+    export function loadJSONBytes(file_path: string, json_bytes: Uint8Array | ArrayBufferLike): number;
+
+    /**
      * Get source mapping info
      * @param file_path File path
      * @param line Compiled code line number

@@ -284,6 +284,9 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
                 emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE, obj);
             }
             JS_FreeValue(ctx, obj);
+            for (size_t i = 0; i < sab_tab.len; i++) {
+                tjs__sab_free(NULL, sab_tab.tab[i]);
+            }
             js_free(ctx, sab_tab.tab);
             memset(&p->reading, 0, sizeof(p->reading));
             return;
@@ -325,8 +328,9 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     }
     JS_FreeValue(ctx, obj);
 
-    /* Decrement the SAB reference counts and free the SAB table. */
-    for (int i = 0; i < sab_tab.len; i++) {
+    /* The sender transfers its SAB references with the serialized message.
+     * JS_ReadObject2() clones them first, then this consumes the transfer. */
+    for (size_t i = 0; i < sab_tab.len; i++) {
         tjs__sab_free(NULL, sab_tab.tab[i]);
     }
     js_free(ctx, sab_tab.tab);
@@ -397,9 +401,12 @@ static void uv__write_cb(uv_write_t *req, int status) {
      * so tjs__free is safe here even after ctx/rt have been freed. */
     tjs__free(wr->data);
 
-    // Free the SAB references that were dup'd for this write
-    for (size_t i = 0; i < wr->sab_count; i++) {
-        tjs__sab_free(NULL, wr->sab_list[i]);
+    /* A successful write transfers these references to the read side. A
+     * failed write has no receiver to consume them. */
+    if (status < 0) {
+        for (size_t i = 0; i < wr->sab_count; i++) {
+            tjs__sab_free(NULL, wr->sab_list[i]);
+        }
     }
     tjs__free(wr->sab_list);
     tjs__free(wr);
@@ -441,7 +448,8 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     if (len) memcpy(wr->data, buf, len);
     js_free(ctx, buf);
 
-    /* Increment SAB reference counts before scheduling the async write. */
+    /* Keep SABs alive until the peer deserializes the message. The read side
+     * consumes these transferred references after cloning the objects. */
     if (sab_tab.len > 0) {
         wr->sab_list = tjs__malloc(sizeof(void*) * sab_tab.len);
         if (!wr->sab_list) {
@@ -886,6 +894,16 @@ static JSValue tjs_worker_terminate(JSContext *ctx, JSValue this_val, int argc, 
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_worker_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSWorker *w = tjs_worker_get(ctx, this_val);
+    if (!w) {
+        return JS_EXCEPTION;
+    }
+    TJSRuntime *wrt = worker_request_stop(w);
+    if (wrt != NULL) TJS_Stop(wrt);
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_worker_close_current(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSRuntime *trt = TJS_GetRuntime(ctx);
     if (!trt->is_worker) {
@@ -904,6 +922,7 @@ static JSValue tjs_worker_get_msgpipe(JSContext *ctx, JSValue this_val) {
 }
 
 static const JSCFunctionListEntry tjs_worker_proto_funcs[] = {
+    TJS_CFUNC_DEF("stop", 0, tjs_worker_stop),
     TJS_CFUNC_DEF("terminate", 0, tjs_worker_terminate),
     TJS_CGETSET_DEF("messagePipe", tjs_worker_get_msgpipe, NULL),
 };

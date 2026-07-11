@@ -54,6 +54,9 @@ declare namespace CModuleWorker {
          */
         constructor(user_data: unknown);
 
+        /** Request termination without waiting for the worker thread to join. */
+        stop(): void;
+
         /**
          * Terminate Worker
          */

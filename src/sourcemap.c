@@ -462,14 +462,19 @@ int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx,
     return success;
 }
 
+static int js_load_sourcemap_json(MappingContext *ctx, JSContext *js_ctx,
+                                   const char *file_path, const char *json_str, size_t json_len) {
+	if (!ctx || !file_path || !json_str) return 0;
+	JSValue json_obj = JS_ParseJSON(js_ctx, json_str, json_len, "<sourcemap>");
+	if (JS_IsException(json_obj)) return 0;
+	int result = js_load_sourcemap(ctx, js_ctx, file_path, json_obj);
+	JS_FreeValue(js_ctx, json_obj);
+	return result;
+}
+
 int js_load_sourcemap_cjson(MappingContext *ctx, JSContext *js_ctx,
                               const char *file_path, const char *json_str) {
-    if (!ctx || !file_path || !json_str) return 0;
-    JSValue json_obj = JS_ParseJSON(js_ctx, json_str, strlen(json_str), "<sourcemap>");
-    if (JS_IsException(json_obj)) return 0;
-    int result = js_load_sourcemap(ctx, js_ctx, file_path, json_obj);
-    JS_FreeValue(js_ctx, json_obj);
-    return result;
+	return js_load_sourcemap_json(ctx, js_ctx, file_path, json_str, strlen(json_str));
 }
 
 MappingResult js_get_source_mapping(MappingContext *ctx, const char *file_path,
@@ -552,7 +557,54 @@ static JSValue tjs__load_sourcemap_cjson(JSContext *ctx, JSValueConst this_val,
     int ret = js_load_sourcemap_cjson(rt->module.mapctx, ctx, fp, js);
     JS_FreeCString(ctx, fp);
     JS_FreeCString(ctx, js);
-    return JS_NewInt32(ctx, ret);
+	return JS_NewInt32(ctx, ret);
+}
+
+static JSValue tjs__load_sourcemap_json_bytes(JSContext *ctx, JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	if (argc < 2) return JS_EXCEPTION;
+	const char *fp = JS_ToCString(ctx, argv[0]);
+	size_t json_len = 0;
+	uint8_t *json = JS_GetAnyBuffer(ctx, &json_len, argv[1]);
+	if (!fp || !json) {
+		JS_FreeCString(ctx, fp);
+		return JS_EXCEPTION;
+	}
+
+	/* toSharedBytes() supplies this NUL guard. For arbitrary public inputs,
+	 * copy before JS_ParseJSON(), whose parser requires one byte past json_len. */
+	bool guarded = false;
+	if (JS_GetTypedArrayType(argv[1]) == JS_TYPED_ARRAY_UINT8) {
+		size_t offset = 0, view_len = 0, bytes_per_element = 0, buffer_len = 0;
+		JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[1], &offset, &view_len, &bytes_per_element);
+		if (!JS_IsException(buffer)) {
+			uint8_t *base = JS_GetArrayBuffer(ctx, &buffer_len, buffer);
+			guarded = base && view_len == json_len && offset <= buffer_len && json_len < buffer_len - offset && base[offset + json_len] == 0;
+			JS_FreeValue(ctx, buffer);
+		}
+	}
+
+	char *copy = NULL;
+	if (!guarded) {
+		if (json_len == SIZE_MAX) {
+			JS_FreeCString(ctx, fp);
+			return JS_ThrowRangeError(ctx, "source map too large");
+		}
+		copy = malloc(json_len + 1);
+		if (!copy) {
+			JS_FreeCString(ctx, fp);
+			return JS_ThrowOutOfMemory(ctx);
+		}
+		if (json_len) memcpy(copy, json, json_len);
+		copy[json_len] = 0;
+		json = (uint8_t *)copy;
+	}
+
+	TJSRuntime *rt = TJS_GetRuntime(ctx);
+	int ret = js_load_sourcemap_json(rt->module.mapctx, ctx, fp, (const char *)json, json_len);
+	free(copy);
+	JS_FreeCString(ctx, fp);
+	return JS_NewInt32(ctx, ret);
 }
 
 static JSValue tjs__get_source_mapping(JSContext *ctx, JSValueConst this_val,
@@ -592,8 +644,9 @@ static JSValue tjs__remove_sourcemap(JSContext *ctx, JSValueConst this_val,
 
 static const JSCFunctionListEntry js_sourcemap_funcs[] = {
     JS_CFUNC_DEF("has",        1, tjs__has_sourcemap),
-    JS_CFUNC_DEF("load",       2, tjs__load_sourcemap),
-    JS_CFUNC_DEF("loadJSON",   2, tjs__load_sourcemap_cjson),
+	JS_CFUNC_DEF("load",       2, tjs__load_sourcemap),
+	JS_CFUNC_DEF("loadJSON",   2, tjs__load_sourcemap_cjson),
+	JS_CFUNC_DEF("loadJSONBytes", 2, tjs__load_sourcemap_json_bytes),
     JS_CFUNC_DEF("getMapping", 3, tjs__get_source_mapping),
     JS_CFUNC_DEF("remove",     1, tjs__remove_sourcemap),
 };

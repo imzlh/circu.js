@@ -83,7 +83,7 @@ static int atomic_add_int(_Atomic int* ptr, int v) {
     return atomic_fetch_add_explicit(ptr, v, memory_order_acq_rel) + v;
 }
 
-static void* tjs__sab_alloc(void* opaque, size_t size) {
+void* tjs__sab_alloc(void* opaque, size_t size) {
     TJSSABHeader* sab = tjs__malloc(sizeof(*sab) + size);
     if (!sab) {
         return NULL;

@@ -28,6 +28,7 @@
 #include "mem.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -230,30 +231,65 @@ static JSValue js_module_static_from(JSContext *ctx, JSValueConst new_target, in
 }
 
 static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
-    if(argc < 2 || !JS_IsString(argv[0])){
-        return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
-    }
+	if(argc < 2){
+		return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
+	}
 
-    size_t len;
-    const char *source = JS_ToCStringLen(ctx, &len, argv[0]);
-    if(!source) return JS_EXCEPTION;
-    const char *_mname = JS_ToCString(ctx, argv[1]);
-    const char *module_name = _mname;
-    if(!_mname) module_name = "<module>";
+	size_t len = 0;
+	const char *source = NULL;
+	char *source_copy = NULL;
+	bool source_is_string = JS_IsString(argv[0]);
+	if (source_is_string) {
+		source = JS_ToCStringLen(ctx, &len, argv[0]);
+		if (!source) return JS_EXCEPTION;
+	} else {
+		source = (const char *)JS_GetAnyBuffer(ctx, &len, argv[0]);
+		if (!source)
+			return JS_ThrowTypeError(ctx, "new Module() source must be a string or UTF-8 bytes");
+
+		/* JS_Eval requires source[len] == '\0' (see quickjs.c). engine.toSharedBytes()
+		 * and oxc's transpileSharedBytes() supply this NUL guard past the exposed
+		 * view; anything else (e.g. a raw fs.readFile() buffer) is not guaranteed
+		 * to have it, so copy+terminate rather than risk a 1-byte heap overread. */
+		bool guarded = false;
+		if (JS_GetTypedArrayType(argv[0]) == JS_TYPED_ARRAY_UINT8) {
+			size_t offset = 0, view_len = 0, bytes_per_element = 0, buffer_len = 0;
+			JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], &offset, &view_len, &bytes_per_element);
+			if (!JS_IsException(buffer)) {
+				uint8_t *base = JS_GetArrayBuffer(ctx, &buffer_len, buffer);
+				guarded = base && view_len == len && offset <= buffer_len && len < buffer_len - offset
+					&& base[offset + len] == 0;
+				JS_FreeValue(ctx, buffer);
+			}
+		}
+		if (!guarded) {
+			if (len == SIZE_MAX) return JS_ThrowRangeError(ctx, "source too large");
+			source_copy = malloc(len + 1);
+			if (!source_copy) return JS_ThrowOutOfMemory(ctx);
+			if (len) memcpy(source_copy, source, len);
+			source_copy[len] = 0;
+			source = source_copy;
+		}
+	}
+	const char *_mname = JS_ToCString(ctx, argv[1]);
+	const char *module_name = _mname;
+	if(!_mname) module_name = "<module>";
 
     JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_BACKTRACE_BARRIER);
     if(JS_IsException(compiled)) goto fail;
 
-    JS_FreeCString(ctx, source);
-    if(_mname) JS_FreeCString(ctx, _mname);
+	if (source_is_string) JS_FreeCString(ctx, source);
+	free(source_copy);
+	if(_mname) JS_FreeCString(ctx, _mname);
     JSModuleDef* def = (JSModuleDef*)JS_VALUE_GET_PTR(compiled);
     JSValue result = module_new(ctx, def);
     JS_FreeValue(ctx, compiled);  // Release the compiled JSValue; module_new now owns the def
     return result;
 fail:
-    JS_FreeCString(ctx, source);
-    if(_mname) JS_FreeCString(ctx, _mname);
-    return JS_EXCEPTION;
+	if (source_is_string) JS_FreeCString(ctx, source);
+	free(source_copy);
+	if(_mname) JS_FreeCString(ctx, _mname);
+	return JS_EXCEPTION;
 }
 
 static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -858,6 +894,49 @@ static JSValue tjs_encodeString(JSContext *ctx, JSValue this_val, int argc, JSVa
     return buffer;
 }
 
+static JSValue tjs_new_shared_bytes_copy(JSContext *ctx, const uint8_t *src, size_t len) {
+	if (len >= INT32_MAX)
+		return JS_ThrowRangeError(ctx, "buffer too large");
+
+	uint8_t *data = tjs__sab_alloc(NULL, len + 1);
+	if (!data)
+		return JS_ThrowOutOfMemory(ctx);
+	if (len)
+		memcpy(data, src, len);
+	data[len] = 0;
+
+	JSValue buffer = JS_NewArrayBuffer(ctx, data, len + 1, NULL, NULL, true);
+	tjs__sab_free(NULL, data);
+	if (JS_IsException(buffer))
+		return buffer;
+
+	JSValue args[] = { buffer, JS_NewInt64(ctx, 0), JS_NewInt64(ctx, len) };
+	JSValue bytes = JS_NewTypedArray(ctx, 3, args, JS_TYPED_ARRAY_UINT8);
+	JS_FreeValue(ctx, buffer);
+	return bytes;
+}
+
+static JSValue tjs_toSharedBytes(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+	if (argc == 0)
+		return JS_ThrowTypeError(ctx, "argument must be a string or byte buffer");
+
+	if (JS_IsString(argv[0])) {
+		size_t len = 0;
+		const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+		if (!str)
+			return JS_EXCEPTION;
+		JSValue bytes = tjs_new_shared_bytes_copy(ctx, (const uint8_t *)str, len);
+		JS_FreeCString(ctx, str);
+		return bytes;
+	}
+
+	size_t len = 0;
+	uint8_t *data = JS_GetAnyBuffer(ctx, &len, argv[0]);
+	if (!data)
+		return JS_ThrowTypeError(ctx, "argument must be a string or byte buffer");
+	return tjs_new_shared_bytes_copy(ctx, data, len);
+}
+
 static JSValue tjs_decodeString(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
     if(argc == 0){
 typerr:
@@ -1080,9 +1159,10 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
     TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
     TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
-    TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
-    TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
-    TJS_CFUNC_DEF("encodeU16String", 1, tjs_encodeU16String),
+	TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
+	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
+	TJS_CFUNC_DEF("toSharedBytes", 1, tjs_toSharedBytes),
+	TJS_CFUNC_DEF("encodeU16String", 1, tjs_encodeU16String),
     TJS_CFUNC_DEF("decodeString", 1, tjs_decodeString),
     TJS_CFUNC_DEF("decodeU16String", 1, tjs_decodeU16String),
     TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),

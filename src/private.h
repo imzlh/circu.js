@@ -236,6 +236,7 @@ void tjs__close_all_msgpipes(TJSRuntime *qrt);
 
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);
+void *tjs__sab_alloc(void *opaque, size_t size);
 
 // Warn: will not dup, use JS_Dup if you want to keep it alive
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val);
