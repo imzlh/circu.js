@@ -1,5 +1,10 @@
 /**
- * Error module - System error codes and error handling
+ * Error module - System error codes and error handling.
+ *
+ * `errno.*` numeric values are libuv UV_* codes: on Unix they are typically
+ * `-(platform errno)` (e.g. Linux ESRCH is often -3), not fixed cross-platform
+ * constants. Prefer `error.errno.NAME` at runtime over hard-coded numbers.
+ * Literals below match libuv's portable fallback table for documentation only.
  */
 declare namespace CModuleError {
     export const errno: {
@@ -89,12 +94,24 @@ declare namespace CModuleError {
         EHWPOISON: -4000;
     };
 
-    export class Error extends globalThis.Error {
-        /**
-         * ERRNO code, mostly for syscall results.
-         */
+    /**
+     * Structured I/O error from the native layer.
+     * `name` is always `"IOError"`; `code` is a UV errno (e.g. `errno.EOF`).
+     * Callable both as `Error(code)` and `new Error(code)`.
+     */
+    export interface Error extends globalThis.Error {
+        name: 'IOError';
+        /** UV errno (negative int), e.g. `errno.EPIPE`. */
         code: number;
     }
+
+    export interface ErrorConstructor {
+        (code: number): Error;
+        new (code: number): Error;
+        prototype: Error;
+    }
+
+    export const Error: ErrorConstructor;
 
     /**
      * Returns a string describing a uv errno code.

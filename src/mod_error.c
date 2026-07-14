@@ -105,27 +105,7 @@ JSValue tjs_throw_errno(JSContext *ctx, int err) {
 }
 
 JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path) {
-    char buf[512];
-    char name_buf[64];
-    char msg_buf[128];
-    const char *name;
-    const char *msg;
-    tjs_uv_error_strings(err, name_buf, sizeof(name_buf), msg_buf, sizeof(msg_buf), &name, &msg);
-    snprintf(buf, sizeof(buf), "%s: %s, path '%s'", name, msg, path ? path : "(null)");
-
-    JSValue obj;
-    obj = JS_NewError(ctx);
-    if (JS_IsException(obj)) {
-        obj = JS_NULL;
-        return JS_Throw(ctx, obj);
-    }
-    JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_NewString(ctx, "IOError"), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, JS_NewString(ctx, buf), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    JS_DefinePropertyValueStr(ctx,
-                              obj,
-                              "code",
-                              JS_NewInt32(ctx, err),
-                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JSValue obj = tjs_new_error_path(ctx, err, path);
     if (JS_IsException(obj)) {
         obj = JS_NULL;
     }
@@ -156,12 +136,20 @@ JSValue tjs__error_strerr(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 	return JS_NewStringLen(ctx, buf, len);
 }
 
-JSCFunctionListEntry tjs__error_funcs[] = {
-	JS_CFUNC_DEF2("Error", 1, tjs_error_constructor, JS_CFUNC_constructor),
+/* strerror only — Error is registered as a real constructor below. */
+static JSCFunctionListEntry tjs__error_funcs[] = {
 	JS_CFUNC_DEF("strerror", 0, tjs__error_strerr)
 };
 
 void tjs__mod_error_init(JSContext *ctx, JSValue ns) {
+	/* JS_CFUNC_DEF2 was misused here: its 4th arg is prop_flags, not cproto,
+	 * so Error was always generic and `new error.Error(code)` threw.
+	 * constructor_or_func allows both call and new. */
+	JSValue error_ctor = JS_NewCFunction2(ctx, tjs_error_constructor, "Error", 1,
+	                                      JS_CFUNC_constructor_or_func, 0);
+	JS_DefinePropertyValueStr(ctx, ns, "Error", error_ctor,
+	                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+
 	JS_SetPropertyFunctionList(ctx, ns, tjs__error_funcs, countof(tjs__error_funcs));
 
 	JSValue uv_errno_obj = JS_NewObject(ctx);
