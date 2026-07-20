@@ -166,6 +166,18 @@ find_package(Iconv REQUIRED)
 find_package(CURL REQUIRED)
 find_package(llhttp)
 
+# Optional Brotli (system libbrotlienc/dec) for one-shot brotliCompress/brotliDecompress
+find_path(BROTLI_INCLUDE_DIR brotli/encode.h)
+find_library(BROTLIENC_LIBRARY NAMES brotlienc)
+find_library(BROTLIDEC_LIBRARY NAMES brotlidec)
+if(BROTLI_INCLUDE_DIR AND BROTLIENC_LIBRARY AND BROTLIDEC_LIBRARY)
+    set(CJS_HAVE_BROTLI ON)
+    message(STATUS "Brotli found: ${BROTLIENC_LIBRARY} ${BROTLIDEC_LIBRARY}")
+else()
+    set(CJS_HAVE_BROTLI OFF)
+    message(STATUS "Brotli not found — brotliCompress/brotliDecompress unavailable")
+endif()
+
 if(EXPAT_FOUND)
     set(CMAKE_REQUIRED_INCLUDES ${EXPAT_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES ${EXPAT_LIBRARIES})
@@ -214,6 +226,7 @@ add_library(libcjs STATIC
     src/mod_streams.c
     src/mod_udp.c
     src/mod_zlib.c
+    src/mod_brotli.c
     src/mod_ssl.c
     src/mod_xml.c
     src/mod_crypto.c
@@ -356,6 +369,11 @@ if(WIN32)
     target_compile_definitions(libcjs PRIVATE USING_QJS_SHARED)
 endif()
 target_link_libraries(libcjs PRIVATE qjs uv_a OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB EXPAT::EXPAT)
+if(CJS_HAVE_BROTLI)
+    target_compile_definitions(libcjs PRIVATE CJS_HAVE_BROTLI)
+    target_include_directories(libcjs PRIVATE ${BROTLI_INCLUDE_DIR})
+    target_link_libraries(libcjs PRIVATE ${BROTLIENC_LIBRARY} ${BROTLIDEC_LIBRARY})
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(libcjs PRIVATE util ${CMAKE_DL_LIBS})
 endif()

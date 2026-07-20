@@ -186,6 +186,7 @@ void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_nodeapi_init(JSContext *ctx, JSValue ns);
 void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
+void tjs__mod_brotli_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
@@ -212,6 +213,7 @@ JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path);
 JSValue tjs_new_pipe(JSContext *ctx);
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);
 uv_pipe_t *tjs_pipe_get_pipe(JSContext *ctx, JSValue obj);
+void tjs_pipe_set_pty_master(JSContext *ctx, JSValue obj);
 
 void tjs__execute_jobs(TJSRuntime *trt);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);

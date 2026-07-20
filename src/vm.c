@@ -33,6 +33,15 @@
 #include <string.h>
 #include <assert.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #ifdef CJS__HAS_WASM
 #include "wasm_export.h"
 #endif
@@ -41,6 +50,39 @@
 
 static int tjs__argc = 0;
 static char** tjs__argv = NULL;
+
+/* Keep the standard descriptor numbers reserved when the parent closes one. */
+static void tjs__normalize_stdio(void) {
+#ifdef _WIN32
+    const int modes[3] = { _O_RDONLY | _O_BINARY, _O_WRONLY | _O_BINARY, _O_WRONLY | _O_BINARY };
+    for (int fd = 0; fd < 3; fd++) {
+        /* Do not probe a missing CRT fd with _get_osfhandle(): MSVCRT may
+         * invoke the process-wide invalid-parameter handler for that call.
+         * Opening NUL allocates the lowest free slot, so its result tells us
+         * whether this descriptor number was vacant without an unsafe probe. */
+        int nullfd = _open("NUL", modes[fd], 0);
+        if (nullfd < 0) continue;
+        if (nullfd == fd) continue;
+        _close(nullfd);
+    }
+#else
+    const int modes[3] = { O_RDONLY, O_WRONLY, O_WRONLY };
+    for (int fd = 0; fd < 3; fd++) {
+        int flags;
+        do {
+            flags = fcntl(fd, F_GETFD);
+        } while (flags == -1 && errno == EINTR);
+        if (flags != -1 || errno != EBADF) continue;
+        int nullfd = open("/dev/null", modes[fd], 0);
+        if (nullfd < 0 || nullfd == fd) continue;
+        if (dup2(nullfd, fd) < 0) {
+            close(nullfd);
+            continue;
+        }
+        close(nullfd);
+    }
+#endif
+}
 
 
 /* JS malloc functions */
@@ -597,6 +639,8 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
 
 void TJS_Initialize(int argc, char** argv) {
     CHECK_EQ(0, uv_replace_allocator(tjs__malloc, tjs__realloc, tjs__calloc, tjs__free));
+
+    tjs__normalize_stdio();
 
     tjs__argc = argc;
     tjs__argv = uv_setup_args(argc, argv);

@@ -228,7 +228,7 @@ declare namespace CModuleFS {
      * @returns File descriptor (integer)
      * @throws Error if open fails
      */
-    export function open(path: string, flags: OpenFlags, mode?: number): number;
+    export function open(path: string, flags: OpenFlags | string, mode?: number): number;
 
     /**
      * Close a file descriptor

@@ -138,7 +138,7 @@ declare namespace CModuleProcess {
          * Wait for process exit
          * @returns Exit code and termination signal
          */
-        wait(): PTY extends true ? never : Promise<ExitInfo>;
+        wait(): Promise<ExitInfo>;
 
         /**
          * Block wait for process exit

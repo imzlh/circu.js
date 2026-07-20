@@ -264,7 +264,9 @@ declare namespace CModuleZLib {
      */
     export function deflate(
         data: BufferSource,
-        level?: number
+        level?: number,
+        strategy?: number,
+        memLevel?: number
     ): ArrayBuffer;
 
     /**
@@ -275,7 +277,9 @@ declare namespace CModuleZLib {
      */
     export function gzip(
         data: BufferSource,
-        level?: number
+        level?: number,
+        strategy?: number,
+        memLevel?: number
     ): ArrayBuffer;
 
     /**
@@ -286,7 +290,9 @@ declare namespace CModuleZLib {
      */
     export function deflateRaw(
         data: BufferSource,
-        level?: number
+        level?: number,
+        strategy?: number,
+        memLevel?: number
     ): ArrayBuffer;
 
     // ============================================================================
@@ -313,6 +319,9 @@ declare namespace CModuleZLib {
      * @returns Decompressed data
      */
     export function inflateRaw(data: BufferSource): ArrayBuffer;
+
+    /** Auto-detect and decompress zlib or gzip wrapped data. */
+    export function unzip(data: BufferSource): ArrayBuffer;
 
     // ============================================================================
     // Streaming Compression
@@ -421,7 +430,7 @@ declare namespace CModuleZLib {
          * @param data - Compressed input chunk
          * @returns Decompressed output chunk
          */
-        inflate(data: BufferSource): ArrayBuffer;
+        inflate(data: BufferSource, flush?: number): ArrayBuffer;
 
         /**
          * Flush pending output
@@ -470,6 +479,9 @@ declare namespace CModuleZLib {
      * @returns Inflate stream object without headers
      */
     export function createInflateRaw(): Inflate;
+
+    /** Create a stream that auto-detects zlib or gzip wrappers. */
+    export function createUnzip(): Inflate;
 
     // ============================================================================
     // Checksums

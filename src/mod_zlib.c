@@ -32,6 +32,7 @@ enum {
     METHOD_DEFLATE = 0,
     METHOD_GZIP,
     METHOD_RAW_DEFLATE,
+    METHOD_UNZIP,
 };
 
 /* Magic values for compression levels */
@@ -71,6 +72,8 @@ static int get_window_bits(int method) {
             return 15 + 16;  /* Add 16 for gzip header */
         case METHOD_RAW_DEFLATE:
             return -15;  /* Negative for raw deflate */
+        case METHOD_UNZIP:
+            return 15 + 32;  /* Auto-detect zlib or gzip wrapper */
         default:
             return 15;
     }
@@ -85,6 +88,8 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
     size_t data_len;
     const uint8_t* data;
     int level = Z_DEFAULT_COMPRESSION;
+    int strategy = Z_DEFAULT_STRATEGY;
+    int mem_level = 8;
 
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "compress() requires at least 1 argument: data");
@@ -97,6 +102,19 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
         }
         if (level < -1 || level > 9) {
             return JS_ThrowRangeError(ctx, "Level must be between -1 and 9");
+        }
+    }
+
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &strategy, argv[2]) < 0) return JS_EXCEPTION;
+        if (strategy < Z_DEFAULT_STRATEGY || strategy > Z_FIXED) {
+            return JS_ThrowRangeError(ctx, "Strategy is out of range");
+        }
+    }
+    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
+        if (JS_ToInt32(ctx, &mem_level, argv[3]) < 0) return JS_EXCEPTION;
+        if (mem_level < 1 || mem_level > 9) {
+            return JS_ThrowRangeError(ctx, "Memory level must be between 1 and 9");
         }
     }
 
@@ -126,7 +144,7 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
     strm.next_out = out;
     strm.avail_out = bound;
     
-    int ret = deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
+    int ret = deflateInit2(&strm, level, Z_DEFLATED, window_bits, mem_level, strategy);
     if (ret != Z_OK) {
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "Failed to initialize compression");
@@ -640,7 +658,12 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     if (argc < 1 && magic == Z_NO_FLUSH) {
         return JS_ThrowTypeError(ctx, "inflate() requires 1 argument: data");
     }
-    
+
+    int flush = magic;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flush, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+
     size_t data_len = 0;
     const uint8_t* data = NULL;
     if (argc >= 1 && !JS_IsUndefined(argv[0])) {
@@ -649,8 +672,6 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
             return JS_EXCEPTION;
         }
     }
-    
-    int flush = magic;  /* Flush mode from magic */
     
     /* Allocate output buffer with room to grow */
     if (data_len > SIZE_MAX / 4) {
@@ -704,7 +725,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         }
     }
 
-    if (magic == Z_FINISH && ret != Z_STREAM_END) {
+    if (flush == Z_FINISH && ret != Z_STREAM_END) {
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "Inflate failed");
     }
@@ -771,15 +792,16 @@ static const JSCFunctionListEntry tjs_inflate_proto_funcs[] = {
 /* Module function list */
 static const JSCFunctionListEntry tjs_zlib_funcs[] = {
     /* One-shot compression */
-    JS_CFUNC_MAGIC_DEF("deflate", 2, tjs_zlib_compress, METHOD_DEFLATE),
-    JS_CFUNC_MAGIC_DEF("gzip", 2, tjs_zlib_compress, METHOD_GZIP),
-    JS_CFUNC_MAGIC_DEF("deflateRaw", 2, tjs_zlib_compress, METHOD_RAW_DEFLATE),
+    JS_CFUNC_MAGIC_DEF("deflate", 4, tjs_zlib_compress, METHOD_DEFLATE),
+    JS_CFUNC_MAGIC_DEF("gzip", 4, tjs_zlib_compress, METHOD_GZIP),
+    JS_CFUNC_MAGIC_DEF("deflateRaw", 4, tjs_zlib_compress, METHOD_RAW_DEFLATE),
     
     /* One-shot decompression */
     JS_CFUNC_MAGIC_DEF("inflate", 1, tjs_zlib_decompress, METHOD_DEFLATE),
     JS_CFUNC_MAGIC_DEF("gunzip", 1, tjs_zlib_decompress, METHOD_GZIP),
     JS_CFUNC_MAGIC_DEF("inflateRaw", 1, tjs_zlib_decompress, METHOD_RAW_DEFLATE),
-    
+    JS_CFUNC_MAGIC_DEF("unzip", 1, tjs_zlib_decompress, METHOD_UNZIP),
+
     /* Streaming compression */
     JS_CFUNC_MAGIC_DEF("createDeflate", 3, tjs_zlib_create_deflate, METHOD_DEFLATE),
     JS_CFUNC_MAGIC_DEF("createGzip", 3, tjs_zlib_create_deflate, METHOD_GZIP),
@@ -789,6 +811,7 @@ static const JSCFunctionListEntry tjs_zlib_funcs[] = {
     JS_CFUNC_MAGIC_DEF("createInflate", 0, tjs_zlib_create_inflate, METHOD_DEFLATE),
     JS_CFUNC_MAGIC_DEF("createGunzip", 0, tjs_zlib_create_inflate, METHOD_GZIP),
     JS_CFUNC_MAGIC_DEF("createInflateRaw", 0, tjs_zlib_create_inflate, METHOD_RAW_DEFLATE),
+    JS_CFUNC_MAGIC_DEF("createUnzip", 0, tjs_zlib_create_inflate, METHOD_UNZIP),
     
     /* Checksums */
     JS_CFUNC_DEF("crc32", 2, tjs_zlib_crc32),

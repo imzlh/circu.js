@@ -38,6 +38,7 @@
 #include <openssl/kdf.h>
 
 #include <limits.h>
+#include <math.h>
 
 /* OpenSSL 3.x has many deprecated functions, we ignore them for now */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -151,6 +152,7 @@ enum {
     ECC_CURVE_P256 = 0,
     ECC_CURVE_P384,
     ECC_CURVE_P521,
+    ECC_CURVE_SECP256K1,
     ECC_END
 };
 
@@ -160,7 +162,18 @@ static const EC_GROUP* get_ec_group_from_magic(int magic) {
         case ECC_CURVE_P256: return EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
         case ECC_CURVE_P384: return EC_GROUP_new_by_curve_name(NID_secp384r1);
         case ECC_CURVE_P521: return EC_GROUP_new_by_curve_name(NID_secp521r1);
+        case ECC_CURVE_SECP256K1: return EC_GROUP_new_by_curve_name(NID_secp256k1);
         default: return NULL;
+    }
+}
+
+static int get_ec_nid_from_magic(int magic) {
+    switch (magic) {
+        case ECC_CURVE_P256: return NID_X9_62_prime256v1;
+        case ECC_CURVE_P384: return NID_secp384r1;
+        case ECC_CURVE_P521: return NID_secp521r1;
+        case ECC_CURVE_SECP256K1: return NID_secp256k1;
+        default: return NID_undef;
     }
 }
 
@@ -554,6 +567,121 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     return result;
 }
 
+static int tjs_crypto_point_format(JSContext* ctx, JSValueConst value, point_conversion_form_t* format) {
+    int32_t raw = POINT_CONVERSION_UNCOMPRESSED;
+    if (!JS_IsUndefined(value) && JS_ToInt32(ctx, &raw, value) < 0) {
+        return -1;
+    }
+    if (raw != POINT_CONVERSION_COMPRESSED && raw != POINT_CONVERSION_UNCOMPRESSED &&
+        raw != POINT_CONVERSION_HYBRID) {
+        JS_ThrowRangeError(ctx, "Invalid EC point conversion format");
+        return -1;
+    }
+    *format = (point_conversion_form_t)raw;
+    return 0;
+}
+
+/* Derive the encoded public point for a raw EC private scalar. */
+static JSValue tjs_crypto_ec_public_from_private(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+    point_conversion_form_t format;
+    size_t private_len;
+    const uint8_t* private_data;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "ecPublicFromPrivate() requires 1 argument: privateKey");
+    }
+    if (tjs_crypto_point_format(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED, &format) < 0) {
+        return JS_EXCEPTION;
+    }
+    private_data = JS_GetAnyBuffer(ctx, &private_len, argv[0]);
+    if (!private_data) {
+        return JS_EXCEPTION;
+    }
+
+    int nid = get_ec_nid_from_magic(magic);
+    EC_GROUP* group = nid == NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
+    BIGNUM* scalar = BN_bin2bn(private_data, private_len, NULL);
+    BIGNUM* order = BN_new();
+    EC_POINT* point = group ? EC_POINT_new(group) : NULL;
+    BN_CTX* bn_ctx = BN_CTX_new();
+    if (!group || !scalar || !order || !point || !bn_ctx ||
+        BN_is_zero(scalar) || EC_GROUP_get_order(group, order, bn_ctx) != 1 ||
+        BN_cmp(scalar, order) >= 0 || EC_POINT_mul(group, point, scalar, NULL, NULL, bn_ctx) != 1 ||
+        EC_POINT_is_at_infinity(group, point)) {
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(point);
+        BN_free(order);
+        BN_free(scalar);
+        EC_GROUP_free(group);
+        return JS_ThrowRangeError(ctx, "Private key is not valid for the selected curve");
+    }
+
+    size_t output_len = EC_POINT_point2oct(group, point, format, NULL, 0, bn_ctx);
+    uint8_t* output = output_len ? js_malloc(ctx, output_len) : NULL;
+    if (!output || EC_POINT_point2oct(group, point, format, output, output_len, bn_ctx) != output_len) {
+        js_free(ctx, output);
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(point);
+        BN_free(order);
+        BN_free(scalar);
+        EC_GROUP_free(group);
+        return JS_ThrowInternalError(ctx, "Failed to derive EC public key");
+    }
+
+    BN_CTX_free(bn_ctx);
+    EC_POINT_free(point);
+    BN_free(order);
+    BN_free(scalar);
+    EC_GROUP_free(group);
+    return js_fastab(ctx, output, output_len);
+}
+
+/* Validate and convert an encoded EC public point. */
+static JSValue tjs_crypto_ec_convert_public(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+    point_conversion_form_t format;
+    size_t public_len;
+    const uint8_t* public_data;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "ecConvertPublic() requires 1 argument: publicKey");
+    }
+    if (tjs_crypto_point_format(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED, &format) < 0) {
+        return JS_EXCEPTION;
+    }
+    public_data = JS_GetAnyBuffer(ctx, &public_len, argv[0]);
+    if (!public_data) {
+        return JS_EXCEPTION;
+    }
+
+    int nid = get_ec_nid_from_magic(magic);
+    EC_GROUP* group = nid == NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
+    EC_POINT* point = group ? EC_POINT_new(group) : NULL;
+    BN_CTX* bn_ctx = BN_CTX_new();
+    if (!group || !point || !bn_ctx ||
+        EC_POINT_oct2point(group, point, public_data, public_len, bn_ctx) != 1 ||
+        EC_POINT_is_on_curve(group, point, bn_ctx) != 1 || EC_POINT_is_at_infinity(group, point)) {
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(point);
+        EC_GROUP_free(group);
+        return JS_ThrowTypeError(ctx, "Public key is not valid for the selected curve");
+    }
+
+    size_t output_len = EC_POINT_point2oct(group, point, format, NULL, 0, bn_ctx);
+    uint8_t* output = output_len ? js_malloc(ctx, output_len) : NULL;
+    if (!output || EC_POINT_point2oct(group, point, format, output, output_len, bn_ctx) != output_len) {
+        js_free(ctx, output);
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(point);
+        EC_GROUP_free(group);
+        return JS_ThrowInternalError(ctx, "Failed to convert EC public key");
+    }
+
+    BN_CTX_free(bn_ctx);
+    EC_POINT_free(point);
+    EC_GROUP_free(group);
+    return js_fastab(ctx, output, output_len);
+}
+
 /* ECDSA Sign */
 static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t key_len, data_len;
@@ -773,14 +901,9 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         return JS_EXCEPTION;
     }
     
-    // Determine curve NID
-    int nid;
-    if (magic == ECC_CURVE_P256) {
-        nid = NID_X9_62_prime256v1;
-    } else if (magic == ECC_CURVE_P384) {
-        nid = NID_secp384r1;
-    } else {
-        nid = NID_secp521r1;
+    int nid = get_ec_nid_from_magic(magic);
+    if (nid == NID_undef) {
+        return JS_ThrowInternalError(ctx, "Invalid ECC curve");
     }
     
     const EC_GROUP* group = EC_GROUP_new_by_curve_name(nid);
@@ -1202,6 +1325,7 @@ static JSValue tjs_crypto_rsa_pss_verify(JSContext* ctx, JSValueConst this_val, 
 static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     size_t data_len;
     const uint8_t* data;
+    uint64_t requested_xof_len = 0;
     
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "hash() requires 1 argument: data");
@@ -1212,6 +1336,18 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
     }
     
+    if (magic == HASH_SHAKE128 || magic == HASH_SHAKE256) {
+        requested_xof_len = magic == HASH_SHAKE128 ? 16 : 32;
+        if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+            double requested;
+            if (JS_ToFloat64(ctx, &requested, argv[1]) < 0 || !isfinite(requested) ||
+                requested < 0 || requested > UINT32_MAX || floor(requested) != requested) {
+                return JS_ThrowRangeError(ctx, "outputLength must be an integer between 0 and 4294967295");
+            }
+            requested_xof_len = (uint64_t)requested;
+        }
+    }
+
     data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
     if (!data) {
         return JS_EXCEPTION;
@@ -1233,7 +1369,23 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
     }
 
     if (magic == HASH_SHAKE128 || magic == HASH_SHAKE256) {
-        xof_len = magic == HASH_SHAKE128 ? 16 : 32;
+        xof_len = requested_xof_len;
+        if (xof_len > EVP_MAX_MD_SIZE) {
+            uint8_t* xof = xof_len ? js_malloc(ctx, xof_len) : NULL;
+            if (xof_len && !xof) {
+                EVP_MD_CTX_free(mdctx);
+                return JS_EXCEPTION;
+            }
+            int ok = EVP_DigestFinalXOF(mdctx, xof, xof_len);
+            EVP_MD_CTX_free(mdctx);
+            if (ok != 1) {
+                js_free(ctx, xof);
+                return JS_ThrowInternalError(ctx, "Hash computation failed");
+            }
+            JSValue result = JS_NewArrayBufferCopy(ctx, xof, xof_len);
+            js_free(ctx, xof);
+            return result;
+        }
         if (EVP_DigestFinalXOF(mdctx, hash, xof_len) != 1) {
             EVP_MD_CTX_free(mdctx);
             return JS_ThrowInternalError(ctx, "Hash computation failed");
@@ -2527,9 +2679,41 @@ static JSValue tjs_hash_digest(JSContext* ctx, JSValueConst this_val, int argc, 
     return JS_NewArrayBufferCopy(ctx, hash, hash_len);
 }
 
+/* Hash.copy() */
+static JSValue tjs_hash_copy(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJSHash* source = JS_GetOpaque2(ctx, this_val, tjs_hash_class_id);
+    if (!source) {
+        return JS_EXCEPTION;
+    }
+
+    TJSHash* copy = js_mallocz(ctx, sizeof(*copy));
+    if (!copy) {
+        return JS_EXCEPTION;
+    }
+
+    copy->md = source->md;
+    copy->ctx = EVP_MD_CTX_new();
+    if (!copy->ctx || EVP_MD_CTX_copy_ex(copy->ctx, source->ctx) != 1) {
+        if (copy->ctx) EVP_MD_CTX_free(copy->ctx);
+        js_free(ctx, copy);
+        return JS_ThrowInternalError(ctx, "Failed to copy hash state");
+    }
+
+    JSValue obj = JS_NewObjectClass(ctx, tjs_hash_class_id);
+    if (JS_IsException(obj)) {
+        EVP_MD_CTX_free(copy->ctx);
+        js_free(ctx, copy);
+        return obj;
+    }
+
+    JS_SetOpaque(obj, copy);
+    return obj;
+}
+
 static const JSCFunctionListEntry tjs_hash_proto_funcs[] = {
     JS_CFUNC_DEF("update", 1, tjs_hash_update),
     JS_CFUNC_DEF("digest", 0, tjs_hash_digest),
+    JS_CFUNC_DEF("copy", 0, tjs_hash_copy),
 };
 
 /* HMAC object for streaming */
@@ -3026,6 +3210,7 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     
     /* Streaming hash */
     JS_CFUNC_MAGIC_DEF("createMd5",    0, tjs_crypto_create_hash, HASH_MD5),
+    JS_CFUNC_MAGIC_DEF("createRipemd160", 0, tjs_crypto_create_hash, HASH_RIPEMD160),
     JS_CFUNC_MAGIC_DEF("createSha1",   0, tjs_crypto_create_hash, HASH_SHA1),
     JS_CFUNC_MAGIC_DEF("createSha224", 0, tjs_crypto_create_hash, HASH_SHA224),
     JS_CFUNC_MAGIC_DEF("createSha256", 0, tjs_crypto_create_hash, HASH_SHA256),
@@ -3116,6 +3301,7 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("generateEcKeyP256", 0, tjs_crypto_generate_ec_key, ECC_CURVE_P256),
     JS_CFUNC_MAGIC_DEF("generateEcKeyP384", 0, tjs_crypto_generate_ec_key, ECC_CURVE_P384),
     JS_CFUNC_MAGIC_DEF("generateEcKeyP521", 0, tjs_crypto_generate_ec_key, ECC_CURVE_P521),
+    JS_CFUNC_MAGIC_DEF("generateEcKeySecp256k1", 0, tjs_crypto_generate_ec_key, ECC_CURVE_SECP256K1),
     
     JS_CFUNC_MAGIC_DEF("ecdsaSignP256", 2, tjs_crypto_ecdsa_sign, HASH_SHA256), // P256 uses SHA256
     JS_CFUNC_MAGIC_DEF("ecdsaSignP384", 2, tjs_crypto_ecdsa_sign, HASH_SHA384),
@@ -3128,6 +3314,15 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("ecdhDeriveP256", 2, tjs_crypto_ecdh_derive, ECC_CURVE_P256),
     JS_CFUNC_MAGIC_DEF("ecdhDeriveP384", 2, tjs_crypto_ecdh_derive, ECC_CURVE_P384),
     JS_CFUNC_MAGIC_DEF("ecdhDeriveP521", 2, tjs_crypto_ecdh_derive, ECC_CURVE_P521),
+    JS_CFUNC_MAGIC_DEF("ecdhDeriveSecp256k1", 2, tjs_crypto_ecdh_derive, ECC_CURVE_SECP256K1),
+    JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP256", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P256),
+    JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP384", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P384),
+    JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP521", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P521),
+    JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateSecp256k1", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_SECP256K1),
+    JS_CFUNC_MAGIC_DEF("ecConvertPublicP256", 2, tjs_crypto_ec_convert_public, ECC_CURVE_P256),
+    JS_CFUNC_MAGIC_DEF("ecConvertPublicP384", 2, tjs_crypto_ec_convert_public, ECC_CURVE_P384),
+    JS_CFUNC_MAGIC_DEF("ecConvertPublicP521", 2, tjs_crypto_ec_convert_public, ECC_CURVE_P521),
+    JS_CFUNC_MAGIC_DEF("ecConvertPublicSecp256k1", 2, tjs_crypto_ec_convert_public, ECC_CURVE_SECP256K1),
     
     /* RSA-OAEP */
     JS_CFUNC_MAGIC_DEF("rsaOaepSha256Encrypt", 2, tjs_crypto_rsa_oaep_encrypt, HASH_SHA256),

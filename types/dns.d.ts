@@ -24,6 +24,9 @@ declare namespace CModuleDNS {
          */
         family: number;
 
+        /** getaddrinfo hint flags (AI_V4MAPPED, AI_ALL, AI_ADDRCONFIG). */
+        hints?: number;
+
         /**
          * DNS server
          */
@@ -51,6 +54,12 @@ declare namespace CModuleDNS {
         options: GetAddrInfoOptions
     ): ResolvedAddress[];
 
+    /** Resolve an IP address and port to their host and service names. */
+    export function lookupService(
+        address: string,
+        port: number
+    ): Promise<{ hostname: string; service: string }>;
+
     /** A record (IPv4 address) = 1 */
     export const A: 1;
     /** NS record (name server) = 2 */
@@ -71,6 +80,8 @@ declare namespace CModuleDNS {
     export const SRV: 33;
     export const NAPTR: 35;    // Naming Authority Pointer
     export const CAA: 257;     // Certification Authority Authorization
+    /** ANY record query = 255 */
+    export const ANY: 255;
 
     /** Base DNS answer record (shared fields) */
     export interface BaseAnswer {
@@ -145,6 +156,8 @@ declare namespace CModuleDNS {
         type: typeof TXT;
         /** Text content */
         txt: string;
+        /** Individual character-string entries, when the response is valid TXT. */
+        entries?: string[];
     }
 
     /** SRV record */

@@ -33,6 +33,7 @@ interface TjsModules {
 }
 
 interface TJSOptionalModules {
+    'brotli': typeof CModuleBrotli,
     'wasm': typeof CModuleWASM,
     'win32': typeof CModuleWin32,
     'signals': typeof CModuleSignals,

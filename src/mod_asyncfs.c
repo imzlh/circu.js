@@ -1017,13 +1017,20 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
-    strflags = JS_ToCStringLen(ctx, &len, argv[1]);
-    if (!strflags) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+    if (JS_IsNumber(argv[1])) {
+        if (JS_ToInt32(ctx, &flags, argv[1])) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+    } else {
+        strflags = JS_ToCStringLen(ctx, &len, argv[1]);
+        if (!strflags) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        flags = TJS_ParseOpenFlags(strflags, len);
+        JS_FreeCString(ctx, strflags);
     }
-    flags = TJS_ParseOpenFlags(strflags, len);
-    JS_FreeCString(ctx, strflags);
 
     mode = 0666;
     if (!JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &mode, argv[2])) {

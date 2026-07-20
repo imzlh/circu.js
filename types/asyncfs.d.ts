@@ -191,7 +191,7 @@ declare namespace CModuleAsyncFS {
      * @param flags Open mode (e.g., OpenMode.READ)
      * @param mode Permissions (default 0o666)
      */
-    export function open(path: string, flags: OpenMode | string, mode?: number): Promise<FileHandle>;
+    export function open(path: string, flags: OpenMode | string | number, mode?: number): Promise<FileHandle>;
 
     /** Get file metadata (async) */
     export function stat(path: string): Promise<StatResult>;

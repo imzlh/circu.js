@@ -46,6 +46,13 @@ typedef struct {
 	bool done;   // For sync operations
 } TJSGetAddrInfoReq;
 
+typedef struct {
+	JSContext* ctx;
+	uv_getnameinfo_t req;
+	TJSPromise result;
+	struct sockaddr_storage addr;
+} TJSGetNameInfoReq;
+
 static JSValue tjs_addrinfo2obj(JSContext* ctx, struct addrinfo* ai) {
 	JSValue obj = JS_NewArray(ctx);
 
@@ -61,6 +68,70 @@ static JSValue tjs_addrinfo2obj(JSContext* ctx, struct addrinfo* ai) {
 	}
 
 	return obj;
+}
+
+static int dns_ai_flags(int hints) {
+	int flags = 0;
+#ifdef AI_V4MAPPED
+	if (hints & 8) flags |= AI_V4MAPPED;
+#endif
+#ifdef AI_ALL
+	if (hints & 16) flags |= AI_ALL;
+#endif
+#ifdef AI_ADDRCONFIG
+	if (hints & 32) flags |= AI_ADDRCONFIG;
+#endif
+	return flags;
+}
+
+static const char* dns_gai_code(int status) {
+#ifdef EAI_NONAME
+	if (status == EAI_NONAME) return "ENOTFOUND";
+#endif
+#ifdef EAI_NODATA
+	if (status == EAI_NODATA) return "ENOTFOUND";
+#endif
+#ifdef EAI_AGAIN
+	if (status == EAI_AGAIN) return "EAI_AGAIN";
+#endif
+#ifdef EAI_ADDRFAMILY
+	if (status == EAI_ADDRFAMILY) return "EAI_ADDRFAMILY";
+#endif
+#ifdef EAI_BADFLAGS
+	if (status == EAI_BADFLAGS) return "EAI_BADFLAGS";
+#endif
+#ifdef EAI_FAIL
+	if (status == EAI_FAIL) return "EAI_FAIL";
+#endif
+#ifdef EAI_FAMILY
+	if (status == EAI_FAMILY) return "EAI_FAMILY";
+#endif
+#ifdef EAI_MEMORY
+	if (status == EAI_MEMORY) return "ENOMEM";
+#endif
+#ifdef EAI_SERVICE
+	if (status == EAI_SERVICE) return "EAI_SERVICE";
+#endif
+#ifdef EAI_SOCKTYPE
+	if (status == EAI_SOCKTYPE) return "EAI_SOCKTYPE";
+#endif
+#ifdef EAI_OVERFLOW
+	if (status == EAI_OVERFLOW) return "EAI_OVERFLOW";
+#endif
+	return "EAI_SYSTEM";
+}
+
+static JSValue dns_new_gai_error(JSContext* ctx, int status) {
+	JSValue error = JS_NewError(ctx);
+	if (JS_IsException(error)) return error;
+	const char* message = gai_strerror(status);
+	JS_DefinePropertyValueStr(ctx, error, "message",
+		JS_NewString(ctx, message ? message : "getaddrinfo failed"),
+		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+	JS_DefinePropertyValueStr(ctx, error, "code",
+		JS_NewString(ctx, dns_gai_code(status)),
+		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+	return error;
 }
 
 static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
@@ -119,9 +190,14 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 	JS_FreeValue(ctx, js_family);
 
-	JSValue js_nameserver = JS_GetPropertyStr(ctx, opts, "server");
-	const char* nameserver = JS_IsString(js_nameserver) ? JS_ToCString(ctx, js_nameserver) : NULL;
-	JS_FreeValue(ctx, js_nameserver);
+	JSValue js_hints = JS_GetPropertyStr(ctx, opts, "hints");
+	int32_t hint_bits = 0;
+	if (!JS_IsUndefined(js_hints) && JS_ToInt32(ctx, &hint_bits, js_hints) < 0) {
+		JS_FreeValue(ctx, js_hints);
+		JS_FreeCString(ctx, node);
+		return JS_ThrowTypeError(ctx, "Invalid hints option. expected integer.");
+	}
+	JS_FreeValue(ctx, js_hints);
 
 	TJSGetAddrInfoReq* gr = js_malloc(ctx, sizeof(*gr));
 	if (!gr) {
@@ -136,19 +212,26 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_family = family;
-	hints.ai_flags = AI_ADDRCONFIG | AI_ALL;
+	hints.ai_flags = dns_ai_flags(hint_bits);
 
-	int r = uv_getaddrinfo(tjs_get_loop(ctx), &gr->req, uv__getaddrinfo_cb, node, nameserver, &hints);
+	JSValue promise = TJS_InitPromise(ctx, &gr->result);
+	if (JS_IsException(promise)) {
+		JS_FreeCString(ctx, node);
+		js_free(ctx, gr);
+		return promise;
+	}
+	int r = uv_getaddrinfo(tjs_get_loop(ctx), &gr->req, uv__getaddrinfo_cb, node, NULL, &hints);
 
-	if (nameserver) JS_FreeCString(ctx, nameserver);
 	JS_FreeCString(ctx, node);
 
 	if (r != 0) {
+		TJS_FreePromise(ctx, &gr->result);
+		JS_FreeValue(ctx, promise);
 		js_free(ctx, gr);
 		return tjs_throw_errno(ctx, r);
 	}
 
-	return TJS_InitPromise(ctx, &gr->result);
+	return promise;
 }
 
 static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int argc, JSValue* argv) {
@@ -176,26 +259,31 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 	}
 	JS_FreeValue(ctx, js_family);
 
-	JSValue js_nameserver = JS_GetPropertyStr(ctx, opts, "server");
-	const char* nameserver = JS_IsString(js_nameserver) ? JS_ToCString(ctx, js_nameserver) : NULL;
-	JS_FreeValue(ctx, js_nameserver);
+	JSValue js_hints = JS_GetPropertyStr(ctx, opts, "hints");
+	int32_t hint_bits = 0;
+	if (!JS_IsUndefined(js_hints) && JS_ToInt32(ctx, &hint_bits, js_hints) < 0) {
+		JS_FreeValue(ctx, js_hints);
+		JS_FreeCString(ctx, node);
+		return JS_ThrowTypeError(ctx, "Invalid hints option. expected integer.");
+	}
+	JS_FreeValue(ctx, js_hints);
 
 	struct addrinfo hints;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_family = family;
-	hints.ai_flags = AI_ADDRCONFIG | AI_ALL;
+	hints.ai_flags = dns_ai_flags(hint_bits);
 
 	// Direct system call instead of using libuv
 	struct addrinfo* res = NULL;
-	int r = getaddrinfo(node, nameserver, &hints, &res);
+	int r = getaddrinfo(node, NULL, &hints, &res);
 
-	if (nameserver) JS_FreeCString(ctx, nameserver);
 	JS_FreeCString(ctx, node);
 
 	JSValue result;
 	if (r != 0) {
-		result = tjs_new_error(ctx, r);
+		result = dns_new_gai_error(ctx, r);
+		return JS_Throw(ctx, result);
 	} else {
 		result = tjs_addrinfo2obj(ctx, res);
 	}
@@ -205,6 +293,88 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 	}
 
 	return result;
+}
+
+static void uv__getnameinfo_cb(uv_getnameinfo_t* req, int status,
+	const char* hostname, const char* service) {
+	TJSGetNameInfoReq* gr = req->data;
+	CHECK_NOT_NULL(gr);
+	JSContext* ctx = gr->ctx;
+	TJSRuntime* qrt = TJS_GetRuntime(ctx);
+	if (!qrt || qrt->freeing) {
+		TJS_FreePromise(ctx, &gr->result);
+		js_free(ctx, gr);
+		return;
+	}
+
+	JSValue result;
+	bool reject = status != 0;
+	if (reject) {
+		result = tjs_new_error(ctx, status);
+	} else {
+		result = JS_NewObjectProto(ctx, JS_NULL);
+		JS_SetPropertyStr(ctx, result, "hostname", JS_NewString(ctx, hostname ? hostname : ""));
+		JS_SetPropertyStr(ctx, result, "service", JS_NewString(ctx, service ? service : ""));
+	}
+	TJS_SettlePromise(ctx, &gr->result, reject, 1, &result);
+	js_free(ctx, gr);
+}
+
+static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
+	int argc, JSValue* argv) {
+	const char* address = JS_ToCString(ctx, argv[0]);
+	if (!address) return JS_EXCEPTION;
+	int32_t port;
+	if (JS_ToInt32(ctx, &port, argv[1]) < 0) {
+		JS_FreeCString(ctx, address);
+		return JS_ThrowTypeError(ctx, "The \"port\" argument must be an integer");
+	}
+	if (port < 0 || port > 65535) {
+		JS_FreeCString(ctx, address);
+		return JS_ThrowRangeError(ctx, "The \"port\" argument is out of range");
+	}
+
+	TJSGetNameInfoReq* gr = js_malloc(ctx, sizeof(*gr));
+	if (!gr) {
+		JS_FreeCString(ctx, address);
+		return JS_EXCEPTION;
+	}
+	memset(gr, 0, sizeof(*gr));
+	gr->ctx = ctx;
+	gr->req.data = gr;
+	struct sockaddr_in addr4;
+	struct sockaddr_in6 addr6;
+	int r = uv_ip4_addr(address, port, &addr4);
+	if (r == 0) {
+		memcpy(&gr->addr, &addr4, sizeof(addr4));
+	} else {
+		r = uv_ip6_addr(address, port, &addr6);
+		if (r == 0) memcpy(&gr->addr, &addr6, sizeof(addr6));
+	}
+	JS_FreeCString(ctx, address);
+	if (r != 0) {
+		js_free(ctx, gr);
+		return JS_ThrowTypeError(ctx, "Invalid IP address");
+	}
+
+	JSValue promise = TJS_InitPromise(ctx, &gr->result);
+	if (JS_IsException(promise)) {
+		js_free(ctx, gr);
+		return promise;
+	}
+	int flags = 0;
+#ifdef NI_NAMEREQD
+	flags |= NI_NAMEREQD;
+#endif
+	r = uv_getnameinfo(tjs_get_loop(ctx), &gr->req, uv__getnameinfo_cb,
+		(const struct sockaddr*) &gr->addr, flags);
+	if (r != 0) {
+		TJS_FreePromise(ctx, &gr->result);
+		JS_FreeValue(ctx, promise);
+		js_free(ctx, gr);
+		return tjs_throw_errno(ctx, r);
+	}
+	return promise;
 }
 
 // DNS header structure (RFC 1035)
@@ -256,7 +426,9 @@ typedef struct {
 	JSValue controller;
 	uint16_t query_id;
 	char* hostname;
-	struct sockaddr_in server_addr;
+	struct sockaddr_storage server_addr;
+	uint8_t query_buf[512];
+	unsigned int query_len;
 	bool done;
 	bool closing;
 } dns_udp_ctx_t;
@@ -293,6 +465,7 @@ typedef struct {
 #define DNS_SVCB    64    /* Service Binding */
 #define DNS_HTTPS   65    /* HTTPS Binding */
 #define DNS_CAA     257   /* Certification Authority Authorization */
+#define DNS_ANY     255   /* Any available record */
 
 static JSClassID tjs_dns_query_class_id;
 static JSClassDef tjs_dns_query_class = { "DNSQuery" };
@@ -303,12 +476,17 @@ static JSClassDef tjs_dns_query_class = { "DNSQuery" };
 static int encode_dns_name(const char* name, uint8_t* buf, size_t buflen) {
 	size_t pos = 0;
 	const char* p = name;
+	if (name[0] == '.' && name[1] == '\0') {
+		if (buflen == 0) return -1;
+		buf[0] = 0;
+		return 1;
+	}
 
 	while (*p) {
 		const char* dot = strchr(p, '.');
 		size_t len = dot ? (size_t) (dot - p) : strlen(p);
 
-		if (len == 0 || len > 63 || pos + len + 1 >= buflen) {
+		if (len == 0 || len > 63 || pos + len + 1 >= buflen || pos + len + 2 > 255) {
 			return -1;
 		}
 
@@ -381,35 +559,64 @@ static int decode_dns_name(const uint8_t* packet, size_t packet_len,
 	return -1;
 }
 
+static bool dns_name_fits_rdata(const uint8_t* packet, size_t packet_len,
+	size_t* offset, size_t rdata_end) {
+	char name[256];
+	if (decode_dns_name(packet, packet_len, offset, name, sizeof(name)) != 0) return false;
+	return *offset <= rdata_end;
+}
+
 // Build DNS query packet
 static int build_dns_query(const char* hostname, uint16_t query_id,
 	uint16_t qtype, uint8_t* buf, size_t buflen) {
 	if (buflen < 512) return -1;
 
-	dns_header_t* hdr = (dns_header_t*) buf;
-	hdr->id = htons(query_id);
-	hdr->flags = htons(0x0100);  // Standard query, recursion desired
-	hdr->qdcount = htons(1);
-	hdr->ancount = 0;
-	hdr->nscount = 0;
-	hdr->arcount = 0;
+	dns_header_t hdr = {
+		.id = htons(query_id),
+		.flags = htons(0x0100),
+		.qdcount = htons(1),
+		.ancount = 0,
+		.nscount = 0,
+		.arcount = 0,
+	};
+	memcpy(buf, &hdr, sizeof(hdr));
 
 	size_t pos = sizeof(dns_header_t);
 	int name_len = encode_dns_name(hostname, buf + pos, buflen - pos - 4);
 	if (name_len < 0) return -1;
 
 	pos += name_len;
-	*(uint16_t*) (buf + pos) = htons(qtype);
+	uint16_t query_type = htons(qtype);
+	memcpy(buf + pos, &query_type, sizeof(query_type));
 	pos += 2;
-	*(uint16_t*) (buf + pos) = htons(1);  // IN class
+	uint16_t query_class = htons(1);
+	memcpy(buf + pos, &query_class, sizeof(query_class));
 	pos += 2;
 
 	return pos;
 }
 
+static uint16_t dns_random_query_id(void) {
+	uint16_t id;
+	if (uv_random(NULL, NULL, &id, sizeof(id), 0, NULL) == 0) return id;
+	return (uint16_t) (uv_hrtime() ^ (uintptr_t) &id);
+}
+
+enum dns_parse_status {
+	DNS_PARSE_OK = 0,
+	DNS_PARSE_BAD_RESPONSE = -1,
+	DNS_PARSE_FORMERR = -2,
+	DNS_PARSE_SERVFAIL = -3,
+	DNS_PARSE_NOTFOUND = -4,
+	DNS_PARSE_NOTIMP = -5,
+	DNS_PARSE_REFUSED = -6,
+	DNS_PARSE_NODATA = -7,
+	DNS_PARSE_TRUNCATED = -8,
+};
+
 // Parse DNS response packet
 static int parse_dns_response(const uint8_t* packet, size_t packet_len,
-	dns_answer_t** answers, int* answer_count) {
+	uint16_t expected_id, dns_answer_t** answers, int* answer_count) {
 	if (packet_len < sizeof(dns_header_t)) return -1;
 
 	dns_header_t hdr;
@@ -419,9 +626,19 @@ static int parse_dns_response(const uint8_t* packet, size_t packet_len,
 	hdr.qdcount = ntohs(hdr.qdcount);
 	hdr.ancount = ntohs(hdr.ancount);
 
-	// Check response code
+	if (hdr.id != expected_id || !(hdr.flags & 0x8000)) return DNS_PARSE_BAD_RESPONSE;
+	if ((hdr.flags & 0x7800) != 0 || hdr.qdcount != 1) return DNS_PARSE_BAD_RESPONSE;
+	if (hdr.flags & 0x0200) return DNS_PARSE_TRUNCATED;
+
+	// Check response code and preserve the DNS-level error for callers.
 	int rcode = hdr.flags & 0x000F;
-	if (rcode != 0) return -1;
+	if (rcode == 1) return DNS_PARSE_FORMERR;
+	if (rcode == 2) return DNS_PARSE_SERVFAIL;
+	if (rcode == 3) return DNS_PARSE_NOTFOUND;
+	if (rcode == 4) return DNS_PARSE_NOTIMP;
+	if (rcode == 5) return DNS_PARSE_REFUSED;
+	if (rcode != 0) return DNS_PARSE_BAD_RESPONSE;
+	if (hdr.ancount > packet_len / 11) return DNS_PARSE_BAD_RESPONSE;
 
 	size_t pos = sizeof(dns_header_t);
 
@@ -439,7 +656,7 @@ static int parse_dns_response(const uint8_t* packet, size_t packet_len,
 	*answer_count = hdr.ancount;
 	if (hdr.ancount == 0) {
 		*answers = NULL;
-		return 0;
+		return DNS_PARSE_NODATA;
 	}
 
 	*answers = calloc(hdr.ancount, sizeof(dns_answer_t));
@@ -454,6 +671,7 @@ static int parse_dns_response(const uint8_t* packet, size_t packet_len,
 			goto parse_error;
 		}
 		ans->name = strdup(name);
+		if (!ans->name) goto parse_error;
 
 		// Parse type, class, TTL, rdlength (use memcpy for alignment safety)
 		if (pos + 10 > packet_len) goto parse_error;
@@ -475,12 +693,74 @@ static int parse_dns_response(const uint8_t* packet, size_t packet_len,
 		ans->packet = packet;
 		ans->packet_len = packet_len;
 		ans->rdata_offset = pos;
+		size_t rdata_end = pos + ans->rdlength;
+		size_t name_offset;
+
+		if (ans->class != 1) goto parse_error;
+		switch (ans->type) {
+		case DNS_A:
+			if (ans->rdlength != 4) goto parse_error;
+			break;
+		case DNS_AAAA:
+			if (ans->rdlength != 16) goto parse_error;
+			break;
+		case DNS_CNAME:
+		case DNS_NS:
+		case DNS_PTR:
+			name_offset = pos;
+			if (!dns_name_fits_rdata(packet, packet_len, &name_offset, rdata_end)) goto parse_error;
+			break;
+		case DNS_MX:
+			name_offset = pos + 2;
+			if (ans->rdlength <= 2 ||
+				!dns_name_fits_rdata(packet, packet_len, &name_offset, rdata_end)) goto parse_error;
+			break;
+		case DNS_SOA:
+			name_offset = pos;
+			if (ans->rdlength < 22 ||
+				!dns_name_fits_rdata(packet, packet_len, &name_offset, rdata_end) ||
+				!dns_name_fits_rdata(packet, packet_len, &name_offset, rdata_end) ||
+				rdata_end - name_offset < 20) goto parse_error;
+			break;
+		case DNS_SRV:
+			name_offset = pos + 6;
+			if (ans->rdlength <= 6 ||
+				!dns_name_fits_rdata(packet, packet_len, &name_offset, rdata_end)) goto parse_error;
+			break;
+		case DNS_TXT: {
+			if (ans->rdlength == 0) goto parse_error;
+			size_t txt_offset = pos;
+			while (txt_offset < rdata_end) {
+				uint8_t length = packet[txt_offset++];
+				if (length > rdata_end - txt_offset) goto parse_error;
+				txt_offset += length;
+			}
+			break;
+		}
+		case DNS_NAPTR: {
+			if (ans->rdlength < 8) goto parse_error;
+			size_t naptr_offset = pos + 4;
+			for (int field = 0; field < 3; field++) {
+				if (naptr_offset >= rdata_end) goto parse_error;
+				uint8_t length = packet[naptr_offset++];
+				if (length > rdata_end - naptr_offset) goto parse_error;
+				naptr_offset += length;
+			}
+			if (!dns_name_fits_rdata(packet, packet_len, &naptr_offset, rdata_end)) goto parse_error;
+			break;
+		}
+		case DNS_CAA:
+			if (ans->rdlength < 2 || packet[pos + 1] > ans->rdlength - 2) goto parse_error;
+			break;
+		default:
+			break;
+		}
 
 		// For CNAME, don't copy raw data (it may contain pointers), decode later
 		if (ans->type == 5) {
 			ans->rdata = NULL;
 		}
-		else {
+		else if (ans->rdlength > 0) {
 			ans->rdata = malloc(ans->rdlength);
 			if (!ans->rdata) goto parse_error;
 			memcpy(ans->rdata, packet + pos, ans->rdlength);
@@ -517,7 +797,7 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 	JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, ans->name));
 	JS_SetPropertyStr(ctx, obj, "type", JS_NewInt32(ctx, ans->type));
 	JS_SetPropertyStr(ctx, obj, "class", JS_NewInt32(ctx, ans->class));
-	JS_SetPropertyStr(ctx, obj, "ttl", JS_NewInt32(ctx, ans->ttl));
+	JS_SetPropertyStr(ctx, obj, "ttl", JS_NewUint32(ctx, ans->ttl));
 
 	if (ans->type == DNS_A && ans->rdlength == 4) {  // A record
 		char ip[INET_ADDRSTRLEN];
@@ -563,7 +843,9 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 		}
 	}
 	else if (ans->type == DNS_MX && ans->rdlength > 2) {  // MX
-		uint16_t priority = ntohs(*(uint16_t*) ans->rdata);
+		uint16_t priority;
+		memcpy(&priority, ans->rdata, sizeof(priority));
+		priority = ntohs(priority);
 		char mx[256];
 		size_t offset = ans->rdata_offset + 2;
 
@@ -576,7 +858,7 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 			JS_SetPropertyStr(ctx, obj, "exchange", JS_NewString(ctx, "(invalid)"));
 		}
 	}
-	else if (ans->type == DNS_SOA && ans->rdlength > 22) {  // SOA
+	else if (ans->type == DNS_SOA && ans->rdlength >= 22) {  // SOA
 		size_t offset = ans->rdata_offset;
 
 		// main domain server
@@ -589,16 +871,7 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 		char admin_dns[256];
 		if (ans->packet && decode_dns_name(ans->packet, ans->packet_len,
 			&offset, admin_dns, sizeof(admin_dns)) == 0) {
-			// email format (host.master@example.com)
-			char admin[256];
-			char* dot = strchr(admin_dns, '.');
-			if (dot) {
-				size_t at = dot - admin_dns;
-				memcpy(admin, admin_dns, at);
-				admin[at] = '@';
-				strcpy(admin + at + 1, dot + 1);
-				JS_SetPropertyStr(ctx, obj, "admin", JS_NewString(ctx, admin));
-			}
+			JS_SetPropertyStr(ctx, obj, "admin", JS_NewString(ctx, admin_dns));
 		}
 
 		// 5x32bit (serial, refresh, retry, expire, minimum)
@@ -619,11 +892,11 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 			expire = ntohl(expire);
 			minimum = ntohl(minimum);
 
-			JS_SetPropertyStr(ctx, obj, "serial", JS_NewInt32(ctx, serial));
-			JS_SetPropertyStr(ctx, obj, "refresh", JS_NewInt32(ctx, refresh));
-			JS_SetPropertyStr(ctx, obj, "retry", JS_NewInt32(ctx, retry));
-			JS_SetPropertyStr(ctx, obj, "expire", JS_NewInt32(ctx, expire));
-			JS_SetPropertyStr(ctx, obj, "minimum", JS_NewInt32(ctx, minimum));
+			JS_SetPropertyStr(ctx, obj, "serial", JS_NewUint32(ctx, serial));
+			JS_SetPropertyStr(ctx, obj, "refresh", JS_NewUint32(ctx, refresh));
+			JS_SetPropertyStr(ctx, obj, "retry", JS_NewUint32(ctx, retry));
+			JS_SetPropertyStr(ctx, obj, "expire", JS_NewUint32(ctx, expire));
+			JS_SetPropertyStr(ctx, obj, "minimum", JS_NewUint32(ctx, minimum));
 		}
 	}
 	else if (ans->type == DNS_SRV && ans->rdlength > 6) {
@@ -647,59 +920,62 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 		}
 	}
 	else if (ans->type == DNS_TXT && ans->rdata) {  // TXT
+		JSValue entries = JS_NewArray(ctx);
+		size_t offset = 0;
+		uint32_t index = 0;
+		while (offset < ans->rdlength) {
+			uint8_t length = ans->rdata[offset++];
+			if (length > ans->rdlength - offset) break;
+			JS_SetPropertyUint32(ctx, entries, index++,
+				JS_NewStringLen(ctx, (char*) ans->rdata + offset, length));
+			offset += length;
+		}
+		JS_SetPropertyStr(ctx, obj, "entries", entries);
 		JS_SetPropertyStr(ctx, obj, "txt",
 			JS_NewStringLen(ctx, (char*) ans->rdata, ans->rdlength));
 	}
-    else if (ans->type == DNS_NAPTR && ans->rdlength > 6) {  // NAPTR (Naming Authority Pointer)
-        size_t offset = ans->rdata_offset;
-        const uint8_t *ptr = ans->rdata ? ans->rdata : (ans->packet + offset);
-        
-        // order (2bytes), preference (2bytes)
-        uint16_t order = ntohs(*(uint16_t *)ptr);
-        uint16_t preference = ntohs(*(uint16_t *)(ptr + 2));
-        
-        // flags
-        uint8_t flags_len = ptr[4];
-        char flags[256] = {0};
-        if (flags_len > 0 && 5 + flags_len <= ans->rdlength) {
-            memcpy(flags, ptr + 5, flags_len);
-            flags[flags_len] = '\0';
-        }
-        
-        // services
-        size_t pos = 5 + flags_len;
-        uint8_t services_len = ptr[pos];
-        char services[256] = {0};
-        if (services_len > 0 && pos + 1 + services_len <= ans->rdlength) {
-            memcpy(services, ptr + pos + 1, services_len);
-            services[services_len] = '\0';
-        }
-        
-        // regexp
-        pos += 1 + services_len;
-        uint8_t regexp_len = ptr[pos];
-        char regexp[512] = {0};
-        if (regexp_len > 0 && pos + 1 + regexp_len <= ans->rdlength) {
-            memcpy(regexp, ptr + pos + 1, regexp_len);
-            regexp[regexp_len] = '\0';
-        }
-        
-        // replacement
-        pos += 1 + regexp_len;
-        char replacement[256] = {0};
-        if (ans->packet && decode_dns_name(ans->packet, ans->packet_len, 
-                                            &offset, replacement, sizeof(replacement)) == 0) {
-            // success
-        }
-        
-        JS_SetPropertyStr(ctx, obj, "order", JS_NewInt32(ctx, order));
-        JS_SetPropertyStr(ctx, obj, "preference", JS_NewInt32(ctx, preference));
-        JS_SetPropertyStr(ctx, obj, "flags", JS_NewString(ctx, flags));
-        JS_SetPropertyStr(ctx, obj, "services", JS_NewString(ctx, services));
-        JS_SetPropertyStr(ctx, obj, "regexp", JS_NewString(ctx, regexp));
-        JS_SetPropertyStr(ctx, obj, "replacement", JS_NewString(ctx, replacement));
-    }
-    else if (ans->type == DNS_CAA && ans->rdlength > 2) {  // CAA (Certification Authority Authorization)
+	else if (ans->type == DNS_NAPTR && ans->rdlength > 7) {
+		const uint8_t* ptr = ans->rdata;
+		uint16_t order_value, preference_value;
+		memcpy(&order_value, ptr, 2);
+		memcpy(&preference_value, ptr + 2, 2);
+		size_t pos = 4;
+		uint8_t flags_len = ptr[pos++];
+		if (pos + flags_len >= ans->rdlength) return obj;
+		JSValue flags = JS_NewStringLen(ctx, (char*) ptr + pos, flags_len);
+		pos += flags_len;
+		uint8_t services_len = ptr[pos++];
+		if (pos + services_len >= ans->rdlength) {
+			JS_FreeValue(ctx, flags);
+			return obj;
+		}
+		JSValue services = JS_NewStringLen(ctx, (char*) ptr + pos, services_len);
+		pos += services_len;
+		uint8_t regexp_len = ptr[pos++];
+		if (pos + regexp_len >= ans->rdlength) {
+			JS_FreeValue(ctx, flags);
+			JS_FreeValue(ctx, services);
+			return obj;
+		}
+		JSValue regexp = JS_NewStringLen(ctx, (char*) ptr + pos, regexp_len);
+		pos += regexp_len;
+		char replacement[256] = {0};
+		size_t replacement_offset = ans->rdata_offset + pos;
+		if (!ans->packet || decode_dns_name(ans->packet, ans->packet_len,
+			&replacement_offset, replacement, sizeof(replacement)) != 0) {
+			JS_FreeValue(ctx, flags);
+			JS_FreeValue(ctx, services);
+			JS_FreeValue(ctx, regexp);
+			return obj;
+		}
+		JS_SetPropertyStr(ctx, obj, "order", JS_NewInt32(ctx, ntohs(order_value)));
+		JS_SetPropertyStr(ctx, obj, "preference", JS_NewInt32(ctx, ntohs(preference_value)));
+		JS_SetPropertyStr(ctx, obj, "flags", flags);
+		JS_SetPropertyStr(ctx, obj, "services", services);
+		JS_SetPropertyStr(ctx, obj, "regexp", regexp);
+		JS_SetPropertyStr(ctx, obj, "replacement", JS_NewString(ctx, replacement));
+	}
+    else if (ans->type == DNS_CAA && ans->rdlength >= 2) {  // CAA (Certification Authority Authorization)
         const uint8_t *ptr = ans->rdata ? ans->rdata : (ans->packet + ans->rdata_offset);
         
         // flags (1bytes)
@@ -709,19 +985,16 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
         // tag (1bytes + string)
         uint8_t tag_len = ptr[1];
         char tag[256] = {0};
-        if (tag_len > 0 && 2 + tag_len <= ans->rdlength) {
+        if (2 + tag_len <= ans->rdlength) {
             memcpy(tag, ptr + 2, tag_len);
             tag[tag_len] = '\0';
             JS_SetPropertyStr(ctx, obj, "tag", JS_NewString(ctx, tag));
         }
         
-        // value (remaining)
-        size_t value_len = (ans->rdlength >= 2 + tag_len) ? ans->rdlength - 2 - tag_len : 0;
-        if (value_len > 0) {
-            const char *value = (const char *)(ptr + 2 + tag_len);
-            JS_SetPropertyStr(ctx, obj, "value", 
-                JS_NewStringLen(ctx, value, value_len));
-        }
+		// value (remaining)
+		size_t value_len = ans->rdlength - 2 - tag_len;
+		const char *value = (const char *)(ptr + 2 + tag_len);
+		JS_SetPropertyStr(ctx, obj, "value", JS_NewStringLen(ctx, value, value_len));
     }
 	else {  // unknown record type
 		if (ans->rdata) {
@@ -780,14 +1053,53 @@ static void dns_udp_finish(dns_udp_ctx_t* ctx) {
 	dns_udp_close(ctx);
 }
 
-static void dns_udp_reject_message(dns_udp_ctx_t* ctx, const char* message) {
+static void dns_udp_reject_code(dns_udp_ctx_t* ctx, const char* code, const char* message) {
 	if (ctx->done) return;
 	ctx->done = true;
-	JS_ThrowPlainError(ctx->ctx, "%s", message);
-	JSValue args[] = { JS_GetException(ctx->ctx) };
-	JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
+	JSValue error = JS_NewError(ctx->ctx);
+	if (JS_IsException(error)) {
+		error = JS_GetException(ctx->ctx);
+	} else {
+		JS_DefinePropertyValueStr(ctx->ctx, error, "message", JS_NewString(ctx->ctx, message),
+			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+		JS_DefinePropertyValueStr(ctx->ctx, error, "code", JS_NewString(ctx->ctx, code),
+			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+	}
+	JSValue args[] = { error };
+	JSValue ignored = JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
+	JS_FreeValue(ctx->ctx, ignored);
 	JS_FreeValue(ctx->ctx, args[0]);
 	dns_udp_finish(ctx);
+}
+
+static const char* dns_parse_error_code(int status) {
+	switch (status) {
+	case DNS_PARSE_FORMERR: return "EFORMERR";
+	case DNS_PARSE_SERVFAIL: return "ESERVFAIL";
+	case DNS_PARSE_NOTFOUND: return "ENOTFOUND";
+	case DNS_PARSE_NOTIMP: return "ENOTIMP";
+	case DNS_PARSE_REFUSED: return "EREFUSED";
+	case DNS_PARSE_NODATA: return "ENODATA";
+	case DNS_PARSE_TRUNCATED: return "EBADRESP";
+	default: return "EBADRESP";
+	}
+}
+
+static bool dns_server_matches(const dns_udp_ctx_t* ctx, const struct sockaddr* addr) {
+	if (!addr || addr->sa_family != ctx->server_addr.ss_family) return false;
+	if (addr->sa_family == AF_INET) {
+		const struct sockaddr_in* expected = (const struct sockaddr_in*) &ctx->server_addr;
+		const struct sockaddr_in* actual = (const struct sockaddr_in*) addr;
+		return expected->sin_port == actual->sin_port &&
+			memcmp(&expected->sin_addr, &actual->sin_addr, sizeof(expected->sin_addr)) == 0;
+	}
+	if (addr->sa_family == AF_INET6) {
+		const struct sockaddr_in6* expected = (const struct sockaddr_in6*) &ctx->server_addr;
+		const struct sockaddr_in6* actual = (const struct sockaddr_in6*) addr;
+		return expected->sin6_port == actual->sin6_port &&
+			memcmp(&expected->sin6_addr, &actual->sin6_addr, sizeof(expected->sin6_addr)) == 0;
+	}
+	return false;
 }
 
 static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
@@ -808,42 +1120,56 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 		if (buf->base) free(buf->base);
 		return;
 	}
+	if (nread >= 0 && !dns_server_matches(ctx, addr)) {
+		if (buf->base) free(buf->base);
+		return;
+	}
+	if (flags & UV_UDP_PARTIAL) {
+		dns_udp_reject_code(ctx, "EBADRESP", "Truncated DNS datagram");
+		if (buf->base) free(buf->base);
+		return;
+	}
 
 	if (nread < 0) {
-		dns_udp_reject_message(ctx, uv_strerror(nread));
+		dns_udp_reject_code(ctx, uv_err_name((int) nread), uv_strerror(nread));
 		if (buf->base) free(buf->base);
 		return;
 	}
 
 	if (nread > 0) {
-		// Parse DNS response
 		dns_answer_t* answers = NULL;
 		int answer_count = 0;
-
-		if (parse_dns_response((uint8_t*) buf->base, nread,
-			&answers, &answer_count) == 0) {
+		if (nread >= (ssize_t) sizeof(dns_header_t)) {
+			uint16_t response_id;
+			memcpy(&response_id, buf->base, sizeof(response_id));
+			if (ntohs(response_id) != ctx->query_id) {
+				free(buf->base);
+				return;
+			}
+		}
+		int parse_status = parse_dns_response((uint8_t*) buf->base, nread,
+			ctx->query_id, &answers, &answer_count);
+		if (parse_status == DNS_PARSE_OK) {
 			JSValue result = JS_NewArray(js_ctx);
-
 			for (int i = 0; i < answer_count; i++) {
 				JSValue ans_obj = dns_answer_to_js(js_ctx, &answers[i]);
 				JS_SetPropertyUint32(js_ctx, result, i, ans_obj);
 			}
-
 			free_dns_answers(answers, answer_count);
-
 			JSValue args[] = { result };
-			JS_Call(js_ctx, ctx->resolve_func, JS_UNDEFINED, 1, args);
+			JSValue ignored = JS_Call(js_ctx, ctx->resolve_func, JS_UNDEFINED, 1, args);
+			JS_FreeValue(js_ctx, ignored);
 			JS_FreeValue(js_ctx, result);
 			ctx->done = true;
-		}
-		else {
-			dns_udp_reject_message(ctx, "Failed to parse DNS response");
-			if (buf->base) free(buf->base);
+		} else {
+			dns_udp_reject_code(ctx, dns_parse_error_code(parse_status),
+				parse_status == DNS_PARSE_NODATA ? "DNS response contains no answers" : "Failed to parse DNS response");
+			free(buf->base);
 			return;
 		}
 	}
 
-	if (buf->base) free(buf->base);
+	free(buf->base);
 	if (ctx->done) dns_udp_finish(ctx);
 }
 
@@ -861,17 +1187,16 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 	if (!qrt || qrt->freeing) {
 		dns_udp_close(ctx);
 		return;
-	} else {
-		if (status == 0 || ctx->done) return;
-		dns_udp_reject_message(ctx, uv_strerror(status));
 	}
+	if (status == 0 || ctx->done) return;
+	dns_udp_reject_code(ctx, uv_err_name(status), uv_strerror(status));
 }
 
 static JSValue tjs_dns_query_abort(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv, int magic, JSValue* func_data) {
 	dns_udp_ctx_t* req_ctx = JS_GetOpaque(func_data[0], tjs_dns_query_class_id);
 	if (!req_ctx || req_ctx->done) return JS_UNDEFINED;
-	dns_udp_reject_message(req_ctx, "DNS query aborted");
+	dns_udp_reject_code(req_ctx, "ECANCELLED", "DNS query cancelled");
 	return JS_UNDEFINED;
 }
 // DNS.query(hostname, type, server, port)
@@ -921,7 +1246,13 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 
 	req_ctx->ctx = ctx;
 	req_ctx->hostname = strdup(hostname);
-	req_ctx->query_id = (uint16_t) (rand() & 0xFFFF);
+	if (!req_ctx->hostname) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
+		free(req_ctx);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	req_ctx->query_id = dns_random_query_id();
 	req_ctx->udp.data = req_ctx;
 	req_ctx->send_req.data = req_ctx;
 	req_ctx->resolve_func = JS_UNDEFINED;
@@ -931,6 +1262,13 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	// Create promise
 	JSValue promise, callbacks[2];
 	promise = JS_NewPromiseCapability(ctx, callbacks);
+	if (JS_IsException(promise)) {
+		if (server_is_js) JS_FreeCString(ctx, server);
+		JS_FreeCString(ctx, hostname);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return promise;
+	}
 	req_ctx->resolve_func = callbacks[0];
 	req_ctx->reject_func = callbacks[1];
 	JSValue controller = JS_NewObjectClass(ctx, tjs_dns_query_class_id);
@@ -961,9 +1299,9 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	JS_DefinePropertyValueStr(ctx, promise, "abort", abort_func, JS_PROP_CONFIGURABLE);
 
 	// Build DNS query packet
-	uint8_t query_buf[512];
 	int query_len = build_dns_query(hostname, req_ctx->query_id, qtype,
-		query_buf, sizeof(query_buf));
+		req_ctx->query_buf, sizeof(req_ctx->query_buf));
+	req_ctx->query_len = query_len > 0 ? (unsigned int) query_len : 0;
 
 	JS_FreeCString(ctx, hostname);
 
@@ -977,8 +1315,16 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
 	}
 
-	// Setup server address
-	int r = uv_ip4_addr(server, port, &req_ctx->server_addr);
+	// Setup IPv4 or IPv6 server address.
+	struct sockaddr_in server_addr4;
+	struct sockaddr_in6 server_addr6;
+	int r = uv_ip4_addr(server, port, &server_addr4);
+	if (r == 0) {
+		memcpy(&req_ctx->server_addr, &server_addr4, sizeof(server_addr4));
+	} else {
+		r = uv_ip6_addr(server, port, &server_addr6);
+		if (r == 0) memcpy(&req_ctx->server_addr, &server_addr6, sizeof(server_addr6));
+	}
 	if (server_is_js) {
 		JS_FreeCString(ctx, server);
 		server_is_js = false;
@@ -1002,7 +1348,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		JS_FreeValue(ctx, promise);
 		free(req_ctx->hostname);
 		free(req_ctx);
-		return JS_ThrowInternalError(ctx, "Failed to initialize UDP socket");
+		return tjs_throw_errno(ctx, r);
 	}
 
 	// Start receiving
@@ -1012,11 +1358,11 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		dns_udp_detach_controller(req_ctx);
 		dns_udp_free_callbacks(req_ctx);
 		JS_FreeValue(ctx, promise);
-		return JS_ThrowInternalError(ctx, "Failed to start UDP receive");
+		return tjs_throw_errno(ctx, r);
 	}
 
 	// Send query
-	uv_buf_t buf = uv_buf_init((char*) query_buf, query_len);
+	uv_buf_t buf = uv_buf_init((char*) req_ctx->query_buf, req_ctx->query_len);
 	r = uv_udp_send(&req_ctx->send_req, &req_ctx->udp, &buf, 1,
 		(const struct sockaddr*) &req_ctx->server_addr,
 		udp_send_callback);
@@ -1027,7 +1373,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		dns_udp_detach_controller(req_ctx);
 		dns_udp_free_callbacks(req_ctx);
 		JS_FreeValue(ctx, promise);
-		return JS_ThrowInternalError(ctx, "Failed to send DNS query");
+		return tjs_throw_errno(ctx, r);
 	}
 
 	return promise;
@@ -1047,7 +1393,9 @@ static const JSCFunctionListEntry tjs_dns_funcs[] = {
 	TJS_CONST2("TXT", DNS_TXT),
 	TJS_CONST2("NAPTR", DNS_NAPTR),
 	TJS_CONST2("CAA", DNS_CAA),
+	TJS_CONST2("ANY", DNS_ANY),
 
+	TJS_CFUNC_DEF("lookupService", 2, tjs_dns_lookup_service),
 	TJS_CFUNC_DEF("resolve", 2, tjs_dns_getaddrinfo),
 	TJS_CFUNC_DEF("resolveSync", 2, tjs_dns_getaddrinfo_sync)
 };

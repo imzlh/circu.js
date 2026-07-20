@@ -70,6 +70,49 @@ declare namespace CModuleSQLite3 {
          * Set SQLite busy timeout in milliseconds.
          */
         busyTimeout(ms: number): void;
+
+        /**
+         * Register a scalar SQL function backed by a JS callback.
+         * @param name SQL function name
+         * @param nArg Argument count, or -1 for varargs
+         * @param func JS function invoked for each call
+         * @param options optional { deterministic, useBigIntArguments }
+         */
+        createFunction(
+            name: string,
+            nArg: number,
+            func: (...args: any[]) => any,
+            options?: { deterministic?: boolean; directOnly?: boolean; useBigIntArguments?: boolean },
+        ): void;
+
+        /**
+         * Register an aggregate (or window) SQL function backed by JS callbacks.
+         * @param name SQL function name
+         * @param nArg Argument count, or -1 for varargs
+         * @param options start, step, optional result/inverse, deterministic, useBigIntArguments
+         */
+        createAggregate(
+            name: string,
+            nArg: number,
+            options: {
+                start: any;
+                step: (...args: any[]) => any;
+                result?: (acc: any) => any;
+                inverse?: (...args: any[]) => any;
+                deterministic?: boolean;
+                directOnly?: boolean;
+                useBigIntArguments?: boolean;
+            },
+        ): void;
+
+        /**
+         * Online backup of this connection to a destination file path.
+         * @param destPath Destination database file
+         * @param sourceName Source schema name (default "main")
+         * @param destName Destination schema name (default "main")
+         * @returns Total page count copied (Node backup() resolve value)
+         */
+        backupTo(destPath: string, sourceName?: string, destName?: string): number;
     }
 
     /**

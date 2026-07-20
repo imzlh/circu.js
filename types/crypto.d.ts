@@ -165,9 +165,9 @@ declare namespace CModuleCrypto {
 
     export function blake2s256(data: BufferSource): ArrayBuffer;
 
-    export function shake128(data: BufferSource): ArrayBuffer;
+    export function shake128(data: BufferSource, outputLength?: number): ArrayBuffer;
 
-    export function shake256(data: BufferSource): ArrayBuffer;
+    export function shake256(data: BufferSource, outputLength?: number): ArrayBuffer;
 
     // ============================================================================
     // HMAC Functions (One-shot)
@@ -287,6 +287,9 @@ declare namespace CModuleCrypto {
          */
         update(data: BufferSource): this;
 
+        /** Clone the current digest state. */
+        copy(): Hash;
+
         /**
          * Finalize hash and return digest
          *
@@ -303,6 +306,8 @@ declare namespace CModuleCrypto {
      * @returns Hash object
      */
     export function createMd5(): Hash;
+
+    export function createRipemd160(): Hash;
 
     /**
      * Create SHA-1 hash object for streaming
@@ -939,6 +944,7 @@ declare namespace CModuleCrypto {
     export function generateEcKeyP384(): EcKeyPair;
     /** Generate P-521 (secp521r1) key pair */
     export function generateEcKeyP521(): EcKeyPair;
+    export function generateEcKeySecp256k1(): EcKeyPair;
 
     /** ECDSA sign with P-256 (uses SHA-256) */
     export function ecdsaSignP256(privateKey: BufferSource, data: BufferSource): ArrayBuffer;
@@ -960,6 +966,17 @@ declare namespace CModuleCrypto {
     export function ecdhDeriveP384(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
     /** ECDH derive shared secret with P-521 */
     export function ecdhDeriveP521(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
+    export function ecdhDeriveSecp256k1(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
+
+    export function ecPublicFromPrivateP256(privateKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecPublicFromPrivateP384(privateKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecPublicFromPrivateP521(privateKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecPublicFromPrivateSecp256k1(privateKey: BufferSource, format?: number): ArrayBuffer;
+
+    export function ecConvertPublicP256(publicKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecConvertPublicP384(publicKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecConvertPublicP521(publicKey: BufferSource, format?: number): ArrayBuffer;
+    export function ecConvertPublicSecp256k1(publicKey: BufferSource, format?: number): ArrayBuffer;
 
     // ============================================================================
     // RSA-OAEP - NEW

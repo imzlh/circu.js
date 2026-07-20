@@ -26,7 +26,11 @@
 #include "private.h"
 
 #include <sqlite3.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <stdint.h>
+
+#define TJS_SQLITE3_MAX_SAFE_INTEGER INT64_C(9007199254740991)
 
 static thread_local JSClassID tjs_sqlite3_class_id;
 
@@ -362,6 +366,809 @@ static JSValue tjs_sqlite3_busy_timeout(JSContext *ctx, JSValue this_val, int ar
     }
 
     int r = sqlite3_busy_timeout(h->handle, ms);
+    if (r != SQLITE_OK) {
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+
+    return JS_UNDEFINED;
+}
+
+/* JS scalar UDF registration (sqlite3_create_function_v2) */
+typedef struct {
+    JSContext *ctx;
+    JSRuntime *rt;
+    JSValue func;
+    int use_bigint;
+} TJSSqlite3Func;
+
+static void tjs_sqlite3_func_destroy(void *p) {
+    TJSSqlite3Func *f = p;
+    if (!f)
+        return;
+    JS_FreeValueRT(f->rt, f->func);
+    js_free_rt(f->rt, f);
+}
+
+static void tjs__sqlite3_result_exception(JSContext *ctx, sqlite3_context *context, const char *fallback) {
+    JSValue exc = JS_GetException(ctx);
+    const char *msg = JS_ToCString(ctx, exc);
+    if (msg) {
+        sqlite3_result_error(context, msg, -1);
+        JS_FreeCString(ctx, msg);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        sqlite3_result_error(context, fallback, -1);
+    }
+    JS_FreeValue(ctx, exc);
+}
+
+static JSValue tjs__sqlite3_value_to_js(JSContext *ctx, sqlite3_value *val, int use_bigint) {
+    switch (sqlite3_value_type(val)) {
+        case SQLITE_INTEGER: {
+            int64_t x = sqlite3_value_int64(val);
+            if (use_bigint)
+                return JS_NewBigInt64(ctx, x);
+            if (x < -TJS_SQLITE3_MAX_SAFE_INTEGER || x > TJS_SQLITE3_MAX_SAFE_INTEGER) {
+                return JS_ThrowRangeError(ctx, "Value is too large to be represented as a JavaScript number: %" PRId64, x);
+            }
+            if (x >= INT32_MIN && x <= INT32_MAX)
+                return JS_NewInt32(ctx, (int32_t)x);
+            return JS_NewInt64(ctx, x);
+        }
+        case SQLITE_FLOAT:
+            return JS_NewFloat64(ctx, sqlite3_value_double(val));
+        case SQLITE3_TEXT: {
+            const unsigned char *text = sqlite3_value_text(val);
+            int len = text ? sqlite3_value_bytes(val) : 0;
+            return JS_NewStringLen(ctx, text ? (const char *)text : "", (size_t)len);
+        }
+        case SQLITE_BLOB: {
+            int len = sqlite3_value_bytes(val);
+            const void *blob = sqlite3_value_blob(val);
+            return JS_NewUint8ArrayCopy(ctx,
+                                         len > 0 ? (const uint8_t *)blob : NULL,
+                                         len > 0 ? (size_t)len : 0);
+        }
+        default:
+            return JS_NULL;
+    }
+}
+
+static int tjs__sqlite3_result_from_js(JSContext *ctx, sqlite3_context *context, JSValue v) {
+    int r;
+
+    if (JS_IsUndefined(v) || JS_IsNull(v)) {
+        sqlite3_result_null(context);
+        return 0;
+    }
+
+    switch (JS_VALUE_GET_NORM_TAG(v)) {
+        case JS_TAG_BIG_INT: {
+            int64_t x;
+            if (JS_ToBigInt64(ctx, &x, v))
+                return -1;
+            sqlite3_result_int64(context, x);
+            return 0;
+        }
+        case JS_TAG_STRING: {
+            size_t len;
+            const char *x = JS_ToCStringLen(ctx, &len, v);
+            if (!x)
+                return -1;
+            if (len > INT_MAX) {
+                JS_FreeCString(ctx, x);
+                sqlite3_result_error(context, "string result too large", -1);
+                return 1;
+            }
+            sqlite3_result_text(context, x, (int)len, SQLITE_TRANSIENT);
+            JS_FreeCString(ctx, x);
+            return 0;
+        }
+        case JS_TAG_OBJECT: {
+            size_t len = 0;
+            const uint8_t *x = JS_GetUint8Array(ctx, &len, v);
+            if (!x) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                sqlite3_result_error(context, "unsupported object result type", -1);
+                return 1;
+            }
+            if (len > INT_MAX) {
+                sqlite3_result_error(context, "blob result too large", -1);
+                return 1;
+            }
+            sqlite3_result_blob(context, x, (int)len, SQLITE_TRANSIENT);
+            return 0;
+        }
+        case JS_TAG_INT: {
+            int64_t x;
+            if (JS_ToInt64(ctx, &x, v))
+                return -1;
+            if (x < INT_MIN || x > INT_MAX)
+                sqlite3_result_int64(context, x);
+            else
+                sqlite3_result_int(context, (int)x);
+            return 0;
+        }
+        case JS_TAG_BOOL: {
+            r = JS_ToBool(ctx, v);
+            if (r < 0)
+                return -1;
+            sqlite3_result_int(context, r);
+            return 0;
+        }
+        case JS_TAG_FLOAT64: {
+            double x;
+            if (JS_ToFloat64(ctx, &x, v))
+                return -1;
+            sqlite3_result_double(context, x);
+            return 0;
+        }
+        default:
+            sqlite3_result_error(context, "unsupported function result type", -1);
+            return 1;
+    }
+}
+
+static void tjs_sqlite3_func_xFunc(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    TJSSqlite3Func *f = sqlite3_user_data(context);
+    if (!f || !f->ctx) {
+        sqlite3_result_error(context, "missing function state", -1);
+        return;
+    }
+
+    JSContext *ctx = f->ctx;
+    JSValue *js_argv = NULL;
+    if (argc > 0) {
+        js_argv = js_malloc(ctx, (size_t)argc * sizeof(JSValue));
+        if (!js_argv) {
+            sqlite3_result_error_nomem(context);
+            return;
+        }
+        for (int i = 0; i < argc; i++) {
+            js_argv[i] = tjs__sqlite3_value_to_js(ctx, argv[i], f->use_bigint);
+            if (JS_IsException(js_argv[i])) {
+                for (int j = 0; j < i; j++)
+                    JS_FreeValue(ctx, js_argv[j]);
+                js_free(ctx, js_argv);
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                sqlite3_result_error(context, "failed to convert argument", -1);
+                return;
+            }
+        }
+    }
+
+    JSValue ret = JS_Call(ctx, f->func, JS_UNDEFINED, argc, js_argv);
+    if (js_argv) {
+        for (int i = 0; i < argc; i++)
+            JS_FreeValue(ctx, js_argv[i]);
+        js_free(ctx, js_argv);
+    }
+
+    if (JS_IsException(ret)) {
+        tjs__sqlite3_result_exception(ctx, context, "function threw");
+        return;
+    }
+
+    if (tjs__sqlite3_result_from_js(ctx, context, ret) < 0) {
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        sqlite3_result_error(context, "failed to convert result", -1);
+        return;
+    }
+    JS_FreeValue(ctx, ret);
+}
+
+/* Aggregate UDF: createAggregate(name, nArg, { start, step, result?, inverse? }) */
+typedef struct {
+    JSContext *ctx;
+    JSRuntime *rt;
+    JSValue start;
+    int start_is_func;
+    JSValue step;
+    JSValue result;
+    int has_result;
+    JSValue inverse;
+    int has_inverse;
+    int use_bigint;
+} TJSSqlite3Agg;
+
+typedef struct {
+    JSValue acc;
+    int inited;
+    int failed;
+} TJSSqlite3AggCtx;
+
+static void tjs_sqlite3_agg_destroy(void *p) {
+    TJSSqlite3Agg *a = p;
+    if (!a)
+        return;
+    JS_FreeValueRT(a->rt, a->start);
+    JS_FreeValueRT(a->rt, a->step);
+    if (a->has_result)
+        JS_FreeValueRT(a->rt, a->result);
+    if (a->has_inverse)
+        JS_FreeValueRT(a->rt, a->inverse);
+    js_free_rt(a->rt, a);
+}
+
+static int tjs_sqlite3_agg_ensure(sqlite3_context *context, TJSSqlite3Agg *a, TJSSqlite3AggCtx **out) {
+    TJSSqlite3AggCtx *ac = sqlite3_aggregate_context(context, (int)sizeof(TJSSqlite3AggCtx));
+    if (!ac) {
+        sqlite3_result_error_nomem(context);
+        return -1;
+    }
+    if (ac->failed)
+        return -1;
+    if (!ac->inited) {
+        JSContext *ctx = a->ctx;
+        JSValue acc;
+        if (a->start_is_func) {
+            acc = JS_Call(ctx, a->start, JS_UNDEFINED, 0, NULL);
+            if (JS_IsException(acc)) {
+                ac->failed = 1;
+                tjs__sqlite3_result_exception(ctx, context, "aggregate start threw");
+                return -1;
+            }
+        } else {
+            acc = JS_DupValue(ctx, a->start);
+        }
+        ac->acc = acc;
+        ac->inited = 1;
+    }
+    *out = ac;
+    return 0;
+}
+
+static void tjs_sqlite3_agg_clear(JSContext *ctx, TJSSqlite3AggCtx *ac) {
+    if (ac->inited)
+        JS_FreeValue(ctx, ac->acc);
+    ac->acc = JS_UNDEFINED;
+    ac->inited = 0;
+}
+
+static int tjs_sqlite3_agg_emit(sqlite3_context *context, TJSSqlite3Agg *a, TJSSqlite3AggCtx *ac) {
+    JSContext *ctx = a->ctx;
+    JSValue out;
+    if (a->has_result) {
+        JSValue argv0 = JS_DupValue(ctx, ac->acc);
+        out = JS_Call(ctx, a->result, JS_UNDEFINED, 1, &argv0);
+        JS_FreeValue(ctx, argv0);
+        if (JS_IsException(out)) {
+            ac->failed = 1;
+            tjs__sqlite3_result_exception(ctx, context, "aggregate result threw");
+            return -1;
+        }
+    } else {
+        out = JS_DupValue(ctx, ac->acc);
+    }
+
+    int r = tjs__sqlite3_result_from_js(ctx, context, out);
+    JS_FreeValue(ctx, out);
+    if (r < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        sqlite3_result_error(context, "failed to convert aggregate result", -1);
+    }
+    if (r != 0)
+        ac->failed = 1;
+    return r;
+}
+
+static void tjs_sqlite3_agg_xStep(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    TJSSqlite3Agg *a = sqlite3_user_data(context);
+    if (!a || !a->ctx) {
+        sqlite3_result_error(context, "missing aggregate state", -1);
+        return;
+    }
+    TJSSqlite3AggCtx *ac;
+    if (tjs_sqlite3_agg_ensure(context, a, &ac) < 0)
+        return;
+
+    JSContext *ctx = a->ctx;
+    int n = argc + 1;
+    JSValue *js_argv = js_malloc(ctx, (size_t)n * sizeof(JSValue));
+    if (!js_argv) {
+        ac->failed = 1;
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    js_argv[0] = JS_DupValue(ctx, ac->acc);
+    for (int i = 0; i < argc; i++) {
+        js_argv[i + 1] = tjs__sqlite3_value_to_js(ctx, argv[i], a->use_bigint);
+        if (JS_IsException(js_argv[i + 1])) {
+            for (int j = 0; j <= i; j++)
+                JS_FreeValue(ctx, js_argv[j]);
+            js_free(ctx, js_argv);
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            ac->failed = 1;
+            sqlite3_result_error(context, "failed to convert aggregate argument", -1);
+            return;
+        }
+    }
+
+    JSValue ret = JS_Call(ctx, a->step, JS_UNDEFINED, n, js_argv);
+    for (int i = 0; i < n; i++)
+        JS_FreeValue(ctx, js_argv[i]);
+    js_free(ctx, js_argv);
+
+    if (JS_IsException(ret)) {
+        ac->failed = 1;
+        tjs__sqlite3_result_exception(ctx, context, "aggregate step threw");
+        return;
+    }
+    JS_FreeValue(ctx, ac->acc);
+    ac->acc = ret;
+}
+
+static void tjs_sqlite3_agg_xInverse(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    TJSSqlite3Agg *a = sqlite3_user_data(context);
+    if (!a || !a->ctx || !a->has_inverse) {
+        sqlite3_result_error(context, "aggregate inverse not configured", -1);
+        return;
+    }
+    TJSSqlite3AggCtx *ac;
+    if (tjs_sqlite3_agg_ensure(context, a, &ac) < 0)
+        return;
+
+    JSContext *ctx = a->ctx;
+    int n = argc + 1;
+    JSValue *js_argv = js_malloc(ctx, (size_t)n * sizeof(JSValue));
+    if (!js_argv) {
+        ac->failed = 1;
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    js_argv[0] = JS_DupValue(ctx, ac->acc);
+    for (int i = 0; i < argc; i++) {
+        js_argv[i + 1] = tjs__sqlite3_value_to_js(ctx, argv[i], a->use_bigint);
+        if (JS_IsException(js_argv[i + 1])) {
+            for (int j = 0; j <= i; j++)
+                JS_FreeValue(ctx, js_argv[j]);
+            js_free(ctx, js_argv);
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            ac->failed = 1;
+            sqlite3_result_error(context, "failed to convert inverse argument", -1);
+            return;
+        }
+    }
+
+    JSValue ret = JS_Call(ctx, a->inverse, JS_UNDEFINED, n, js_argv);
+    for (int i = 0; i < n; i++)
+        JS_FreeValue(ctx, js_argv[i]);
+    js_free(ctx, js_argv);
+
+    if (JS_IsException(ret)) {
+        ac->failed = 1;
+        tjs__sqlite3_result_exception(ctx, context, "aggregate inverse threw");
+        return;
+    }
+    JS_FreeValue(ctx, ac->acc);
+    ac->acc = ret;
+}
+
+static void tjs_sqlite3_agg_xFinal(sqlite3_context *context) {
+    TJSSqlite3Agg *a = sqlite3_user_data(context);
+    if (!a || !a->ctx) {
+        sqlite3_result_error(context, "missing aggregate state", -1);
+        return;
+    }
+
+    TJSSqlite3AggCtx *ac = sqlite3_aggregate_context(context, (int)sizeof(TJSSqlite3AggCtx));
+    if (!ac) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    if (ac->failed) {
+        tjs_sqlite3_agg_clear(a->ctx, ac);
+        return;
+    }
+    if (!ac->inited) {
+        if (tjs_sqlite3_agg_ensure(context, a, &ac) < 0)
+            return;
+    }
+
+    tjs_sqlite3_agg_emit(context, a, ac);
+    tjs_sqlite3_agg_clear(a->ctx, ac);
+}
+
+static void tjs_sqlite3_agg_xValue(sqlite3_context *context) {
+    TJSSqlite3Agg *a = sqlite3_user_data(context);
+    if (!a || !a->ctx) {
+        sqlite3_result_error(context, "missing aggregate state", -1);
+        return;
+    }
+
+    TJSSqlite3AggCtx *ac;
+    if (tjs_sqlite3_agg_ensure(context, a, &ac) < 0)
+        return;
+    tjs_sqlite3_agg_emit(context, a, ac);
+}
+
+/* createAggregate(name, nArg, optionsObject)
+ * options: start (value|function), step (function), result? (function),
+ *          inverse? (function), deterministic?, useBigIntArguments?
+ */
+static JSValue tjs_sqlite3_create_aggregate(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h)
+        return JS_EXCEPTION;
+
+    if (argc < 3)
+        return JS_ThrowTypeError(ctx, "createAggregate(name, nArg, options) requires 3 arguments");
+
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
+
+    int n_arg;
+    if (JS_ToInt32(ctx, &n_arg, argv[1])) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    if (n_arg < -1) {
+        JS_FreeCString(ctx, name);
+        return JS_ThrowRangeError(ctx, "nArg must be >= -1");
+    }
+
+    if (!JS_IsObject(argv[2])) {
+        JS_FreeCString(ctx, name);
+        return JS_ThrowTypeError(ctx, "createAggregate options must be an object");
+    }
+
+    JSValue start = JS_GetPropertyStr(ctx, argv[2], "start");
+    if (JS_IsException(start)) {
+        JS_FreeCString(ctx, name);
+        return start;
+    }
+    if (JS_IsUndefined(start)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeCString(ctx, name);
+        return JS_ThrowTypeError(ctx, "options.start must be a function or a primitive value");
+    }
+
+    JSValue step = JS_GetPropertyStr(ctx, argv[2], "step");
+    if (JS_IsException(step)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeCString(ctx, name);
+        return step;
+    }
+    if (!JS_IsFunction(ctx, step)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        JS_FreeCString(ctx, name);
+        return JS_ThrowTypeError(ctx, "options.step must be a function");
+    }
+
+    JSValue result = JS_GetPropertyStr(ctx, argv[2], "result");
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        JS_FreeCString(ctx, name);
+        return result;
+    }
+    int has_result = 0;
+    if (!JS_IsUndefined(result) && !JS_IsNull(result)) {
+        if (!JS_IsFunction(ctx, result)) {
+            JS_FreeValue(ctx, start);
+            JS_FreeValue(ctx, step);
+            JS_FreeValue(ctx, result);
+            JS_FreeCString(ctx, name);
+            return JS_ThrowTypeError(ctx, "options.result must be a function");
+        }
+        has_result = 1;
+    } else {
+        JS_FreeValue(ctx, result);
+        result = JS_UNDEFINED;
+    }
+
+    JSValue inverse = JS_GetPropertyStr(ctx, argv[2], "inverse");
+    if (JS_IsException(inverse)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        if (has_result)
+            JS_FreeValue(ctx, result);
+        JS_FreeCString(ctx, name);
+        return inverse;
+    }
+    int has_inverse = 0;
+    if (!JS_IsUndefined(inverse) && !JS_IsNull(inverse)) {
+        if (!JS_IsFunction(ctx, inverse)) {
+            JS_FreeValue(ctx, start);
+            JS_FreeValue(ctx, step);
+            if (has_result)
+                JS_FreeValue(ctx, result);
+            JS_FreeValue(ctx, inverse);
+            JS_FreeCString(ctx, name);
+            return JS_ThrowTypeError(ctx, "options.inverse must be a function");
+        }
+        has_inverse = 1;
+    } else {
+        JS_FreeValue(ctx, inverse);
+        inverse = JS_UNDEFINED;
+    }
+
+    int eflags = SQLITE_UTF8;
+    int use_bigint = 0;
+    JSValue det = JS_GetPropertyStr(ctx, argv[2], "deterministic");
+    if (JS_IsException(det)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        if (has_result)
+            JS_FreeValue(ctx, result);
+        if (has_inverse)
+            JS_FreeValue(ctx, inverse);
+        JS_FreeCString(ctx, name);
+        return det;
+    }
+    if (JS_ToBool(ctx, det))
+        eflags |= SQLITE_DETERMINISTIC;
+    JS_FreeValue(ctx, det);
+
+    JSValue direct = JS_GetPropertyStr(ctx, argv[2], "directOnly");
+    if (JS_IsException(direct)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        if (has_result)
+            JS_FreeValue(ctx, result);
+        if (has_inverse)
+            JS_FreeValue(ctx, inverse);
+        JS_FreeCString(ctx, name);
+        return direct;
+    }
+    if (JS_ToBool(ctx, direct))
+        eflags |= SQLITE_DIRECTONLY;
+    JS_FreeValue(ctx, direct);
+
+    JSValue bi = JS_GetPropertyStr(ctx, argv[2], "useBigIntArguments");
+    if (JS_IsException(bi)) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        if (has_result)
+            JS_FreeValue(ctx, result);
+        if (has_inverse)
+            JS_FreeValue(ctx, inverse);
+        JS_FreeCString(ctx, name);
+        return bi;
+    }
+    use_bigint = JS_ToBool(ctx, bi) ? 1 : 0;
+    JS_FreeValue(ctx, bi);
+
+    TJSSqlite3Agg *agg = js_mallocz(ctx, sizeof(*agg));
+    if (!agg) {
+        JS_FreeValue(ctx, start);
+        JS_FreeValue(ctx, step);
+        if (has_result)
+            JS_FreeValue(ctx, result);
+        if (has_inverse)
+            JS_FreeValue(ctx, inverse);
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    agg->ctx = ctx;
+    agg->rt = JS_GetRuntime(ctx);
+    agg->start = start;
+    agg->start_is_func = JS_IsFunction(ctx, start);
+    agg->step = step;
+    agg->result = result;
+    agg->has_result = has_result;
+    agg->inverse = inverse;
+    agg->has_inverse = has_inverse;
+    agg->use_bigint = use_bigint;
+
+    int r;
+    if (has_inverse) {
+        r = sqlite3_create_window_function(h->handle,
+                                           name,
+                                           n_arg,
+                                           eflags,
+                                           agg,
+                                           tjs_sqlite3_agg_xStep,
+                                           tjs_sqlite3_agg_xFinal,
+                                           tjs_sqlite3_agg_xValue,
+                                           tjs_sqlite3_agg_xInverse,
+                                           tjs_sqlite3_agg_destroy);
+    } else {
+        r = sqlite3_create_function_v2(h->handle,
+                                       name,
+                                       n_arg,
+                                       eflags,
+                                       agg,
+                                       NULL,
+                                       tjs_sqlite3_agg_xStep,
+                                       tjs_sqlite3_agg_xFinal,
+                                       tjs_sqlite3_agg_destroy);
+    }
+    JS_FreeCString(ctx, name);
+    if (r != SQLITE_OK) {
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+    return JS_UNDEFINED;
+}
+
+/* backupTo(destPath [, sourceName [, destName]]) — online copy via sqlite3_backup_*
+ * Returns total page count of the completed backup (Node backup() result shape).
+ */
+static JSValue tjs_sqlite3_backup_to(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h)
+        return JS_EXCEPTION;
+
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "backupTo(destPath[, sourceName[, destName]]) requires destPath");
+
+    const char *dest_path = JS_ToCString(ctx, argv[0]);
+    if (!dest_path)
+        return JS_EXCEPTION;
+
+    const char *src_name = "main";
+    const char *dst_name = "main";
+    char *src_owned = NULL;
+    char *dst_owned = NULL;
+
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        src_owned = (char *)JS_ToCString(ctx, argv[1]);
+        if (!src_owned) {
+            JS_FreeCString(ctx, dest_path);
+            return JS_EXCEPTION;
+        }
+        src_name = src_owned;
+    }
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        dst_owned = (char *)JS_ToCString(ctx, argv[2]);
+        if (!dst_owned) {
+            JS_FreeCString(ctx, dest_path);
+            if (src_owned)
+                JS_FreeCString(ctx, src_owned);
+            return JS_EXCEPTION;
+        }
+        dst_name = dst_owned;
+    }
+
+    sqlite3 *dest = NULL;
+    int r = sqlite3_open_v2(dest_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (r != SQLITE_OK) {
+        JS_FreeCString(ctx, dest_path);
+        if (src_owned)
+            JS_FreeCString(ctx, src_owned);
+        if (dst_owned)
+            JS_FreeCString(ctx, dst_owned);
+        if (dest)
+            sqlite3_close_v2(dest);
+        return tjs_throw_sqlite3_errno(ctx, r);
+    }
+
+    sqlite3_backup *bak = sqlite3_backup_init(dest, dst_name, h->handle, src_name);
+    if (!bak) {
+        int err = sqlite3_errcode(dest);
+        sqlite3_close_v2(dest);
+        JS_FreeCString(ctx, dest_path);
+        if (src_owned)
+            JS_FreeCString(ctx, src_owned);
+        if (dst_owned)
+            JS_FreeCString(ctx, dst_owned);
+        return tjs_throw_sqlite3_errno(ctx, err != SQLITE_OK ? err : SQLITE_ERROR);
+    }
+
+    do {
+        r = sqlite3_backup_step(bak, -1);
+    } while (r == SQLITE_OK || r == SQLITE_BUSY || r == SQLITE_LOCKED);
+
+    int pages = sqlite3_backup_pagecount(bak);
+    int fin = sqlite3_backup_finish(bak);
+    if (r != SQLITE_DONE) {
+        int err = r != SQLITE_OK ? r : fin;
+        sqlite3_close_v2(dest);
+        JS_FreeCString(ctx, dest_path);
+        if (src_owned)
+            JS_FreeCString(ctx, src_owned);
+        if (dst_owned)
+            JS_FreeCString(ctx, dst_owned);
+        return tjs_throw_sqlite3_errno(ctx, err);
+    }
+    if (fin != SQLITE_OK) {
+        sqlite3_close_v2(dest);
+        JS_FreeCString(ctx, dest_path);
+        if (src_owned)
+            JS_FreeCString(ctx, src_owned);
+        if (dst_owned)
+            JS_FreeCString(ctx, dst_owned);
+        return tjs_throw_sqlite3_errno(ctx, fin);
+    }
+
+    sqlite3_close_v2(dest);
+    JS_FreeCString(ctx, dest_path);
+    if (src_owned)
+        JS_FreeCString(ctx, src_owned);
+    if (dst_owned)
+        JS_FreeCString(ctx, dst_owned);
+
+    return JS_NewInt32(ctx, pages);
+}
+
+/* createFunction(name, nArg, func [, options])
+ * options.deterministic (bool), options.useBigIntArguments (bool)
+ * nArg < 0 → SQLITE varargs (-1)
+ */
+static JSValue tjs_sqlite3_create_function(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h)
+        return JS_EXCEPTION;
+
+    if (argc < 3)
+        return JS_ThrowTypeError(ctx, "createFunction(name, nArg, func[, options]) requires 3 arguments");
+
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
+
+    int n_arg;
+    if (JS_ToInt32(ctx, &n_arg, argv[1])) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    if (n_arg < -1) {
+        JS_FreeCString(ctx, name);
+        return JS_ThrowRangeError(ctx, "nArg must be >= -1");
+    }
+
+    if (!JS_IsFunction(ctx, argv[2])) {
+        JS_FreeCString(ctx, name);
+        return JS_ThrowTypeError(ctx, "createFunction func must be a function");
+    }
+
+    int eflags = SQLITE_UTF8;
+    int use_bigint = 0;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        if (!JS_IsObject(argv[3])) {
+            JS_FreeCString(ctx, name);
+            return JS_ThrowTypeError(ctx, "createFunction options must be an object");
+        }
+        JSValue det = JS_GetPropertyStr(ctx, argv[3], "deterministic");
+        if (JS_IsException(det)) {
+            JS_FreeCString(ctx, name);
+            return det;
+        }
+        if (JS_ToBool(ctx, det))
+            eflags |= SQLITE_DETERMINISTIC;
+        JS_FreeValue(ctx, det);
+
+        JSValue direct = JS_GetPropertyStr(ctx, argv[3], "directOnly");
+        if (JS_IsException(direct)) {
+            JS_FreeCString(ctx, name);
+            return direct;
+        }
+        if (JS_ToBool(ctx, direct))
+            eflags |= SQLITE_DIRECTONLY;
+        JS_FreeValue(ctx, direct);
+
+        JSValue bi = JS_GetPropertyStr(ctx, argv[3], "useBigIntArguments");
+        if (JS_IsException(bi)) {
+            JS_FreeCString(ctx, name);
+            return bi;
+        }
+        use_bigint = JS_ToBool(ctx, bi) ? 1 : 0;
+        JS_FreeValue(ctx, bi);
+    }
+
+    TJSSqlite3Func *f = js_mallocz(ctx, sizeof(*f));
+    if (!f) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    f->ctx = ctx;
+    f->rt = JS_GetRuntime(ctx);
+    f->func = JS_DupValue(ctx, argv[2]);
+    f->use_bigint = use_bigint;
+
+    int r = sqlite3_create_function_v2(h->handle,
+                                       name,
+                                       n_arg,
+                                       eflags,
+                                       f,
+                                       tjs_sqlite3_func_xFunc,
+                                       NULL,
+                                       NULL,
+                                       tjs_sqlite3_func_destroy);
+    JS_FreeCString(ctx, name);
     if (r != SQLITE_OK) {
         return tjs_throw_sqlite3_errno(ctx, r);
     }
@@ -768,6 +1575,9 @@ static const JSCFunctionListEntry tjs_sqlite3_proto_funcs[] = {
     TJS_CFUNC_DEF("lastInsertRowid", 0, tjs_sqlite3_last_insert_rowid),
     TJS_CFUNC_DEF("interrupt", 0, tjs_sqlite3_interrupt),
     TJS_CFUNC_DEF("busyTimeout", 1, tjs_sqlite3_busy_timeout),
+    TJS_CFUNC_DEF("createFunction", 4, tjs_sqlite3_create_function),
+    TJS_CFUNC_DEF("createAggregate", 4, tjs_sqlite3_create_aggregate),
+    TJS_CFUNC_DEF("backupTo", 3, tjs_sqlite3_backup_to),
 };
 
 static const JSCFunctionListEntry tjs_sqlite3_stmt_proto_funcs[] = {

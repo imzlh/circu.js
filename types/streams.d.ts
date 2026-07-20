@@ -91,6 +91,11 @@ declare namespace CModuleStreams {
         stopRead(): void;
 
         /**
+         * Cancel the active one-shot read without closing the stream.
+         */
+        cancelRead(): void;
+
+        /**
          * Write data to stream
          * @param buffer Data to write
          * @returns Promise resolves to bytes written, rejects on failure
@@ -153,7 +158,7 @@ declare namespace CModuleStreams {
         createReadStream(): ReadableStream;
         createWriteStream(): WritableStream;
         close(): void;
-        setRaw(mode: boolean): void;
+        setRaw(mode: boolean, cbreak?: boolean): void;
     }
 
     export const stdin: StdioStream;
@@ -266,6 +271,18 @@ declare namespace CModuleStreams {
          * @throws Synchronous throw on error
          */
         mode: number;
+
+        /**
+         * Enable or disable raw mode
+         * @param cbreak Keep terminal-generated signals enabled in raw mode
+         * @throws Synchronous throw on error
+         */
+        setRaw(mode: boolean, cbreak?: boolean): void;
+
+        /**
+         * Return whether this TTY belongs to the terminal foreground process group.
+         */
+        isForeground(): boolean;
 
         /**
          * Get terminal window size
