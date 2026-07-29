@@ -846,25 +846,21 @@ static JSValue tjs_bytes_concat(JSContext* ctx, JSValue this_arg, int argc, JSVa
 	if (JS_GetLength(ctx, argv[0], &length) < 0) {
 		return JS_EXCEPTION;
 	}
-	if (length > UINT32_MAX) {
+	if (length > UINT32_MAX || length > SIZE_MAX / sizeof(TJSBytesChunk)) {
 		return JS_ThrowRangeError(ctx, "Too many chunks");
 	}
-	uint32_t chunk_count = (uint32_t)length;
-	if (chunk_count == 0) {
+	if (length == 0) {
 		return JS_NewUint8ArrayCopy(ctx, NULL, 0);
 	}
-	if (chunk_count > SIZE_MAX / sizeof(TJSBytesChunk)) {
-		return JS_ThrowRangeError(ctx, "Too many chunks");
-	}
 
-	TJSBytesChunk* chunks = js_malloc(ctx, sizeof(*chunks) * chunk_count);
+	TJSBytesChunk* chunks = js_malloc(ctx, sizeof(*chunks) * length);
 	if (!chunks) {
 		return JS_ThrowOutOfMemory(ctx);
 	}
 
 	size_t total = 0;
-	uint32_t collected = 0;
-	for (uint32_t i = 0; i < chunk_count; i++) {
+	uint32_t collected = 0, length_u32 = (uint32_t)length;
+	for (uint32_t i = 0; i < length_u32; i++) {
 		JSValue chunk = JS_GetPropertyUint32(ctx, argv[0], i);
 		if (JS_IsException(chunk)) {
 			tjs_free_bytes_chunks(ctx, chunks, collected);

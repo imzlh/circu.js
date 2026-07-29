@@ -1107,7 +1107,7 @@ repl.start().then(() => {
 });
 
 // bind exit handler
-signal.signal(signal.signals.SIGINT, () => {
+signal!.signal(signal!.signals.SIGINT, () => {
     console.log('Got SIGINT, exiting...');
     repl.handleCtrlC();
 });

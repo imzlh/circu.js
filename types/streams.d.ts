@@ -144,27 +144,6 @@ declare namespace CModuleStreams {
         readonly [Symbol.toStringTag]: 'Stream';
     }
 
-    /**
-     * Runtime stdio singleton injected by cno's stdio facade.
-     */
-    export interface StdioStream {
-        readonly fd: number;
-        readonly isTTY: boolean;
-        readonly size: { width: number; height: number };
-        write(data: Uint8Array): Promise<number>;
-        writeSync(data: Uint8Array): number;
-        read(buf: Uint8Array<ArrayBuffer>): Promise<number | null>;
-        readSync(buf: Uint8Array): number | null;
-        createReadStream(): ReadableStream;
-        createWriteStream(): WritableStream;
-        close(): void;
-        setRaw(mode: boolean, cbreak?: boolean): void;
-    }
-
-    export const stdin: StdioStream;
-    export const stdout: StdioStream;
-    export const stderr: StdioStream;
-
     export type AddressInfo = {
         /**
          * IP address (e.g., "127.0.0.1")
