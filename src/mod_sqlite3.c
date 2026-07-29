@@ -1215,7 +1215,9 @@ static JSValue tjs_sqlite3_stmt_expand(JSContext *ctx, JSValue this_val, int arg
         return JS_ThrowOutOfMemory(ctx);
     }
 
-    return JS_NewString(ctx, sql);
+    JSValue ret = JS_NewString(ctx, sql);
+    sqlite3_free(sql);
+    return ret;
 }
 
 static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {

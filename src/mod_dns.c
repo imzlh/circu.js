@@ -1176,7 +1176,9 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 static void udp_alloc_callback(uv_handle_t* handle, size_t suggested_size,
 	uv_buf_t* buf) {
 	buf->base = malloc(suggested_size);
-	buf->len = suggested_size;
+	/* Honour the libuv alloc-cb contract: on failure hand back a zero-length
+	 * buffer rather than a NULL base with a non-zero length. */
+	buf->len = buf->base ? suggested_size : 0;
 }
 
 static void udp_send_callback(uv_udp_send_t* req, int status) {

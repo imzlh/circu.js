@@ -48,6 +48,7 @@
             free(arr); \
             (arr) = NULL; \
         } \
+        (cnt) = 0; \
     } while (0)
 
 /* ---------- Structures ---------- */
@@ -259,6 +260,12 @@ static FileSourceMap *find_file_map(MappingContext *ctx, const char *path) {
 
 static FileSourceMap *get_or_create_file_map(MappingContext *ctx, const char *path) {
     FileSourceMap *map = find_file_map(ctx, path);
+    /* Returns a map with an EXTRA reference held by the caller (the loader),
+     * on top of the one owned by the ctx->files[] slot. The loader runs
+     * arbitrary JS (property getters / Proxy traps / toString) while holding
+     * this pointer, and that JS can call sourcemap.remove() on the same path;
+     * without the temp ref that would free the map underneath us. The caller
+     * MUST release it with free_file_map() on every exit path. */
     if (map) { map->ref_count++; return map; }
 
     map = create_file_map(path);
@@ -272,6 +279,9 @@ static FileSourceMap *get_or_create_file_map(MappingContext *ctx, const char *pa
         ctx->files_capacity = nc;
     }
     ctx->files[ctx->files_count++] = map;
+    /* +1 for the caller's temp ref (the slot keeps the ref_count==1 from
+     * create_file_map), matching the reload path above. */
+    map->ref_count++;
     return map;
 }
 
@@ -384,8 +394,23 @@ static int parse_mappings(FileSourceMap *map, const char *mappings_str) {
         if (*p == ',') { p++; continue; }
 
         int values[5] = {0}, cnt = 0;
-        while (*p && *p != ',' && *p != ';' && cnt < 5)
-            if (!decode_vlq(&p, &values[cnt++])) break;
+        int decode_failed = 0;
+        while (*p && *p != ',' && *p != ';' && cnt < 5) {
+            const char *before = p;
+            if (!decode_vlq(&p, &values[cnt++])) { decode_failed = 1; break; }
+            /* decode_vlq must always advance on success; guard against a stuck
+             * pointer to avoid an infinite loop on malformed input. */
+            if (p == before) { decode_failed = 1; break; }
+        }
+        /* On a malformed segment, skip to the next segment/line separator so
+         * the outer loop always makes progress (otherwise p never advances),
+         * and DISCARD the segment: decode_vlq leaves *value unwritten on
+         * failure, and all five fields are cumulative deltas, so committing a
+         * bogus 0 would corrupt every well-formed segment that follows. */
+        if (decode_failed) {
+            while (*p && *p != ',' && *p != ';') p++;
+            continue;
+        }
 
         if (cnt >= 4) {
             gen_col   += values[0];
@@ -459,6 +484,10 @@ int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx,
         JS_FreeCString(js_ctx, mappings_str);
     }
     JS_FreeValue(js_ctx, mappings_val);
+    /* Release the loader's temp ref taken by get_or_create_file_map. If JS
+     * re-entered and removed this path, this is the free; otherwise the
+     * ctx->files[] slot keeps it alive. */
+    free_file_map(map);
     return success;
 }
 

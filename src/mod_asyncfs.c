@@ -271,7 +271,7 @@ static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st) {
     sr->st_mode = st->st_mode;
 
 #define SET_UINT64_FIELD(x)                                                                                            \
-    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewUint32(ctx, st->st_##x), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, (int64_t) st->st_##x), JS_PROP_C_W_E);
 
     SET_UINT64_FIELD(dev);
     SET_UINT64_FIELD(mode);
@@ -800,6 +800,13 @@ static JSValue tjs_dir_close(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    if (!d->dir) {
+        /* Already closed. Must still return a promise — this method is async
+         * and callers do dir.close().then(...) / Promise.all([...]). */
+        JSValue u = JS_UNDEFINED;
+        return TJS_NewResolvedPromise(ctx, 1, &u);
+    }
+
     TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
     if (!fr) {
         return JS_EXCEPTION;
@@ -831,7 +838,7 @@ static JSValue tjs_dir_next(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
-    if (d->done) {
+    if (d->done || !d->dir) {
         return JS_UNDEFINED;
     }
 
@@ -1451,6 +1458,13 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     dbuf_init2(&fr->dbuf, NULL, tjs__dbuf_realloc);
     fr->r = -1;
     fr->filename = js_strdup(ctx, path);
+    if (!fr->filename) {
+        /* tjs__load_file would strdup(NULL) → crash on the worker thread. */
+        dbuf_free(&fr->dbuf);
+        js_free(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
     fr->req.data = fr;
     JS_FreeCString(ctx, path);
 

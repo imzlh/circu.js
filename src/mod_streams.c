@@ -129,6 +129,16 @@ static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
     tjs__free(wr);
 }
 
+/* Teardown-safe variant: the promise was never settled (runtime is freeing),
+ * so release it here without calling into JS. */
+static void tjs_write_req_free_rt(JSRuntime *rt, TJSWriteReq *wr) {
+    if (!wr) return;
+    tjs__free(wr->data);
+    TJS_FreePromiseRT(rt, &wr->result);
+    JS_FreeValueRT(rt, wr->buf);
+    tjs__free(wr);
+}
+
 static void stream_unlink(TJSStream *s) {
     if (s && s->link.next) {
         list_del(&s->link);
@@ -472,6 +482,18 @@ static void uv__write_cb(uv_write_t *req, int status) {
     TJSStream *s    = req->handle->data;
     CHECK_NOT_NULL(s);
     JSContext *ctx = s->ctx;
+
+    /* This runs from uv__run_closing_handles (the write queue is flushed with
+     * UV_ECANCELED when the handle closes), NOT from the finalizer — so it is
+     * legal and necessary to settle the promise here, otherwise an awaiting
+     * caller hangs forever. Only bail out when the runtime itself is going
+     * away. Use s->trt: it outlives the JSContext, which is freed before the
+     * final teardown drain. */
+    TJSRuntime *qrt = s->trt;
+    if (!qrt || qrt->freeing) {
+        tjs_write_req_free_rt(qrt ? qrt->rt : JS_GetRuntime(ctx), wr);
+        return;
+    }
 
     if (status < 0) {
         JSValue arg = tjs_new_error(ctx, status);

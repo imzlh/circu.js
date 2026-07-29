@@ -61,6 +61,8 @@ static thread_local JSClassID tjs_sock_classid;
 typedef struct {
     sock_fd_t  sock;
     bool       closed, poll_init, in_cb, finalized;
+    bool       poll_closing;  /* uv_close on poll handle initiated */
+    bool       poll_closed;   /* poll close_cb has fired */
     JSValue    callback, this_obj;
     JSContext *jsctx;
     uv_poll_t  poll;
@@ -114,8 +116,12 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
 static void tjs_sock_poll_close_cb(uv_handle_t *handle) {
     tjs_sock_t *s = uv_handle_get_data(handle);
     if (!s) return;
-    // Only free the structure; JSValues freed in finalizer when rt is alive
-    tjs__free(s);
+    s->poll_closed = true;
+    /* Only free once the JS wrapper has also been finalized; otherwise the
+     * opaque pointer is still live and freeing here would be a use-after-free
+     * on the next method call / finalizer. JSValues freed in finalizer. */
+    if (s->finalized)
+        tjs__free(s);
 }
 
 static JSValue tjs_sock_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -147,8 +153,10 @@ static void close_sock(tjs_sock_t *s) {
     if (s->poll_init) {
         if (uv_is_active((uv_handle_t *) &s->poll))
             uv_poll_stop(&s->poll);
-        if (!uv_is_closing((uv_handle_t *) &s->poll))
+        if (!uv_is_closing((uv_handle_t *) &s->poll)) {
+            s->poll_closing = true;
             uv_close((uv_handle_t *) &s->poll, tjs_sock_poll_close_cb);
+        }
         if (!JS_IsUndefined(s->callback)) {
             JS_FreeValue(s->jsctx, s->callback);
             s->callback  = JS_UNDEFINED;
@@ -168,11 +176,12 @@ static void tjs_sock_finalizer(JSRuntime *rt, JSValue val) {
         /* this_obj is a self-pin of the socket wrapper being finalized. */
         s->this_obj = JS_UNDEFINED;
         close_sock(s);
-        // Only free if close_cb won't (i.e., handle not pending close)
-        if (!uv_is_closing((uv_handle_t *) &s->poll)) {
+        /* Free now only if the poll close_cb will not run later. If a close
+         * is in flight and its cb has not fired yet, defer freeing to the cb
+         * (which now checks s->finalized). */
+        if (!s->poll_closing || s->poll_closed) {
             tjs__free(s);
         }
-        // If handle is closing, close_cb will free s
     }
 }
 
@@ -396,6 +405,7 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
 
     msg.msg_iovlen = argc - 3;
     msg.msg_iov    = js_malloc(ctx, sizeof(struct iovec) * msg.msg_iovlen);
+    if (!msg.msg_iov) return JS_ThrowOutOfMemory(ctx);
     for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
         size_t sz;
         uint8_t *buf = JS_GetUint8Array(ctx, &sz, argv[i + 3]);

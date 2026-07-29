@@ -206,8 +206,11 @@ static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg) {
     if (!JS_IsFunction(ctx, event_func)) {
         if (event == MSGPIPE_EVENT_MESSAGE) {
             if (p->pending_count >= p->pending_cap) {
-                p->pending_cap = p->pending_cap ? p->pending_cap * 2 : 8;
-                p->pending = js_realloc(ctx, p->pending, p->pending_cap * sizeof(JSValue));
+                size_t new_cap = p->pending_cap ? p->pending_cap * 2 : 8;
+                JSValue *grown = js_realloc(ctx, p->pending, new_cap * sizeof(JSValue));
+                if (!grown) return;  /* keep existing buffer + queued values */
+                p->pending = grown;
+                p->pending_cap = new_cap;
             }
             if (p->pending) p->pending[p->pending_count++] = JS_DupValue(ctx, arg);
         }
@@ -591,12 +594,6 @@ static void worker_mark_exited(TJSWorker *w) {
     uv_mutex_unlock(&w->lock);
 }
 
-static void worker_mark_returned(TJSWorker *w) {
-    uv_mutex_lock(&w->lock);
-    w->exited = true;
-    uv_mutex_unlock(&w->lock);
-}
-
 static void worker_mark_started(TJSWorker *w, TJSRuntime *wrt) {
     uv_mutex_lock(&w->lock);
     w->exited = false;
@@ -612,15 +609,19 @@ static TJSRuntime *worker_get_runtime(TJSWorker *w) {
     return wrt;
 }
 
-static TJSRuntime *worker_request_stop(TJSWorker *w) {
-    TJSRuntime *wrt = NULL;
+/* Request a stop AND deliver it while still holding the lock.
+ * TJS_Stop() must not be called on a runtime pointer that escaped the lock:
+ * worker_mark_exited() clears w->wrt under the same lock and the worker thread
+ * then runs TJS_FreeRuntime(), which uv_close()s wrt->stop and frees wrt. A
+ * stop delivered after that window is a use-after-free / send on a closed
+ * handle. Serializing against worker_mark_exited() closes it. */
+static void worker_stop_locked(TJSWorker *w) {
     uv_mutex_lock(&w->lock);
     if (!w->terminated) {
         w->terminated = true;
-        wrt = w->wrt;
+        if (w->wrt) TJS_Stop(w->wrt);
     }
     uv_mutex_unlock(&w->lock);
-    return wrt;
 }
 
 static bool worker_should_join(TJSWorker *w) {
@@ -638,20 +639,33 @@ static void worker_mark_joined(TJSWorker *w) {
     uv_mutex_unlock(&w->lock);
 }
 
-static bool worker_is_done(TJSWorker *w) {
-    bool done;
+/* Atomically mark that the GC finalizer has run and decide, under the lock,
+ * whether the finalizer is the party responsible for freeing the struct.
+ * The finalizer frees only if the worker thread has already returned; else it
+ * defers to the thread (which will observe finalized_by_gc under the lock). */
+static bool worker_gc_claim_free(TJSWorker *w) {
+    bool free_now;
     uv_mutex_lock(&w->lock);
-    /* wrt can be cleared before the worker thread fully returns because the
-     * thread still runs TJS_FreeRuntime() after dropping the runtime pointer.
-     * Only treat the worker as done once it has actually exited or been joined. */
-    done = w->joined || w->exited;
+    w->finalized_by_gc = true;
+    free_now = w->joined || w->exited;
     uv_mutex_unlock(&w->lock);
-    return done;
+    return free_now;
+}
+
+/* Atomically mark the worker thread as returned and decide, under the lock,
+ * whether the thread is responsible for freeing the struct (i.e. the GC
+ * finalizer already ran and deferred to us). */
+static bool worker_thread_claim_free(TJSWorker *w) {
+    bool free_now;
+    uv_mutex_lock(&w->lock);
+    w->exited = true;
+    free_now = w->finalized_by_gc;
+    uv_mutex_unlock(&w->lock);
+    return free_now;
 }
 
 void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w) {
-    TJSRuntime *wrt = worker_request_stop(w);
-    if (wrt != NULL) TJS_Stop(wrt);
+    worker_stop_locked(w);
 
     if (worker_should_join(w)) {
         CHECK_EQ(uv_thread_join(&w->tid), 0);
@@ -699,14 +713,13 @@ static void worker_entry(void *arg) {
 
     TJS_FreeRuntime(wrt);
 
-    if (owner) worker_mark_returned(owner);
-
-    /* If the parent GC already ran tjs_worker_finalizer while we were
-     * still alive, the finalizer deferred freeing the TJSWorker struct
-     * to us.  The finalizer already closed the parent-side message_pipe
-     * TCP handle; TJS_FreeRuntime pumped the loop so the close callback
-     * has fired and freed the TJSMessagePipe C struct.  Now free w. */
-    if (owner && owner->finalized_by_gc) {
+    /* If the parent GC already ran tjs_worker_finalizer while we were still
+     * alive, the finalizer deferred freeing the TJSWorker struct to us. The
+     * parent-side message_pipe is owned by its own JS wrapper on the parent's
+     * loop and is released independently of this thread.
+     * The exited flag and the finalized_by_gc read must be a single atomic
+     * decision under the lock to avoid racing the finalizer for ownership. */
+    if (owner && worker_thread_claim_free(owner)) {
         uv_mutex_destroy(&owner->lock);
         tjs__free(owner);
     }
@@ -724,36 +737,26 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     /* Signal the worker thread to stop, but don't block in finalizer.
      * Blocking here can cause hangs if the worker thread is stuck in a
      * synchronous operation (deadloop, blocking syscall).
-     * The thread will clean up when it exits. */
-    TJSRuntime *wrt = worker_request_stop(w);
-    if (wrt != NULL) {
-        TJS_Stop(wrt);
-        // Don't call uv_thread_join here - it can block indefinitely
-        // if the worker thread is stuck. The thread will clean up on exit.
-    }
+     * The thread will clean up when it exits.
+     * Don't call uv_thread_join here - it can block indefinitely if the
+     * worker thread is stuck. */
+    worker_stop_locked(w);
 
-    if (worker_is_done(w)) {
-        JSValue message_pipe = w->message_pipe;
-        w->message_pipe = JS_UNDEFINED;
-        JS_FreeValueRT(rt, message_pipe);
-    } else {
-        /* Thread still alive — we cannot block here (may deadlock).
-         * Close the parent-side TCP handle now so the socket does not
-         * leak.  TJS_FreeRuntime will pump the loop and fire the close
-         * callback, freeing the TJSMessagePipe C struct.
-         * The thread will free w itself when it exits. */
-        TJSMessagePipe *mp = JS_GetOpaque(w->message_pipe, tjs_msgpipe_class_id);
-        if (mp && !uv_is_closing(&mp->h.handle)) {
-            uv_read_stop(&mp->h.stream);
-            uv_close(&mp->h.handle, uv__close_cb);
-        }
-        w->message_pipe = JS_UNDEFINED;
-        w->finalized_by_gc = true;
-    }
+    /* Drop our reference to the msgpipe wrapper. Its finalizer closes the
+     * handle (setting p->finalized so uv__close_cb frees the C struct once the
+     * close cb fires), which is correct whether or not the worker thread has
+     * exited — the parent and child hold different handles on different loops
+     * over the two ends of the socketpair. */
+    JSValue message_pipe = w->message_pipe;
+    w->message_pipe = JS_UNDEFINED;
+    JS_FreeValueRT(rt, message_pipe);
 
     if (w->link.next) list_del(&w->link);
-    // Don't free w here if thread is still running - let thread cleanup handle it
-    if (worker_is_done(w)) {
+
+    /* Decide ownership of the struct free atomically under the lock. If the
+     * worker thread has already returned we free now; otherwise the thread
+     * frees it when it exits (observing finalized_by_gc under the same lock). */
+    if (worker_gc_claim_free(w)) {
         uv_mutex_destroy(&w->lock);
         tjs__free(w);
     }
@@ -899,8 +902,7 @@ static JSValue tjs_worker_stop(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (!w) {
         return JS_EXCEPTION;
     }
-    TJSRuntime *wrt = worker_request_stop(w);
-    if (wrt != NULL) TJS_Stop(wrt);
+    worker_stop_locked(w);
     return JS_UNDEFINED;
 }
 

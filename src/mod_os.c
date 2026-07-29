@@ -808,7 +808,7 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CFUNC_DEF("uname", 0, tjs_uname),
     TJS_CFUNC_DEF("uptime", 0, tjs_uptime),
     TJS_CFUNC_DEF("guessHandle", 1, tjs_guess_handle),
-    TJS_CFUNC_DEF("getenv", 0, tjs_getenv),
+    TJS_CFUNC_DEF("getenv", 1, tjs_getenv),
     TJS_CFUNC_DEF("setenv", 2, tjs_setenv),
     TJS_CFUNC_DEF("unsetenv", 1, tjs_unsetenv),
     TJS_CFUNC_DEF("envKeys", 0, tjs_envKeys),

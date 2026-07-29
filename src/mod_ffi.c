@@ -206,6 +206,7 @@ static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int a
     if (arrSz > 0) {
         structType->ffi_type->size = arrSz * ffi_type_get_sz(elements[0]);
         structType->ffi_type->alignment = elements[0]->alignment;
+        structType->offsets = NULL;
     } else {
         size_t *offsets = js_malloc(ctx, sizeof(size_t) * typeCnt);
         if (!offsets) {
@@ -780,7 +781,10 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     size_t retsz = ffi_type_get_sz(cif->ffi_cif.rtype);
-    void *rptr = js_malloc(ctx, retsz > sizeof(long) ? retsz : sizeof(long));
+    /* libffi widens integer return values to sizeof(ffi_arg) and writes that
+     * many bytes into rvalue, so the buffer must be at least that large
+     * (sizeof(long) is only 4 on LLP64/Win64 → heap overflow). */
+    void *rptr = js_malloc(ctx, retsz > sizeof(ffi_arg) ? retsz : sizeof(ffi_arg));
     if (!rptr) {
         js_free(ctx, aval);
         return JS_EXCEPTION;
@@ -801,7 +805,8 @@ static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
 
 static thread_local JSClassID js_uv_lib_classid;
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(__GLIBC__)
+/* dlmopen/Lmid_t are glibc extensions; musl has neither. */
 static uv_once_t js_ffi_loader_once = UV_ONCE_INIT;
 static uv_mutex_t js_ffi_loader_mutex;
 static bool js_ffi_loader_has_lmid;

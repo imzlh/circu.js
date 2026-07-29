@@ -242,19 +242,18 @@ static int alpn_cb(SSL* ssl, const unsigned char** out, unsigned char* outlen,
 	/* Pass the full ALPN list to SSL_select_next_proto.
 	 * The list format is [len1][proto1][len2][proto2]... with total length */
 	unsigned char* list = (unsigned char*) arg;
-	/* Use the full list length stored in ssl_ctx->alpn_list_len */
-	TJSSSLContext *ssl_ctx = SSL_get_app_data(ssl);
-	if (ssl_ctx && ssl_ctx->alpn_list_len > 0) {
+	/* Recover the context (and thus the authoritative binary list length) from
+	 * the SSL_CTX app data. The list is a length-prefixed binary blob, so it is
+	 * NOT NUL-terminated — strlen() on it would read out of bounds. */
+	TJSSSLContext *ssl_ctx = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
+	if (ssl_ctx && ssl_ctx->alpn_list && ssl_ctx->alpn_list_len > 0) {
 		if (SSL_select_next_proto((unsigned char**) out, outlen,
-			list, (unsigned int)ssl_ctx->alpn_list_len, in, inlen)
+			ssl_ctx->alpn_list, (unsigned int)ssl_ctx->alpn_list_len, in, inlen)
 			== OPENSSL_NPN_NEGOTIATED) {
 			return SSL_TLSEXT_ERR_OK;
 		}
-	} else if (SSL_select_next_proto((unsigned char**) out, outlen,
-		list, (unsigned int)strlen((const char*)list), in, inlen)
-		== OPENSSL_NPN_NEGOTIATED) {
-		return SSL_TLSEXT_ERR_OK;
 	}
+	(void) list;
 	return SSL_TLSEXT_ERR_NOACK;
 }
 
@@ -470,6 +469,9 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
                 /* server: callback retains the pointer — keep on ssl_ctx */
                 ssl_ctx->alpn_list = alpn_list;
                 ssl_ctx->alpn_list_len = alpn_list_len;
+                /* Expose the context so alpn_cb can read the authoritative
+                 * (binary, non-NUL-terminated) list length. */
+                SSL_CTX_set_app_data(ssl_ctx->ssl_ctx, ssl_ctx);
                 SSL_CTX_set_alpn_select_cb(ssl_ctx->ssl_ctx, alpn_cb, alpn_list);
             } else {
                 /* client: SSL_CTX_set_alpn_protos copies the buffer internally */

@@ -37,7 +37,9 @@ static WCHAR *to_wcs(JSContext *ctx, JSValue v) {
     const char *s = JS_ToCString(ctx, v);
     if (!s) return NULL;
     int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) { JS_FreeCString(ctx, s); return NULL; }
     WCHAR *w = js_malloc(ctx, n * sizeof(WCHAR));
+    if (!w) { JS_FreeCString(ctx, s); return NULL; }
     MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
     JS_FreeCString(ctx, s);
     return w;
@@ -45,7 +47,9 @@ static WCHAR *to_wcs(JSContext *ctx, JSValue v) {
 
 static JSValue from_wcs(JSContext *ctx, const WCHAR *w, int nchars) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w, nchars, NULL, 0, NULL, NULL);
-    char *s = js_malloc(ctx, n + 1);
+    if (n < 0) return JS_ThrowInternalError(ctx, "invalid UTF-16 string");
+    char *s = js_malloc(ctx, (size_t) n + 1);
+    if (!s) return JS_EXCEPTION;
     WideCharToMultiByte(CP_UTF8, 0, w, nchars, s, n, NULL, NULL);
     s[n] = '\0';
     JSValue v = JS_NewString(ctx, s);
@@ -82,8 +86,10 @@ static JSValue reg_to_js(JSContext *ctx, DWORD type, const BYTE *data, DWORD sz)
         return from_wcs(ctx, (const WCHAR *)data, n);
     }
     case REG_DWORD:
+        if (sz < sizeof(DWORD)) return JS_UNDEFINED;
         return JS_NewUint32(ctx, *(const DWORD *)data);
     case REG_QWORD:
+        if (sz < sizeof(int64_t)) return JS_UNDEFINED;
         return JS_NewInt64(ctx, *(const int64_t *)data);
     case REG_MULTI_SZ: {
         JSValue arr = JS_NewArray(ctx);
@@ -107,11 +113,13 @@ static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (!hk) return JS_EXCEPTION;
 
     WCHAR *name = to_wcs(ctx, argv[2]);
+    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
     DWORD type, size;
     LONG r = RegQueryValueExW(hk, name, NULL, &type, NULL, &size);
     if (r != ERROR_SUCCESS) { js_free(ctx, name); RegCloseKey(hk); return THROW_WIN32(); }
 
     BYTE *data = js_malloc(ctx, size + 2);  /* +2: guard missing null terminator */
+    if (!data) { js_free(ctx, name); RegCloseKey(hk); return JS_EXCEPTION; }
     memset(data + size, 0, 2);
     r = RegQueryValueExW(hk, name, NULL, &type, data, &size);
     js_free(ctx, name); RegCloseKey(hk);
@@ -130,6 +138,7 @@ static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (!hk) return JS_EXCEPTION;
 
     WCHAR *name = to_wcs(ctx, argv[2]);
+    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
     JSValue val = argv[3];
     DWORD type, size;
     WCHAR *wbuf = NULL;
@@ -139,6 +148,7 @@ static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     if (JS_IsString(val)) {
         wbuf = to_wcs(ctx, val);
+        if (!wbuf) { js_free(ctx, name); RegCloseKey(hk); return JS_EXCEPTION; }
         type = REG_SZ; size = (wcslen(wbuf) + 1) * sizeof(WCHAR);
         data = (const BYTE *)wbuf;
     } else if (JS_IsNumber(val)) {
@@ -166,6 +176,7 @@ static JSValue tjs_reg_delete(JSContext *ctx, JSValue this_val, int argc, JSValu
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_WRITE);
     if (!hk) return JS_EXCEPTION;
     WCHAR *name = to_wcs(ctx, argv[2]);
+    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
     LONG r = RegDeleteValueW(hk, name);
     js_free(ctx, name); RegCloseKey(hk);
     return r == ERROR_SUCCESS ? JS_UNDEFINED : THROW_WIN32();
@@ -340,6 +351,7 @@ static JSValue tjs_get_certs(JSContext *ctx, JSValue this_val, int argc, JSValue
         CryptBinaryToStringA(cert->pbCertEncoded, cert->cbCertEncoded,
                              CRYPT_STRING_BASE64HEADER, NULL, &pem_len);
         char *pem = js_malloc(ctx, pem_len);
+        if (!pem) { CertFreeCertificateContext(cert); CertCloseStore(store, 0); JS_FreeValue(ctx, arr); return JS_EXCEPTION; }
         CryptBinaryToStringA(cert->pbCertEncoded, cert->cbCertEncoded,
                              CRYPT_STRING_BASE64HEADER, pem, &pem_len);
         JS_SetPropertyUint32(ctx, arr, i++, JS_NewString(ctx, pem));

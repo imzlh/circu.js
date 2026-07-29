@@ -40,7 +40,12 @@
 #define fstat _fstat64
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
-#define S_ISLNK(m) (0)
+/* MSVC's <sys/stat.h> has no S_IFLNK; libuv's uv/win.h defines it as 0xA000
+ * and uv_fs_lstat() sets it, so lstat() can report symlinks like POSIX. */
+#ifndef S_IFLNK
+#define S_IFLNK 0xA000
+#endif
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 #define close _close
 #define read _read
 #define write _write
@@ -268,6 +273,7 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
         if (!str) return -1;
 
         flags = TJS_ParseOpenFlags(str, strlen);
+        JS_FreeCString(ctx, str);
     }
     else {
         if (JS_ToInt32(ctx, &flags, flags_obj) < 0) {
@@ -619,11 +625,35 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
     if (!path) THROW_PATH();
 
 #ifdef _WIN32
-    /* Windows doesn't have lstat, use stat */
-    WCHAR *wpath = utf8_to_wcs(path);
-    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
-    int ret = _wstat64(wpath, &st);
-    free(wpath);
+    /* MSVC has no lstat and _wstat64 FOLLOWS symlinks, so it can never report
+     * one (POSIX requires lstat to stat the link itself). uv_fs_lstat does the
+     * reparse-point handling and sets S_IFLNK, so go through libuv and map its
+     * uv_stat_t onto the struct stat build_stat_obj expects. */
+    uv_fs_t lreq;
+    int ret = uv_fs_lstat(NULL, &lreq, path, NULL);
+    if (ret == 0) {
+        const uv_stat_t* s = &lreq.statbuf;
+        memset(&st, 0, sizeof(st));
+        st.st_dev = (unsigned int) s->st_dev;
+        st.st_mode = (unsigned short) s->st_mode;
+        st.st_nlink = (short) s->st_nlink;
+        st.st_uid = (short) s->st_uid;
+        st.st_gid = (short) s->st_gid;
+        st.st_rdev = (unsigned int) s->st_rdev;
+        st.st_ino = (unsigned __int64) s->st_ino;
+        st.st_size = (__int64) s->st_size;
+        st.st_atime = (time_t) s->st_atim.tv_sec;
+        st.st_mtime = (time_t) s->st_mtim.tv_sec;
+        st.st_ctime = (time_t) s->st_ctim.tv_sec;
+    }
+    uv_fs_req_cleanup(&lreq);
+    if (ret < 0) {
+        JSValue err = tjs_throw_errno_path(ctx, ret, path);
+        JS_FreeCString(ctx, path);
+        return err;
+    }
+    JS_FreeCString(ctx, path);
+    return build_stat_obj(ctx, &st);
 #else
     int ret = lstat(path, &st);
 #endif

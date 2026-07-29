@@ -194,7 +194,7 @@ static inline bool ring_pop(MsgRing *r, RingMsg *out) {
 }
 
 static inline void ring_msg_free(RingMsg *m) {
-    if (m->is_heap && m->data) { free(m->data); m->data = NULL; }
+    if (m->is_heap && m->data) { tjs__free(m->data); m->data = NULL; }
 }
 
 /* ---- Message types ------------------------------------------------------- */
@@ -269,7 +269,7 @@ static void dcb_decref(DebugControlBlock *cb) {
         /* we were the last holder */
         tjs_sem_destroy(&cb->main_sem);
         tjs_sem_destroy(&cb->worker_sem);
-        free(cb);
+        tjs__free(cb);
     }
 }
 
@@ -913,7 +913,7 @@ static void tjs_dc_main_finalizer(JSRuntime *rt, JSValue val) {
         /* Note: relies on debug.stop()/dc.stop() having already cleared the
          * weak trt->debug.channel pointer before the handle is collected. */
         dcb_decref(h->cb);
-        js_free_rt(rt, h);
+        tjs__free(h);
     }
 }
 

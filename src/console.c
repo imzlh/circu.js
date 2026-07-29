@@ -78,7 +78,8 @@ static void* console_realloc(void* opaque, void* ptr, size_t size) {
 
 /* STDOUT lock */
 static uv_mutex_t stdout_mutex;
-static int console_group_indent = 0;
+static uv_once_t stdout_mutex_once = UV_ONCE_INIT;
+static thread_local int console_group_indent = 0;
 
 typedef struct ConsoleCounter {
     char* label;
@@ -92,8 +93,10 @@ typedef struct ConsoleTimer {
     struct ConsoleTimer* next;
 } ConsoleTimer;
 
-static ConsoleCounter* console_counters = NULL;
-static ConsoleTimer* console_timers = NULL;
+/* Per-thread: each worker runtime has its own console state; sharing these
+ * across threads without locks would race. */
+static thread_local ConsoleCounter* console_counters = NULL;
+static thread_local ConsoleTimer* console_timers = NULL;
 
 #define __mutex(op) do { uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex); } while(0)
 #define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
@@ -1803,12 +1806,13 @@ static const JSCFunctionListEntry console_funcs[] = {
     JS_CFUNC_DEF("format", 0, js_console_format)
 };
 
+static void stdout_mutex_init_once(void) {
+    uv_mutex_init(&stdout_mutex);
+}
+
 void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
-    static int initialized = 0;
-    if (!initialized) {
-        uv_mutex_init(&stdout_mutex);
-        initialized = 1;
-    }
+    /* Racy under worker threads with a plain static flag; uv_once is safe. */
+    uv_once(&stdout_mutex_once, stdout_mutex_init_once);
 #ifdef _WIN32
     // use utf-8 to display correctly in Windows
     SetConsoleOutputCP(CP_UTF8);

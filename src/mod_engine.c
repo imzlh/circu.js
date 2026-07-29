@@ -446,6 +446,7 @@ static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
 
 JSModuleDef* tjs__module_getdef(JSContext* ctx, JSValueConst this_val){
     tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
+    if (!mt) return NULL;
     return mt->def;
 }
 

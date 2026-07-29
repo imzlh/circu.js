@@ -1680,8 +1680,18 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
                 goto fail;
             }
             uv_pipe_t *pipe = tjs_pipe_get_pipe(ctx, p->ipc_pipe);
-            if (pipe) {
-                uv_pipe_open(pipe, ipc_fds[0]);
+            int pipe_open_r = pipe ? uv_pipe_open(pipe, ipc_fds[0]) : UV_EINVAL;
+            if (pipe_open_r != 0) {
+                /* libuv did not adopt the read-end fd; close it so it does
+                 * not leak. goto fail returns JS_EXCEPTION, so an exception
+                 * must be pending. */
+                tjs_throw_errno(ctx, pipe_open_r);
+                close(ipc_fds[0]);
+                close(ipc_fds[1]);
+                JS_FreeValue(ctx, p->ipc_pipe);
+                p->ipc_pipe = JS_UNDEFINED;
+                JS_FreeValue(ctx, js_ipc);
+                goto fail;
             }
 
             // Add the peer endpoint to the child's requested stdio fd. Node's
@@ -1690,8 +1700,11 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
             if (ipc_fd < 3) {
                 JS_FreeValue(ctx, p->stdio[ipc_fd]);
                 p->stdio[ipc_fd] = JS_UNDEFINED;
-                stdio[ipc_fd].flags = UV_INHERIT_FD;
-                stdio[ipc_fd].data.fd = ipc_child_fd;
+                /* options.stdio may have been moved to the heap by
+                 * setup_extra_stdio(); write through options.stdio so uv_spawn
+                 * actually sees the IPC fd. */
+                options.stdio[ipc_fd].flags = UV_INHERIT_FD;
+                options.stdio[ipc_fd].data.fd = ipc_child_fd;
             } else {
                 if (ensure_stdio_capacity(ctx, &options, stdio, &stdio_heap, (int)ipc_fd + 1) < 0) {
                     close(ipc_fds[1]);

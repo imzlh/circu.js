@@ -495,7 +495,7 @@ JSValue TJS_EvalScript(JSContext *ctx, const char *filename) {
     /* Add null termination, required by JS_Eval. */
     dbuf_putc(&dbuf, '\0');
 
-    ret = JS_Eval(ctx, (char *) dbuf.buf, dbuf_size - 1, filename, JS_EVAL_TYPE_GLOBAL);
+    ret = JS_Eval(ctx, (char *) dbuf.buf, dbuf_size, filename, JS_EVAL_TYPE_GLOBAL);
 
     dbuf_free(&dbuf);
     return ret;
@@ -520,7 +520,7 @@ JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main) {
     /* Add null termination, required by JS_Eval. */
     dbuf_putc(&dbuf, '\0');
 
-    ret = TJS_EvalModuleContent(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size - 1);
+    ret = TJS_EvalModuleContent(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size);
 
     dbuf_free(&dbuf);
     return ret;

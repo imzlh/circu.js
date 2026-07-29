@@ -229,6 +229,7 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
         if (JS_IsException(ret)) {
             JS_FreeValue(curl->ctx, ret);
+            JS_FreeValue(curl->ctx, JS_GetException(curl->ctx)); /* clear latched exception */
             return 0; /* abort transfer; perform() will reject */
         }
 
@@ -262,7 +263,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     if (realsize >= 5 &&
             ptr[0] == 'H' && ptr[1] == 'T' && ptr[2] == 'T' && ptr[3] == 'P' && ptr[4] == '/') {
         dbuf_free(&curl->response_headers);
-        dbuf_init(&curl->response_headers);
+        tjs_dbuf_init(curl->ctx, &curl->response_headers);
         curl->headers_complete_fired = false;
     }
 
@@ -279,6 +280,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
         JS_FreeValue(curl->ctx, args[0]);
         if (JS_IsException(ret)) {
             JS_FreeValue(curl->ctx, ret);
+            JS_FreeValue(curl->ctx, JS_GetException(curl->ctx)); /* clear latched exception */
             return 0;
         }
         int32_t processed = 0;
@@ -336,6 +338,7 @@ static int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow
 
         if (JS_IsException(ret)) {
             JS_FreeValue(curl->ctx, ret);
+            JS_FreeValue(curl->ctx, JS_GetException(curl->ctx)); /* clear latched exception */
             return 1; /* abort */
         }
         /* returning false from JS aborts the transfer */
@@ -363,6 +366,7 @@ static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t s
 
     if (JS_IsException(ret)) {
         JS_FreeValue(curl->ctx, ret);
+        JS_FreeValue(curl->ctx, JS_GetException(curl->ctx)); /* clear latched exception */
         return 0;
     }
     JS_FreeValue(curl->ctx, ret);
@@ -1138,8 +1142,15 @@ static JSValue tjs_curl_set_headers(JSContext *ctx, JSValueConst this_val, int a
                         if (new_headers) {
                             curl->request_headers = new_headers;
                         } else {
-                            /* OOM: keep existing headers, free temp, report error */
+                            /* OOM: keep existing headers, free temp + this
+                             * iteration's values + the property enum, then
+                             * report the error. */
                             js_free(ctx, header);
+                            JS_FreeCString(ctx, key_str);
+                            JS_FreeCString(ctx, val_str);
+                            JS_FreeValue(ctx, key);
+                            JS_FreeValue(ctx, val);
+                            js_free(ctx, props);
                             return JS_ThrowOutOfMemory(ctx);
                         }
                         js_free(ctx, header);
@@ -2274,8 +2285,16 @@ static void export_constants(JSContext *ctx, JSValue ns) {
     EXPORT_CONST(ns, CURL_IPRESOLVE_V6);
 }
 
-void tjs__mod_curl_init(JSContext *ctx, JSValue ns) {
+static uv_once_t tjs__curl_global_once = UV_ONCE_INIT;
+
+static void tjs__curl_global_init_once(void) {
+    /* curl_global_init is not thread-safe; this init runs per-context,
+     * including from worker threads. */
     curl_global_init(CURL_GLOBAL_ALL);
+}
+
+void tjs__mod_curl_init(JSContext *ctx, JSValue ns) {
+    uv_once(&tjs__curl_global_once, tjs__curl_global_init_once);
     JSRuntime *rt = JS_GetRuntime(ctx);
 
     /* ConnPool */

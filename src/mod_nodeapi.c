@@ -481,6 +481,13 @@ static void napi_env_cleanup(napi_env env) {
         napi_ref ref = list_entry(el, struct napi_ref__, link);
         list_del(&ref->link);
         napi_ref_clear_values(env, ref);
+        /* The struct is intentionally NOT freed here. Addon finalizers run
+         * after env cleanup (vm.c: tjs__nodeapi_cleanup_runtime precedes
+         * JS_FreeContext/JS_FreeRuntime) and may still call
+         * napi_delete_reference() on this ref — see the
+         * `ref->link.prev && ref->link.next` guard there, which exists
+         * precisely to tolerate an already-unlinked ref. Freeing here is a
+         * use-after-free plus double-free. */
     }
 
     list_for_each_safe(el, tmp, &env->tsfns) {
@@ -506,6 +513,18 @@ static void napi_env_cleanup(napi_env env) {
 
     napi_hs_block *b = env->orphan_handles;
     env->orphan_handles = NULL;
+    while (b) {
+        napi_hs_block *next = b->next;
+        for (size_t i = 0; i < b->used; i++)
+            JS_FreeValue(env->ctx, b->slots[i]);
+        free(b);
+        b = next;
+    }
+
+    /* Deferred blocks are pending when the env is torn down while
+     * callback_depth > 0; they would otherwise leak with their JSValues. */
+    b = env->deferred_handles;
+    env->deferred_handles = NULL;
     while (b) {
         napi_hs_block *next = b->next;
         for (size_t i = 0; i < b->used; i++)
@@ -877,7 +896,9 @@ napi_create_string_latin1(napi_env env, const char *str, size_t length, napi_val
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
     size_t len = (length == NAPI_AUTO_LENGTH) ? strlen(str) : length;
     /* latin1 -> utf16 -> string */
+    if (len > SIZE_MAX / sizeof(uint16_t)) return napi_generic_failure;
     uint16_t *buf = malloc(sizeof(uint16_t) * (len ? len : 1));
+    if (!buf) return napi_generic_failure;
     for (size_t i = 0; i < len; i++) buf[i] = (uint8_t) str[i];
     JSValue s = JS_NewStringUTF16(env->ctx, buf, len);
     free(buf);
@@ -2848,8 +2869,10 @@ napi_release_threadsafe_function(napi_threadsafe_function func,
         if (mode == napi_tsfn_abort) func->aborted = true;
     }
     uv_mutex_unlock(&func->mutex);
+    /* napi_tsfn_maybe_close() already wakes the loop when needed (guarded by
+     * uv_is_closing). An unconditional uv_async_send() here can touch a handle
+     * that the async callback has already closed and freed. */
     napi_tsfn_maybe_close(func);
-    uv_async_send(&func->async);
     return NAPI_OK(func->env);
 }
 

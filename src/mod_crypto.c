@@ -1988,9 +1988,11 @@ static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int
         JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, plaintext, plaintext_len));
         JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 1));
     } else {
-        // Verification failed - still return plaintext but mark as unverified
-        plaintext_len += final_len;
-        JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, plaintext, plaintext_len));
+        /* Authentication failed. Never release unauthenticated plaintext, and
+         * do not use final_len (undefined when EVP_DecryptFinal_ex fails).
+         * Return an empty buffer so callers cannot accidentally trust it. */
+        js_free(ctx, plaintext);
+        JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, NULL, 0));
         JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 0));
     }
     
@@ -2133,19 +2135,19 @@ static JSValue tjs_crypto_generate_rsa_key(JSContext* ctx, JSValueConst this_val
         return JS_ThrowRangeError(ctx, "Key size must be between 512 and 8192");
     }
     
-    EVP_PKEY* pkey = EVP_PKEY_new();
+    /* EVP_PKEY_keygen allocates a fresh key into *pkey; do NOT pre-allocate
+     * with EVP_PKEY_new() or the original allocation leaks. */
+    EVP_PKEY* pkey = NULL;
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
     
-    if (!pkey || !pctx) {
-        if (pkey) EVP_PKEY_free(pkey);
-        if (pctx) EVP_PKEY_CTX_free(pctx);
+    if (!pctx) {
         return JS_ThrowInternalError(ctx, "Failed to create RSA context");
     }
     
     if (EVP_PKEY_keygen_init(pctx) != 1 ||
         EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, bits) != 1 ||
         EVP_PKEY_keygen(pctx, &pkey) != 1) {
-        EVP_PKEY_free(pkey);
+        if (pkey) EVP_PKEY_free(pkey);
         EVP_PKEY_CTX_free(pctx);
         return JS_ThrowInternalError(ctx, "RSA key generation failed");
     }
@@ -2520,6 +2522,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         // Return {data, tag}
         if (out_len > 0) {
             uint8_t *data_copy = js_malloc(ctx, out_len);
+            if (!data_copy) { JS_FreeValue(ctx, result); return JS_ThrowOutOfMemory(ctx); }
             memcpy(data_copy, out_data, out_len);
             JS_SetPropertyStr(ctx, result, "data", 
                 js_fastab(ctx, data_copy, out_len));
@@ -2529,6 +2532,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         }
         
         uint8_t *tag_copy = js_malloc(ctx, 16);
+        if (!tag_copy) { JS_FreeValue(ctx, result); return JS_ThrowOutOfMemory(ctx); }
         memcpy(tag_copy, tag, 16);
         JS_SetPropertyStr(ctx, result, "tag", 
             js_fastab(ctx, tag_copy, 16));
@@ -2560,6 +2564,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         // Return {data, verified}
         if (out_len > 0) {
             uint8_t *data_copy = js_malloc(ctx, out_len);
+            if (!data_copy) { JS_FreeValue(ctx, result); return JS_ThrowOutOfMemory(ctx); }
             memcpy(data_copy, out_data, out_len);
             JS_SetPropertyStr(ctx, result, "data", 
                 js_fastab(ctx, data_copy, out_len));

@@ -422,6 +422,12 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
     uint32_t param_count = wasm_func_type_get_param_count(func_type);
     uint32_t result_count = wasm_func_type_get_result_count(func_type);
 
+    /* js_args is a fixed-size stack array; clamp so JS_Call and the cleanup
+     * loop below never read/free uninitialized slots on an import with more
+     * than TJS__WASM_MAX_ARGS parameters. */
+    if (param_count > TJS__WASM_MAX_ARGS)
+        param_count = TJS__WASM_MAX_ARGS;
+
     /* Convert WASM args to JS values */
     JSValue js_args[TJS__WASM_MAX_ARGS];
     for (uint32_t i = 0; i < param_count && i < TJS__WASM_MAX_ARGS; i++) {

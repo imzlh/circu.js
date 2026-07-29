@@ -624,7 +624,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
 
     size_t data_len = 0;
     const uint8_t *data = NULL;
-    if (!JS_IsUndefined(argv[0])) {
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
         data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
         if (!data)
             return JS_EXCEPTION;
