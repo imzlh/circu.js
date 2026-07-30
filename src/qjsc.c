@@ -291,7 +291,7 @@ namelist_entry_t *namelist_find(namelist_t *lp, const char *name) {
     return NULL;
 }
 
-static void get_c_name(char *buf, size_t buf_size, const char *file) {
+static void get_c_name(char *buf, ssize_t buf_size, const char *file) {
     const char *p, *r;
     size_t len, i;
     int c;

@@ -1711,15 +1711,17 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "Invalid key length");
     }
 
-    // IV is optional for some modes
-    if (argc >= 3 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
-        iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
-        if (!iv) {
-            return JS_EXCEPTION;
-        }
-        /* Validate IV length */
-        if (iv_len != (size_t)EVP_CIPHER_iv_length(cipher)) {
-            return JS_ThrowTypeError(ctx, "Invalid IV length");
+    // IV is optional for some modes, but a three-argument call always stores data in argv[2].
+    if (argc >= 3) {
+        if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+            iv = JS_GetAnyBuffer(ctx, &iv_len, argv[1]);
+            if (!iv) {
+                return JS_EXCEPTION;
+            }
+            /* Validate IV length */
+            if (iv_len != (size_t)EVP_CIPHER_iv_length(cipher)) {
+                return JS_ThrowTypeError(ctx, "Invalid IV length");
+            }
         }
         data = JS_GetAnyBuffer(ctx, &data_len, argv[2]);
     } else {
@@ -3235,6 +3237,9 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("createHmacSha512", 1, tjs_crypto_create_hmac, HASH_SHA512),
     
     /* Cipher functions - encrypt (high bit set) */
+    JS_CFUNC_MAGIC_DEF("aes128EcbEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_128_ECB),
+    JS_CFUNC_MAGIC_DEF("aes192EcbEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_192_ECB),
+    JS_CFUNC_MAGIC_DEF("aes256EcbEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_256_ECB),
     JS_CFUNC_MAGIC_DEF("aes128CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_128_CBC),
     JS_CFUNC_MAGIC_DEF("aes192CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_256_CBC),
@@ -3242,11 +3247,17 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("aes192GcmEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_192_GCM),
     JS_CFUNC_MAGIC_DEF("aes256GcmEncrypt", 3, tjs_crypto_cipher, (1 << 8) | CIPHER_AES_256_GCM),
     /* No-padding variants (bit 9 set) */
+    JS_CFUNC_MAGIC_DEF("aes128EcbEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_128_ECB),
+    JS_CFUNC_MAGIC_DEF("aes192EcbEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_192_ECB),
+    JS_CFUNC_MAGIC_DEF("aes256EcbEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_256_ECB),
     JS_CFUNC_MAGIC_DEF("aes128CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_128_CBC),
     JS_CFUNC_MAGIC_DEF("aes192CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcEncryptRaw", 3, tjs_crypto_cipher, (1 << 9) | (1 << 8) | CIPHER_AES_256_CBC),
 
     /* Cipher functions - decrypt */
+    JS_CFUNC_MAGIC_DEF("aes128EcbDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_128_ECB),
+    JS_CFUNC_MAGIC_DEF("aes192EcbDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_192_ECB),
+    JS_CFUNC_MAGIC_DEF("aes256EcbDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_256_ECB),
     JS_CFUNC_MAGIC_DEF("aes128CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_128_CBC),
     JS_CFUNC_MAGIC_DEF("aes192CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_256_CBC),
@@ -3254,6 +3265,9 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("aes192GcmDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_192_GCM),
     JS_CFUNC_MAGIC_DEF("aes256GcmDecrypt", 3, tjs_crypto_cipher, CIPHER_AES_256_GCM),
     /* No-padding variants (bit 9 set) */
+    JS_CFUNC_MAGIC_DEF("aes128EcbDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_128_ECB),
+    JS_CFUNC_MAGIC_DEF("aes192EcbDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_192_ECB),
+    JS_CFUNC_MAGIC_DEF("aes256EcbDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_256_ECB),
     JS_CFUNC_MAGIC_DEF("aes128CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_128_CBC),
     JS_CFUNC_MAGIC_DEF("aes192CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_192_CBC),
     JS_CFUNC_MAGIC_DEF("aes256CbcDecryptRaw", 3, tjs_crypto_cipher, (1 << 9) | CIPHER_AES_256_CBC),

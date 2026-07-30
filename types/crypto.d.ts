@@ -403,6 +403,14 @@ declare namespace CModuleCrypto {
     // Symmetric Encryption (One-shot)
     // ============================================================================
 
+    /** AES-ECB one-shot operations. The IV must be null. */
+    export function aes128EcbEncrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes128EcbDecrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes192EcbEncrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes192EcbDecrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes256EcbEncrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes256EcbDecrypt(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+
     /**
      * Encrypt data using AES-128-CBC
      * @param key - Encryption key (16 bytes)
@@ -666,6 +674,14 @@ declare namespace CModuleCrypto {
         key: BufferSource,
         iv: BufferSource
     ): Cipher;
+
+    /** AES-ECB one-shot operations without PKCS7 padding. */
+    export function aes128EcbEncryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes128EcbDecryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes192EcbEncryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes192EcbDecryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes256EcbEncryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
+    export function aes256EcbDecryptRaw(key: BufferSource, iv: null, data: BufferSource): ArrayBuffer;
 
     /** AES-128-CBC one-shot encrypt, no PKCS7 padding. Data must be a multiple of 16 bytes. */
     export function aes128CbcEncryptRaw(
