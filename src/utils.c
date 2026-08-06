@@ -22,6 +22,19 @@
  * THE SOFTWARE.
  */
 
+/* pthread_getattr_np (used by tjs__native_stack_bounds below) is a GNU
+ * extension: glibc hides it behind __USE_GNU, which only _GNU_SOURCE sets. It
+ * has to be defined before ANY header is pulled in, hence above "utils.h" —
+ * that header reaches <uv.h> and from there the libc headers. Without it the
+ * call is an implicit declaration, and the POSIX build compiles with
+ * -Wall -Werror (CMakeLists.txt:58), so it is a hard build break on Linux;
+ * modern gcc/clang reject implicit declarations outright regardless. MSVC
+ * takes the _WIN32 branch and never sees it, so /Zs on Windows cannot catch
+ * this. Same guard style as src/mod_ffi.c:1-3. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "utils.h"
 
 #include "private.h"
@@ -184,8 +197,17 @@ size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped) {
     return requested;
 }
 
-size_t tjs__max_usable_stack_size(void) {
-    return tjs__clamp_stack_size(0, NULL);
+/* Total bytes the current thread's stack spans, or 0 when the platform did not
+ * report bounds. Only feeds the diagnostic in mod_engine.c, which is reached
+ * exclusively on the path where tjs__clamp_stack_size DID find bounds, so a 0
+ * can never reach a printed message. */
+size_t tjs__native_stack_total_size(void) {
+    uintptr_t low = 0, high = 0;
+
+    if (!tjs__native_stack_bounds(&low, &high)) {
+        return 0;
+    }
+    return (size_t) (high - low);
 }
 
 

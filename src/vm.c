@@ -429,13 +429,35 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     JS_SetMemoryLimit(rt, options->mem_limit);
 
     /* Set stack size */
-    /* Clamp against the stack this thread actually owns. The main thread gets
-     * 8MB here (/STACK:8388608, CMakeLists.txt:51) so the 6MB default already
-     * fits, but a Worker runs TJS_NewRuntimeWorker on a uv thread whose default
-     * stack is platform-dependent — Darwin secondary threads get 512KB, far
-     * under the 6MB default — and an unclamped limit there means QuickJS's
-     * overflow check can never fire. REASONED for the worker case: only the
-     * Windows main-thread path was measured here. */
+    /* Clamp against the stack this thread actually owns, because QuickJS just
+     * computes stack_limit = stack_top - stack_size and never checks it against
+     * the real stack (deps/quickjs/quickjs.c:3473-3484). An unclamped limit at
+     * or past the real stack means js_check_stack_overflow can never fire and
+     * recursion walks into the guard page instead of raising RangeError.
+     *
+     * Reading the bounds HERE is load-bearing for workers: a Worker calls
+     * TJS_NewRuntimeWorker from inside worker_entry (mod_worker.c:679-682),
+     * i.e. already on the new thread, so the clamp measures that thread's own
+     * stack rather than the parent's.
+     *
+     * Worker stack sizes, OBSERVED by reading deps/libuv/src/unix/thread.c:
+     * uv_thread_create defers to uv_thread_create_ex with no explicit size, so
+     * the thread gets uv__thread_stack_size() = RLIMIT_STACK page-aligned on
+     * both macOS and Linux (:101-122). libuv deliberately compensates for
+     * Darwin's reduced secondary-thread default, so the usual worker stack is
+     * ~8MB, NOT 512KB. The 6MB default therefore normally fits. It does not fit
+     * in two reachable cases: RLIMIT_STACK is RLIM_INFINITY or getrlimit fails,
+     * where uv__default_stack_size() returns 0 on non-Linux and libuv skips
+     * pthread_attr_setstacksize entirely, leaving the Darwin 512KB default; and
+     * Linux, where that same fallback is 2MB (4MB on ppc). Those are the cases
+     * this clamp exists for. REASONED: only the Windows main thread was
+     * measured directly; the POSIX worker figures are read from libuv's source,
+     * not observed.
+     *
+     * NULL for was_clamped on purpose: this path has no user-supplied flag to
+     * report against. The tier default arriving here silently reduced is
+     * correct behaviour, whereas an explicit --max-stack-size that cannot be
+     * honoured is reported by the mod_engine.c call site. */
     JS_SetMaxStackSize(rt, tjs__clamp_stack_size(options->stack_size, NULL));
 
     /* SharedArrayBuffer functions */

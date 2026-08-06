@@ -388,7 +388,9 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
                         format_value_with_depth(ctx, arg, &fmt_buf, 4, false, stream);
                         break;
                     case 'O':
-                        format_value_with_depth(ctx, arg, &fmt_buf, 100, false, stream);
+                        /* Node's %O is inspect(arg) with DEFAULT options, i.e.
+                         * depth 2 — not an effectively unbounded 100. */
+                        format_value_with_depth(ctx, arg, &fmt_buf, 2, false, stream);
                         break;
                     case 'c':
                         /* Node ignores CSS in non-browser terminals. */
@@ -414,7 +416,10 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
     for (int i = start; i < argc; i++) {
         if (wrote) dbuf_putc(buf, ' ');
         if (JS_IsString(argv[i])) format_to_string(ctx, argv[i], buf);
-        else format_value_with_depth(ctx, argv[i], buf, 3, false, stream);
+        /* Node's console.log formats its arguments with util.inspect's DEFAULT
+         * depth of 2, not 3 — passing 3 rendered one level deeper than node
+         * before collapsing to `[Object]`. */
+        else format_value_with_depth(ctx, argv[i], buf, 2, false, stream);
         wrote = true;
     }
     return true;
@@ -467,20 +472,29 @@ static void format_string(JSContext* ctx, JSValue val, DynBuf* buf, bool quoted,
         dbuf_printf(buf, "%.*s%s", opts->max_string_length, str, 
                    len > (size_t)opts->max_string_length ? "..." : "");
     } else {
+        /* Node picks the quote that needs the fewest escapes: single, else
+         * double, else backtick. Always escaping `'` inside single quotes
+         * rendered "it's" as 'it\'s' where node gives "it's". */
+        char quote = '\'';
+        if (strchr(str, '\'') != NULL) {
+            if (strchr(str, '"') == NULL) quote = '"';
+            else if (strchr(str, '`') == NULL) quote = '`';
+        }
+
         put_color(buf, opts, ANSI_GREEN);
-        dbuf_putc(buf, '\'');
+        dbuf_putc(buf, quote);
         for (size_t i = 0; i < len && i < (size_t)opts->max_string_length; i++) {
             unsigned char c = str[i];
             if (c == '\n') dbuf_putstr(buf, "\\n");
             else if (c == '\r') dbuf_putstr(buf, "\\r");
             else if (c == '\t') dbuf_putstr(buf, "\\t");
             else if (c == '\\') dbuf_putstr(buf, "\\\\");
-            else if (c == '\'') dbuf_putstr(buf, "\\'");
+            else if (c == (unsigned char)quote) { dbuf_putc(buf, '\\'); dbuf_putc(buf, c); }
             else if (c < 32 || c == 127) dbuf_printf(buf, "\\x%02x", c);
             else dbuf_putc(buf, c);
         }
         if (len > (size_t)opts->max_string_length) dbuf_putstr(buf, "...");
-        dbuf_putc(buf, '\'');
+        dbuf_putc(buf, quote);
         put_reset(buf, opts);
     }
     JS_FreeCString(ctx, str);
@@ -499,7 +513,9 @@ static void format_number(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     if (isnan(num)) {
         dbuf_putstr(buf, "NaN");
     } else if (isinf(num)) {
-        dbuf_printf(buf, "%cInfinity", num < 0 ? '-' : '+');
+        /* Node prints `Infinity`, not `+Infinity`; only the negative form
+         * carries a sign. */
+        dbuf_putstr(buf, num < 0 ? "-Infinity" : "Infinity");
     } else if (floor(num) == num && fabs(num) < 1e21) {
         dbuf_printf(buf, "%.0f", num);
     } else {
@@ -516,15 +532,96 @@ static void format_bigint(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     if (str) JS_FreeCString(ctx, str);
 }
 
+/* Classify a callable the way Node's util.inspect does.
+ *
+ * Node keys `[class ...]` off the *source text* starting with `class`, not off
+ * the presence of [[Construct]] — every ordinary function is a constructor, so
+ * JS_IsConstructor() labelled plain functions `[class ...]`. Async/generator
+ * kinds come from Object.prototype.toString's builtinTag, which QuickJS reports
+ * identically to V8 (measured).
+ *
+ * Returns a static string: "class", "Function", "AsyncFunction",
+ * "GeneratorFunction" or "AsyncGeneratorFunction".
+ */
+static const char* function_kind(JSContext* ctx, JSValue val) {
+    /* Resolve Function.prototype.toString rather than val.toString, so a user
+     * override cannot steer the classification. */
+    const char* src = NULL;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn_ctor = JS_GetPropertyStr(ctx, global, "Function");
+    JS_FreeValue(ctx, global);
+    if (!JS_IsException(fn_ctor) && !JS_IsUndefined(fn_ctor)) {
+        JSValue fn_proto = JS_GetProperty(ctx, fn_ctor, JS_ATOM_prototype);
+        if (!JS_IsException(fn_proto)) {
+            JSValue to_str = JS_GetProperty(ctx, fn_proto, JS_ATOM_toString);
+            if (JS_IsFunction(ctx, to_str)) {
+                JSValue s = JS_Call(ctx, to_str, val, 0, NULL);
+                if (JS_IsString(s)) src = JS_ToCString(ctx, s);
+                else JS_FreeValue(ctx, JS_GetException(ctx));
+                JS_FreeValue(ctx, s);
+            }
+            JS_FreeValue(ctx, to_str);
+        }
+        JS_FreeValue(ctx, fn_proto);
+    }
+    JS_FreeValue(ctx, fn_ctor);
+
+    bool is_class = false;
+    if (src) {
+        const char* p = src;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (strncmp(p, "class", 5) == 0 &&
+            (p[5] == ' ' || p[5] == '\t' || p[5] == '\n' || p[5] == '\r' ||
+             p[5] == '{' || p[5] == '\0')) {
+            is_class = true;
+        }
+        JS_FreeCString(ctx, src);
+    }
+    if (is_class) return "class";
+
+    /* Not a class: distinguish the async/generator kinds via Symbol.toStringTag,
+     * which the spec installs on %AsyncFunction.prototype% et al. */
+    JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
+    const char* tag_str = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
+    const char* kind = "Function";
+    if (tag_str) {
+        if (strcmp(tag_str, "AsyncFunction") == 0) kind = "AsyncFunction";
+        else if (strcmp(tag_str, "GeneratorFunction") == 0) kind = "GeneratorFunction";
+        else if (strcmp(tag_str, "AsyncGeneratorFunction") == 0) kind = "AsyncGeneratorFunction";
+        JS_FreeCString(ctx, tag_str);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, tag);
+    return kind;
+}
+
 static void format_function(JSContext* ctx, JSValue val, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
+    bool has_name = name_str && name_str[0];
+    const char* kind = function_kind(ctx, val);
 
     put_color(buf, opts, ANSI_CYAN);
-    if (JS_IsConstructor(ctx, val)) {
-        dbuf_printf(buf, "[class %s]", name_str && name_str[0] ? name_str : "anonymous");
+    if (strcmp(kind, "class") == 0) {
+        /* Node: `[class Foo]`, `[class Foo extends Bar]`, `[class (anonymous)]`. */
+        dbuf_putstr(buf, "[class ");
+        if (has_name) dbuf_putstr(buf, name_str);
+        else dbuf_putstr(buf, "(anonymous)");
+        JSValue super = JS_GetPrototype(ctx, val);
+        if (JS_IsFunction(ctx, super)) {
+            JSValue sname = JS_GetProperty(ctx, super, JS_ATOM_name);
+            const char* s = JS_IsString(sname) ? JS_ToCString(ctx, sname) : NULL;
+            if (s && s[0]) dbuf_printf(buf, " extends %s", s);
+            if (s) JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, sname);
+        }
+        JS_FreeValue(ctx, super);
+        dbuf_putstr(buf, "]");
+    } else if (has_name) {
+        dbuf_printf(buf, "[%s: %s]", kind, name_str);
     } else {
-        dbuf_printf(buf, "[Function: %s]", name_str && name_str[0] ? name_str : "anonymous");
+        dbuf_printf(buf, "[%s (anonymous)]", kind);
     }
     put_reset(buf, opts);
 
@@ -591,9 +688,34 @@ static void format_symbol(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 }
 
 static void format_date(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
-
-	const char* str = JS_ToCString(ctx, val);
+	/* Node renders a Date as its ISO-8601 form (util.inspect uses
+	 * toISOString), not the local-timezone toString. The local form also made
+	 * output depend on the host timezone, so it could not be asserted on. */
 	put_color(buf, opts, ANSI_MAGENTA);
+
+	double t = 0;
+	bool valid = false;
+	JSValue getTime = JS_GetPropertyStr(ctx, val, "getTime");
+	if (JS_IsFunction(ctx, getTime)) {
+		JSValue tv = JS_Call(ctx, getTime, val, 0, NULL);
+		if (!JS_IsException(tv) && JS_ToFloat64(ctx, &t, tv) == 0 && !isnan(t)) valid = true;
+		else JS_FreeValue(ctx, JS_GetException(ctx));
+		JS_FreeValue(ctx, tv);
+	}
+	JS_FreeValue(ctx, getTime);
+
+	const char* str = NULL;
+	if (valid) {
+		JSValue iso_fn = JS_GetPropertyStr(ctx, val, "toISOString");
+		if (JS_IsFunction(ctx, iso_fn)) {
+			JSValue s = JS_Call(ctx, iso_fn, val, 0, NULL);
+			if (JS_IsString(s)) str = JS_ToCString(ctx, s);
+			else JS_FreeValue(ctx, JS_GetException(ctx));
+			JS_FreeValue(ctx, s);
+		}
+		JS_FreeValue(ctx, iso_fn);
+	}
+
 	dbuf_printf(buf, "%s", str ? str : "Invalid Date");
 	put_reset(buf, opts);
 	if (str) JS_FreeCString(ctx, str);
@@ -837,8 +959,26 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
 
     visit_push(stack, val);
 
+    /* A null prototype is load-bearing information — it is the shape that
+     * prototype-pollution guards produce, and dropping the marker made a
+     * hardened object indistinguishable from a plain one. Node prints
+     * `[Object: null prototype] { ... }`. */
+    JSValue own_proto = JS_GetPrototype(ctx, val);
+    bool null_proto = JS_IsNull(own_proto);
+    if (JS_IsException(own_proto)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        null_proto = false;
+    }
+    JS_FreeValue(ctx, own_proto);
+
     // Get class name
     char* cls = get_class_name(ctx, val);
+    if (null_proto) {
+        put_color(buf, opts, ANSI_BOLD);
+        dbuf_printf(buf, "[%s: null prototype] ", cls ? cls : "Object");
+        put_reset(buf, opts);
+        if (cls) { js_free(ctx, cls); cls = NULL; }
+    }
     if (cls) {
         put_color(buf, opts, ANSI_BOLD);
         dbuf_printf(buf, "%s ", cls);
@@ -870,14 +1010,33 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
         /* No own enumerable props: fall back to prototype getters (e.g. TS class with only get accessors).
          * Only one level up — avoids showing every Object.prototype method. */
         JSValue proto = JS_GetPrototype(ctx, val);
-        if (!JS_IsNull(proto) && !JS_IsException(proto)) {
+        /* ...but never walk Object.prototype itself. Doing so invoked its
+         * `__proto__` accessor and rendered a bare `{}` as
+         * `{\n  __proto__: {}\n}`. Only a *subclass* prototype can carry
+         * meaningful accessors. */
+        JSValue obj_proto = JS_UNDEFINED;
+        {
+            JSValue g = JS_GetGlobalObject(ctx);
+            JSValue object_ctor = JS_GetPropertyStr(ctx, g, "Object");
+            JS_FreeValue(ctx, g);
+            if (!JS_IsException(object_ctor) && !JS_IsUndefined(object_ctor))
+                obj_proto = JS_GetProperty(ctx, object_ctor, JS_ATOM_prototype);
+            else
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, object_ctor);
+        }
+        bool plain = JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT &&
+                     JS_VALUE_GET_TAG(obj_proto) == JS_TAG_OBJECT &&
+                     JS_VALUE_GET_PTR(proto) == JS_VALUE_GET_PTR(obj_proto);
+        JS_FreeValue(ctx, obj_proto);
+        if (!plain && !JS_IsNull(proto) && !JS_IsException(proto)) {
             JSPropertyEnum* pprops = NULL;
             uint32_t pcount = 0;
             if (JS_GetOwnPropertyNames(ctx, &pprops, &pcount, proto, JS_GPN_STRING_MASK) == 0) {
                 uint32_t gshown = 0;
                 for (uint32_t i = 0; i < pcount; i++) {
                     const char* k = JS_AtomToCString(ctx, pprops[i].atom);
-                    if (!k || strcmp(k, "constructor") == 0) { if (k) JS_FreeCString(ctx, k); continue; }
+                    if (!k || strcmp(k, "constructor") == 0 || strcmp(k, "__proto__") == 0) { if (k) JS_FreeCString(ctx, k); continue; }
 
                     JSPropertyDescriptor desc;
                     int res = JS_GetOwnProperty(ctx, &desc, proto, pprops[i].atom);
@@ -1033,21 +1192,29 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
     default: break;
     }
 
-	size_t offset = 0, len = 0, per = 0;
-    JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &offset, &len, &per);
+	size_t offset = 0, byte_len = 0, per = 0;
+    JSValue buffer = JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &per);
     if (JS_IsException(buffer)) {
-        /* Detached buffer — fall back to generic object display */
+        /* Detached buffer — Node reports a zero length for a detached view. */
+        JS_FreeValue(ctx, JS_GetException(ctx));
         put_color(buf, opts, ANSI_MAGENTA);
-        dbuf_printf(buf, "%s(%zu) [ <detached> ]", name, len);
+        dbuf_printf(buf, "%s(0) [ <detached> ]", name);
         put_reset(buf, opts);
         JS_FreeValue(ctx, buffer);
         return;
     }
 
+    /* JS_GetTypedArrayBuffer yields the length in BYTES and the element size
+     * separately; the element count is the quotient. Printing byte_len here
+     * overstated the length for every multi-byte element type and made the
+     * loop read past the end, rendering elements that do not exist as
+     * `undefined`. */
+    size_t len = per ? byte_len / per : byte_len;
+
     put_color(buf, opts, ANSI_MAGENTA);
     dbuf_printf(buf, "%s(%zu) [ ", name, len);
     put_reset(buf, opts);
-    size_t show = MIN(len, opts->max_array_length);
+    size_t show = MIN(len, (size_t)opts->max_array_length);
     for (size_t i = 0; i < show; i++) {
         if (i > 0) dbuf_putstr(buf, ", ");
         JSValue elem = JS_GetPropertyUint32(ctx, val, (uint32_t)i);
@@ -1256,21 +1423,32 @@ static void format_set(JSContext* ctx, JSValue val, int depth, VisitStack* stack
 }
 
 static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
-    put_color(buf, opts, ANSI_CYAN);
-	dbuf_printf(buf, "Promise<");
+	/* Node: `Promise { 1 }`, `Promise { <pending> }`, `Promise { <rejected> Error: x }`.
+	 * The old `Promise<...>` form resembled a TypeScript type annotation and
+	 * lost the fulfilled/rejected distinction entirely. */
+	JSPromiseStateEnum state = JS_PromiseState(ctx, val);
+	put_color(buf, opts, ANSI_CYAN);
+	dbuf_putstr(buf, "Promise { ");
+	put_reset(buf, opts);
 
-	if (JS_PromiseState(ctx, val) == JS_PROMISE_PENDING) {
+	if (state == JS_PROMISE_PENDING) {
 		put_color(buf, opts, ANSI_GRAY);
-		dbuf_printf(buf, "%s", "pending");
+		dbuf_putstr(buf, "<pending>");
+		put_reset(buf, opts);
 	} else {
+		if (state == JS_PROMISE_REJECTED) {
+			put_color(buf, opts, ANSI_RED);
+			dbuf_putstr(buf, "<rejected> ");
+			put_reset(buf, opts);
+		}
 		JSValue result = JS_PromiseResult(ctx, val);
 		format_value(ctx, result, depth + 1, stack, buf, true, opts);
 		JS_FreeValue(ctx, result);
 	}
 
 	put_color(buf, opts, ANSI_CYAN);
-	dbuf_putc(buf, '>');
-		put_reset(buf, opts);
+	dbuf_putstr(buf, " }");
+	put_reset(buf, opts);
 }
 
 /* Main dispatch */
@@ -1287,12 +1465,19 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
             JS_FreeValue(ctx, lv);
             dbuf_printf(buf, "[Array(%lld)]", (long long)alen);
         } else if (JS_IsFunction(ctx, val)) {
-            JSValue nm = JS_GetProperty(ctx, val, JS_ATOM_name);
-            const char* ns = JS_IsString(nm) ? JS_ToCString(ctx, nm) : NULL;
-            if (ns && ns[0]) dbuf_printf(buf, "[Function: %s]", ns);
-            else              dbuf_putstr(buf, "[Function]");
-            if (ns) JS_FreeCString(ctx, ns);
-            JS_FreeValue(ctx, nm);
+            /* Functions are never collapsed by depth in node — render in full. */
+            format_function(ctx, val, stack, buf, opts);
+            put_reset(buf, opts);
+            return;
+        } else if (JS_GetTypedArrayType(val) != -1) {
+            char* tcls = get_class_name(ctx, val);
+            dbuf_printf(buf, "[%s]", tcls ? tcls : "TypedArray");
+            if (tcls) js_free(ctx, tcls);
+        } else if (JS_IsDate(val)) {
+            /* Node prints a Date verbatim at any depth. */
+            put_reset(buf, opts);
+            format_date(ctx, val, buf, opts);
+            return;
         } else {
             /* Map / Set / named class — give a hint */
             JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
@@ -1483,12 +1668,34 @@ static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (argc == 0) return JS_UNDEFINED;
-    
+
+    JSValue opts_val = argc > 1 ? argv[1] : JS_UNDEFINED;
     InspectOptions opts;
-    parse_inspect_options(ctx, argc > 1 ? argv[1] : JS_UNDEFINED, &opts);
-    opts.depth = 100;
-    opts.show_hidden = true;
-    opts.compact = false;
+    parse_inspect_options(ctx, opts_val, &opts);
+
+    /* These were unconditional assignments, which silently discarded a
+     * caller-supplied depth/showHidden/compact — `console.dir(o, {depth: 1})`
+     * behaved exactly like `console.dir(o)`. Apply them only as defaults, so an
+     * explicit option wins while a bare `console.dir(o)` is unchanged. */
+    if (JS_IsObject(opts_val)) {
+        JSValue v = JS_GetPropertyStr(ctx, opts_val, "depth");
+        bool has_depth = JS_IsNumber(v);
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, opts_val, "showHidden");
+        bool has_hidden = JS_IsBool(v);
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, opts_val, "compact");
+        bool has_compact = JS_IsBool(v);
+        JS_FreeValue(ctx, v);
+
+        if (!has_depth) opts.depth = 100;
+        if (!has_hidden) opts.show_hidden = true;
+        if (!has_compact) opts.compact = false;
+    } else {
+        opts.depth = 100;
+        opts.show_hidden = true;
+        opts.compact = false;
+    }
 
     VisitStack stack = {0};
     DynBuf buf;

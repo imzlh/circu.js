@@ -64,7 +64,7 @@
  * header is shared with concurrent work; the definition and both call sites
  * (here and vm.c) are the whole surface. */
 size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped);
-size_t tjs__max_usable_stack_size(void);
+size_t tjs__native_stack_total_size(void);
 
 static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
     (void) argc;
@@ -781,12 +781,19 @@ static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, J
          * let --memory-limit=16MB allow 4GB (src/commands/run.ts:115-121), and
          * the requirement for this flag is that no value may produce an empty
          * diagnostic. Only fires when the caller asked for more than the
-         * thread can address, so the default tiers never print. */
+         * thread can address, so the default tiers (2/4/6MB, cts/src/config.ts:37-41)
+         * never print.
+         *
+         * Prints the thread's TOTAL stack rather than the usable ceiling: the
+         * ceiling is by construction equal to `limit` whenever clamped is true,
+         * so naming it would print the same number twice and read like a bug.
+         * The total is also the actionable figure, since it is what /STACK (or
+         * the thread's dwStackSize / RLIMIT_STACK) controls. */
         fprintf(stderr,
-                "cno: --max-stack-size=%zu exceeds the %zu bytes this thread's stack can "
-                "address; using %zu instead\n",
+                "cno: --max-stack-size=%zu does not fit in this thread's %zu-byte stack; "
+                "using %zu instead\n",
                 (size_t) v,
-                tjs__max_usable_stack_size(),
+                tjs__native_stack_total_size(),
                 limit);
         fflush(stderr);
     }
