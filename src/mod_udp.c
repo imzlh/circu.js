@@ -282,14 +282,10 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
-    /* arg 0: data buffer */
-    size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-
-    /* arg 1: target address */
+    /* arg 1: target address — resolved BEFORE acquiring argv[0]'s backing
+     * store. tjs_obj2addr reads .ip/.port and converts them, so it can run a
+     * user getter/toString/valueOf that detaches argv[0]; doing it afterwards
+     * left `buf`/`size` dangling and sent freed heap over the network. */
     struct sockaddr_storage ss;
     struct sockaddr *sa = NULL;
     int r;
@@ -299,6 +295,13 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
             return JS_EXCEPTION;
         }
         sa = (struct sockaddr *) &ss;
+    }
+
+    /* arg 0: data buffer */
+    size_t size;
+    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
+    if (!buf) {
+        return JS_EXCEPTION;
     }
 
     /* First try to do the write inline */

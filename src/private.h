@@ -80,6 +80,13 @@ struct TJSRuntime {
 
     bool is_worker;
     int exit_code;
+    /* Set once EV_EXIT has been dispatched, by whichever path got there first
+     * (uv__stop, os.exit, or the natural-drain path in TJS_Run). Gates both
+     * 'beforeunload' and EV_EXIT so an explicit exit cannot be followed by a
+     * second teardown when the loop later drains. Deno 2.9.3 fires 'unload' but
+     * NOT 'beforeunload' for an explicit exit (OBSERVED), which is exactly what
+     * one shared flag produces here. */
+    bool unload_dispatched;
     struct list_head workers;
     struct list_head streams;
     struct list_head msgpipes;
@@ -158,7 +165,11 @@ typedef enum {
 	EV_UNHANDLED_REJECTION = 0,
 	EV_JOB_EXCEPTION,
 	EV_EXIT,
-	EV_LOAD
+	EV_LOAD,
+	/* Appended last on purpose: JS hardcodes 0-3 as fallbacks when the engine
+	 * enum is unreadable (cts/src/runtime/event-mux.ts:31-45), so renumbering
+	 * the existing members would silently misroute every event. */
+	EV_BEFORE_UNLOAD
 } TJSEvents;
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
@@ -203,6 +214,32 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 
 #ifdef CJS__HAS_WASM
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
+#endif
+
+#ifdef _WIN32
+/* Full 64-bit Windows stat timestamps, shared by mod_fs.c (sync) and
+ * mod_asyncfs.c (async) so the two agree.
+ *
+ * libuv's uv_timespec_t.tv_sec is a 32-bit `long` on Windows (libuv's own
+ * "not 2038-proof" note, libuv#3864), so every uv_fs_stat/lstat/fstat result
+ * truncates at 2^31 seconds. These readers go to the FILETIME directly.
+ * Implemented in mod_fs.c; declared here so the ~110 lines are not duplicated.
+ *
+ * Both readers are best-effort: on any failure they leave valid == 0 and the
+ * caller falls back to libuv's own (truncated) timespec, so a stat never fails
+ * merely because the extra read did.
+ */
+typedef struct {
+    int valid;
+    double atim_ms;
+    double mtim_ms;
+    double ctim_ms;
+    double birthtim_ms;
+} tjs_win_stat_times_t;
+
+/* follow_symlinks == 0 describes the reparse point itself, for lstat. */
+void tjs_win_stat_times_from_path(const char* path, int follow_symlinks, tjs_win_stat_times_t* out);
+void tjs_win_stat_times_from_fd(int fd, tjs_win_stat_times_t* out);
 #endif
 
 JSValue tjs_new_error(JSContext *ctx, int err);

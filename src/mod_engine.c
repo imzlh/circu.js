@@ -53,13 +53,18 @@
 
 #include <llhttp.h>
 #define LLHTTP_VERSION STRINGIFY(LLHTTP_VERSION_MAJOR) "." STRINGIFY(LLHTTP_VERSION_MINOR) "." STRINGIFY(LLHTTP_VERSION_PATCH)
-
 #define CHECK_IF_IN_SANDBOX() do {\
     App* app = TJS_GetApp(ctx); \
     if (app->is_sandbox) { \
         return JS_ThrowTypeError(ctx, "cannot call in sandbox mode"); \
     } \
 } while(0)
+
+/* Implemented in utils.c. Declared locally rather than in utils.h because that
+ * header is shared with concurrent work; the definition and both call sites
+ * (here and vm.c) are the whole surface. */
+size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped);
+size_t tjs__max_usable_stack_size(void);
 
 static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
     (void) argc;
@@ -235,17 +240,38 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 		return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
 	}
 
+	/* Convert the module name BEFORE acquiring argv[0]'s backing store: if
+	 * argv[1] is an object, JS_ToCString runs a user toString() that can detach
+	 * argv[0]. On the zero-copy "guarded" path below, `source` points straight
+	 * into that backing store and JS_Eval would then compile freed heap. */
+	const char *_mname = JS_ToCString(ctx, argv[1]);
+	/* Propagate instead of falling back to "<module>". This is NOT an OOM-only
+	 * path: argv[1] may be any object, so the JS_ToCString above runs a user
+	 * toString() (the very reason it was hoisted here), and that throw landed in
+	 * ctx as a pending exception while the old code carried on to compile and
+	 * return a module. OBSERVED before this change:
+	 *   new Module('export const x = 1;', { toString(){ throw new Error('x') } })
+	 * returned a usable module object, resolve() and eval() both succeeded and
+	 * the process exited 0 -- the user's exception vanished. Node/V8 propagate a
+	 * throwing toString() from an argument conversion, so returning JS_EXCEPTION
+	 * is both the correct protocol and the matching behaviour. Nothing is
+	 * allocated yet at this point, so a bare return needs no cleanup. */
+	if (!_mname) return JS_EXCEPTION;
+	const char *module_name = _mname;
+
 	size_t len = 0;
 	const char *source = NULL;
 	char *source_copy = NULL;
 	bool source_is_string = JS_IsString(argv[0]);
 	if (source_is_string) {
 		source = JS_ToCStringLen(ctx, &len, argv[0]);
-		if (!source) return JS_EXCEPTION;
+		if (!source) { if(_mname) JS_FreeCString(ctx, _mname); return JS_EXCEPTION; }
 	} else {
 		source = (const char *)JS_GetAnyBuffer(ctx, &len, argv[0]);
-		if (!source)
+		if (!source) {
+			if(_mname) JS_FreeCString(ctx, _mname);
 			return JS_ThrowTypeError(ctx, "new Module() source must be a string or UTF-8 bytes");
+		}
 
 		/* JS_Eval requires source[len] == '\0' (see quickjs.c). engine.toSharedBytes()
 		 * and oxc's transpileSharedBytes() supply this NUL guard past the exposed
@@ -263,18 +289,20 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 			}
 		}
 		if (!guarded) {
-			if (len == SIZE_MAX) return JS_ThrowRangeError(ctx, "source too large");
+			if (len == SIZE_MAX) {
+				if(_mname) JS_FreeCString(ctx, _mname);
+				return JS_ThrowRangeError(ctx, "source too large");
+			}
 			source_copy = malloc(len + 1);
-			if (!source_copy) return JS_ThrowOutOfMemory(ctx);
+			if (!source_copy) {
+				if(_mname) JS_FreeCString(ctx, _mname);
+				return JS_ThrowOutOfMemory(ctx);
+			}
 			if (len) memcpy(source_copy, source, len);
 			source_copy[len] = 0;
 			source = source_copy;
 		}
 	}
-	const char *_mname = JS_ToCString(ctx, argv[1]);
-	const char *module_name = _mname;
-	if(!_mname) module_name = "<module>";
-
     JSValue compiled = JS_Eval(ctx, source, len, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_BACKTRACE_BARRIER);
     if(JS_IsException(compiled)) goto fail;
 
@@ -730,11 +758,39 @@ static JSValue tjs_setMemoryLimit(JSContext *ctx, JSValue this_val, int argc, JS
 static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     uint32_t v;
     CHECK_IF_IN_SANDBOX();
-    
+
     if (JS_ToUint32(ctx, &v, argv[0])) {
         return JS_EXCEPTION;
     }
-    JS_SetMaxStackSize(JS_GetRuntime(ctx), v);
+    /* This is the ONLY live path for --max-stack-size: the CLI parses it in
+     * src/commands/run.ts:123 and cts/src/config.ts:356 calls straight through
+     * to here. Passing the request to QuickJS unchecked put its soft limit at
+     * or below the guard page for any value >= the thread's real stack, and an
+     * ordinary recursion then died on the guard page with rc 0xC00000FD and
+     * NOTHING on stdout or stderr — see the OBSERVED table above
+     * tjs__clamp_stack_size in utils.c. A clamped value still throws a
+     * catchable RangeError; an unclamped one cannot.
+     *
+     * The clamp reads the OS stack bounds, not the stack pointer, which is
+     * required here: this runs many JS frames deep, so an sp-relative
+     * measurement would under-report the available stack badly. */
+    bool clamped = false;
+    size_t limit = tjs__clamp_stack_size((size_t) v, &clamped);
+    if (clamped) {
+        /* Report it. A silently ignored resource flag is the failure mode that
+         * let --memory-limit=16MB allow 4GB (src/commands/run.ts:115-121), and
+         * the requirement for this flag is that no value may produce an empty
+         * diagnostic. Only fires when the caller asked for more than the
+         * thread can address, so the default tiers never print. */
+        fprintf(stderr,
+                "cno: --max-stack-size=%zu exceeds the %zu bytes this thread's stack can "
+                "address; using %zu instead\n",
+                (size_t) v,
+                tjs__max_usable_stack_size(),
+                limit);
+        fflush(stderr);
+    }
+    JS_SetMaxStackSize(JS_GetRuntime(ctx), limit);
     return JS_UNDEFINED;
 }
 
@@ -1045,6 +1101,35 @@ static JSValue tjs_isArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSV
     return JS_NewBool(ctx, argc >= 1 && JS_IsArrayBuffer(argv[0]));
 }
 
+static JSValue tjs_isProxy(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    return JS_NewBool(ctx, argc >= 1 && JS_IsProxy(argv[0]));
+}
+
+#define TJS_ENGINE_PREDICATE(name, predicate) \
+    static JSValue tjs_##name(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) { \
+        return JS_NewBool(ctx, argc >= 1 && predicate(argv[0])); \
+    }
+
+TJS_ENGINE_PREDICATE(isDataView, JS_IsDataView)
+TJS_ENGINE_PREDICATE(isAsyncFunction, JS_IsAsyncFunction)
+TJS_ENGINE_PREDICATE(isArgumentsObject, JS_IsArgumentsObject)
+TJS_ENGINE_PREDICATE(isGeneratorFunction, JS_IsGeneratorFunction)
+TJS_ENGINE_PREDICATE(isGeneratorObject, JS_IsGeneratorObject)
+TJS_ENGINE_PREDICATE(isMapIterator, JS_IsMapIterator)
+TJS_ENGINE_PREDICATE(isSetIterator, JS_IsSetIterator)
+TJS_ENGINE_PREDICATE(isModuleNamespaceObject, JS_IsModuleNamespaceObject)
+TJS_ENGINE_PREDICATE(isDate, JS_IsDate)
+TJS_ENGINE_PREDICATE(isError, JS_IsError)
+TJS_ENGINE_PREDICATE(isMap, JS_IsMap)
+TJS_ENGINE_PREDICATE(isPromise, JS_IsPromise)
+TJS_ENGINE_PREDICATE(isRegExp, JS_IsRegExp)
+TJS_ENGINE_PREDICATE(isSet, JS_IsSet)
+TJS_ENGINE_PREDICATE(isWeakMap, JS_IsWeakMap)
+TJS_ENGINE_PREDICATE(isWeakRef, JS_IsWeakRef)
+TJS_ENGINE_PREDICATE(isWeakSet, JS_IsWeakSet)
+
+#undef TJS_ENGINE_PREDICATE
+
 static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if(argc == 0 || !JS_IsArrayBuffer(argv[0]))
         return JS_ThrowTypeError(ctx, "first argument is not an ArrayBuffer");
@@ -1179,6 +1264,24 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("decodeU16String", 1, tjs_decodeU16String),
     TJS_CFUNC_DEF("promiseResult", 1, tjs_proimise_result),
     TJS_CFUNC_DEF("isArrayBuffer", 1, tjs_isArrayBuffer),
+    TJS_CFUNC_DEF("isProxy", 1, tjs_isProxy),
+    TJS_CFUNC_DEF("isDataView", 1, tjs_isDataView),
+    TJS_CFUNC_DEF("isAsyncFunction", 1, tjs_isAsyncFunction),
+    TJS_CFUNC_DEF("isArgumentsObject", 1, tjs_isArgumentsObject),
+    TJS_CFUNC_DEF("isGeneratorFunction", 1, tjs_isGeneratorFunction),
+    TJS_CFUNC_DEF("isGeneratorObject", 1, tjs_isGeneratorObject),
+    TJS_CFUNC_DEF("isMapIterator", 1, tjs_isMapIterator),
+    TJS_CFUNC_DEF("isSetIterator", 1, tjs_isSetIterator),
+    TJS_CFUNC_DEF("isModuleNamespaceObject", 1, tjs_isModuleNamespaceObject),
+    TJS_CFUNC_DEF("isDate", 1, tjs_isDate),
+    TJS_CFUNC_DEF("isError", 1, tjs_isError),
+    TJS_CFUNC_DEF("isMap", 1, tjs_isMap),
+    TJS_CFUNC_DEF("isPromise", 1, tjs_isPromise),
+    TJS_CFUNC_DEF("isRegExp", 1, tjs_isRegExp),
+    TJS_CFUNC_DEF("isSet", 1, tjs_isSet),
+    TJS_CFUNC_DEF("isWeakMap", 1, tjs_isWeakMap),
+    TJS_CFUNC_DEF("isWeakRef", 1, tjs_isWeakRef),
+    TJS_CFUNC_DEF("isWeakSet", 1, tjs_isWeakSet),
     TJS_CFUNC_DEF("detachArrayBuffer", 1, tjs_detachArrayBuffer),
     TJS_CFUNC_DEF("setImmutableArrayBuffer", 2, tjs_immutArrayBuffer),
     TJS_CFUNC_DEF("getGlobalLexVar", 0, tjs_get_global_lexvar),
@@ -1219,6 +1322,7 @@ static const JSCFunctionListEntry tjs_event_enum[] = {
     TJS_CONST2("EXIT", EV_EXIT),
     TJS_CONST2("UNHANDLED_REJECTION", EV_UNHANDLED_REJECTION),
     TJS_CONST2("JOB_EXCEPTION", EV_JOB_EXCEPTION),
+    TJS_CONST2("BEFORE_UNLOAD", EV_BEFORE_UNLOAD),
 };
 
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {

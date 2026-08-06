@@ -100,6 +100,7 @@ static JSValue reg_to_js(JSContext *ctx, DWORD type, const BYTE *data, DWORD sz)
     }
     default: {
         uint8_t *copy = js_malloc(ctx, sz);
+        if (!copy) return JS_ThrowOutOfMemory(ctx);
         memcpy(copy, data, sz);
         return TJS_NewUint8Array(ctx, copy, sz);
     }
@@ -194,6 +195,8 @@ typedef struct {
     JSValue     callback;
     JSContext  *jsctx;
     volatile LONG stopped;
+    int         closed;
+    int         finalized;
 } tjs_regwatch_t;
 
 static void reg_watch_thread(void *arg) {
@@ -244,7 +247,11 @@ static JSValue tjs_regwatch_close(JSContext *ctx, JSValue this_val, int argc, JS
 
 static void regwatch_close_cb(uv_handle_t *handle) {
     tjs_regwatch_t *w = uv_handle_get_data(handle);
-    tjs__free(w);
+    if (!w) return;
+    w->closed = 1;
+    if (w->finalized) {
+        tjs__free(w);
+    }
 }
 
 static void tjs_regwatch_finalizer(JSRuntime *rt, JSValue val) {
@@ -253,7 +260,13 @@ static void tjs_regwatch_finalizer(JSRuntime *rt, JSValue val) {
     regwatch_stop(w);
     JS_FreeValueRT(rt, w->callback);
     w->callback = JS_UNDEFINED;
-    /* w is freed in regwatch_close_cb after libuv finishes processing the handle */
+    /* Two-flag rendezvous: the close cb may already have run (explicit
+     * close()), or may still be in flight — free only when both sides are
+     * done, whichever lands last. */
+    w->finalized = 1;
+    if (w->closed) {
+        tjs__free(w);
+    }
 }
 
 static void tjs_regwatch_gc_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
@@ -311,6 +324,8 @@ static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue
         JS_FreeValue(ctx, w->callback);
         CloseHandle(event);
         RegCloseKey(hk);
+        /* no JS wrapper owns w: let the close cb be the sole owner */
+        w->finalized = 1;
         uv_close((uv_handle_t *)&w->async, regwatch_close_cb);
         return obj;
     }
@@ -321,6 +336,8 @@ static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue
         JS_FreeValue(ctx, obj);
         CloseHandle(event);
         RegCloseKey(hk);
+        /* opaque was never set, so no finalizer will run for w */
+        w->finalized = 1;
         uv_close((uv_handle_t *)&w->async, regwatch_close_cb);
         return tjs_throw_errno(ctx, r);
     }

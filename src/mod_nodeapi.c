@@ -434,6 +434,7 @@ static napi_env napi_env_new(JSContext *ctx, const char *filename, int api_versi
     napi_ensure_classes(ctx);
 
     napi_env env = calloc(1, sizeof(*env));
+    if (!env) return NULL;
     env->ctx = ctx;
     env->trt = TJS_GetRuntime(ctx);
     env->loop = TJS_GetLoop(env->trt);
@@ -566,6 +567,11 @@ void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt) {
 
 static napi_handle_scope napi_scope_open(napi_env env, bool escapable) {
     napi_handle_scope s = calloc(1, sizeof(*s));
+    /* On OOM return NULL rather than dereferencing. Callers with no error
+     * channel pass the NULL straight back to napi_scope_close (a no-op);
+     * handles created meanwhile fall into env->orphan_handles and are freed at
+     * env cleanup. Public wrappers below translate NULL into a napi_status. */
+    if (!s) return NULL;
     s->parent = env->open_scope;
     s->head = NULL;
     s->env = env;
@@ -592,6 +598,7 @@ static void napi_free_deferred_handles(napi_env env) {
 }
 
 static void napi_scope_close(napi_env env, napi_handle_scope s) {
+    if (!s) return;  /* scope open failed (OOM); nothing was pushed */
     napi_hs_block *b = s->head;
     if (b && env->callback_depth > 0) {
         napi_hs_block *tail = b;
@@ -610,6 +617,7 @@ napi_open_handle_scope(napi_env env, napi_handle_scope *result) {
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, result);
     *result = napi_scope_open(env, false);
+    if (!*result) return NAPI_RET(env, napi_generic_failure);
     return NAPI_OK(env);
 }
 
@@ -627,6 +635,7 @@ napi_open_escapable_handle_scope(napi_env env, napi_escapable_handle_scope *resu
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, result);
     *result = (napi_escapable_handle_scope) napi_scope_open(env, true);
+    if (!*result) return NAPI_RET(env, napi_generic_failure);
     return NAPI_OK(env);
 }
 
@@ -2566,6 +2575,7 @@ napi_open_callback_scope(napi_env env, napi_value resource_object,
     napi_callback_scope s = calloc(1, sizeof(*s));
     if (!s) return NAPI_RET(env, napi_generic_failure);
     s->scope = napi_scope_open(env, false);
+    if (!s->scope) { free(s); return NAPI_RET(env, napi_generic_failure); }
     *result = s;
     return NAPI_OK(env);
 }
@@ -2968,6 +2978,12 @@ static JSValue tjs__napi_dlopen(JSContext *ctx, JSValueConst this_val,
     }
 
     napi_env env = napi_env_new(ctx, path, api_version);
+    if (!env) {
+        uv_dlclose(&node->lib);
+        free(node);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     napi_handle_scope scope = napi_scope_open(env, false);
     JSValue exports_obj = JS_NewObject(ctx);
     napi_value exports_handle = napi_add_handle(env, JS_DupValue(ctx, exports_obj));

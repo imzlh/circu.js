@@ -155,6 +155,27 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 	JSValue arrbuf;
 	if (JS_IsDataView(obj)) {
 		JSValue off_val, len_val;
+		/* buffer/byteOffset/byteLength are prototype accessors, but an own
+		 * property on the instance shadows them and would run user JS during
+		 * the JS_GetPropertyStr calls below. Callers routinely hold a raw
+		 * pointer into another argument's backing store by then, so that JS
+		 * could detach it (ArrayBuffer.prototype.transfer) and turn this into
+		 * a use-after-free. A genuine DataView never has these as own
+		 * properties, so fail closed. JS_GetOwnProperty with a NULL descriptor
+		 * is a shape lookup only and runs no JS. */
+		static const char *const dv_props[3] = { "buffer", "byteOffset", "byteLength" };
+		for (int i = 0; i < 3; i++) {
+			JSAtom a = JS_NewAtom(ctx, dv_props[i]);
+			if (a == JS_ATOM_NULL)
+				return NULL;
+			int has_own = JS_GetOwnProperty(ctx, NULL, obj, a);
+			JS_FreeAtom(ctx, a);
+			if (has_own != 0) {
+				if (has_own > 0)
+					JS_ThrowTypeError(ctx, "DataView with an own '%s' property is not accepted", dv_props[i]);
+				return NULL;
+			}
+		}
 		arrbuf = JS_GetPropertyStr(ctx, obj, "buffer");
 		if (JS_IsException(arrbuf))
 			return NULL;

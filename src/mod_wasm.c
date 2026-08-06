@@ -63,6 +63,25 @@ typedef struct {
     uint32_t resolved_table_count;
     WASMMemory **resolved_memories;
     uint32_t resolved_memory_count;
+    /* Imported WebAssembly.Memory objects awaiting binding.
+     * resolveMemoryImports records the JS object; buildInstance seeds the freshly
+     * instantiated linear memory from it and then rebinds the JS wrapper onto the
+     * instance, so both sides address the SAME bytes from then on. */
+    struct {
+        JSValue obj;         /* duped WebAssembly.Memory JSValue */
+        uint32_t import_idx; /* index into module_inst->memories */
+    } *mem_bindings;
+    uint32_t mem_binding_count;
+    /* The init/max page counts the wasm binary itself declares, captured before
+     * resolveMemoryImports overwrites them with the JS memory's real geometry.
+     * Without this, instantiating one Module twice would validate the second
+     * import against the first import's numbers. */
+    struct {
+        uint32_t init;
+        uint32_t max;
+        bool saved;
+    } *mem_decls;
+    uint32_t mem_decl_count;
 } TJSWasmModule;
 
 static void tjs_wasm_module_finalizer(JSRuntime *rt, JSValue val) {
@@ -100,6 +119,11 @@ static void tjs_wasm_module_finalizer(JSRuntime *rt, JSValue val) {
             wasm_runtime_free(m->resolved_memories[i]);
         }
         js_free_rt(rt, m->resolved_memories);
+        for (uint32_t i = 0; i < m->mem_binding_count; i++) {
+            JS_FreeValueRT(rt, m->mem_bindings[i].obj);
+        }
+        js_free_rt(rt, m->mem_bindings);
+        js_free_rt(rt, m->mem_decls);
         js_free_rt(rt, m);
     }
 }
@@ -279,11 +303,15 @@ static JSValue tjs__wasm_val_to_js(JSContext *ctx, const wasm_val_t *val) {
         case WASM_I32:
             return JS_NewInt32(ctx, val->of.i32);
         case WASM_I64:
-            if (val->of.i64 == (int32_t) val->of.i64) {
-                return JS_NewInt32(ctx, (int32_t) val->of.i64);
-            } else {
-                return JS_NewBigInt64(ctx, val->of.i64);
-            }
+            /* The WebAssembly JS API converts an i64 result with ToBigInt, so it
+             * is ALWAYS a BigInt -- magnitude is irrelevant. Returning a Number
+             * for int32-fitting values made `typeof f()` "number" where node says
+             * "bigint", and (once the inbound path was correctly tightened to
+             * reject Numbers) made the identity round trip `id(id(3n))` throw:
+             * the inner call handed back Number 3, which the outer call rejected.
+             * Every i64 leaving wasm -- function result, global read, table-call
+             * result -- goes through here, so this one site fixes all of them. */
+            return JS_NewBigInt64(ctx, val->of.i64);
         case WASM_F32:
             return JS_NewFloat64(ctx, (double) val->of.f32);
         case WASM_F64:
@@ -306,19 +334,18 @@ static bool tjs__js_to_wasm_val(JSContext *ctx, JSValue jsval, wasm_valkind_t ty
         }
         case WASM_I64: {
             int64_t i64;
-            // Try BigInt first
-            if (!JS_ToBigInt64(ctx, &i64, jsval)) {
-                val->of.i64 = i64;
-                return true;
-            }
-            // Clear the exception from BigInt attempt
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            // Try as regular integer
-            int32_t i32;
-            if (JS_ToInt32(ctx, &i32, jsval)) {
+            /* The WebAssembly JS API converts an i64 parameter with ToBigInt64
+             * -- ToBigInt, then wrap mod 2^64 -- which throws TypeError for
+             * Number, null and undefined. JS_ToBigInt64 implements exactly that
+             * (quickjs.c JS_ToBigIntFree fails on JS_TAG_INT/FLOAT64/NULL/
+             * UNDEFINED and converts Boolean/String/Object per spec), so its
+             * failure MUST propagate. Clearing the exception and retrying with
+             * JS_ToInt32 handed wasm a silently truncated value instead:
+             * 2**40 arrived as 0, 1e15 as -1530494976, 1.5 as 1. */
+            if (JS_ToBigInt64(ctx, &i64, jsval)) {
                 return false;
             }
-            val->of.i64 = i32;
+            val->of.i64 = i64;
             return true;
         }
         case WASM_F32: {
@@ -530,30 +557,37 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
         return;
     }
 
-    /* Convert return value back to WASM */
+    /* Convert return value back to WASM.
+     *
+     * Every conversion here can fail (BigInt where a Number is required and
+     * vice versa). A failure MUST become a wasm trap carrying the JS exception:
+     *   - ignoring the return value of JS_ToInt32/JS_ToFloat64 left a *pending*
+     *     JS exception while wasm kept executing, so the next JS_Call in the
+     *     same wasm activation saw a stale exception;
+     *   - the i64 case actively cleared the exception and retried with
+     *     JS_ToInt32, so an import declared `(result i64)` that returned Number
+     *     7 handed wasm 7 instead of throwing TypeError like node does. This is
+     *     the same swallow-and-truncate bug that was fixed on the inbound
+     *     (parameter) path in tjs__js_to_wasm_val. */
     if (result_count > 0) {
         wasm_valkind_t ret_kind = wasm_func_type_get_result_valkind(func_type, 0);
+        bool conv_failed = false;
         switch (ret_kind) {
             case WASM_I32: {
-                int32_t i32;
-                JS_ToInt32(ctx, &i32, ret);
+                int32_t i32 = 0;
+                conv_failed = JS_ToInt32(ctx, &i32, ret) != 0;
                 args[0] = (uint64_t) (uint32_t) i32;
                 break;
             }
             case WASM_I64: {
-                int64_t i64;
-                if (JS_ToBigInt64(ctx, &i64, ret)) {
-                    JS_FreeValue(ctx, JS_GetException(ctx));
-                    int32_t i32;
-                    JS_ToInt32(ctx, &i32, ret);
-                    i64 = i32;
-                }
+                int64_t i64 = 0;
+                conv_failed = JS_ToBigInt64(ctx, &i64, ret) != 0;
                 args[0] = (uint64_t) i64;
                 break;
             }
             case WASM_F32: {
-                double f64;
-                JS_ToFloat64(ctx, &f64, ret);
+                double f64 = 0;
+                conv_failed = JS_ToFloat64(ctx, &f64, ret) != 0;
                 union {
                     uint32_t i;
                     float f;
@@ -563,8 +597,8 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
                 break;
             }
             case WASM_F64: {
-                double f64;
-                JS_ToFloat64(ctx, &f64, ret);
+                double f64 = 0;
+                conv_failed = JS_ToFloat64(ctx, &f64, ret) != 0;
                 union {
                     uint64_t i;
                     double f;
@@ -576,6 +610,26 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
             default:
                 args[0] = 0;
                 break;
+        }
+
+        if (conv_failed) {
+            TJSWasmInstance *inst = wasm_runtime_get_user_data(exec_env);
+            if (inst) {
+                /* Drop any exception the caller already parked, then take ours. */
+                if (inst->has_pending_exception) {
+                    JS_FreeValue(ctx, inst->pending_exception);
+                    inst->pending_exception = JS_UNDEFINED;
+                    inst->has_pending_exception = false;
+                }
+                inst->pending_exception = JS_GetException(ctx);
+                inst->has_pending_exception = true;
+            } else {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            }
+            wasm_runtime_set_exception(wasm_runtime_get_module_inst(exec_env),
+                                       "imported function returned a value of the wrong type");
+            JS_FreeValue(ctx, ret);
+            return;
         }
     }
 
@@ -1325,6 +1379,10 @@ static JSValue tjs_wasm_resolveimports(JSContext *ctx, JSValue this_val, int arg
 
             /* Set up the native symbol */
             group->symbols[si].symbol = js_strdup(ctx, descs[j].func_name);
+            if (!group->symbols[si].symbol) {
+                js_free(ctx, sig);
+                goto fail_groups;
+            }
             group->symbols[si].func_ptr = tjs__wasm_import_trampoline;
             group->symbols[si].signature = sig;
             group->symbols[si].attachment = &group->ctxs[si];
@@ -1442,39 +1500,47 @@ static JSValue tjs_wasm_resolveglobalimports(JSContext *ctx, JSValue this_val, i
         for (uint32_t j = 0; j < wasm_module->import_global_count; j++) {
             WASMGlobalImport *gi = &wasm_module->import_globals[j].u.global;
             if (strcmp(gi->module_name, mod_name) == 0 && strcmp(gi->field_name, field_name) == 0) {
-                /* Set the value based on type */
+                /* Set the value based on the type the MODULE declares. Every
+                 * conversion below can fail, and the failure must propagate:
+                 * the i64 arm used to clear the exception and retry with
+                 * JS_ToInt32, so `{env:{g:3}}` linked against
+                 * `(import "env" "g" (global i64))` silently became 3 instead
+                 * of the TypeError node raises; the i32/f32/f64 arms ignored
+                 * the return value entirely and left a pending exception. */
+                bool conv_failed = false;
                 switch (gi->type.val_type) {
                     case VALUE_TYPE_I32: {
-                        int32_t v;
-                        JS_ToInt32(ctx, &v, js_value);
+                        int32_t v = 0;
+                        conv_failed = JS_ToInt32(ctx, &v, js_value) != 0;
                         gi->global_data_linked.i32 = v;
                         break;
                     }
                     case VALUE_TYPE_I64: {
-                        int64_t v;
-                        if (JS_ToBigInt64(ctx, &v, js_value)) {
-                            JS_FreeValue(ctx, JS_GetException(ctx));
-                            int32_t i32;
-                            JS_ToInt32(ctx, &i32, js_value);
-                            v = i32;
-                        }
+                        int64_t v = 0;
+                        conv_failed = JS_ToBigInt64(ctx, &v, js_value) != 0;
                         gi->global_data_linked.i64 = v;
                         break;
                     }
                     case VALUE_TYPE_F32: {
-                        double f64;
-                        JS_ToFloat64(ctx, &f64, js_value);
+                        double f64 = 0;
+                        conv_failed = JS_ToFloat64(ctx, &f64, js_value) != 0;
                         gi->global_data_linked.f32 = (float) f64;
                         break;
                     }
                     case VALUE_TYPE_F64: {
-                        double f64;
-                        JS_ToFloat64(ctx, &f64, js_value);
+                        double f64 = 0;
+                        conv_failed = JS_ToFloat64(ctx, &f64, js_value) != 0;
                         gi->global_data_linked.f64 = f64;
                         break;
                     }
                     default:
                         break;
+                }
+                if (conv_failed) {
+                    JS_FreeCString(ctx, mod_name);
+                    JS_FreeCString(ctx, field_name);
+                    JS_FreeValue(ctx, js_value);
+                    return JS_EXCEPTION;
                 }
                 gi->is_linked = true;
                 found = true;
@@ -1668,6 +1734,33 @@ static JSValue tjs_wasm_resolvetableimports(JSContext *ctx, JSValue this_val, in
  * memoryDescs is an array of { module: string, name: string, initial: number, maximum?: number }
  * Creates a WASMMemory stub with the matching type and links it into the module's import.
  */
+/* Read the byte range currently backing a JS WebAssembly.Memory.
+ * Goes through the public `buffer` getter so it works both for a standalone
+ * Memory (its own ArrayBuffer) and for one already bound to an instance (a view
+ * over WAMR linear memory). Returns the ArrayBuffer JSValue -- the caller must
+ * free it, and must not use *pptr after that. */
+static JSValue tjs__wasm_js_memory_bytes(JSContext *ctx, JSValue mem_obj, uint8_t **pptr, size_t *plen) {
+    *pptr = NULL;
+    *plen = 0;
+    JSValue buf = JS_GetPropertyStr(ctx, mem_obj, "buffer");
+    if (JS_IsException(buf))
+        return buf;
+    size_t len = 0;
+    uint8_t *ptr = JS_GetArrayBuffer(ctx, &len, buf);
+    if (!ptr) {
+        /* A zero-length ArrayBuffer legitimately yields NULL with no exception. */
+        if (!JS_HasException(ctx)) {
+            JS_FreeValue(ctx, buf);
+            return JS_UNDEFINED;
+        }
+        JS_FreeValue(ctx, buf);
+        return JS_EXCEPTION;
+    }
+    *pptr = ptr;
+    *plen = len;
+    return buf;
+}
+
 static JSValue tjs_wasm_resolvememoryimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {
@@ -2030,18 +2123,14 @@ static JSValue tjs_wasm_setglobal(JSContext *ctx, JSValue this_val, int argc, JS
             break;
         }
         case WASM_I64: {
+            /* An i64 global is written with ToBigInt64: a Number must throw,
+             * not be silently narrowed through JS_ToInt32 (which is what the
+             * cleared-exception fallback here used to do). */
             int64_t v;
-            if (!JS_ToBigInt64(ctx, &v, argv[2])) {
-                memcpy(global_inst.global_data, &v, sizeof(v));
-                break;
-            }
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            int32_t i32;
-            if (JS_ToInt32(ctx, &i32, argv[2])) {
+            if (JS_ToBigInt64(ctx, &v, argv[2])) {
                 return JS_EXCEPTION;
             }
-            int64_t i64 = i32;
-            memcpy(global_inst.global_data, &i64, sizeof(i64));
+            memcpy(global_inst.global_data, &v, sizeof(v));
             break;
         }
         case WASM_F32: {

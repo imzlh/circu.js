@@ -664,6 +664,16 @@ static JSValue tjs_source_map_mappings_encode(JSContext* ctx, JSValue this_arg, 
 		return JS_ThrowTypeError(ctx, "Invalid arguments. expected: (Int32Array)");
 	}
 
+	/* Convert argv[1] BEFORE acquiring the backing store: JS_ToIndex can run a
+	 * user valueOf() that detaches argv[0], which would free `buffer` below and
+	 * leave the segment loop reading freed heap. Validating the value against
+	 * int_count still happens after the acquisition. */
+	bool has_requested_count = (argc >= 2 && !JS_IsUndefined(argv[1]));
+	uint64_t requested_count = 0;
+	if (has_requested_count && JS_ToIndex(ctx, &requested_count, argv[1])) {
+		return JS_EXCEPTION;
+	}
+
 	size_t offset = 0;
 	size_t byte_len = 0;
 	size_t bytes_per_element = 0;
@@ -688,12 +698,7 @@ static JSValue tjs_source_map_mappings_encode(JSContext* ctx, JSValue this_arg, 
 	}
 
 	size_t int_count = byte_len / sizeof(int32_t);
-	if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-		uint64_t requested_count = 0;
-		if (JS_ToIndex(ctx, &requested_count, argv[1])) {
-			JS_FreeValue(ctx, array_buffer);
-			return JS_EXCEPTION;
-		}
+	if (has_requested_count) {
 		if (requested_count > int_count) {
 			JS_FreeValue(ctx, array_buffer);
 			return JS_ThrowRangeError(ctx, "Source map segment count exceeds Int32Array length");

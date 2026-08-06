@@ -48,10 +48,15 @@
 
 #define TJS__DEFAULT_STACK_SIZE 6 * 1024 * 1024  // 6MB
 
+/* Implemented in utils.c — see the OBSERVED table there. Declared locally
+ * rather than in utils.h because that header is shared with concurrent work. */
+size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped);
+
 static int tjs__argc = 0;
 static char** tjs__argv = NULL;
 
-/* Keep the standard descriptor numbers reserved when the parent closes one. */
+/* Keep the standard descriptor numbers reserved when the parent closes one,
+ * and force binary mode on the ones we inherited. */
 static void tjs__normalize_stdio(void) {
 #ifdef _WIN32
     const int modes[3] = { _O_RDONLY | _O_BINARY, _O_WRONLY | _O_BINARY, _O_WRONLY | _O_BINARY };
@@ -62,8 +67,16 @@ static void tjs__normalize_stdio(void) {
          * whether this descriptor number was vacant without an unsafe probe. */
         int nullfd = _open("NUL", modes[fd], 0);
         if (nullfd < 0) continue;
+        /* Vacant: our NUL fd now owns the slot and was opened _O_BINARY. */
         if (nullfd == fd) continue;
         _close(nullfd);
+        /* Occupied by an inherited handle. Inherited CRT descriptors start in
+         * TEXT mode, which rewrites \n as \r\n on write and strips \r (and
+         * stops at Ctrl-Z) on read — that corrupts all binary stdio. Node and
+         * Deno never translate, so force binary for parity. Reaching here
+         * proves the descriptor exists, so _setmode cannot trip the
+         * invalid-parameter handler the comment above warns about. */
+        _setmode(fd, _O_BINARY);
     }
 #else
     const int modes[3] = { O_RDONLY, O_WRONLY, O_WRONLY };
@@ -206,17 +219,92 @@ JSValue tjs__get_args(JSContext* ctx) {
 static int tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* col) {
     TJSRuntime* qrt = TJS_GetRuntime(ctx);
 
-    MappingResult res = js_get_source_mapping(qrt->module.mapctx, name, *line, *col);
+    /* Base conversion belongs here, not in js_get_source_mapping().
+     *
+     * That function converts the LINE (`gen_line - 1`, and returns
+     * `original_line + 1`) but passes the COLUMN through raw against 0-based
+     * mapping data, returning `original_column` raw as well. Its column
+     * contract is therefore 0-based in and out, and the other consumer relies
+     * on that: the getMapping() binding hands original_column straight to JS,
+     * where src/inspector/shared/console-utils.ts documents it as "already
+     * 0-based" for CDP. Adjusting sourcemap.c would break the inspector.
+     *
+     * Backtrace columns from QuickJS are 1-based, so feeding one in unadjusted
+     * mis-SELECTS the segment rather than merely reporting an off-by-one: with
+     * segments at 0-based 10 and 20, col=20 resolves to the 20 segment where it
+     * should resolve to the 10 one. Convert on the way in, restore on the way
+     * out, and leave the line alone since both sides already agree on 1-based. */
+    MappingResult res = js_get_source_mapping(qrt->module.mapctx, name, *line, *col > 0 ? *col - 1 : 0);
     if (res.found) {
         *line = res.original_line;
-        *col = res.original_column;
+        *col = res.original_column + 1;
     }
     return res.found;
 }
 
+/* Number of deferral hops currently outstanding on this thread. Only ever
+ * touched from the job loop, which is single-threaded per runtime, but workers
+ * each get their own runtime on their own thread, so it must not be shared. */
+static thread_local int tjs__rejection_deferrals = 0;
+
+/* Hop bound used ONLY while another deferral is already outstanding. See the
+ * termination argument in tjs__promise_rejection_dispatch. */
+#define TJS_REJECTION_MAX_HOPS 16
+
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
     JSValue promise = argv[0], reason = argv[1];
+
+    /* argv[2], when present, is the hop count of a re-enqueued dispatch. Read it
+     * before anything can return: the matching decrement has to happen on EVERY
+     * exit path, or a promise that gets handled while deferred (the common good
+     * case) would leak the counter and permanently disable the unbounded wait
+     * below. Read with JS_VALUE_GET_INT rather than JS_ToInt32 -- we put the int
+     * there ourselves, so there is no conversion-failure path to handle. */
+    int hop = 0;
+    if (argc > 2) {
+        hop = JS_VALUE_GET_INT(argv[2]);
+        tjs__rejection_deferrals--;
+    }
+
     if (JS_PromiseIsHandled(ctx, promise)) return JS_UNDEFINED;
+
+    /* Thenable adoption is not synchronous. `return inner()` from an async
+     * function resolves the outer promise WITH inner's rejected promise, and the
+     * handler that marks inner handled is only attached by a later
+     * PromiseResolveThenableJob. The tracker enqueued us the moment inner
+     * rejected, so on the first pass we can be exactly one job too early and
+     * would report a rejection that is about to be handled. `return await
+     * inner()` attaches in the same job and never had the problem -- the two
+     * differ only in WHEN the handler lands, so reporting the first is a timing
+     * artifact, not a real unhandled rejection.
+     *
+     * So: while other jobs are still pending, go to the back of the queue and
+     * look again. JS_EnqueueJob uses list_add_tail and the loop pops from
+     * job_list.next, i.e. FIFO, so the re-enqueued dispatch is guaranteed to run
+     * AFTER the adoption job that is already queued (OBSERVED in quickjs.c).
+     *
+     * TERMINATION. Deferring unconditionally on JS_IsJobPending hangs, because a
+     * deferral is itself a pending job: with two rejections in one tick each one
+     * keeps seeing the other's deferral and they ping-pong forever. Hence the
+     * counter. An unbounded wait is only taken while NO other deferral is
+     * outstanding (tjs__rejection_deferrals == 0), which is the single-rejection
+     * case where the only thing we can be waiting on is real work; the moment a
+     * second deferral coexists, both fall back to the hop bound and the loop is
+     * capped at TJS_REJECTION_MAX_HOPS. The counter is decremented on entry, so
+     * a lone rejection oscillates 0 <-> 1 and keeps its unbounded wait, while
+     * two or more can never both see 0 again. */
+    if (JS_IsJobPending(JS_GetRuntime(ctx)) &&
+        (tjs__rejection_deferrals == 0 || hop < TJS_REJECTION_MAX_HOPS)) {
+        JSValue again[3] = { promise, reason, JS_NewInt32(ctx, hop + 1) };
+        /* No manual dup/free: JS_EnqueueJob dups every argv element and the job
+         * loop frees the entry's copies after job_func returns, and js_dup on an
+         * int tag is a no-op (OBSERVED in quickjs.c). If the enqueue fails we
+         * must NOT swallow the report -- fall through and report it now. */
+        if (JS_EnqueueJob(ctx, tjs__promise_rejection_dispatch, 3, (JSValueConst*) again) >= 0) {
+            tjs__rejection_deferrals++;
+            return JS_UNDEFINED;
+        }
+    }
 
     JSValue args = JS_NewArrayFrom(ctx, 2, (JSValueConst[]) {
         JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
@@ -270,6 +358,10 @@ static void uv__stop(uv_async_t* handle) {
      * always made from the correct thread. TJS_Stop may be called from a
      * different thread (e.g. main thread stopping a worker), so JS dispatch
      * must NOT happen in TJS_Stop itself. */
+    /* Explicit exit: mark teardown as done so a later natural drain in TJS_Run
+     * neither re-fires EV_EXIT nor introduces a 'beforeunload' that Deno does
+     * not fire on an explicit exit (OBSERVED against Deno 2.9.3). */
+    trt->unload_dispatched = true;
     tjs__dispatch_event2(trt->main_ctx, EV_EXIT, JS_NewInt32(trt->main_ctx, trt->exit_code));
     uv_stop(&trt->loop);
 }
@@ -337,7 +429,14 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     JS_SetMemoryLimit(rt, options->mem_limit);
 
     /* Set stack size */
-    JS_SetMaxStackSize(rt, options->stack_size);
+    /* Clamp against the stack this thread actually owns. The main thread gets
+     * 8MB here (/STACK:8388608, CMakeLists.txt:51) so the 6MB default already
+     * fits, but a Worker runs TJS_NewRuntimeWorker on a uv thread whose default
+     * stack is platform-dependent — Darwin secondary threads get 512KB, far
+     * under the 6MB default — and an unclamped limit there means QuickJS's
+     * overflow check can never fire. REASONED for the worker case: only the
+     * Windows main-thread path was measured here. */
+    JS_SetMaxStackSize(rt, tjs__clamp_stack_size(options->stack_size, NULL));
 
     /* SharedArrayBuffer functions */
     JS_SetSharedArrayBufferFunctions(rt, &tjs_sf);
@@ -808,6 +907,90 @@ void tjs__run_main(TJSRuntime* qrt) {
     }
 }
 
+/* Lifecycle teardown, run when the event loop has nothing left to do.
+ *
+ * Returns true when the caller must give the loop another pass.
+ *
+ * RETURN-VALUE POLARITY: only an explicit JS `true` means "cancelled, keep
+ * running". This is forced by the JS side, not a free choice. The multiplexer
+ * that owns the native receiver ends every dispatch with
+ * `typeof ret === 'boolean' ? ret : defaultReturn(name)`, and defaultReturn
+ * (cts/src/runtime/event-mux.ts:104-107) yields `false` for every id except
+ * EV_JOB_EXCEPTION. No receiver knows EV_BEFORE_UNLOAD, so an un-bridged mux
+ * returns `false` on every dispatch. Had `false` meant "cancelled" (as the
+ * other two sites' polarities might suggest) every single run would re-dispatch
+ * forever and never exit. Choosing `true` also makes both degenerate returns
+ * safe: tjs__dispatch_event yields JS_UNDEFINED when the runtime is freeing or
+ * no receiver is installed, and JS_EXCEPTION when a listener throws — neither
+ * is JS_TRUE, so both fall through to teardown instead of hanging. */
+static bool tjs__lifecycle_drain(TJSRuntime* qrt) {
+    if (qrt->unload_dispatched)
+        return false;
+    /* Deno fires neither 'beforeunload' nor 'unload' inside a worker, on
+     * self.close() or on natural drain (both OBSERVED). Worker teardown keeps
+     * going through uv__stop, which is unchanged. */
+    if (qrt->is_worker)
+        return false;
+
+    JSContext* ctx = qrt->main_ctx;
+
+    JSValue bu = tjs__dispatch_event(ctx, EV_BEFORE_UNLOAD, JS_UNDEFINED);
+    if (JS_IsException(bu)) {
+        /* Deno: a throwing 'beforeunload' listener is an uncaught error — exit
+         * code 1, later listeners skipped, 'unload' never fires (OBSERVED).
+         * Suppress EV_EXIT to reproduce that, and stop looping. */
+        TJS_DumpException(ctx);
+        if (qrt->exit_code == 0)
+            qrt->exit_code = 1;
+        qrt->unload_dispatched = true;
+        return false;
+    }
+
+    /* Tag test, not JS_IsEqual: that is loose `==` (js_eq_slow), and this is the
+     * teardown path where a pending exception has no later consumer.
+     *
+     * Two OBSERVED consequences of the loose form, both against the documented
+     * contract above. `engine.onEvent` is a single-slot setter reachable from
+     * user JS (Symbol.for('cjs.internal.use')('engine'), because
+     * CJS_USE_SYMBOL_INTERNAL puts `use` on a global symbol), so a receiver that
+     * is not the multiplexer is not hypothetical -- the REPL shipped one, see
+     * src/commands/repl/index.ts.
+     *   1. '1', [1], new Boolean(true) and 1 all cancelled teardown, so the
+     *      "only an explicit JS `true`" contract was not enforced.
+     *   2. For an object receiver, js_eq_slow reaches JS_ToPrimitiveFree and runs
+     *      a user valueOf()/toString() INSIDE teardown. A throw there makes
+     *      JS_IsEqual return -1, so `-1 == 1` left cancelled false, and the
+     *      function went on to dispatch EV_EXIT with that exception still
+     *      pending in ctx and nothing left to consume it.
+     * A tag test runs no JS, cannot throw, and keeps the polarity unchanged:
+     * true still means "cancelled, keep running". */
+    bool cancelled = JS_IsBool(bu) && JS_VALUE_GET_BOOL(bu);
+    JS_FreeValue(ctx, bu);
+
+    if (cancelled) {
+        /* Deno re-dispatches on every subsequent drain with no cap at all: 13
+         * consecutive cancels that queued no work produced 13 dispatches and
+         * exited only when the listener stopped cancelling (OBSERVED). A cap
+         * would deviate from the oracle, so there is none here either. A
+         * listener that cancels forever spins, exactly as it does under Deno. */
+        return true;
+    }
+
+    /* Uncancelled: teardown proceeds. Set the flag before dispatching so a
+     * throwing 'unload'/'exit' listener cannot re-enter this path. */
+    qrt->unload_dispatched = true;
+    tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, qrt->exit_code));
+
+    /* Deliberately no extra loop pass. Work queued from a non-cancelling
+     * 'beforeunload' listener, and from an 'unload' listener, is DROPPED by
+     * Deno — neither a setTimeout nor a microtask ran (both OBSERVED) — and
+     * Node likewise does not drain work queued in a 'exit' handler. Running
+     * another pass here would also let an exit listener that creates a ref'd
+     * handle wedge the process forever, so both oracles and the hang risk agree
+     * on stopping. */
+    return false;
+}
+
 /* main loop which calls the user JS callbacks */
 int TJS_Run(TJSRuntime* qrt) {
     CHECK_EQ(uv_prepare_start(&qrt->jobs.prepare, uv__prepare_cb), 0);
@@ -824,11 +1007,28 @@ int TJS_Run(TJSRuntime* qrt) {
         return qrt->exit_code;
     }
 
+    /* Restructured from `do { ... } while (r != 0 && JS_IsJobPending(...))`.
+     * A `continue` inside a do-while jumps to the controlling expression, not
+     * the body, and that expression tests `r != 0` — false in the only branch
+     * that wants to re-dispatch (we get there only when r == 0). Patching the
+     * drain into the old shape would therefore have made cancellation a silent
+     * no-op. The original continue condition is preserved verbatim below. */
     int r;
-    do {
+    for (;;) {
         uv__maybe_idle(qrt);
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
-    } while (r != 0 && JS_IsJobPending(qrt->rt));
+
+        if (r != 0 && JS_IsJobPending(qrt->rt))
+            continue;
+
+        /* Nothing left to run. r == 0 is a genuine natural drain; r != 0 with no
+         * pending jobs means uv_stop ran, and that path already dispatched
+         * EV_EXIT and set unload_dispatched, so the drain declines. */
+        if (r == 0 && tjs__lifecycle_drain(qrt))
+            continue;
+
+        break;
+    }
 
     return qrt->exit_code;
 }

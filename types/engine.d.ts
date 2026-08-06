@@ -431,6 +431,28 @@ declare namespace CModuleEngine {
     export function isArrayBuffer(value: unknown): boolean;
 
     /**
+     * Check whether a value is a Proxy without invoking any proxy traps.
+     */
+    export function isProxy(value: unknown): boolean;
+    export function isDataView(value: unknown): boolean;
+    export function isAsyncFunction(value: unknown): boolean;
+    export function isArgumentsObject(value: unknown): boolean;
+    export function isGeneratorFunction(value: unknown): boolean;
+    export function isGeneratorObject(value: unknown): boolean;
+    export function isMapIterator(value: unknown): boolean;
+    export function isSetIterator(value: unknown): boolean;
+    export function isModuleNamespaceObject(value: unknown): boolean;
+    export function isDate(value: unknown): boolean;
+    export function isError(value: unknown): boolean;
+    export function isMap(value: unknown): boolean;
+    export function isPromise(value: unknown): boolean;
+    export function isRegExp(value: unknown): boolean;
+    export function isSet(value: unknown): boolean;
+    export function isWeakMap(value: unknown): boolean;
+    export function isWeakRef(value: unknown): boolean;
+    export function isWeakSet(value: unknown): boolean;
+
+    /**
      * Detach an ArrayBuffer synchronously.
      *
      * The native function returns `undefined`; it does not create or await a

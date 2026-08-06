@@ -154,6 +154,53 @@ JSValue tjs_throw_sqlite3_errno(JSContext *ctx, int err) {
     return JS_Throw(ctx, obj);
 }
 
+/**
+ * Node reports SQLite's *extended* result code and the detailed sqlite3_errmsg,
+ * so five distinguishable constraint failures stay distinguishable: UNIQUE 2067,
+ * PRIMARY KEY 1555, NOT NULL 1299, CHECK 275, FOREIGN KEY 787. The primary code
+ * is 19 for all five and sqlite3_errstr() is "constraint failed" for all five,
+ * so without this they collapse into one error a caller cannot branch on.
+ *
+ * Both values live on the *connection*, not the statement, so only a caller
+ * holding a db handle can reach them. The connection reports its most recent
+ * error, so trust it only when that error is the one being thrown: compare
+ * masked, since `err` from step/exec is the primary code. That check is what
+ * keeps a stale errmsg from a previous failure off this error.
+ *
+ * sqlite3_extended_result_codes() is NOT a prerequisite: it only sets
+ * db->errMask, which sqlite3_errcode() applies and sqlite3_extended_errcode()
+ * does not. And sqlite3_errstr() masks to the primary code internally, so
+ * passing the extended code still yields the primary string Node puts in
+ * `errstr`.
+ */
+JSValue tjs_throw_sqlite3_err_db(JSContext *ctx, sqlite3 *db, int err) {
+    int extended = err;
+    const char *msg = NULL;
+    if (db) {
+        int db_err = sqlite3_extended_errcode(db);
+        if ((db_err & 0xff) == (err & 0xff) && db_err != SQLITE_OK) {
+            extended = db_err;
+            msg = sqlite3_errmsg(db);
+        }
+    }
+    JSValue obj = JS_NewError(ctx);
+    JS_DefinePropertyValueStr(ctx,
+                              obj,
+                              "message",
+                              JS_NewString(ctx, msg ? msg : sqlite3_errstr(err)),
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx, obj, "errno", JS_NewInt32(ctx, extended), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx,
+                              obj,
+                              "errstr",
+                              JS_NewString(ctx, sqlite3_errstr(extended)),
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    if (JS_IsException(obj)) {
+        obj = JS_NULL;
+    }
+    return JS_Throw(ctx, obj);
+}
+
 static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     const char *db_name = JS_ToCString(ctx, argv[0]);
 
@@ -276,7 +323,7 @@ static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSVa
     JS_FreeCString(ctx, sql);
 
     if (r != SQLITE_OK) {
-        return tjs_throw_sqlite3_errno(ctx, r);
+        return tjs_throw_sqlite3_err_db(ctx, h->handle, r);
     }
 
     return JS_UNDEFINED;
@@ -301,7 +348,7 @@ static JSValue tjs_sqlite3_prepare(JSContext *ctx, JSValue this_val, int argc, J
     JS_FreeCString(ctx, sql);
 
     if (r != SQLITE_OK) {
-        return tjs_throw_sqlite3_errno(ctx, r);
+        return tjs_throw_sqlite3_err_db(ctx, h->handle, r);
     }
 
     JSValue obj = tjs_new_sqlite3_stmt(ctx, stmt);
@@ -1246,7 +1293,13 @@ static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {
             }
             case SQLITE3_TEXT: {
                 const unsigned char *text = sqlite3_column_text(h->stmt, i);
-                value = JS_NewString(ctx, text ? (const char *)text : "");
+                /* Byte count, not strlen: a stored NUL truncated the value.
+                   Measured "a\0b" -> length 1 here while Node gives 3, and the
+                   UDF-argument path below (:420) already does it correctly.
+                   sqlite3_column_text must be called first so the byte count
+                   reflects the UTF-8 conversion. */
+                int len = text ? sqlite3_column_bytes(h->stmt, i) : 0;
+                value = JS_NewStringLen(ctx, text ? (const char *) text : "", (size_t) len);
                 break;
             }
             case SQLITE_BLOB: {
@@ -1292,10 +1345,27 @@ static JSValue tjs__sqlite3_bind_param(JSContext *ctx, sqlite3_stmt *stmt, int i
     }
 
     switch (JS_VALUE_GET_NORM_TAG(v)) {
+        case JS_TAG_SHORT_BIG_INT:
         case JS_TAG_BIG_INT: {
             int64_t x;
+            /* Two defects lived here. (1) Only JS_TAG_BIG_INT was handled, but a
+               BigInt small enough to fit inline carries JS_TAG_SHORT_BIG_INT (=7,
+               a distinct tag from JS_TAG_BIG_INT=-9), so `42n` fell through to
+               default: and was rejected while huge values were accepted — exactly
+               inverted. (2) JS_ToBigInt64 does no range check: quickjs.c:15784
+               documents "return the value mod 2^64", so 2n**63n persisted as a
+               negative and 2n**64n+5n persisted as 5, silently.
+               There is no range-checking variant in this quickjs, so verify by
+               round-trip: convert back and require strict equality. */
             r = JS_ToBigInt64(ctx, &x, v);
             CHECK_VALUE(r, idx);
+            JSValue back = JS_NewBigInt64(ctx, x);
+            bool exact = JS_IsStrictEqual(ctx, back, v);
+            JS_FreeValue(ctx, back);
+            if (!exact) {
+                return JS_ThrowRangeError(ctx,
+                    "BigInt value is out of int64 range at position %d", idx);
+            }
             r = sqlite3_bind_int64(stmt, idx, x);
             CHECK_RET(r);
             break;
@@ -1527,7 +1597,7 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
 
     if (r != SQLITE_OK && r != SQLITE_DONE) {
         JS_FreeValue(ctx, result);
-        return tjs_throw_sqlite3_errno(ctx, r);
+        return tjs_throw_sqlite3_err_db(ctx, sqlite3_db_handle(h->stmt), r);
     }
 
     return result;
@@ -1559,7 +1629,7 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
 
     r = sqlite3_step(h->stmt);
     if (r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) {
-        return tjs_throw_sqlite3_errno(ctx, r);
+        return tjs_throw_sqlite3_err_db(ctx, sqlite3_db_handle(h->stmt), r);
     }
 
     return JS_UNDEFINED;

@@ -329,6 +329,16 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
     int consumed = 0;
 
     if (JS_IsString(argv[0])) {
+        /* Node short-circuits a lone string argument: formatWithOptionsInternal
+         * returns `first` verbatim when args.length === 1, so no specifier
+         * processing happens at all and `%%` is NOT collapsed
+         * (util.format('a%%b') === 'a%%b'). With further arguments the
+         * specifier pass does run and `%%` does collapse to `%`. */
+        if (argc == 1) {
+            format_to_string(ctx, argv[0], buf);
+            return true;
+        }
+
         const char* fmt = JS_ToCString(ctx, argv[0]);
         if (!fmt) return false;
 
@@ -761,7 +771,10 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
     put_color(buf, opts, ANSI_CYAN);
     dbuf_putstr(buf, "[");
     put_reset(buf, opts);
-    if (inline_disp && opts->show_hidden) dbuf_putstr(buf, " ");
+    /* Node pads inline array contents: `[ 1, 2 ]`, not `[1, 2]`. This is not
+     * conditional on show_hidden — format_object does the same unconditionally
+     * for `{ a: 1 }`. The empty-array early return above keeps `[]` bare. */
+    if (inline_disp) dbuf_putstr(buf, " ");
 
     int64_t show = len < opts->max_array_length ? len : opts->max_array_length;
     for (int64_t i = 0; i < show; i++) {
@@ -806,7 +819,7 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
     }
 
     put_color(buf, opts, ANSI_CYAN);
-    if (inline_disp && opts->show_hidden) dbuf_putstr(buf, " ");
+    if (inline_disp) dbuf_putstr(buf, " ");
     dbuf_putstr(buf, "]");
     put_reset(buf, opts);
 

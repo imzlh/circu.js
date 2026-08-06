@@ -388,12 +388,39 @@ static void maybe_close(TJSProcess *p) {
         uv_close(handle, uv__proc_close_cb);
 }
 
+#ifdef _WIN32
+/* Close the pseudoconsole exactly once.
+ *
+ * ConPTY owns the write end of the master output pipe and holds it open until
+ * ClosePseudoConsole(), so EOF on p->pty_readable is otherwise unreachable: a
+ * read-to-EOF loop hangs forever even after the child has exited. Nulling hpc
+ * before the call makes every later caller a no-op, so the GC finalizer and
+ * this exit path can both call it.
+ *
+ * Bytes already buffered in the pipe stay readable after the close, so calling
+ * this the moment the child exits does not truncate output. */
+static void pty_win_close_hpcon(TJSProcess *p) {
+    HPCON hpc = p->hpc;
+    p->hpc = NULL;
+    if (hpc && pClosePseudoConsole) pClosePseudoConsole(hpc);
+}
+#endif
+
 static void process_finish(TJSProcess *p, int64_t exit_status, int term_signal) {
     if (p->status.exited) return;
 
     p->status.exited = true;
     p->status.exit_status = exit_status;
     p->status.term_signal = term_signal;
+
+#ifdef _WIN32
+    /* Every caller reaches here only once the child is confirmed dead
+     * (uv__exit_cb, uv__pty_wait_cb's WAIT_OBJECT_0, waitSync's INFINITE
+     * wait), so releasing the pseudoconsole here cannot cut a live child off.
+     * Done before the promise settles so EOF is already in flight by the time
+     * JS observes the exit. */
+    if (p->pty_mode) pty_win_close_hpcon(p);
+#endif
 
     if (!JS_IsUndefined(p->status.result.p)) {
         JSValue arg = make_exit_obj(p->ctx, exit_status, term_signal);
@@ -467,8 +494,10 @@ static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
         JS_FreeValueRT(rt, p->pty_readable);
         JS_FreeValueRT(rt, p->pty_writable);
 #ifdef _WIN32
-        if (p->hpc && pClosePseudoConsole) pClosePseudoConsole(p->hpc);
-        if (p->pty_proc_handle) CloseHandle(p->pty_proc_handle);
+        /* Normally already closed by process_finish(); this covers a wrapper
+         * collected while the child is still running. */
+        pty_win_close_hpcon(p);
+        if (p->pty_proc_handle) { CloseHandle(p->pty_proc_handle); p->pty_proc_handle = NULL; }
 #else
         /* master_fd is owned by libuv through pty_readable; do NOT close here */
 #endif
@@ -669,6 +698,23 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     STARTUPINFOEXW siEx = { 0 };
     siEx.StartupInfo.cb = sizeof(STARTUPINFOEXW);
     siEx.lpAttributeList = attrList;
+    /* Bind the child's stdio to the pseudoconsole.
+     *
+     * Without STARTF_USESTDHANDLES, CreateProcessW propagates *this* process's
+     * standard handle values into the child, and the console-attach path only
+     * re-points them at the pseudoconsole when they already are console
+     * handles. So whenever cno's own stdio is a pipe or a file (test harness,
+     * CI, any redirection) the child keeps the parent's stdio: its output lands
+     * on our stdout, the PTY master only ever sees ConPTY's 16-byte handshake,
+     * and isatty() is false in the child. Setting the flag with NULL handles
+     * leaves the child's std handles empty, and the pseudoconsole attach then
+     * supplies real ConDrv handles. bInheritHandles stays false: there is
+     * nothing to inherit, and passing true instead hands the child our own
+     * un-inheritable handle values. */
+    siEx.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
+    siEx.StartupInfo.hStdInput  = NULL;
+    siEx.StartupInfo.hStdOutput = NULL;
+    siEx.StartupInfo.hStdError  = NULL;
     PROCESS_INFORMATION pi = { 0 };
     if (!CreateProcessW(wexe, wcmd, NULL, NULL, false,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
@@ -1550,8 +1596,8 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 #ifdef _WIN32
             TerminateProcess(p->pty_proc_handle, 1);
             WaitForSingleObject(p->pty_proc_handle, INFINITE);
-            if (p->hpc && pClosePseudoConsole) pClosePseudoConsole(p->hpc);
-            if (p->pty_proc_handle) CloseHandle(p->pty_proc_handle);
+            pty_win_close_hpcon(p);
+            if (p->pty_proc_handle) { CloseHandle(p->pty_proc_handle); p->pty_proc_handle = NULL; }
 #else
             kill(p->pty_pid, SIGKILL);
             while (waitpid(p->pty_pid, NULL, 0) < 0 && errno == EINTR) {}
@@ -1576,7 +1622,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     uv_process_options_t options;
     memset(&options, 0, sizeof(options));
     uv_stdio_container_t *stdio_heap = NULL;
-    int ipc_child_fd = -1;
+    char *argv0_file_owned = NULL;
 #ifdef _WIN32
     options.flags = UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME;
 #endif
@@ -1593,6 +1639,37 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 
     if (argc >= 2 && JS_IsObject(argv[1])) {
         JSValue arg1 = argv[1];
+
+        /* argv0: run options.file but let the child see a different argv[0]
+         * (Node semantics). options.file currently aliases options.args[0], so
+         * take ownership of the executable string before replacing args[0] —
+         * otherwise tjs__free_args would leave options.file dangling. */
+        JSValue js_argv0 = JS_GetPropertyStr(ctx, arg1, "argv0");
+        if (JS_IsString(js_argv0)) {
+            const char *s = JS_ToCString(ctx, js_argv0);
+            /* Bail rather than fall through: JS_ToCString left an exception
+             * pending, and continuing would spawn the child and return a live
+             * process object with that exception still set -- while also
+             * silently ignoring the caller's argv0. js_argv0 is already known to
+             * be a string, so the only way here is a failed js_alloc_string
+             * inside JS_ToCStringLen2, i.e. OOM; nothing else in that function
+             * runs user JS for a string input. */
+            if (!s) {
+                JS_FreeValue(ctx, js_argv0);
+                goto fail;
+            }
+            char *dup = js_strdup(ctx, s);
+            JS_FreeCString(ctx, s);
+            if (!dup) {
+                JS_FreeValue(ctx, js_argv0);
+                JS_ThrowOutOfMemory(ctx);
+                goto fail;
+            }
+            argv0_file_owned = options.args[0];
+            options.file = argv0_file_owned;
+            options.args[0] = dup;
+        }
+        JS_FreeValue(ctx, js_argv0);
 
         JSValue js_env = JS_GetPropertyStr(ctx, arg1, "env");
         if (JS_IsObject(js_env)) options.env = parse_env_obj(ctx, js_env);
@@ -1655,39 +1732,26 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
             }
             JS_FreeValue(ctx, js_ipc_fd);
 
-            // Create IPC pipe pair
-            int ipc_fds[2];
-#ifdef _WIN32
-            if (_pipe(ipc_fds, 65536, _O_BINARY) != 0) {
-                tjs_throw_errno(ctx, -1);
-                JS_FreeValue(ctx, js_ipc);
-                goto fail;
-            }
-#else
-            if (socketpair(AF_UNIX, SOCK_STREAM, 0, ipc_fds) != 0) {
-                tjs_throw_errno(ctx, uv_translate_sys_error(errno));
-                JS_FreeValue(ctx, js_ipc);
-                goto fail;
-            }
-#endif
-            // Store the read end in the parent process
+            /* Let libuv create the channel instead of _pipe()/socketpair().
+             * An anonymous _pipe() on Windows is UNIDIRECTIONAL: the parent
+             * kept only the read end, so every child.send() failed EPIPE while
+             * child->parent worked, which looked like a broken fork() rather
+             * than a broken transport. libuv's UV_CREATE_PIPE with both
+             * direction flags builds a duplex named pipe on Windows and a
+             * socketpair on Unix (uv__create_stdio_pipe_pair), which is exactly
+             * how Node does IPC. tjs_new_pipe() leaves the handle
+             * uv_pipe_init'd but unconnected, which is the state libuv asserts
+             * on here; it connects both ends during uv_spawn and owns the
+             * child end, so there is no fd for us to close afterwards. */
             p->ipc_pipe = tjs_new_pipe(ctx);
             if (JS_IsException(p->ipc_pipe)) {
-                close(ipc_fds[0]);
-                close(ipc_fds[1]);
                 p->ipc_pipe = JS_UNDEFINED;
                 JS_FreeValue(ctx, js_ipc);
                 goto fail;
             }
             uv_pipe_t *pipe = tjs_pipe_get_pipe(ctx, p->ipc_pipe);
-            int pipe_open_r = pipe ? uv_pipe_open(pipe, ipc_fds[0]) : UV_EINVAL;
-            if (pipe_open_r != 0) {
-                /* libuv did not adopt the read-end fd; close it so it does
-                 * not leak. goto fail returns JS_EXCEPTION, so an exception
-                 * must be pending. */
-                tjs_throw_errno(ctx, pipe_open_r);
-                close(ipc_fds[0]);
-                close(ipc_fds[1]);
+            if (!pipe) {
+                tjs_throw_errno(ctx, UV_EINVAL);
                 JS_FreeValue(ctx, p->ipc_pipe);
                 p->ipc_pipe = JS_UNDEFINED;
                 JS_FreeValue(ctx, js_ipc);
@@ -1696,32 +1760,44 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 
             // Add the peer endpoint to the child's requested stdio fd. Node's
             // child_process allows "ipc" at any stdio array index.
-            ipc_child_fd = ipc_fds[1];
+            //
+            // UV_NONBLOCK_PIPE is required, not an optimisation. Without it
+            // libuv opens the CHILD end with no FILE_FLAG_OVERLAPPED, so
+            // uv_pipe_open() in the child takes the UV_HANDLE_NON_OVERLAPPED_PIPE
+            // path, where a pending read is a *blocking* zero-byte ReadFile on a
+            // threadpool thread (win/pipe.c uv_pipe_zero_readfile_thread_proc).
+            // NT serialises all I/O on a synchronous file object, so that
+            // pending read blocks the child's own WriteFile on the same handle:
+            // the child's send() never reaches the wire until the parent happens
+            // to write first, which deadlocked every `cno test` worker. Measured
+            // in-process against a hand-built pipe pair: child write settles in
+            // 1 ms with the flag and never without it. Unix ignores the flag
+            // (uv__process_init_stdio always uses a plain socketpair), so this is
+            // Windows-only and matches how Node marks its IPC pipe.
+            const unsigned ipc_flags =
+                UV_CREATE_PIPE | UV_READABLE_PIPE | UV_WRITABLE_PIPE | UV_NONBLOCK_PIPE;
             if (ipc_fd < 3) {
                 JS_FreeValue(ctx, p->stdio[ipc_fd]);
                 p->stdio[ipc_fd] = JS_UNDEFINED;
                 /* options.stdio may have been moved to the heap by
                  * setup_extra_stdio(); write through options.stdio so uv_spawn
-                 * actually sees the IPC fd. */
-                options.stdio[ipc_fd].flags = UV_INHERIT_FD;
-                options.stdio[ipc_fd].data.fd = ipc_child_fd;
+                 * actually sees the IPC pipe. */
+                options.stdio[ipc_fd].flags = ipc_flags;
+                options.stdio[ipc_fd].data.stream = (uv_stream_t *) pipe;
             } else {
                 if (ensure_stdio_capacity(ctx, &options, stdio, &stdio_heap, (int)ipc_fd + 1) < 0) {
-                    close(ipc_fds[1]);
-                    ipc_child_fd = -1;
                     JS_ThrowOutOfMemory(ctx);
+                    JS_FreeValue(ctx, p->ipc_pipe);
+                    p->ipc_pipe = JS_UNDEFINED;
                     JS_FreeValue(ctx, js_ipc);
                     goto fail;
                 }
                 if (!JS_IsUndefined(p->stdio_extra)) {
                     JS_SetPropertyUint32(ctx, p->stdio_extra, ipc_fd, JS_NULL);
                 }
-                options.stdio[ipc_fd].flags = UV_INHERIT_FD;
-                options.stdio[ipc_fd].data.fd = ipc_child_fd;
+                options.stdio[ipc_fd].flags = ipc_flags;
+                options.stdio[ipc_fd].data.stream = (uv_stream_t *) pipe;
             }
-
-            // Store write fd info for cleanup
-            // Note: we'll close it after spawn
         }
         JS_FreeValue(ctx, js_ipc);
 
@@ -1732,6 +1808,14 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         JSValue js_bg = JS_GetPropertyStr(ctx, arg1, "background");
         if (JS_IsEqual(ctx, js_bg, JS_TRUE)) options.flags |= UV_PROCESS_WINDOWS_HIDE;
         JS_FreeValue(ctx, js_bg);
+        /* windowsVerbatimArguments: hand the command line to CreateProcess
+         * unmodified. Without it libuv's quote_cmd_arg() rewrites inner " as \"
+         * and cmd.exe passes the backslashes through literally, so any shell
+         * command containing quotes is corrupted. Node exposes the same option
+         * and forces it on for shell spawns. */
+        JSValue js_verbatim = JS_GetPropertyStr(ctx, arg1, "windowsVerbatimArguments");
+        if (JS_IsEqual(ctx, js_verbatim, JS_TRUE)) options.flags |= UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS;
+        JS_FreeValue(ctx, js_verbatim);
 #endif
     }
 
@@ -1740,11 +1824,8 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
     p->handle_initialized = true;
 
-    // Close child endpoint of IPC pipe in parent (child owns it now)
-    if (ipc_child_fd >= 0) {
-        close(ipc_child_fd);
-        ipc_child_fd = -1;
-    }
+    /* libuv created and owns both ends of the UV_CREATE_PIPE IPC channel and
+     * closes the child end itself, so there is nothing to close here. */
 
     JS_SetOpaque(obj, p);
     p->obj = JS_DupValue(ctx, obj);
@@ -1752,7 +1833,6 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     goto cleanup;
 
 fail:
-    if (ipc_child_fd >= 0) close(ipc_child_fd);
     for (int i = 0; i < 3; i++) { JS_FreeValue(ctx, p->stdio[i]); p->stdio[i] = JS_UNDEFINED; }
     JS_FreeValue(ctx, p->stdio_extra);
     p->stdio_extra = JS_UNDEFINED;
@@ -1762,6 +1842,7 @@ fail:
     JS_FreeValue(ctx, obj);
 cleanup:
     tjs__free_args(ctx, options.args);
+    if (argv0_file_owned) js_free(ctx, argv0_file_owned);
     free_env(ctx, (char **)options.env);
     if (options.cwd) js_free(ctx, (void *)options.cwd);
     if (stdio_heap) js_free(ctx, stdio_heap);
@@ -1909,7 +1990,15 @@ static JSValue tjs_process_resize(JSContext *ctx, JSValue this_val, int argc, JS
         return JS_EXCEPTION;
 
 #ifdef _WIN32
-    if (!p->hpc) return JS_ThrowInternalError(ctx, "ConPTY unavailable");
+    /* After the child exits the pseudoconsole is gone (process_finish releases
+     * it so the master pipe can reach EOF). POSIX still accepts a resize on the
+     * surviving master fd, so keep the tracked size coherent rather than
+     * throwing on a difference JS callers cannot see. */
+    if (!p->hpc) {
+        if (!p->status.exited) return JS_ThrowInternalError(ctx, "ConPTY unavailable");
+        p->pty_cols = cols; p->pty_rows = rows;
+        return JS_UNDEFINED;
+    }
     COORD sz = { (SHORT)cols, (SHORT)rows };
     HRESULT hr = pResizePseudoConsole(p->hpc, sz);
     if (FAILED(hr)) return JS_ThrowInternalError(ctx, "ResizePseudoConsole failed: 0x%08lx", hr);

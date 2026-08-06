@@ -30,6 +30,164 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+/* utils.h -> <uv.h> -> uv/win.h already defines _WIN32_WINNT as 0x0A00
+ * (deps/libuv/include/uv/win.h:23), so GetCurrentThreadStackLimits — which
+ * needs >= 0x0602 — is declared. This matters because the build compiles with
+ * /W4 /WX (CMakeLists.txt:46), where an implicit declaration is a hard error. */
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#else
+#include <pthread.h>
+#include <sys/resource.h>
+#endif
+
+
+/* ---- native stack bounds -------------------------------------------------
+ *
+ * JS_SetMaxStackSize only stores the number; QuickJS derives its soft limit as
+ * `stack_limit = stack_top - stack_size` (deps/quickjs/quickjs.c,
+ * update_stack_limit at :3473) and nothing checks that against the stack the
+ * thread actually owns. Once stack_size reaches the real stack size the limit
+ * lands at or below the guard page, js_check_stack_overflow (:2320) can never
+ * fire, and an ordinary JS recursion walks into the guard page instead of
+ * raising a RangeError.
+ *
+ * OBSERVED 2026-08-06, Windows 11 x64, build/stage/cno.exe (Debug build, links
+ * /STACK:8388608 per CMakeLists.txt:51), script recursing until it catches:
+ *
+ *     --max-stack-size=8160KB -> rc 0, "CAUGHT RangeError depth= 382"
+ *     --max-stack-size=8176KB -> rc -1073741571 (0xC00000FD,
+ *                                STATUS_STACK_OVERFLOW) with stdout AND
+ *                                stderr COMPLETELY EMPTY
+ *     --max-stack-size=8MB..1GB -> same silent 0xC00000FD
+ *
+ * So the cliff sat ~16-32KB under the 8MB reserve, i.e. exactly at the guard
+ * region. Real node has the same defect (`node --stack-size=16000` dies with
+ * no output at all, OBSERVED), so clamping here is hardening past node rather
+ * than a parity fix.
+ *
+ * A requested size of 0 is NOT "engine default" either: update_stack_limit
+ * reads 0 as "no limit", which is the same silent crash with no way to opt out
+ * of it. tjs__clamp_stack_size therefore maps 0 onto the platform maximum.
+ *
+ * Both bounds come from the OS, never from the current stack pointer, so the
+ * answer does not depend on how deep the caller happens to be. That is
+ * required: the CLI flag arrives via engine.setMaxStackSize() from
+ * cts/src/config.ts:356, dozens of JS frames deep, where an sp-relative
+ * measurement would under-report by hundreds of KB.
+ */
+static bool tjs__native_stack_bounds(uintptr_t *low, uintptr_t *high) {
+#if defined(_WIN32)
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    if (hi <= lo) {
+        return false;
+    }
+    *low = (uintptr_t) lo;
+    *high = (uintptr_t) hi;
+    return true;
+#elif defined(__APPLE__)
+    /* Returns the BASE (highest address) on Darwin, not the low end. */
+    void *base = pthread_get_stackaddr_np(pthread_self());
+    size_t size = pthread_get_stacksize_np(pthread_self());
+    if (base == NULL || size == 0) {
+        return false;
+    }
+    *high = (uintptr_t) base;
+    *low = (uintptr_t) base - size;
+    return true;
+#elif defined(__linux__) && defined(__GLIBC__)
+    pthread_attr_t attr;
+    void *addr = NULL;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+        return false;
+    }
+    if (pthread_attr_getstack(&attr, &addr, &size) != 0 || addr == NULL || size == 0) {
+        pthread_attr_destroy(&attr);
+        return false;
+    }
+    pthread_attr_destroy(&attr);
+    *low = (uintptr_t) addr;
+    *high = (uintptr_t) addr + size;
+    return true;
+#else
+    /* Portable fallback: no way to locate the stack, so only its SIZE is
+     * known. Report a synthetic window of that size ending at the current
+     * frame — tjs__clamp_stack_size only ever uses (high - low). */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) != 0) {
+        return false;
+    }
+    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur == 0) {
+        return false; /* unknown -> caller leaves the request alone */
+    }
+    uintptr_t here = (uintptr_t) &rl;
+    if ((uintptr_t) rl.rlim_cur >= here) {
+        return false;
+    }
+    *high = here;
+    *low = here - (uintptr_t) rl.rlim_cur;
+    return true;
+#endif
+}
+
+/* Headroom kept below QuickJS's soft limit, so that the limit fires while
+ * there is still real stack left for the guard region and for the C frames
+ * that build and propagate the RangeError. The observed cliff needed only
+ * ~32KB; 512KB costs ~6% of usable depth on an 8MB stack and absorbs the
+ * platform-to-platform variation in guard size and frame cost. Small stacks
+ * (Darwin secondary threads default to 512KB) take the proportional branch so
+ * the headroom can never consume the whole stack. */
+#define TJS__STACK_HEADROOM   (512 * 1024)
+#define TJS__STACK_MIN_LIMIT  (64 * 1024)
+
+/* Mirrors TJS__DEFAULT_STACK_SIZE (vm.c:49). Duplicated rather than shared
+ * because that macro lives in vm.c, not in a header, and utils.h is owned
+ * elsewhere. Keep the two in sync. */
+#define TJS__STACK_FALLBACK   (6 * 1024 * 1024)
+
+size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped) {
+    uintptr_t low = 0, high = 0;
+
+    if (was_clamped != NULL) {
+        *was_clamped = false;
+    }
+
+    if (!tjs__native_stack_bounds(&low, &high)) {
+        /* Platform did not tell us. Honour the request rather than silently
+         * shrinking it — but never leave it at 0/"no limit", which is the one
+         * value guaranteed to crash. */
+        return requested == 0 ? (size_t) TJS__STACK_FALLBACK : requested;
+    }
+
+    size_t total = (size_t) (high - low);
+    size_t headroom = total / 8 < (size_t) TJS__STACK_HEADROOM ? total / 8 : (size_t) TJS__STACK_HEADROOM;
+    size_t max_usable = total > headroom ? total - headroom : 0;
+
+    if (max_usable < (size_t) TJS__STACK_MIN_LIMIT) {
+        /* Pathologically small stack: a limit this low cannot be honoured
+         * meaningfully, but 0 must still not be propagated. */
+        max_usable = (size_t) TJS__STACK_MIN_LIMIT;
+    }
+
+    /* 0 means "no limit" to QuickJS, so it is the maximum request, not a
+     * pass-through. */
+    if (requested == 0 || requested > max_usable) {
+        if (was_clamped != NULL) {
+            *was_clamped = true;
+        }
+        return max_usable;
+    }
+    return requested;
+}
+
+size_t tjs__max_usable_stack_size(void) {
+    return tjs__clamp_stack_size(0, NULL);
+}
+
 
 void tjs_assert(const struct AssertionInfo info) {
     fprintf(stderr,

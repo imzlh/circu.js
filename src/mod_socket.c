@@ -285,10 +285,13 @@ static JSValue tjs_sock_recv(JSContext *ctx, JSValue this_val, int argc, JSValue
 /* send: write bytes (cross-platform via send) */
 static JSValue tjs_sock_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     GET_SOCK(ctx, this_val, s);
-    ARGV_BUF(ctx, argv, 0, buf, sz);
+    /* Convert flags BEFORE capturing the backing store: JS_ToUint32 can run a
+     * user valueOf() that detaches argv[0] and frees the memory (see the
+     * setsockopt ordering below). */
     unsigned flags = 0;
     if (argc > 1 && !JS_IsUndefined(argv[1]))
         JS_ToUint32(ctx, &flags, argv[1]);
+    ARGV_BUF(ctx, argv, 0, buf, sz);
     int ret = send(s->sock, (const char *) buf, sz, (int) flags);
     RET_THROW_ERRNO(ctx, ret >= 0);
     return JS_NewUint32(ctx, ret);
@@ -388,6 +391,12 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     GET_SOCK(ctx, this_val, s);
     if (argc < 4) return JS_ThrowInternalError(ctx, "expected at least 4 arguments");
 
+    /* Convert flags BEFORE capturing any backing store: JS_ToUint32 can run a
+     * user valueOf() that detaches argv[0]/argv[1]. No JS may run between
+     * acquiring a raw buffer pointer and sendmsg(). */
+    unsigned flags;
+    TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &flags, argv[2]), 2, "uint");
+
     struct msghdr msg = {0};
 
     if (!JS_IsUndefined(argv[0])) {
@@ -400,8 +409,6 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         msg.msg_control    = cbuf;
         msg.msg_controllen = csz;
     }
-    unsigned flags;
-    TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &flags, argv[2]), 2, "uint");
 
     msg.msg_iovlen = argc - 3;
     msg.msg_iov    = js_malloc(ctx, sizeof(struct iovec) * msg.msg_iovlen);

@@ -256,7 +256,14 @@ static TJSDirEnt *tjs_dirent_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_dirent_class_id);
 }
 
+/* On Windows the caller also passes the full 64-bit FILETIME-derived times,
+ * because uv_stat_t's tv_sec is only 32 bits wide there. times may be NULL or
+ * invalid, in which case libuv's own (truncated) values are used. */
+#ifdef _WIN32
+static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st, const tjs_win_stat_times_t *times) {
+#else
 static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st) {
+#endif
     JSValue obj = JS_NewObjectClass(ctx, tjs_stat_class_id);
     if (JS_IsException(obj)) {
         return obj;
@@ -286,12 +293,26 @@ static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st) {
     SET_UINT64_FIELD(flags);
 #undef SET_UINT64_FIELD
 
+/* Keep this expression identical to build_uv_stat_obj() in mod_fs.c: sync and
+ * async stat must report the same number for the same file. */
+#ifdef _WIN32
+#define SET_TIMESPEC_FIELD(x)                                                                                          \
+    JS_DefinePropertyValueStr(ctx,                                                                                     \
+                              obj,                                                                                     \
+                              STRINGIFY(x),                                                                            \
+                              JS_NewDate(ctx,                                                                          \
+                                         (times && times->valid)                                                       \
+                                             ? times->x##_ms                                                           \
+                                             : (st->st_##x.tv_sec * 1e3 + st->st_##x.tv_nsec / 1e6)),                  \
+                              JS_PROP_C_W_E);
+#else
 #define SET_TIMESPEC_FIELD(x)                                                                                          \
     JS_DefinePropertyValueStr(ctx,                                                                                     \
                               obj,                                                                                     \
                               STRINGIFY(x),                                                                            \
                               JS_NewDate(ctx, st->st_##x.tv_sec * 1e3 + st->st_##x.tv_nsec / 1e6),                     \
                               JS_PROP_C_W_E);
+#endif
     SET_TIMESPEC_FIELD(atim);
     SET_TIMESPEC_FIELD(mtim);
     SET_TIMESPEC_FIELD(ctim);
@@ -399,7 +420,28 @@ static void uv__fs_req_cb(uv_fs_t *req) {
         case UV_FS_STAT:
         case UV_FS_LSTAT:
         case UV_FS_FSTAT:
+#ifdef _WIN32
+        {
+            /* Re-read the timestamps as 64-bit FILETIMEs; uv_stat_t truncated
+             * them to 32 bits. Safe here: uv__fs_done runs this callback on the
+             * loop thread, and uv_fs_req_cleanup() (which frees req.path) is
+             * only called further down at the end of this function, so both
+             * req.path and req.file.fd are still valid. */
+            tjs_win_stat_times_t wtimes;
+            wtimes.valid = 0;
+            if (req->fs_type == UV_FS_FSTAT) {
+                if (fr->req.file.fd >= 0) {
+                    tjs_win_stat_times_from_fd(fr->req.file.fd, &wtimes);
+                }
+            } else if (fr->req.path) {
+                /* LSTAT must not follow the link. */
+                tjs_win_stat_times_from_path(fr->req.path, req->fs_type == UV_FS_LSTAT ? 0 : 1, &wtimes);
+            }
+            arg = tjs_new_stat(ctx, &fr->req.statbuf, &wtimes);
+        }
+#else
             arg = tjs_new_stat(ctx, &fr->req.statbuf);
+#endif
             break;
 
         case UV_FS_STATFS:
@@ -1128,8 +1170,16 @@ static JSValue tjs_fs_stat_sync(JSContext *ctx, JSValue this_val, int argc, JSVa
         return err;
     }
 
+#ifdef _WIN32
+    /* Read the 64-bit FILETIME while path is still alive. */
+    tjs_win_stat_times_t wtimes;
+    tjs_win_stat_times_from_path(path, 1, &wtimes);
+    JS_FreeCString(ctx, path);
+    JSValue ret = tjs_new_stat(ctx, &req.statbuf, &wtimes);
+#else
     JS_FreeCString(ctx, path);
     JSValue ret = tjs_new_stat(ctx, &req.statbuf);
+#endif
     uv_fs_req_cleanup(&req);
 
     return ret;

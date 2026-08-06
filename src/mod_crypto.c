@@ -1569,11 +1569,12 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
 
 /* CRC32 implementation */
 static uint32_t crc32_table[256];
-static int crc32_table_initialized = 0;
+static uv_once_t crc32_table_once = UV_ONCE_INIT;
 
-static void init_crc32_table(void) {
-    if (crc32_table_initialized) return;
-    
+/* Process-global table built lazily; crc32() also runs on worker threads, so a
+ * plain `static int initialized` flag races (one thread reads a half-built
+ * table). uv_once is safe. */
+static void init_crc32_table_once(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int j = 0; j < 8; j++) {
@@ -1581,7 +1582,10 @@ static void init_crc32_table(void) {
         }
         crc32_table[i] = c;
     }
-    crc32_table_initialized = 1;
+}
+
+static void init_crc32_table(void) {
+    uv_once(&crc32_table_once, init_crc32_table_once);
 }
 
 static JSValue tjs_crypto_crc32(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {

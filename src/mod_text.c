@@ -187,6 +187,34 @@ static const char *normalize_encoding_name(const char *enc) {
     return enc;
 }
 
+/* Code-unit width, in bytes, of a *source* encoding. EILSEQ recovery must
+ * resync on a code-unit boundary: dropping a single byte of a UTF-16 or UTF-32
+ * stream misaligns every unit that follows, so the whole remainder decodes to
+ * garbage with no error raised.
+ *
+ * Only fixed-width multi-byte families are listed. Byte-oriented encodings
+ * (UTF-8, ISO-8859-*, ASCII, Shift_JIS, GB18030, ...) must keep skipping one
+ * byte: they resync at byte granularity, and widening them here would corrupt
+ * input that decodes correctly today. Anything unrecognized falls back to 1,
+ * which is the pre-existing behaviour.
+ *
+ * Normalized spellings come from normalize_encoding_name(); the bare "UTF-16"/
+ * "UTF-32" and UCS aliases are also matched because a label that normalizer
+ * does not rewrite is handed to iconv verbatim and can still reach here. */
+static size_t encoding_unit_width(const char *enc) {
+    if (!enc)
+        return 1;
+    if (strcasecmp(enc, "UTF-16LE") == 0 || strcasecmp(enc, "UTF-16BE") == 0 ||
+        strcasecmp(enc, "UTF-16") == 0 || strcasecmp(enc, "UCS-2") == 0 ||
+        strcasecmp(enc, "UCS-2LE") == 0 || strcasecmp(enc, "UCS-2BE") == 0)
+        return 2;
+    if (strcasecmp(enc, "UTF-32LE") == 0 || strcasecmp(enc, "UTF-32BE") == 0 ||
+        strcasecmp(enc, "UTF-32") == 0 || strcasecmp(enc, "UCS-4") == 0 ||
+        strcasecmp(enc, "UCS-4LE") == 0 || strcasecmp(enc, "UCS-4BE") == 0)
+        return 4;
+    return 1;
+}
+
 /* Count UTF-16 code units in the first `n` bytes of a (valid) UTF-8 buffer.
  * Used by encodeInto() to report `read` per the WHATWG spec. iconv only ever
  * consumes whole code points, so `n` always lands on a code-point boundary. */
@@ -216,7 +244,8 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
  *  - Grows `gb` on E2BIG (never drops output, never overflows).
  *  - On EILSEQ: if `fatal`, throws and returns -1; otherwise emits one
  *    replacement (U+FFFD for UTF-8 targets, '?' otherwise) and resyncs by
- *    skipping one input byte.
+ *    skipping one source code unit -- `unit` bytes, from
+ *    encoding_unit_width() of the *input* encoding.
  *  - On EINVAL (incomplete trailing sequence): stops and reports the number of
  *    unconsumed trailing bytes via *trailing_out (caller decides whether to
  *    buffer them for streaming or treat them as an error / replacement).
@@ -225,7 +254,7 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
  * ==========================================================================*/
 static int iconv_drive(JSContext *ctx, iconv_t cd,
                        const char *inbuf, size_t inlen,
-                       bool fatal, bool to_utf8,
+                       bool fatal, bool to_utf8, size_t unit,
                        growbuf_t *gb, size_t *trailing_out) {
     char *inptr = (char *)inbuf;
     size_t inleft = inlen;
@@ -265,9 +294,16 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
                 JS_ThrowTypeError(ctx, "The encoded data was not valid");
                 return -1;
             }
-            /* Resync: drop one byte and emit a single replacement. */
-            inptr++;
-            inleft--;
+            /* Resync on a code-unit boundary and emit a single replacement.
+             * Advancing a single byte would misalign every following unit of a
+             * UTF-16/UTF-32 stream, silently garbling the whole remainder. A
+             * short tail (fewer than `unit` bytes left) is consumed whole so
+             * one bad unit yields exactly one replacement. `unit` is >= 1 and
+             * `inleft` is > 0 here, so `skip` is always >= 1 and the loop
+             * always makes progress. */
+            size_t skip = (inleft < unit) ? inleft : unit;
+            inptr += skip;
+            inleft -= skip;
             if (to_utf8) {
                 if (gb_put(ctx, gb, kUtf8Replacement, sizeof kUtf8Replacement) < 0) {
                     JS_ThrowOutOfMemory(ctx);
@@ -482,7 +518,8 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
     growbuf_t gb = {0};
     size_t trailing = 0;
     int rc = iconv_drive(ctx, dec->cd, conv_in, conv_len,
-                         dec->fatal, /*to_utf8=*/true, &gb, &trailing);
+                         dec->fatal, /*to_utf8=*/true,
+                         encoding_unit_width(dec->encoding), &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
         /* Incomplete sequence at the end of input. */
@@ -637,8 +674,11 @@ static JSValue tjs_text_encoder_encode(JSContext *ctx, JSValueConst this_val,
     growbuf_t gb = {0};
     /* TextEncoder never throws on bad data; unrepresentable chars in a custom
      * target encoding become '?'. */
+    /* The source is always the UTF-8 C-string from JS, never enc->encoding
+     * (which is the *target*), so the resync unit is 1 byte. */
     int rc = iconv_drive(ctx, enc->cd, str, str_len,
-                         /*fatal=*/false, /*to_utf8=*/enc->is_utf8, &gb, NULL);
+                         /*fatal=*/false, /*to_utf8=*/enc->is_utf8,
+                         /*unit=*/1, &gb, NULL);
     JS_FreeCString(ctx, str);
 
     if (rc != 0) {
@@ -773,6 +813,12 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     }
 
     bool is_to_utf8 = (strcasecmp(to_n, "UTF-8") == 0);
+    /* Resync width of the *source* encoding. Must be computed here, BEFORE the
+     * JS_FreeCString() below: normalize_encoding_name() returns either a static
+     * literal or its own argument, so for any label it does not rewrite
+     * (e.g. "windows-1252") `from_n` aliases into `from` and reading it after
+     * the free is a use-after-free. Same reason `is_to_utf8` is computed early. */
+    size_t from_unit = encoding_unit_width(from_n);
 
     /* from/to C strings are no longer needed for formatting; the data buffer is
      * acquired last and used without any further JS calls. */
@@ -789,7 +835,7 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     growbuf_t gb = {0};
     size_t trailing = 0;
     int rc = iconv_drive(ctx, cd, (const char *)inbuf, inlen,
-                         /*fatal=*/false, is_to_utf8, &gb, &trailing);
+                         /*fatal=*/false, is_to_utf8, from_unit, &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
         /* Best-effort: stand in one replacement for the incomplete tail. */
