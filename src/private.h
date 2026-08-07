@@ -197,7 +197,6 @@ void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_nodeapi_init(JSContext *ctx, JSValue ns);
 void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
-void tjs__mod_brotli_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
@@ -214,6 +213,10 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns);
 
 #ifdef CJS__HAS_WASM
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
+#endif
+
+#ifdef CJS_HAVE_BROTLI
+void tjs__mod_brotli_init(JSContext* ctx, JSValue ns);
 #endif
 
 #ifdef _WIN32

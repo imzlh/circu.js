@@ -50,7 +50,9 @@ static const struct TJSModule tjs_modules[] = {
 	{ "algorithm", tjs__mod_algorithm_init, true },
 	{ "asyncfs", tjs__mod_asyncfs_init, true },
 	{ "bjson", tjs__mod_bjson_init, true },
+#ifdef CJS_HAVE_BROTLI
 	{ "brotli", tjs__mod_brotli_init, true },
+#endif
 	{ "curl", tjs__mod_curl_init, true },
 	{ "crypto", tjs__mod_crypto_init, true },
 	{ "console", tjs__mod_console_init, true },

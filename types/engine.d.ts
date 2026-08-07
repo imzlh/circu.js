@@ -164,17 +164,12 @@ declare namespace CModuleEngine {
         wasm3?: string;
         /** If compiled with mimalloc (number) */
         mimalloc?: number;
+        /** If compiled with brotil */
+        brotli?: string;
 
         /** Core circu.js version */
         core: string;
     }
-
-    /**
-     * Expat XML parser version string.
-     *
-     * Exported directly on the engine module, not inside `versions`.
-     */
-    export const EXPAT_VERSION: string;
 
     /**
      * Set engine memory limit
@@ -341,7 +336,7 @@ declare namespace CModuleEngine {
          * Resolve dependencies, initialize `import.meta`, and evaluate as a
          * module.
          */
-        eval(): Promise;
+        eval(): Promise<any>;
 
         /**
          * Start resolving dependencies. Throws on error

@@ -794,19 +794,6 @@ void tjs__mod_brotli_init(JSContext *ctx, JSValue ns) {
     JS_SetClassProto(ctx, tjs_brotli_decompress_class_id, decompress_proto);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_brotli_funcs, countof(tjs_brotli_funcs));
-
-    /* Runtime version string, e.g. "1.1.0" */
-    uint32_t v = BrotliEncoderVersion();
-    char ver[32];
-    snprintf(ver, sizeof(ver), "%u.%u.%u", (v >> 24) & 0xFFF, (v >> 12) & 0xFFF, v & 0xFFF);
-    JS_DefinePropertyValueStr(ctx, ns, "version", JS_NewString(ctx, ver), JS_PROP_C_W_E);
-}
-
-#else /* !CJS_HAVE_BROTLI */
-
-/* Brotli unavailable at build time: expose only a feature-detection flag. */
-void tjs__mod_brotli_init(JSContext *ctx, JSValue ns) {
-    JS_DefinePropertyValueStr(ctx, ns, "available", JS_NewBool(ctx, 0), JS_PROP_C_W_E);
 }
 
 #endif /* CJS_HAVE_BROTLI */

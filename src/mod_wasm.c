@@ -1734,33 +1734,6 @@ static JSValue tjs_wasm_resolvetableimports(JSContext *ctx, JSValue this_val, in
  * memoryDescs is an array of { module: string, name: string, initial: number, maximum?: number }
  * Creates a WASMMemory stub with the matching type and links it into the module's import.
  */
-/* Read the byte range currently backing a JS WebAssembly.Memory.
- * Goes through the public `buffer` getter so it works both for a standalone
- * Memory (its own ArrayBuffer) and for one already bound to an instance (a view
- * over WAMR linear memory). Returns the ArrayBuffer JSValue -- the caller must
- * free it, and must not use *pptr after that. */
-static JSValue tjs__wasm_js_memory_bytes(JSContext *ctx, JSValue mem_obj, uint8_t **pptr, size_t *plen) {
-    *pptr = NULL;
-    *plen = 0;
-    JSValue buf = JS_GetPropertyStr(ctx, mem_obj, "buffer");
-    if (JS_IsException(buf))
-        return buf;
-    size_t len = 0;
-    uint8_t *ptr = JS_GetArrayBuffer(ctx, &len, buf);
-    if (!ptr) {
-        /* A zero-length ArrayBuffer legitimately yields NULL with no exception. */
-        if (!JS_HasException(ctx)) {
-            JS_FreeValue(ctx, buf);
-            return JS_UNDEFINED;
-        }
-        JS_FreeValue(ctx, buf);
-        return JS_EXCEPTION;
-    }
-    *pptr = ptr;
-    *plen = len;
-    return buf;
-}
-
 static JSValue tjs_wasm_resolvememoryimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {

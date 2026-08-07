@@ -77,11 +77,6 @@ declare namespace CModuleBrotli {
         getTotalOut(): number;
     }
 
-    /** True when built with libbrotli (always true in this module namespace) */
-    export const available: boolean;
-    /** libbrotli version string, e.g. "1.1.0" */
-    export const version: string;
-
     /**
      * Compress data with Brotli.
      * @param data - Input data

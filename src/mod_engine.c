@@ -1363,9 +1363,13 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
 #endif
     ;
     JS_DefinePropertyValueStr(ctx, versions, "expat", JS_NewString(ctx, expat_version), JS_PROP_C_W_E);
-
-    /* Export version info */
-    JS_SetPropertyStr(ctx, ns, "EXPAT_VERSION", JS_NewString(ctx, expat_version));
+#ifdef CJS_HAVE_BROTLI
+    /* Runtime version string, e.g. "1.1.0" */
+    uint32_t v = BrotliEncoderVersion();
+    char ver[32];
+    snprintf(ver, sizeof(ver), "%u.%u.%u", (v >> 24) & 0xFFF, (v >> 12) & 0xFFF, v & 0xFFF);
+    JS_DefinePropertyValueStr(ctx, versions, "brotli", JS_NewString(ctx, ver), JS_PROP_C_W_E);
+#endif
 
     JSValue gc = JS_NewObjectProto(ctx, JS_NULL);
     JS_SetPropertyFunctionList(ctx, gc, tjs_gc_funcs, countof(tjs_gc_funcs));
