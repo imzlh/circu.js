@@ -75,6 +75,12 @@ struct TJSRuntime {
         uv_prepare_t prepare;
 		bool paused;
 		int waitio_depth;  /* Track nested waitIO calls */
+		/* Set by engine.notifyNextTick() when a callback lands in an empty
+		 * nextTick queue, cleared by tjs__run_next_ticks() before it calls the
+		 * JS drain. ticks_draining guards against re-entering the drain when a
+		 * tick callback synchronously pumps the loop again. */
+		bool ticks_pending;
+		bool ticks_draining;
     } jobs;
     uv_async_t stop;
 
@@ -101,6 +107,10 @@ struct TJSRuntime {
         JSValue promise_hook_fn;
 		JSValue message_pipe;	// for worker messaging
 		JSValue worker_udata;	// user-data passed from parent
+		/* process.nextTick drain, registered from cno/src/node/process/mod.ts
+		 * via engine.setNextTickDrain(). Node keeps the nextTick queue OUTSIDE
+		 * the promise job queue; this is how tjs__execute_jobs() reaches it. */
+		JSValue nexttick_drain_fn;
     } builtins;
 	struct {
 		JSValue resolver;
@@ -256,6 +266,9 @@ uv_pipe_t *tjs_pipe_get_pipe(JSContext *ctx, JSValue obj);
 void tjs_pipe_set_pty_master(JSContext *ctx, JSValue obj);
 
 void tjs__execute_jobs(TJSRuntime *trt);
+/* Runs the JS-side process.nextTick drain if one is registered and ticks are
+ * pending. Defined in mod_engine.c, called from tjs__execute_jobs() in vm.c. */
+void tjs__run_next_ticks(TJSRuntime *trt);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);
 
 JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value);

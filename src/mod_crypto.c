@@ -358,10 +358,23 @@ static const char* tjs_crypto_key_type_name(EVP_PKEY* pkey) {
 
     switch (EVP_PKEY_base_id(pkey)) {
         case EVP_PKEY_RSA:
-        case EVP_PKEY_RSA_PSS:
             return "rsa";
+        case EVP_PKEY_RSA_PSS:
+            return "rsa-pss";
         case EVP_PKEY_EC:
             return "ec";
+        case EVP_PKEY_ED25519:
+            return "ed25519";
+        case EVP_PKEY_ED448:
+            return "ed448";
+        case EVP_PKEY_X25519:
+            return "x25519";
+        case EVP_PKEY_X448:
+            return "x448";
+        case EVP_PKEY_DSA:
+            return "dsa";
+        case EVP_PKEY_DH:
+            return "dh";
         default:
             return NULL;
     }
@@ -466,7 +479,7 @@ static JSValue tjs_crypto_export_key(JSContext* ctx, JSValueConst this_val, int 
             ok = PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL);
             break;
         case KEY_OP_EXPORT_PRIVATE_DER:
-            ok = i2d_PrivateKey_bio(bio, pkey);
+            ok = i2d_PKCS8PrivateKey_bio(bio, pkey, NULL, NULL, 0, NULL, NULL);
             break;
         case KEY_OP_EXPORT_PUBLIC_PEM:
         case KEY_OP_DERIVE_PUBLIC_PEM:

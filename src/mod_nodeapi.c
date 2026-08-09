@@ -14,22 +14,6 @@
  * all copies or substantial portions of the Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
- *
- * --------------------------------------------------------------------------
- * Design notes (see also AGENT.md / plan):
- *   - napi_value  == pointer to a JSValue slot owned by the current handle
- *     scope. Handle scopes are block-allocated linked lists so slot pointers
- *     stay stable across growth.
- *   - napi_env    == one per loaded addon, created in tjs__napi_dlopen and
- *     freed by a JS runtime finalizer registered on first use.
- *   - Exceptions follow the N-API "pending exception" model: napi_throw_*
- *     stash the value on env->pending_exception; the C-function trampoline
- *     re-throws into QuickJS when control returns to JS.
- *   - This whole module lives in a single translation unit on purpose: the
- *     napi_* symbols are only referenced dynamically by dlopen'd addons, so
- *     keeping them in one object file (pulled in via tjs__mod_nodeapi_init in
- *     the static module table) guarantees the linker keeps them in the host
- *     executable's dynamic symbol table.
  */
 
 /* Request the full v9 surface from the public headers. Must precede includes. */
@@ -108,6 +92,8 @@ typedef struct {
     /* optional type tag (napi_type_tag_object) */
     bool has_tag;
     napi_type_tag tag;
+    /* True while this carrier holds a live napi_wrap payload. */
+    bool wrapped;
 } napi_ext_payload;
 
 /* C-function closure bundle, carried inside a func object's data. */
@@ -1027,6 +1013,10 @@ napi_get_value_string_utf8(napi_env env, napi_value value, char *buf, size_t buf
         if (result) *result = len;
     } else if (bufsize > 0) {
         size_t n = len < bufsize - 1 ? len : bufsize - 1;
+        /* Never split a multi-byte sequence. */
+        if (n < len) {
+            while (n > 0 && ((unsigned char) s[n] & 0xC0) == 0x80) n--;
+        }
         memcpy(buf, s, n);
         buf[n] = '\0';
         if (result) *result = n;
@@ -1635,6 +1625,25 @@ napi_define_class(napi_env env, const char *utf8name, size_t length,
 /* Wrap / unwrap / external / type tags                                       */
 /* ========================================================================== */
 
+/* Neutralise a carrier's finalizer before dropping it on an error path.
+ *
+ * N-API's contract is that a FAILED napi_wrap / napi_add_finalizer leaves
+ * ownership of the native pointer with the caller, so the addon frees it
+ * itself. Running finalize_cb here as well is a double free -- OBSERVED as
+ * STATUS_HEAP_CORRUPTION (0xC0000374) from an addon that merely followed the
+ * documented contract, where node exits 0. */
+static void napi_disarm_ext(JSValue carrier) {
+    napi_ext_payload *p = JS_GetOpaque(carrier, napi_ext_class_id);
+    if (p) p->finalize_cb = NULL;
+}
+
+/* Forward: napi_wrap (below) consults an existing payload before replacing it,
+ * but the definition sits after napi_unwrap. Without this prototype the call at
+ * napi_wrap is an implicit declaration returning int, which /W4 /WX rejects as
+ * C4047 on the pointer assignment -- and on a compiler that accepted it, the
+ * pointer would be truncated to 32 bits. */
+static napi_ext_payload *napi_get_wrap_payload(napi_env env, napi_value js_object);
+
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_wrap(napi_env env, napi_value js_object, void *native_object,
           napi_finalize finalize_cb, void *finalize_hint, napi_ref *result) {
@@ -1646,22 +1655,54 @@ napi_wrap(napi_env env, napi_value js_object, void *native_object,
     int has_wrap = JS_HasProperty(env->ctx, v(js_object), atom);
     if (has_wrap < 0) {
         JS_FreeAtom(env->ctx, atom);
+        napi_disarm_ext(carrier);
         JS_FreeValue(env->ctx, carrier);
         napi_capture_exception(env);
         return NAPI_RET(env, napi_pending_exception);
     }
     if (has_wrap) {
+        /* An emptied carrier (napi_remove_wrap) stays attached, because it is
+         * non-deletable. Node allows re-wrapping after napi_remove_wrap, so
+         * re-arm the existing payload in place rather than refusing. A wrap
+         * that is still live is still napi_invalid_arg. */
+        napi_ext_payload *old = napi_get_wrap_payload(env, js_object);
+        if (old && !old->wrapped) {
+            JS_FreeAtom(env->ctx, atom);
+            napi_disarm_ext(carrier);
+            JS_FreeValue(env->ctx, carrier);
+            old->data = native_object;
+            old->finalize_cb = finalize_cb;
+            old->finalize_hint = finalize_hint;
+            old->wrapped = true;
+            if (result) return napi_create_reference(env, js_object, 0, result);
+            return NAPI_OK(env);
+        }
         JS_FreeAtom(env->ctx, atom);
+        napi_disarm_ext(carrier);
         JS_FreeValue(env->ctx, carrier);
         return NAPI_RET(env, napi_invalid_arg);
     }
-    if (JS_DefinePropertyValue(env->ctx, v(js_object), atom, carrier,
-                               0 /* not enum/writable/config */) < 0) {
-        JS_FreeAtom(env->ctx, atom);
+    /* JS_DefinePropertyValue consumes `carrier` and frees it on failure, which
+     * would fire the finalizer on that failure path too. Disarm across the call
+     * and re-arm only once js_object owns the carrier. */
+    napi_ext_payload *payload = JS_GetOpaque(carrier, napi_ext_class_id);
+    if (payload) payload->finalize_cb = NULL;
+    int def_rc = JS_DefinePropertyValue(env->ctx, v(js_object), atom, carrier,
+                                       0 /* not enum/writable/config: keeping it
+                                          * non-configurable means JS cannot
+                                          * `delete` the wrap and trigger the
+                                          * addon's finalizer early. Removal is
+                                          * handled by the payload's `wrapped`
+                                          * flag instead, not by deleting. */);
+    JS_FreeAtom(env->ctx, atom);
+    if (def_rc < 0) {
         napi_capture_exception(env);
         return NAPI_RET(env, napi_pending_exception);
     }
-    JS_FreeAtom(env->ctx, atom);
+    if (payload) {
+        payload->finalize_cb = finalize_cb;
+        payload->wrapped = true;
+    }
     if (result) {
         /* optional reference to the wrapped object */
         return napi_create_reference(env, js_object, 0, result);
@@ -1681,7 +1722,12 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_unwrap(napi_env env, napi_value js_object, void **result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object); NAPI_CHECK_ARG(env, result);
     napi_ext_payload *p = napi_get_wrap_payload(env, js_object);
-    if (!p) return NAPI_RET(env, napi_invalid_arg);
+    /* `wrapped` and not merely `p`: napi_remove_wrap leaves the carrier
+     * attached (it is non-deletable), so the payload outlives the wrap. Without
+     * this test unwrap-after-remove returned napi_ok and handed back the
+     * pointer the addon now owns -- OBSERVED st=0 where node returns
+     * napi_invalid_arg, i.e. a dangling pointer as soon as the addon frees it. */
+    if (!p || !p->wrapped) return NAPI_RET(env, napi_invalid_arg);
     *result = p->data;
     return NAPI_OK(env);
 }
@@ -1690,12 +1736,12 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_remove_wrap(napi_env env, napi_value js_object, void **result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object);
     napi_ext_payload *p = napi_get_wrap_payload(env, js_object);
-    if (!p) return NAPI_RET(env, napi_invalid_arg);
+    if (!p || !p->wrapped) return NAPI_RET(env, napi_invalid_arg);
+    p->finalize_cb = NULL;
+    p->finalize_hint = NULL;
+    p->wrapped = false;
     if (result) *result = p->data;
-    p->finalize_cb = NULL;  /* prevent finalizer from running */
-    JSAtom atom = JS_NewAtom(env->ctx, NAPI_WRAP_PROP);
-    JS_DeleteProperty(env->ctx, v(js_object), atom, 0);
-    JS_FreeAtom(env->ctx, atom);
+    p->data = NULL;
     return NAPI_OK(env);
 }
 
@@ -1754,10 +1800,17 @@ napi_add_finalizer(napi_env env, napi_value js_object, void *finalize_data,
     static thread_local uint32_t seq = 0;
     char key[32];
     snprintf(key, sizeof(key), "\xff""napi_fin%u", seq++);
-    if (JS_DefinePropertyValueStr(env->ctx, v(js_object), key, carrier, 0) < 0) {
+    /* Same ownership contract as napi_wrap: on failure the caller still owns
+     * finalize_data, so the finalizer must not run. JS_DefinePropertyValueStr
+     * consumes and frees the carrier on failure, so disarm across the call. */
+    napi_ext_payload *payload = JS_GetOpaque(carrier, napi_ext_class_id);
+    if (payload) payload->finalize_cb = NULL;
+    int def_rc = JS_DefinePropertyValueStr(env->ctx, v(js_object), key, carrier, 0);
+    if (def_rc < 0) {
         napi_capture_exception(env);
         return NAPI_RET(env, napi_pending_exception);
     }
+    if (payload) payload->finalize_cb = finalize_cb;
     if (result) return napi_create_reference(env, js_object, 0, result);
     return NAPI_OK(env);
 }
@@ -2298,9 +2351,12 @@ napi_is_detached_arraybuffer(napi_env env, napi_value value, bool *result) {
     if (!JS_IsArrayBuffer(v(value))) return NAPI_RET(env, napi_arraybuffer_expected);
     size_t len = 0;
     uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, v(value));
-    if (!ptr && len != 0) {
-        JSValue exc = JS_GetException(env->ctx);
-        JS_FreeValue(env->ctx, exc);
+    if (ptr) {
+        *result = false;
+        return NAPI_OK(env);
+    }
+    if (JS_HasException(env->ctx)) {
+        JS_FreeValue(env->ctx, JS_GetException(env->ctx));
         *result = true;
     } else {
         *result = false;
@@ -2818,11 +2874,13 @@ napi_create_threadsafe_function(napi_env env, napi_value func,
     return NAPI_OK(env);
 }
 
+/* The any-thread entry points */
+
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_threadsafe_function_context(napi_threadsafe_function func, void **result) {
     if (!func || !result) return napi_invalid_arg;
     *result = func->context;
-    return NAPI_OK(func->env);
+    return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
@@ -2834,25 +2892,25 @@ napi_call_threadsafe_function(napi_threadsafe_function func, void *data,
            func->queue_size >= func->max_queue_size) {
         if (is_blocking == napi_tsfn_nonblocking) {
             uv_mutex_unlock(&func->mutex);
-            return NAPI_RET(func->env, napi_queue_full);
+            return napi_queue_full;
         }
         uv_cond_wait(&func->cond, &func->mutex);
     }
     if (func->closing) {
         uv_mutex_unlock(&func->mutex);
-        return NAPI_RET(func->env, napi_closing);
+        return napi_closing;
     }
     napi_tsfn_item *item = calloc(1, sizeof(*item));
     if (!item) {
         uv_mutex_unlock(&func->mutex);
-        return NAPI_RET(func->env, napi_generic_failure);
+        return napi_generic_failure;
     }
     item->data = data;
     list_add_tail(&item->link, &func->queue);
     func->queue_size++;
     uv_mutex_unlock(&func->mutex);
     uv_async_send(&func->async);
-    return NAPI_OK(func->env);
+    return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
@@ -2861,11 +2919,11 @@ napi_acquire_threadsafe_function(napi_threadsafe_function func) {
     uv_mutex_lock(&func->mutex);
     if (func->closing) {
         uv_mutex_unlock(&func->mutex);
-        return NAPI_RET(func->env, napi_closing);
+        return napi_closing;
     }
     func->thread_count++;
     uv_mutex_unlock(&func->mutex);
-    return NAPI_OK(func->env);
+    return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
@@ -2883,7 +2941,9 @@ napi_release_threadsafe_function(napi_threadsafe_function func,
      * uv_is_closing). An unconditional uv_async_send() here can touch a handle
      * that the async callback has already closed and freed. */
     napi_tsfn_maybe_close(func);
-    return NAPI_OK(func->env);
+    /* Bare status: any-thread entry point, and `func` may be torn down from
+     * here on -- see the block comment above napi_get_threadsafe_function_context. */
+    return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL

@@ -1623,6 +1623,10 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     memset(&options, 0, sizeof(options));
     uv_stdio_container_t *stdio_heap = NULL;
     char *argv0_file_owned = NULL;
+    /* Set once uv_spawn() has been entered: from that point on &p->process is
+     * linked into loop->handle_queue and must be uv_close()d, never freed.
+     * Declared before the first `goto fail` so the fail path always sees it. */
+    bool spawn_attempted = false;
 #ifdef _WIN32
     options.flags = UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME;
 #endif
@@ -1820,6 +1824,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     }
 
     options.exit_cb = uv__exit_cb;
+    spawn_attempted = true;
     int r = uv_spawn(tjs_get_loop(ctx), &p->process, &options);
     if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
     p->handle_initialized = true;
@@ -1838,7 +1843,15 @@ fail:
     p->stdio_extra = JS_UNDEFINED;
     JS_FreeValue(ctx, p->ipc_pipe);
     p->ipc_pipe = JS_UNDEFINED;
-    tjs__free(p);
+    /* A failed uv_spawn() still leaves the handle registered with the loop.
+     * Here we try to close it completely */
+    if (spawn_attempted) {
+        p->handle_initialized = true;
+        p->finalized = true;
+        maybe_close(p);
+    } else {
+        tjs__free(p);
+    }
     JS_FreeValue(ctx, obj);
 cleanup:
     tjs__free_args(ctx, options.args);

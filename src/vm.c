@@ -519,6 +519,7 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
     qrt->builtins.worker_udata = JS_UNDEFINED;
     qrt->builtins.message_pipe = JS_UNDEFINED;
+    qrt->builtins.nexttick_drain_fn = JS_UNDEFINED;
 
     /* debug */
     qrt->debug.onBreak = JS_UNDEFINED;
@@ -650,10 +651,20 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     qrt->builtins.worker_udata = JS_UNDEFINED;
     JS_FreeValue(ctx, qrt->builtins.dispatch_event_fn);
     qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
+    /* Unregister before freeing the function: the hook fires from
+     * js_promise_new and fulfill_or_reject_promise, both of which are still
+     * reachable from the job drain and GC below. Leaving rt->promise_hook
+     * installed over a freed hook_fn is a use-after-free. */
+    JS_SetPromiseHook(qrt->rt, NULL, NULL);
     JS_FreeValue(ctx, qrt->builtins.promise_hook_fn);
     qrt->builtins.promise_hook_fn = JS_UNDEFINED;
     JS_FreeValue(ctx, qrt->builtins.message_pipe);
     qrt->builtins.message_pipe = JS_UNDEFINED;
+    /* Cleared before the job drain below: that drain must not call back into a
+     * nextTick queue whose module is being torn down. */
+    JS_FreeValue(ctx, qrt->builtins.nexttick_drain_fn);
+    qrt->builtins.nexttick_drain_fn = JS_UNDEFINED;
+    qrt->jobs.ticks_pending = false;
 
     /* Destroy shared module namespace */
     JS_FreeValue(ctx, qrt->module.imod_ns);
@@ -779,7 +790,11 @@ static void uv__idle_cb(uv_idle_t* handle) {
 }
 
 static void uv__maybe_idle(TJSRuntime* qrt) {
-    if (JS_IsJobPending(qrt->rt)) {
+    /* ticks_pending counts as work: the nextTick queue lives outside the QuickJS
+     * job queue, so JS_IsJobPending() cannot see it. Without this a bare
+     * `process.nextTick(cb)` -- no promise anywhere -- would stop the idle
+     * handle, let the loop go quiet and never reach the checkpoint that runs cb. */
+    if (JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending) {
         CHECK_EQ(uv_idle_start(&qrt->jobs.idle, uv__idle_cb), 0);
     }
     else {
@@ -794,11 +809,12 @@ static void uv__prepare_cb(uv_prepare_t* handle) {
     uv__maybe_idle(qrt);
 }
 
-void tjs__execute_jobs(TJSRuntime* trt) {
+/* The pending-job loop, lifted out of tjs__execute_jobs() unchanged so the
+ * nextTick checkpoint below can run it more than once per checkpoint. Returns
+ * true when a job error stopped the runtime, so the caller stops draining. */
+static bool tjs__execute_pending_jobs(TJSRuntime* trt) {
     JSContext* ctx1;
     int err;
-
-    assert(trt != NULL);
 
     /* execute the pending jobs */
     while (!trt->jobs.paused) {
@@ -809,10 +825,11 @@ void tjs__execute_jobs(TJSRuntime* trt) {
                 if (JS_IsUncatchableError(js_err)) {
                     TJS_Stop(trt);
                     JS_FreeValue(ctx1, js_err);
-                    break;
+                    return true;
                 }
                 JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
-                if (JS_IsEqual(ctx1, retv, JS_FALSE)) {
+                bool stop = JS_IsEqual(ctx1, retv, JS_FALSE);
+                if (stop) {
 #ifdef DEBUG
                     fprintf(stderr, "[CORE] JOB: ");
                     tjs_dump_error(ctx1, js_err);
@@ -821,11 +838,22 @@ void tjs__execute_jobs(TJSRuntime* trt) {
                 }
                 JS_FreeValue(ctx1, js_err);
                 JS_FreeValue(ctx1, retv);
+                return stop;
             }
 
             break;
         }
     }
+    return false;
+}
+
+void tjs__execute_jobs(TJSRuntime* trt) {
+    assert(trt != NULL);
+
+    /* Node's microtask checkpoint */
+    do {
+        tjs__run_next_ticks(trt);
+    } while (!tjs__execute_pending_jobs(trt) && trt->jobs.ticks_pending && !trt->jobs.paused);
 }
 
 static void uv__check_cb(uv_check_t* handle) {
@@ -1040,7 +1068,10 @@ int TJS_Run(TJSRuntime* qrt) {
         uv__maybe_idle(qrt);
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
 
-        if (r != 0 && JS_IsJobPending(qrt->rt))
+        if (r != 0
+            ? JS_IsJobPending(qrt->rt)
+            : (!qrt->jobs.paused && (JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending))
+        )
             continue;
 
         /* Nothing left to run. r == 0 is a genuine natural drain; r != 0 with no

@@ -66,18 +66,30 @@
 size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped);
 size_t tjs__native_stack_total_size(void);
 
-static JSValue tjs__promise_hook_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
-    (void) argc;
-    TJSRuntime* trt = TJS_GetRuntime(ctx);
-    JSValue ret = JS_Call(ctx, trt->builtins.promise_hook_fn, JS_UNDEFINED, argc, argv);
-    JS_FreeValue(ctx, ret);
-
-    return JS_UNDEFINED;
-}
+/* PromiseHook 
+ * Called SYNCHRONOUSLY, matching V8: PromiseHook events describe a moment, so
+ * dispatching them later reports the wrong moment.
+ */
+static thread_local bool tjs__in_promise_hook = false;
 
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
     JSValueConst promise, JSValueConst parent_promise, void* opaque) {
     (void) opaque;
+
+    TJSRuntime* trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing || tjs__in_promise_hook) {
+        return;
+    }
+    if (!JS_IsFunction(ctx, trt->builtins.promise_hook_fn)) {
+        return;
+    }
+
+    /* Preserve any exception the engine is already carrying. */
+    JSValue pending = JS_UNDEFINED;
+    bool had_pending = JS_HasException(ctx);
+    if (had_pending) {
+        pending = JS_GetException(ctx);
+    }
 
     JSValue argv[3] = {
         JS_NewUint32(ctx, type),
@@ -85,13 +97,22 @@ static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
         JS_DupValue(ctx, parent_promise),
     };
 
-    int ret = JS_EnqueueJob(ctx, tjs__promise_hook_dispatch, 3, (JSValueConst*) argv);
+    tjs__in_promise_hook = true;
+    JSValue ret = JS_Call(ctx, trt->builtins.promise_hook_fn, JS_UNDEFINED, 3, (JSValueConst*) argv);
+    tjs__in_promise_hook = false;
+
     for (int i = 0; i < 3; i++) {
         JS_FreeValue(ctx, argv[i]);
     }
 
-    if (ret < 0) {
+    if (JS_IsException(ret)) {
+        /* The hook threw. Report it here -- there is no caller that could. */
         TJS_DumpException(ctx);
+    }
+    JS_FreeValue(ctx, ret);
+
+    if (had_pending) {
+        JS_Throw(ctx, pending);
     }
 }
 
@@ -953,6 +974,70 @@ static JSValue tjs__getset_promise_hook(JSContext *ctx, JSValue this_val, int ar
     return JS_UNDEFINED;
 }
 
+/* process.nextTick checkpoint */
+static JSValue tjs__set_nexttick_drain(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    CHECK_IF_IN_SANDBOX();
+    TJSRuntime* trt = TJS_GetRuntime(ctx);
+
+    JS_FreeValue(ctx, trt->builtins.nexttick_drain_fn);
+    if (argc > 0 && JS_IsFunction(ctx, argv[0])) {
+        trt->builtins.nexttick_drain_fn = JS_DupValue(ctx, argv[0]);
+    } else {
+        /* Unregistering: drop any pending flag too, or the checkpoint would
+         * keep looping on a drain that no longer exists. */
+        trt->builtins.nexttick_drain_fn = JS_UNDEFINED;
+        trt->jobs.ticks_pending = false;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue tjs__notify_nexttick(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSRuntime* trt = TJS_GetRuntime(ctx);
+    trt->jobs.ticks_pending = true;
+    return JS_UNDEFINED;
+}
+
+void tjs__run_next_ticks(TJSRuntime* trt) {
+    if (!trt->jobs.ticks_pending || trt->jobs.ticks_draining || trt->jobs.paused) {
+        return;
+    }
+    if (JS_IsUndefined(trt->builtins.nexttick_drain_fn)) {
+        /* No drain registered: DROP the flag rather than leave it set. */
+        trt->jobs.ticks_pending = false;
+        return;
+    }
+
+    JSContext* ctx = trt->main_ctx;
+
+    /* Cleared BEFORE the call so a tick callback that queues another tick can
+     * re-raise it. The JS drain loops until its queue is empty, so the common
+     * case costs one crossing per checkpoint, not one per callback. */
+    trt->jobs.ticks_pending = false;
+    trt->jobs.ticks_draining = true;
+    JSValue ret = JS_Call(ctx, trt->builtins.nexttick_drain_fn, JS_UNDEFINED, 0, NULL);
+    trt->jobs.ticks_draining = false;
+
+    if (JS_IsException(ret)) {
+        /* The JS drain catches each callback and only rethrows when there is no
+         * 'uncaughtException' listener. Route that exactly like a failed promise
+         * job: today the drain runs AS a promise job, so this is the same path
+         * the error already takes, diagnostic and exit code included. */
+        JSValue js_err = JS_GetException(ctx);
+        if (JS_IsUncatchableError(js_err)) {
+            TJS_Stop(trt);
+        } else {
+            JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, js_err);
+            if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+                TJS_Stop(trt);
+            }
+            JS_FreeValue(ctx, retv);
+        }
+        JS_FreeValue(ctx, js_err);
+    } else {
+        JS_FreeValue(ctx, ret);
+    }
+}
+
 static JSValue tjs_encodeString(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
     if(argc == 0 || !JS_IsString(argv[0])){
         return JS_ThrowTypeError(ctx, "argument must be a string");
@@ -1264,6 +1349,8 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
     TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
+    TJS_CFUNC_DEF("setNextTickDrain", 1, tjs__set_nexttick_drain),
+    TJS_CFUNC_DEF("notifyNextTick", 0, tjs__notify_nexttick),
 	TJS_CFUNC_DEF("encodeString", 1, tjs_encodeString),
 	TJS_CFUNC_DEF("toSharedBytes", 1, tjs_toSharedBytes),
 	TJS_CFUNC_DEF("encodeU16String", 1, tjs_encodeU16String),
