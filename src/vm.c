@@ -957,6 +957,33 @@ void tjs__run_main(TJSRuntime* qrt) {
     }
 }
 
+/* The status this run will exit with, resolving the two sources.
+ *
+ * exit_code wins when nonzero: it is only set that way by a fatal path
+ * (TJS_Stop, a throwing 'beforeunload', a worker os.exit), and node likewise
+ * lets an uncaught fatal override `process.exitCode` (OBSERVED v24.18.0: rc 1
+ * with `process.exitCode = 5` and a top-level throw). Otherwise a JS-pushed code
+ * applies, including an explicit 0 that withdraws an earlier nonzero. */
+static int tjs__resolved_exit_code(TJSRuntime* qrt) {
+    if (qrt->exit_code != 0)
+        return qrt->exit_code;
+    if (qrt->js_exit_code_set)
+        return qrt->js_exit_code;
+    return 0;
+}
+
+/* Did a 'beforeExit' listener queue work that must run before teardown?
+ *
+ * All three queues have to be consulted and they are genuinely independent:
+ * JS_IsJobPending covers promise jobs, ticks_pending covers the nextTick queue
+ * (which lives outside the QuickJS job queue, see uv__maybe_idle), and
+ * uv_loop_alive covers a fresh ref'd handle such as a setTimeout. Reaching here
+ * at all means uv_run returned 0, i.e. every one of them was empty a moment ago,
+ * so any true reading is new work the listener just created. */
+static bool tjs__has_new_work(TJSRuntime* qrt) {
+    return JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending || uv_loop_alive(&qrt->loop) != 0;
+}
+
 /* Lifecycle teardown, run when the event loop has nothing left to do.
  *
  * Returns true when the caller must give the loop another pass.
@@ -983,6 +1010,41 @@ static bool tjs__lifecycle_drain(TJSRuntime* qrt) {
         return false;
 
     JSContext* ctx = qrt->main_ctx;
+
+    /* Node's 'beforeExit', ahead of Deno's 'beforeunload'.
+     *
+     * Ordering is forced, not stylistic: 'beforeExit' may legitimately queue work
+     * and get re-dispatched several times, whereas 'beforeunload' is the last
+     * word before teardown. Dispatching beforeunload first would mean a listener
+     * saw "about to unload", then watched the loop run again — and it would fire
+     * once per beforeExit round instead of once.
+     *
+     * Not reached on process.exit() (mod_os.c goes straight to libc exit, and
+     * sets unload_dispatched, which the guard above declines on) nor after an
+     * uncaught fatal (TJS_Stop -> uv__stop dispatches EV_EXIT and sets the same
+     * flag). Both match node: neither fires 'beforeExit' (OBSERVED v24.18.0).
+     *
+     * tjs__dispatch_event, not the _event2 wrapper: the return value decides
+     * whether a listener threw, and _event2 returns void after freeing it. */
+    JSValue be = tjs__dispatch_event(ctx, EV_BEFORE_EXIT, JS_NewInt32(ctx, tjs__resolved_exit_code(qrt)));
+    if (JS_IsException(be)) {
+        /* A throwing 'beforeExit' listener is an uncaught error: node reports it
+         * and exits 1, but still fires 'exit' with that code (OBSERVED — unlike
+         * 'beforeunload', which suppresses EV_EXIT). So report, force the code,
+         * and fall through to teardown instead of returning. */
+        TJS_DumpException(ctx);
+        if (qrt->exit_code == 0)
+            qrt->exit_code = 1;
+    } else {
+        JS_FreeValue(ctx, be);
+        /* The listener queued something. Hand the loop back so it runs; node
+         * re-fires 'beforeExit' on each subsequent drain, and returning to the
+         * caller (rather than looping in place) is what puts a real loop pass
+         * between the rounds. unload_dispatched is still clear, so the next drain
+         * re-enters here from the top. */
+        if (tjs__has_new_work(qrt))
+            return true;
+    }
 
     JSValue bu = tjs__dispatch_event(ctx, EV_BEFORE_UNLOAD, JS_UNDEFINED);
     if (JS_IsException(bu)) {
@@ -1029,7 +1091,7 @@ static bool tjs__lifecycle_drain(TJSRuntime* qrt) {
     /* Uncancelled: teardown proceeds. Set the flag before dispatching so a
      * throwing 'unload'/'exit' listener cannot re-enter this path. */
     qrt->unload_dispatched = true;
-    tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, qrt->exit_code));
+    tjs__dispatch_event2(ctx, EV_EXIT, JS_NewInt32(ctx, tjs__resolved_exit_code(qrt)));
 
     /* Deliberately no extra loop pass. Work queued from a non-cancelling
      * 'beforeunload' listener, and from an 'unload' listener, is DROPPED by
@@ -1083,7 +1145,11 @@ int TJS_Run(TJSRuntime* qrt) {
         break;
     }
 
-    return qrt->exit_code;
+    /* Resolved, not the raw field: a code assigned from an 'exit' or 'beforeExit'
+     * listener lands in js_exit_code, and this read happens after both dispatches.
+     * The early return at the top of this function deliberately still tests the
+     * raw exit_code -- see the private.h field comment. */
+    return tjs__resolved_exit_code(qrt);
 }
 
 void TJS_Stop(TJSRuntime* qrt) {

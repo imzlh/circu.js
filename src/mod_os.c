@@ -89,6 +89,41 @@ static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     exit(status);
 }
 
+/* Record `process.exitCode = N` without exiting.
+ *
+ * The JS binding is a plain module-scoped `let` (cno/src/node/process/mod.ts:1049),
+ * so nothing native could ever see it: on a natural drain TJS_Run returned
+ * qrt->exit_code, which no assignment had touched, and the status was lost
+ * (OBSERVED: a code assigned from a 'exit' listener exited 0 where node
+ * v24.18.0 exits with it). Pushing the value at assignment time makes the
+ * teardown reads in vm.c see it.
+ *
+ * Writes js_exit_code, never exit_code — see the field comment in private.h for
+ * why conflating them would return before the event loop ran. */
+static JSValue tjs_set_exit_code(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt) {
+        return JS_UNDEFINED;
+    }
+
+    /* undefined clears the request: node treats `process.exitCode = undefined`
+     * as "no code asked for", not as 0-the-value. */
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+        trt->js_exit_code_set = false;
+        trt->js_exit_code = 0;
+        return JS_UNDEFINED;
+    }
+
+    int status;
+    if (JS_ToInt32(ctx, &status, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    trt->js_exit_code = status;
+    trt->js_exit_code_set = true;
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_uname(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JSValue obj;
     int r;
@@ -806,6 +841,7 @@ static const JSCFunctionListEntry tjs_os_funcs[] = {
     TJS_CONST(STDOUT_FILENO),
     TJS_CONST(STDERR_FILENO),
     TJS_CFUNC_DEF("exit", 1, tjs_exit),
+    TJS_CFUNC_DEF("setExitCode", 1, tjs_set_exit_code),
     TJS_CFUNC_DEF("uname", 0, tjs_uname),
     TJS_CFUNC_DEF("uptime", 0, tjs_uptime),
     TJS_CFUNC_DEF("guessHandle", 1, tjs_guess_handle),

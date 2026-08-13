@@ -95,6 +95,7 @@ static thread_local JSClassID tjs_sqlite3_stmt_class_id;
 
 typedef struct {
     sqlite3_stmt *stmt;
+    int read_big_ints;
 } TJSSqlite3Stmt;
 
 static void tjs_sqlite3_stmt_finalizer(JSRuntime *rt, JSValue val) {
@@ -386,7 +387,8 @@ static JSValue tjs_sqlite3_last_insert_rowid(JSContext *ctx, JSValue this_val, i
         return JS_EXCEPTION;
     }
 
-    return JS_NewInt64(ctx, sqlite3_last_insert_rowid(h->handle));
+    int64_t rowid = sqlite3_last_insert_rowid(h->handle);
+    return argc > 0 && JS_ToBool(ctx, argv[0]) ? JS_NewBigInt64(ctx, rowid) : JS_NewInt64(ctx, rowid);
 }
 
 static JSValue tjs_sqlite3_interrupt(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -481,6 +483,33 @@ static JSValue tjs__sqlite3_value_to_js(JSContext *ctx, sqlite3_value *val, int 
     }
 }
 
+/* QuickJS preserves lone surrogates as WTF-8; SQLite text must be valid UTF-8. */
+static int tjs__sqlite3_replace_lone_surrogates(JSContext *ctx, const char *src, size_t len, char **out) {
+    *out = NULL;
+    for (size_t i = 0; i + 3 <= len; i++) {
+        const unsigned char *p = (const unsigned char *)src + i;
+        if (p[0] != 0xed || p[1] < 0xa0 || p[1] > 0xbf || p[2] < 0x80 || p[2] > 0xbf)
+            continue;
+
+        char *copy = js_malloc(ctx, len);
+        if (!copy)
+            return -1;
+        memcpy(copy, src, len);
+        for (size_t j = 0; j + 3 <= len; j++) {
+            unsigned char *q = (unsigned char *)copy + j;
+            if (q[0] == 0xed && q[1] >= 0xa0 && q[1] <= 0xbf && q[2] >= 0x80 && q[2] <= 0xbf) {
+                q[0] = 0xef;
+                q[1] = 0xbf;
+                q[2] = 0xbd;
+                j += 2;
+            }
+        }
+        *out = copy;
+        return 0;
+    }
+    return 0;
+}
+
 static int tjs__sqlite3_result_from_js(JSContext *ctx, sqlite3_context *context, JSValue v) {
     int r;
 
@@ -490,10 +519,18 @@ static int tjs__sqlite3_result_from_js(JSContext *ctx, sqlite3_context *context,
     }
 
     switch (JS_VALUE_GET_NORM_TAG(v)) {
+        case JS_TAG_SHORT_BIG_INT:
         case JS_TAG_BIG_INT: {
             int64_t x;
             if (JS_ToBigInt64(ctx, &x, v))
                 return -1;
+            JSValue back = JS_NewBigInt64(ctx, x);
+            bool exact = JS_IsStrictEqual(ctx, back, v);
+            JS_FreeValue(ctx, back);
+            if (!exact) {
+                sqlite3_result_error(context, "BigInt value is too large for SQLite", -1);
+                return 1;
+            }
             sqlite3_result_int64(context, x);
             return 0;
         }
@@ -507,7 +544,13 @@ static int tjs__sqlite3_result_from_js(JSContext *ctx, sqlite3_context *context,
                 sqlite3_result_error(context, "string result too large", -1);
                 return 1;
             }
-            sqlite3_result_text(context, x, (int)len, SQLITE_TRANSIENT);
+            char *normalized = NULL;
+            if (tjs__sqlite3_replace_lone_surrogates(ctx, x, len, &normalized) < 0) {
+                JS_FreeCString(ctx, x);
+                return -1;
+            }
+            sqlite3_result_text(context, normalized ? normalized : x, (int)len, SQLITE_TRANSIENT);
+            if (normalized) js_free(ctx, normalized);
             JS_FreeCString(ctx, x);
             return 0;
         }
@@ -1284,7 +1327,11 @@ static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {
 
         switch (sqlite3_column_type(h->stmt, i)) {
             case SQLITE_INTEGER: {
-                value = JS_NewInt64(ctx, sqlite3_column_int64(h->stmt, i));
+                int64_t x = sqlite3_column_int64(h->stmt, i);
+                if (h->read_big_ints || x < -TJS_SQLITE3_MAX_SAFE_INTEGER || x > TJS_SQLITE3_MAX_SAFE_INTEGER)
+                    value = JS_NewBigInt64(ctx, x);
+                else
+                    value = JS_NewInt64(ctx, x);
                 break;
             }
             case SQLITE_FLOAT: {
@@ -1380,7 +1427,13 @@ static JSValue tjs__sqlite3_bind_param(JSContext *ctx, sqlite3_stmt *stmt, int i
                 JS_FreeCString(ctx, x);
                 return JS_ThrowRangeError(ctx, "Bound string is too large");
             }
-            r = sqlite3_bind_text(stmt, idx, x, len, SQLITE_TRANSIENT);
+            char *normalized = NULL;
+            if (tjs__sqlite3_replace_lone_surrogates(ctx, x, len, &normalized) < 0) {
+                JS_FreeCString(ctx, x);
+                return JS_EXCEPTION;
+            }
+            r = sqlite3_bind_text(stmt, idx, normalized ? normalized : x, (int)len, SQLITE_TRANSIENT);
+            if (normalized) js_free(ctx, normalized);
             JS_FreeCString(ctx, x);
             CHECK_RET(r);
             break;
@@ -1551,6 +1604,147 @@ static JSValue tjs_sqlite3_stmt_reset(JSContext *ctx, JSValue this_val, int argc
     return JS_UNDEFINED;
 }
 
+static JSValue tjs_sqlite3_stmt_set_read_big_ints(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
+    if (!h)
+        return JS_EXCEPTION;
+    if (!h->stmt)
+        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    h->read_big_ints = argc > 0 && JS_ToBool(ctx, argv[0]);
+    return JS_UNDEFINED;
+}
+
+/* Return prepared-statement metadata without calling sqlite3_step().  The
+ * sqlite3_column_* metadata APIs are valid immediately after prepare, so this
+ * remains a pure operation even for INSERT/UPDATE/DELETE statements. */
+static JSValue tjs_sqlite3_stmt_column_names(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+    if (!h->stmt) {
+        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    }
+
+    int count = sqlite3_column_count(h->stmt);
+    JSValue result = JS_NewArray(ctx);
+    if (JS_IsException(result)) {
+        return result;
+    }
+    for (int i = 0; i < count; i++) {
+        const char *name = sqlite3_column_name(h->stmt, i);
+        if (!name) {
+            JS_FreeValue(ctx, result);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        JSValue value = JS_NewString(ctx, name);
+        if (JS_IsException(value)) {
+            JS_FreeValue(ctx, result);
+            return value;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, result, (uint32_t)i, value, JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, value);
+            JS_FreeValue(ctx, result);
+            return JS_EXCEPTION;
+        }
+    }
+    return result;
+}
+
+/* Set `key` to a string, or to null when SQLite has no answer. Node's
+   columns() always carries all five keys, using null for a result column with
+   no table origin (an expression, a literal, PRAGMA output), so an absent key
+   is never the right shape. Takes ownership of nothing; returns -1 on failure. */
+static int tjs__sqlite3_set_str_or_null(JSContext *ctx, JSValue obj, const char *key, const char *str) {
+    JSValue value = str ? JS_NewString(ctx, str) : JS_NULL;
+    if (JS_IsException(value)) {
+        return -1;
+    }
+    if (JS_DefinePropertyValueStr(ctx, obj, key, value, JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, value);
+        return -1;
+    }
+    return 0;
+}
+
+/* Full per-column metadata in Node's StatementSync.columns() shape: an array of
+   { column, database, name, table, type } in that key order, with null for any
+   field SQLite cannot attribute to a table column. `columnNames()` above cannot
+   serve this -- the four non-name fields are not derivable from a name, and the
+   TS layer must not guess them from the SQL text.
+
+   `type` is sqlite3_column_decltype, which every SQLite build provides. The
+   other three need the library to be built with SQLITE_ENABLE_COLUMN_METADATA,
+   so they are gated on TJS_SQLITE_HAS_COLUMN_METADATA (a CMake link check). When
+   that is off the keys are still present and null, which keeps the shape stable
+   and lets the TS layer stay unconditional.
+
+   Never steps the statement: metadata on a DML statement must not execute it.
+   sqlite3_column_count is 0 there, so the loop yields [] -- Node's answer. */
+static JSValue tjs_sqlite3_stmt_column_metadata(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
+
+    if (!h) {
+        return JS_EXCEPTION;
+    }
+    if (!h->stmt) {
+        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    }
+
+    int count = sqlite3_column_count(h->stmt);
+    JSValue result = JS_NewArray(ctx);
+    if (JS_IsException(result)) {
+        return result;
+    }
+
+    for (int i = 0; i < count; i++) {
+        const char *name = sqlite3_column_name(h->stmt, i);
+        if (!name) {
+            JS_FreeValue(ctx, result);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+
+        /* Null prototype, like the row objects tjs__stmt2obj builds and like
+           Node: its columns() entries are `[Object: null prototype] {...}`, and
+           assert.deepStrictEqual compares prototypes, so a plain JS_NewObject
+           here fails against Node's own output. */
+        JSValue entry = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(entry)) {
+            JS_FreeValue(ctx, result);
+            return entry;
+        }
+
+#ifdef TJS_SQLITE_HAS_COLUMN_METADATA
+        const char *origin = sqlite3_column_origin_name(h->stmt, i);
+        const char *table = sqlite3_column_table_name(h->stmt, i);
+        const char *database = sqlite3_column_database_name(h->stmt, i);
+#else
+        const char *origin = NULL;
+        const char *table = NULL;
+        const char *database = NULL;
+#endif
+
+        /* Key order matches Node's, so Object.keys() compares equal. */
+        if (tjs__sqlite3_set_str_or_null(ctx, entry, "column", origin) < 0
+            || tjs__sqlite3_set_str_or_null(ctx, entry, "database", database) < 0
+            || tjs__sqlite3_set_str_or_null(ctx, entry, "name", name) < 0
+            || tjs__sqlite3_set_str_or_null(ctx, entry, "table", table) < 0
+            || tjs__sqlite3_set_str_or_null(ctx, entry, "type", sqlite3_column_decltype(h->stmt, i)) < 0) {
+            JS_FreeValue(ctx, entry);
+            JS_FreeValue(ctx, result);
+            return JS_EXCEPTION;
+        }
+
+        if (JS_DefinePropertyValueUint32(ctx, result, (uint32_t)i, entry, JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, entry);
+            JS_FreeValue(ctx, result);
+            return JS_EXCEPTION;
+        }
+    }
+    return result;
+}
+
 static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSSqlite3Stmt *h = tjs_sqlite3_stmt_get(ctx, this_val);
 
@@ -1657,6 +1851,9 @@ static const JSCFunctionListEntry tjs_sqlite3_stmt_proto_funcs[] = {
     TJS_CFUNC_DEF("expand", 0, tjs_sqlite3_stmt_expand),
     TJS_CFUNC_DEF("bind", 1, tjs_sqlite3_stmt_bind),
     TJS_CFUNC_DEF("reset", 0, tjs_sqlite3_stmt_reset),
+    TJS_CFUNC_DEF("setReadBigInts", 1, tjs_sqlite3_stmt_set_read_big_ints),
+    TJS_CFUNC_DEF("columnNames", 0, tjs_sqlite3_stmt_column_names),
+    TJS_CFUNC_DEF("columnMetadata", 0, tjs_sqlite3_stmt_column_metadata),
     TJS_CFUNC_DEF("all", 1, tjs_sqlite3_stmt_all),
     TJS_CFUNC_DEF("run", 1, tjs_sqlite3_stmt_run),
 };

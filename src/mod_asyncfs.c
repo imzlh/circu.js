@@ -32,9 +32,10 @@
 
 static thread_local JSClassID tjs_file_class_id;
 
-static void tjs__buf_free_untracked(JSRuntime *rt, void *opaque, void *ptr) {
+static void* tjs__buf_realloc_untracked(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
     (void) rt; (void) opaque;
-    tjs__free(ptr);
+    if (size == 0) return tjs__free(ptr), NULL;
+    else return tjs__realloc(ptr, size);
 }
 
 static void *tjs__dbuf_realloc(void *opaque, void *ptr, size_t size) {
@@ -1479,7 +1480,7 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
         dbuf_free(&fr->dbuf);
     } else {
         
-        arg = JS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size, tjs__buf_free_untracked, NULL, false);
+        arg = JS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size, tjs__buf_realloc_untracked, NULL, false);
         if (JS_IsException(arg)) {
             dbuf_free(&fr->dbuf);
         }

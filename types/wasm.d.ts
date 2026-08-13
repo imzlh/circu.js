@@ -155,9 +155,9 @@ declare namespace CModuleWASM {
      * Get the content of a custom section by name
      * @param module The Module to inspect
      * @param sectionName The name of the custom section
-     * @returns First matching section content, or null if not found
+     * @returns Every matching section content in module order
      */
-    export function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer | null;
+    export function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer[];
 
     /**
      * Get list of exports from a Module

@@ -907,6 +907,16 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
             /* For externref, box the JSValue and store the host pointer */
             if (param_types[j] == WASM_EXTERNREF) {
                 if (JS_IsNull(argv[j]) || JS_IsUndefined(argv[j])) {
+                    /* MEASURED DEFECT (unfixed): the guest sees this as a
+                     * NON-null externref, so `ref.is_null` on a JS null answers
+                     * false where node answers true.
+                     *
+                     * Substituting NULL_REF (0xFFFFFFFF) here was tried and
+                     * changed nothing: `of.foreign` is a host *key pointer* that
+                     * WAMR maps through wasm_externref_obj2ref, so no raw
+                     * sentinel written here reaches WAMR's internal null ref.
+                     * A real fix has to obtain the null reference from WAMR
+                     * itself rather than fabricate one. */
                     params[j].of.foreign = (uintptr_t) (void *) NULL;
                 } else {
                     uint32_t idx;
@@ -1169,9 +1179,9 @@ static JSValue tjs_wasm_moduleimports(JSContext *ctx, JSValue this_val, int argc
 /*
  * moduleCustomSections(module, sectionName)
  *
- * Returns an ArrayBuffer for the custom section with the given name.
- * If multiple sections share the same name, only the first match is returned.
- * Returns null if not found or if custom sections are not loaded.
+ * Returns an array of ArrayBuffers for every custom section with the given name
+ * in module order. WAMR links its list by prepending each section, so the
+ * second pass writes matching nodes backwards into the JS array.
  */
 static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
@@ -1185,15 +1195,40 @@ static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, i
     }
 
     WASMModule *wasm_module = (WASMModule *) m->module;
-    JSValue result = JS_NULL;
+    JSValue result = JS_NewArray(ctx);
+    if (JS_IsException(result)) {
+        JS_FreeCString(ctx, name);
+        return result;
+    }
 
 #if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
     WASMCustomSection *section = wasm_module->custom_section_list;
+    uint32_t count = 0;
     while (section) {
         if (section->name_len == strlen(name) &&
             memcmp(section->name_addr, name, section->name_len) == 0) {
-            result = JS_NewArrayBufferCopy(ctx, section->content_addr, section->content_len);
-            break;
+            count++;
+        }
+        section = section->next;
+    }
+    section = wasm_module->custom_section_list;
+    uint32_t index = count;
+    while (section) {
+        if (section->name_len == strlen(name) &&
+            memcmp(section->name_addr, name, section->name_len) == 0) {
+            JSValue content = JS_NewArrayBufferCopy(ctx, section->content_addr, section->content_len);
+            if (JS_IsException(content)) {
+                JS_FreeValue(ctx, result);
+                JS_FreeCString(ctx, name);
+                return JS_EXCEPTION;
+            }
+            if (JS_DefinePropertyValueUint32(ctx, result, --index, content, JS_PROP_C_W_E) < 0) {
+                /* The define helper consumes content on both success and
+                 * failure; only release the container here. */
+                JS_FreeValue(ctx, result);
+                JS_FreeCString(ctx, name);
+                return JS_EXCEPTION;
+            }
         }
         section = section->next;
     }
@@ -1927,8 +1962,9 @@ static JSValue tjs_wasm_parsemodule(JSContext *ctx, JSValue this_val, int argc, 
 }
 
 /* No-op free function: WAMR owns the memory, not JS */
-static void tjs__wasm_memory_free(JSRuntime *rt, void *opaque, void *ptr) {
-    /* intentionally empty */
+static void *tjs__wasm_memory_free(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    (void)rt; (void)opaque; (void)ptr;
+    return NULL;
 }
 
 static JSValue tjs_wasm_getmemorybuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1959,7 +1995,7 @@ static JSValue tjs_wasm_getmemorybuffer(JSContext *ctx, JSValue this_val, int ar
         tjs__wasm_invalidate_membuf(ctx, i);
     }
 
-    JSValue buf = JS_NewArrayBuffer(ctx, (uint8_t *) base, byte_length, tjs__wasm_memory_free, NULL, false);
+    JSValue buf = JS_NewArrayBuffer(ctx, (uint8_t *) base, byte_length, 0, tjs__wasm_memory_free, NULL, false);
     if (JS_IsException(buf))
         return buf;
     /* Keep our own tracking reference so we can detach it on grow. */

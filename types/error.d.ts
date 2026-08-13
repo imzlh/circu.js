@@ -54,6 +54,7 @@ declare namespace CModuleError {
         ENOTSOCK: -4052;
         ENOTSUP: -4051;
         EOPNOTSUPP: -4051;
+        EPERM: number;
         EPROTONOSUPPORT: -4049;
         EPROTOTYPE: -4048;
         EPIPE: -4047;

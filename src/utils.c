@@ -457,12 +457,17 @@ JSValue TJS_NewRejectedPromise(JSContext *ctx, int argc, JSValue *argv) {
     return tjs__settled_promise(ctx, true, argc, argv);
 }
 
-static void tjs__buf_free(JSRuntime *rt, void *opaque, void *ptr) {
-    js_free_rt(rt, ptr);
+static void* tjs__buf_realloc(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    if (size == 0){
+        js_free_rt(rt, ptr);
+        return NULL;
+    } else {
+        return js_realloc_rt(rt, ptr, size);
+    }
 }
 
 JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size) {
-    return JS_NewUint8Array(ctx, data, size, tjs__buf_free, NULL, false);
+    return JS_NewUint8Array(ctx, data, size, tjs__buf_realloc, NULL, false);
 }
 
 const char *tjs_signal_map[] = {

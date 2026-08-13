@@ -160,6 +160,26 @@ if(NOT SQLITE_HAS_LOAD_EXTENSION)
     message(WARNING "SQLite3 does not support extension loading. Some features may be disabled.")
 endif()
 
+# sqlite3_column_origin_name/table_name/database_name exist only when SQLite was
+# built with SQLITE_ENABLE_COLUMN_METADATA. This header declares them
+# unconditionally, so a compile check alone would pass and the failure would
+# surface at link time -- check_c_source_compiles links, which is what gates it.
+# sqlite3_column_decltype needs no flag and is used unconditionally.
+check_c_source_compiles("
+    #include <sqlite3.h>
+    int main() {
+        sqlite3_stmt *st = 0;
+        (void) sqlite3_column_origin_name(st, 0);
+        (void) sqlite3_column_table_name(st, 0);
+        (void) sqlite3_column_database_name(st, 0);
+        return 0;
+    }
+" SQLITE_HAS_COLUMN_METADATA)
+
+if(NOT SQLITE_HAS_COLUMN_METADATA)
+    message(WARNING "SQLite3 lacks column metadata; StatementSync.columns() will report null for column/table/database.")
+endif()
+
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Iconv REQUIRED)
@@ -362,6 +382,13 @@ string(TOLOWER ${CMAKE_SYSTEM_NAME} TJS_PLATFORM)
 target_compile_options(libcjs PRIVATE ${cjs_cflags})
 target_link_options(libcjs PRIVATE ${cjs_ldflags})
 target_compile_definitions(libcjs PRIVATE TJS__PLATFORM="${TJS_PLATFORM}")
+# The feature check above only sets a CMake variable; without this the #ifdef in
+# mod_sqlite3.c is dead. (SQLITE_HAS_LOAD_EXTENSION is checked but never plumbed,
+# which is why its TJS_CFUNC_DEF never registers -- left alone here on purpose,
+# since enabling extension loading is a security-relevant change, not a fix.)
+if(SQLITE_HAS_COLUMN_METADATA)
+    target_compile_definitions(libcjs PRIVATE TJS_SQLITE_HAS_COLUMN_METADATA)
+endif()
 target_include_directories(libcjs PUBLIC src)
 target_include_directories(libcjs PRIVATE deps/nodeapi)
 # qjs is PRIVATE so USING_QJS_SHARED doesn't propagate automatically on Windows

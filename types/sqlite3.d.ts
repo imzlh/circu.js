@@ -14,7 +14,7 @@
 declare namespace CModuleSQLite3 {
     export type SqliteValue = null | number | bigint | string | boolean | Uint8Array;
     export type SqliteParams = SqliteValue[] | Record<string, SqliteValue>;
-    export type SqliteRow = Record<string, null | number | string | Uint8Array>;
+    export type SqliteRow = Record<string, null | number | bigint | string | Uint8Array>;
 
     /**
      * SQLite3 database connection handle
@@ -60,6 +60,9 @@ declare namespace CModuleSQLite3 {
          * Rowid of the most recent successful INSERT.
          */
         lastInsertRowid(): number;
+        lastInsertRowid(readBigInts: false): number;
+        lastInsertRowid(readBigInts: true): bigint;
+        lastInsertRowid(readBigInts: boolean): number | bigint;
 
         /**
          * Interrupt a pending SQLite operation on this connection.
@@ -144,6 +147,34 @@ declare namespace CModuleSQLite3 {
          * Reset the statement cursor while preserving bindings.
          */
         reset(): void;
+
+        /** Select exact BigInt results for INTEGER columns. */
+        setReadBigInts(enabled: boolean): void;
+
+        /**
+         * Read the result-column names from the prepared statement without
+         * stepping or executing it. Statements with no result columns return
+         * an empty array.
+         */
+        columnNames(): string[];
+
+        /**
+         * Read full per-column metadata without stepping or executing the
+         * statement, in Node's StatementSync.columns() shape. Statements with no
+         * result columns return an empty array.
+         *
+         * `column`, `table` and `database` are null unless SQLite was built with
+         * SQLITE_ENABLE_COLUMN_METADATA, and are null for any result column with
+         * no table origin (an expression, a literal, PRAGMA output). `type` is the
+         * declared type, null when the column has none.
+         */
+        columnMetadata(): {
+            column: string | null;
+            database: string | null;
+            name: string;
+            table: string | null;
+            type: string | null;
+        }[];
 
         /**
          * Execute the prepared statement and return all rows

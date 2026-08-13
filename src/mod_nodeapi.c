@@ -1695,9 +1695,16 @@ napi_wrap(napi_env env, napi_value js_object, void *native_object,
                                           * handled by the payload's `wrapped`
                                           * flag instead, not by deleting. */);
     JS_FreeAtom(env->ctx, atom);
-    if (def_rc < 0) {
-        napi_capture_exception(env);
-        return NAPI_RET(env, napi_pending_exception);
+    if (def_rc <= 0) {
+        /* Without JS_PROP_THROW, QuickJS returns 0 (and consumes `carrier`)
+         * when the target refuses the definition. The payload was disarmed
+         * above, so report a plain N-API failure and never touch its freed
+         * opaque storage. Only a negative result carries a pending exception. */
+        if (def_rc < 0) {
+            napi_capture_exception(env);
+            return NAPI_RET(env, napi_pending_exception);
+        }
+        return NAPI_RET(env, napi_generic_failure);
     }
     if (payload) {
         payload->finalize_cb = finalize_cb;
@@ -1806,9 +1813,14 @@ napi_add_finalizer(napi_env env, napi_value js_object, void *finalize_data,
     napi_ext_payload *payload = JS_GetOpaque(carrier, napi_ext_class_id);
     if (payload) payload->finalize_cb = NULL;
     int def_rc = JS_DefinePropertyValueStr(env->ctx, v(js_object), key, carrier, 0);
-    if (def_rc < 0) {
-        napi_capture_exception(env);
-        return NAPI_RET(env, napi_pending_exception);
+    if (def_rc <= 0) {
+        /* JS_DefinePropertyValue consumes the carrier on a false result too;
+         * its finalizer is disarmed, so the caller keeps ownership of data. */
+        if (def_rc < 0) {
+            napi_capture_exception(env);
+            return NAPI_RET(env, napi_pending_exception);
+        }
+        return NAPI_RET(env, napi_generic_failure);
     }
     if (payload) payload->finalize_cb = finalize_cb;
     if (result) return napi_create_reference(env, js_object, 0, result);
@@ -1967,18 +1979,21 @@ napi_get_reference_value(napi_env env, napi_ref ref, napi_value *result) {
 /* ArrayBuffer / TypedArray / Buffer / DataView                               */
 /* ========================================================================== */
 
-static void napi_raw_ab_free(JSRuntime *rt, void *opaque, void *ptr) {
-    (void) rt; (void) opaque;
-    free(ptr);
+static void *napi_raw_ab_free(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    (void)rt; (void)opaque;
+    if (size == 0) { free(ptr); return NULL; }
+    return realloc(ptr, size);
 }
 
-static void napi_external_ab_free(JSRuntime *rt, void *opaque, void *ptr) {
-    (void) rt;
+static void *napi_external_ab_free(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    (void)rt;
+    if (size != 0) return NULL;
     napi_ab_payload *p = opaque;
-    if (!p) return;
+    if (!p) return NULL;
     if (p->finalize_cb) p->finalize_cb(p->env, ptr, p->finalize_hint);
     if (p->free_data) free(ptr);
     free(p);
+    return NULL;
 }
 
 static napi_status napi_get_buffer_ctor(napi_env env, JSValue *ctor) {
@@ -2033,7 +2048,7 @@ static napi_status napi_make_owned_arraybuffer(napi_env env, size_t byte_length,
         buf = malloc(byte_length);
         if (!buf) return NAPI_RET(env, napi_generic_failure);
     }
-    JSValue ab = JS_NewArrayBuffer(env->ctx, buf, byte_length, napi_raw_ab_free, NULL, false);
+    JSValue ab = JS_NewArrayBuffer(env->ctx, buf, byte_length, 0, napi_raw_ab_free, NULL, false);
     if (JS_IsException(ab)) {
         free(buf);
         napi_capture_exception(env);
@@ -2072,7 +2087,7 @@ napi_create_external_arraybuffer(napi_env env, void *external_data,
     p->finalize_hint = finalize_hint;
     p->free_data = false;
     JSValue ab = JS_NewArrayBuffer(env->ctx, external_data, byte_length,
-                                   napi_external_ab_free, p, false);
+                                   0, napi_external_ab_free, p, false);
     if (JS_IsException(ab)) {
         free(p);
         napi_capture_exception(env);

@@ -984,6 +984,14 @@ declare namespace CModuleCrypto {
     export function ecdhDeriveP521(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
     export function ecdhDeriveSecp256k1(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
 
+    /**
+     * Key agreement over ENCODED keys, with the algorithm taken from the key
+     * material: PKCS#8/SEC1/PEM private, SPKI/PEM public. Covers X25519, X448,
+     * the named EC curves and DH -- the whole surface of node's
+     * `crypto.diffieHellman()`. Raw EC bytes are also accepted.
+     */
+    export function deriveSharedSecret(privateKey: BufferSource, publicKey: BufferSource): ArrayBuffer;
+
     export function ecPublicFromPrivateP256(privateKey: BufferSource, format?: number): ArrayBuffer;
     export function ecPublicFromPrivateP384(privateKey: BufferSource, format?: number): ArrayBuffer;
     export function ecPublicFromPrivateP521(privateKey: BufferSource, format?: number): ArrayBuffer;

@@ -178,10 +178,11 @@ static int get_ec_nid_from_magic(int magic) {
 }
 
 /* Helper: free js_malloc allocated memory */
-static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
-	js_free_rt(rt, ptr);
+static void* realloc_js_malloc(JSRuntime *rt, void *opaque, void *ptr, size_t size){
+	if (size == 0) return js_free_rt(rt, ptr), NULL;
+    else return js_realloc_rt(rt, ptr, size);
 }
-#define js_fastab(ctx, buf, len) JS_NewArrayBuffer(ctx, buf, len, free_js_malloc, NULL, false)
+#define js_fastab(ctx, buf, len) JS_NewArrayBuffer(ctx, buf, len, 0, realloc_js_malloc, NULL, false)
 
 static EVP_PKEY* tjs_crypto_load_private_key(const uint8_t* key_data, size_t key_len) {
     EVP_PKEY* pkey = NULL;
@@ -1053,6 +1054,93 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     
     JSValue result = js_fastab(ctx, secret, secret_len);
     return result;
+}
+
+/* Generic key agreement over ENCODED keys (PKCS#8/SEC1/PEM private, SPKI/PEM
+ * public). Unlike ecdhDerive*, the algorithm comes from the key material rather
+ * than a fixed curve magic, so this covers X25519/X448 and DH as well as the
+ * named EC curves -- i.e. everything node's crypto.diffieHellman() accepts.
+ * The output length is queried from OpenSSL: for X25519 it is the 32-byte
+ * u-coordinate, for EC the field size, and for DH the prime size. */
+static JSValue tjs_crypto_derive_shared_secret(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    size_t priv_len, pub_len;
+    const uint8_t *priv_data, *pub_data;
+
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "deriveSharedSecret() requires 2 arguments: privateKey and publicKey");
+    }
+
+    priv_data = JS_GetAnyBuffer(ctx, &priv_len, argv[0]);
+    pub_data = JS_GetAnyBuffer(ctx, &pub_len, argv[1]);
+
+    if (!priv_data || !pub_data) {
+        return JS_EXCEPTION;
+    }
+
+    EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(priv_data, priv_len);
+    if (!pkey) {
+        ERR_clear_error();
+        return JS_ThrowTypeError(ctx, "Failed to parse private key");
+    }
+
+    EVP_PKEY* peer = tjs_crypto_load_public_key_auto(pub_data, pub_len);
+    if (!peer) {
+        EVP_PKEY_free(pkey);
+        ERR_clear_error();
+        return JS_ThrowTypeError(ctx, "Failed to parse public key");
+    }
+
+    /* Mismatched algorithms would otherwise fail deep inside derive_set_peer
+     * with an error that names neither key. */
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_base_id(peer)) {
+        EVP_PKEY_free(peer);
+        EVP_PKEY_free(pkey);
+        return JS_ThrowTypeError(ctx, "Private and public keys use different algorithms");
+    }
+
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (!pctx || EVP_PKEY_derive_init(pctx) != 1 ||
+        EVP_PKEY_derive_set_peer(pctx, peer) != 1) {
+        if (pctx) EVP_PKEY_CTX_free(pctx);
+        EVP_PKEY_free(peer);
+        EVP_PKEY_free(pkey);
+        ERR_clear_error();
+        return JS_ThrowTypeError(ctx, "Keys are not usable for key agreement");
+    }
+
+    size_t secret_len = 0;
+    if (EVP_PKEY_derive(pctx, NULL, &secret_len) != 1 || secret_len == 0) {
+        EVP_PKEY_CTX_free(pctx);
+        EVP_PKEY_free(peer);
+        EVP_PKEY_free(pkey);
+        ERR_clear_error();
+        return JS_ThrowInternalError(ctx, "Failed to determine shared secret length");
+    }
+
+    uint8_t* secret = js_malloc(ctx, secret_len);
+    if (!secret) {
+        EVP_PKEY_CTX_free(pctx);
+        EVP_PKEY_free(peer);
+        EVP_PKEY_free(pkey);
+        return JS_EXCEPTION;
+    }
+
+    size_t out_len = secret_len;
+    int derived = EVP_PKEY_derive(pctx, secret, &out_len);
+
+    EVP_PKEY_CTX_free(pctx);
+    EVP_PKEY_free(peer);
+    EVP_PKEY_free(pkey);
+
+    if (derived != 1) {
+        js_free(ctx, secret);
+        ERR_clear_error();
+        return JS_ThrowInternalError(ctx, "Key agreement failed");
+    }
+
+    /* X25519/X448 report the maximum up front and the exact size after; trust
+     * the post-derive length rather than the query. */
+    return js_fastab(ctx, secret, out_len);
 }
 
 /* RSA-OAEP encrypt */
@@ -3351,6 +3439,7 @@ static const JSCFunctionListEntry tjs_crypto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("ecdhDeriveP384", 2, tjs_crypto_ecdh_derive, ECC_CURVE_P384),
     JS_CFUNC_MAGIC_DEF("ecdhDeriveP521", 2, tjs_crypto_ecdh_derive, ECC_CURVE_P521),
     JS_CFUNC_MAGIC_DEF("ecdhDeriveSecp256k1", 2, tjs_crypto_ecdh_derive, ECC_CURVE_SECP256K1),
+    JS_CFUNC_DEF("deriveSharedSecret", 2, tjs_crypto_derive_shared_secret),
     JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP256", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P256),
     JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP384", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P384),
     JS_CFUNC_MAGIC_DEF("ecPublicFromPrivateP521", 2, tjs_crypto_ec_public_from_private, ECC_CURVE_P521),

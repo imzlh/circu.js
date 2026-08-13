@@ -467,8 +467,9 @@ static JSValue js_module_get_namespace(JSContext *ctx, JSValueConst this_val){
     return JS_GetModuleNamespace(ctx, mt->def);
 }
 
-static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr){
-    js_free_rt(rt, ptr);
+static void *free_js_malloc(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    if (size == 0) { js_free_rt(rt, ptr); return NULL; }
+    return js_realloc_rt(rt, ptr, size);
 }
 
 static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv){
@@ -484,7 +485,7 @@ static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, J
     uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, mt->def), flags);
     if(!data) return JS_EXCEPTION;
 
-    return JS_NewArrayBuffer(ctx, data, len, free_js_malloc, NULL, false);
+    return JS_NewArrayBuffer(ctx, data, len, 0, free_js_malloc, NULL, false);
 }
 
 static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
@@ -1064,7 +1065,7 @@ static JSValue tjs_new_shared_bytes_copy(JSContext *ctx, const uint8_t *src, siz
 		memcpy(data, src, len);
 	data[len] = 0;
 
-	JSValue buffer = JS_NewArrayBuffer(ctx, data, len + 1, NULL, NULL, true);
+	JSValue buffer = JS_NewArrayBuffer(ctx, data, len + 1, 0, NULL, NULL, true);
 	tjs__sab_free(NULL, data);
 	if (JS_IsException(buffer))
 		return buffer;
@@ -1417,6 +1418,7 @@ static const JSCFunctionListEntry tjs_event_enum[] = {
     TJS_CONST2("UNHANDLED_REJECTION", EV_UNHANDLED_REJECTION),
     TJS_CONST2("JOB_EXCEPTION", EV_JOB_EXCEPTION),
     TJS_CONST2("BEFORE_UNLOAD", EV_BEFORE_UNLOAD),
+    TJS_CONST2("BEFORE_EXIT", EV_BEFORE_EXIT),
 };
 
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {

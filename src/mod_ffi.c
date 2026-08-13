@@ -93,8 +93,9 @@
 
 #pragma region "FFI Helpers"
 
-static void js__free_rt(JSRuntime *rt, void* ptr, void* opaque) {
-    js_free_rt(rt, ptr);
+static void *js__free_rt(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    if (size == 0) { js_free_rt(rt, ptr); return NULL; }
+    return js_realloc_rt(rt, ptr, size);
 }
 
 
@@ -1081,7 +1082,7 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
             return;
         }
         memcpy(arg_copy, args[i], arg_sz);
-        jsargs[i] = JS_NewArrayBuffer(ctx, arg_copy, arg_sz, js__free_rt, NULL, true);
+        jsargs[i] = JS_NewArrayBuffer(ctx, arg_copy, arg_sz, 0, js__free_rt, NULL, true);
     }
     JSValue jsret = JS_Call(ctx, jscl->func, JS_UNDEFINED, cif->nargs, jsargs);
     for (unsigned i = 0; i < cif->nargs; i++) {

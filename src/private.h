@@ -86,6 +86,19 @@ struct TJSRuntime {
 
     bool is_worker;
     int exit_code;
+    /* `process.exitCode = N` pushed in from JS by os.setExitCode().
+     *
+     * Deliberately NOT stored in exit_code: TJS_Run returns early whenever
+     * exit_code is nonzero (vm.c:1056, the fatal path), so a top-level
+     * `process.exitCode = 3` written straight into that field would return
+     * before the event loop ever ran and silently truncate every pending timer
+     * and IO callback. This pair is read only at the teardown sites, where the
+     * loop has already drained.
+     *
+     * A flag rather than a sentinel because 0 is a meaningful value: node honours
+     * `process.exitCode = 3` followed by `= 0` as rc 0 (OBSERVED v24.18.0). */
+    int js_exit_code;
+    bool js_exit_code_set;
     /* Set once EV_EXIT has been dispatched, by whichever path got there first
      * (uv__stop, os.exit, or the natural-drain path in TJS_Run). Gates both
      * 'beforeunload' and EV_EXIT so an explicit exit cannot be followed by a
@@ -179,7 +192,12 @@ typedef enum {
 	/* Appended last on purpose: JS hardcodes 0-3 as fallbacks when the engine
 	 * enum is unreadable (cts/src/runtime/event-mux.ts:31-45), so renumbering
 	 * the existing members would silently misroute every event. */
-	EV_BEFORE_UNLOAD
+	EV_BEFORE_UNLOAD,
+	/* Node's 'beforeExit'. Same append-only rule as above: the JS fallback table
+	 * pins 0-4, so this must stay last. Dispatched from tjs__lifecycle_drain()
+	 * BEFORE EV_BEFORE_UNLOAD, and re-dispatched for as long as a listener keeps
+	 * queueing work, which is what node does. */
+	EV_BEFORE_EXIT
 } TJSEvents;
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);

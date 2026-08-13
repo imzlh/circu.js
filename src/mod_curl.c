@@ -119,6 +119,7 @@ typedef struct {
     bool completed;
     bool in_callback;  /* true while inside a libcurl callback - prevent reentry */
     bool headers_complete_fired;  /* true after onHeadersComplete has been called */
+    long header_status_code;  /* status line for the response block currently buffered */
     bool verbose;
     bool recv_paused;
     bool recv_pause_requested;
@@ -205,8 +206,9 @@ static void call_err_cb(TJSConnPool *pool, CURLMcode err) {
 } while (0)
 
 /* free an ArrayBuffer backing store that was js_malloc'd */
-static void free_js_malloc(JSRuntime *rt, void *opaque, void *ptr) {
-    js_free_rt(rt, ptr);
+static void *free_js_malloc(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
+    if (size == 0) { js_free_rt(rt, ptr); return NULL; }
+    return js_realloc_rt(rt, ptr, size);
 }
 
 #pragma endregion
@@ -265,6 +267,19 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
         dbuf_free(&curl->response_headers);
         tjs_dbuf_init(curl->ctx, &curl->response_headers);
         curl->headers_complete_fired = false;
+        curl->header_status_code = 0;
+        /* Parse the status from this line instead of CURLINFO_RESPONSE_CODE:
+         * the latter is only updated for the final hop and mislabels 100/103
+         * blocks when several response heads arrive on one transfer. */
+        size_t i = 5;
+        while (i < realsize && ptr[i] != ' ') i++;
+        while (i < realsize && ptr[i] == ' ') i++;
+        long code = 0;
+        while (i < realsize && ptr[i] >= '0' && ptr[i] <= '9') {
+            code = code * 10 + (long) (ptr[i] - '0');
+            i++;
+        }
+        curl->header_status_code = code;
     }
 
     if (dbuf_put(&curl->response_headers, (const uint8_t *) ptr, realsize) < 0) {
@@ -284,9 +299,17 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
             return 0;
         }
         int32_t processed = 0;
-        if (JS_IsNumber(ret) && JS_ToInt32(curl->ctx, &processed, ret) == 0 && processed <= 0) {
-            JS_FreeValue(curl->ctx, ret);
-            return 0;
+        if (JS_IsNumber(ret)) {
+            int conv = JS_ToInt32(curl->ctx, &processed, ret);
+            if (conv < 0) {
+                JS_FreeValue(curl->ctx, ret);
+                JS_FreeValue(curl->ctx, JS_GetException(curl->ctx));
+                return 0;
+            }
+            if (processed <= 0) {
+                JS_FreeValue(curl->ctx, ret);
+                return 0;
+            }
         }
         JS_FreeValue(curl->ctx, ret);
     }
@@ -296,11 +319,11 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     if (!JS_IsUndefined(curl->on_headers_complete) &&
             curl->in_flight && !curl->completed &&
             (realsize == 2 && ptr[0] == '\r' && ptr[1] == '\n')) {
-        long status = 0;
-        curl_easy_getinfo(curl->handle, CURLINFO_RESPONSE_CODE, &status);
-        /* Skip informational 1xx responses — headers aren't final yet.
-         * Also skip if already fired (e.g., on redirect chain). */
-        if (status >= 200 && !curl->headers_complete_fired) {
+        long status = curl->header_status_code;
+        if (status == 0) curl_easy_getinfo(curl->handle, CURLINFO_RESPONSE_CODE, &status);
+        /* 101 is a final response for protocol upgrades. Other 1xx responses
+         * are informational and must not resolve the response headers yet. */
+        if ((status == 101 || status >= 200) && !curl->headers_complete_fired) {
             curl->headers_complete_fired = true;
             JSValue args[2] = {
                 JS_NewInt32(curl->ctx, (int32_t) status),
@@ -314,6 +337,11 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
             curl->in_callback = false;
             JS_FreeValue(curl->ctx, args[0]);
             JS_FreeValue(curl->ctx, args[1]);
+            if (JS_IsException(ret)) {
+                JS_FreeValue(curl->ctx, ret);
+                JS_FreeValue(curl->ctx, JS_GetException(curl->ctx));
+                return 0;
+            }
             JS_FreeValue(curl->ctx, ret);
         }
     }
@@ -553,7 +581,7 @@ static JSValue body_to_arraybuffer(JSContext *ctx, DynBuf *b) {
     if (b->size == 0) {
         return JS_NewArrayBufferCopy(ctx, NULL, 0);
     }
-    JSValue ab = JS_NewArrayBuffer(ctx, b->buf, b->size, free_js_malloc, NULL, false);
+    JSValue ab = JS_NewArrayBuffer(ctx, b->buf, b->size, 0, free_js_malloc, NULL, false);
     if (JS_IsException(ab)) return ab;
     /* ownership transferred; detach so dbuf_free()/reuse won't double free */
     b->buf = NULL;
@@ -1015,6 +1043,12 @@ static void curl_apply_default_opts(TJSCURL *curl) {
     curl_easy_setopt(curl->handle, CURLOPT_DEBUGFUNCTION, debug_callback);
     curl_easy_setopt(curl->handle, CURLOPT_DEBUGDATA, curl);
     curl_easy_setopt(curl->handle, CURLOPT_NOPROGRESS, 0L);
+    /* libcurl otherwise forwards an HTTPS proxy's CONNECT response through
+     * HEADERFUNCTION before the target response, which confuses consumers that
+     * resolve headers from that callback. */
+#if LIBCURL_VERSION_NUM >= 0x073600
+    curl_easy_setopt(curl->handle, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
+#endif
     curl_easy_setopt(curl->handle, CURLOPT_ERRORBUFFER, curl->error_buffer);
     curl_easy_setopt(curl->handle, CURLOPT_FOLLOWLOCATION, 1L);
 }
@@ -1822,6 +1856,7 @@ static void curl_reset_buffers(TJSCURL *curl) {
     tjs_dbuf_init(curl->ctx, &curl->response_headers);
     curl->completed = false;
     curl->headers_complete_fired = false;
+    curl->header_status_code = 0;
     curl->upload_offset = 0;
     if (curl->upload_fp) fseek(curl->upload_fp, 0, SEEK_SET);
 }
@@ -1882,6 +1917,7 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->in_flight = false;
     curl->completed = true;
     curl->headers_complete_fired = false;
+    curl->header_status_code = 0;
     curl->recv_paused = false;
 
     if (TJS_IsPromisePending(ctx, &curl->promise)) {
@@ -1979,6 +2015,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     tjs_dbuf_init(ctx, &curl->response_headers);
     curl->completed = false;
     curl->headers_complete_fired = false;
+    curl->header_status_code = 0;
     curl->stream_mode = false;
     curl->verbose = false;
     curl->recv_paused = false;
@@ -2201,8 +2238,12 @@ static void export_curlopt_table(JSContext *ctx, JSValue ns) {
         CURLOPT_ENTRY(CURLOPT_RESUME_FROM_LARGE),
         CURLOPT_ENTRY(CURLOPT_AUTOREFERER),
         CURLOPT_ENTRY(CURLOPT_DNS_SERVERS),
-#ifdef CURLOPT_CAINFO_BLOB
+#if LIBCURL_VERSION_NUM >= 0x074D00
         CURLOPT_ENTRY(CURLOPT_CAINFO_BLOB),
+#endif
+#if LIBCURL_VERSION_NUM >= 0x074700
+        CURLOPT_ENTRY(CURLOPT_SSLCERT_BLOB),
+        CURLOPT_ENTRY(CURLOPT_SSLKEY_BLOB),
 #endif
     };
     for (size_t i = 0; i < sizeof(opts)/sizeof(opts[0]); i++) {
@@ -2267,6 +2308,13 @@ static void export_constants(JSContext *ctx, JSValue ns) {
     EXPORT_CONST(ns, CURLOPT_CAINFO);
     EXPORT_CONST(ns, CURLOPT_SSLCERT);
     EXPORT_CONST(ns, CURLOPT_SSLKEY);
+#if LIBCURL_VERSION_NUM >= 0x074D00
+    EXPORT_CONST(ns, CURLOPT_CAINFO_BLOB);
+#endif
+#if LIBCURL_VERSION_NUM >= 0x074700
+    EXPORT_CONST(ns, CURLOPT_SSLCERT_BLOB);
+    EXPORT_CONST(ns, CURLOPT_SSLKEY_BLOB);
+#endif
     EXPORT_CONST(ns, CURL_HTTP_VERSION_1_0);
     EXPORT_CONST(ns, CURL_HTTP_VERSION_1_1);
     EXPORT_CONST(ns, CURL_HTTP_VERSION_2_0);

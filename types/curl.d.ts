@@ -580,7 +580,12 @@ declare namespace CModuleCURL {
     export const CURLOPT_RESUME_FROM_LARGE: number;
     export const CURLOPT_LOCALPORT: number;
     export const CURLOPT_DNS_SERVERS: number;
+    /** Available with libcurl >= 7.77.0. */
     export const CURLOPT_CAINFO_BLOB: number;
+    /** Available with libcurl >= 7.71.0. */
+    export const CURLOPT_SSLCERT_BLOB: number;
+    /** Available with libcurl >= 7.71.0. */
+    export const CURLOPT_SSLKEY_BLOB: number;
     export const CURLAUTH_BASIC: number;
     export const CURLAUTH_DIGEST: number;
     export const CURLAUTH_NTLM: number;
