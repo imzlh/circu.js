@@ -170,6 +170,7 @@ typedef struct {
 /* Forward declarations — used by the import trampoline before their definition. */
 static void tjs__wasm_invalidate_membuf(JSContext *ctx, TJSWasmInstance *inst);
 static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem);
+static wasm_valkind_t tjs__wasm_func_type_get_result_valkind_safe(WASMFuncType *func_type, uint32_t result_index);
 
 static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
     TJSWasmInstance *i = JS_GetOpaque(val, tjs_wasm_instance_class_id);
@@ -570,7 +571,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
      *     the same swallow-and-truncate bug that was fixed on the inbound
      *     (parameter) path in tjs__js_to_wasm_val. */
     if (result_count > 0) {
-        wasm_valkind_t ret_kind = wasm_func_type_get_result_valkind(func_type, 0);
+        wasm_valkind_t ret_kind = tjs__wasm_func_type_get_result_valkind_safe(func_type, 0);
         bool conv_failed = false;
         switch (ret_kind) {
             case WASM_I32: {
@@ -1238,6 +1239,35 @@ static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, i
     return result;
 }
 
+/* Direct struct access wrapper for result valkind to avoid WAMR's broken API.
+ * wasm_func_type_get_result_valkind asserts on VALUE_TYPE_EXTERNREF; this reads
+ * WASMFuncType.types[] directly. Params are at [0..param_count), results at
+ * [param_count..param_count+result_count). */
+static wasm_valkind_t tjs__wasm_func_type_get_result_valkind_safe(WASMFuncType *func_type, uint32_t result_index) {
+    if (!func_type || result_index >= func_type->result_count) {
+        return (wasm_valkind_t)-1;
+    }
+    uint8_t value_type = func_type->types[func_type->param_count + result_index];
+    switch (value_type) {
+        case VALUE_TYPE_I32:
+            return WASM_I32;
+        case VALUE_TYPE_I64:
+            return WASM_I64;
+        case VALUE_TYPE_F32:
+            return WASM_F32;
+        case VALUE_TYPE_F64:
+            return WASM_F64;
+        case VALUE_TYPE_V128:
+            return WASM_V128;
+        case VALUE_TYPE_FUNCREF:
+            return WASM_FUNCREF;
+        case VALUE_TYPE_EXTERNREF:
+            return WASM_EXTERNREF;
+        default:
+            return (wasm_valkind_t)-1;
+    }
+}
+
 static char tjs__wasm_valkind_to_sig(wasm_valkind_t kind) {
     switch (kind) {
         case WASM_I32:
@@ -1248,8 +1278,8 @@ static char tjs__wasm_valkind_to_sig(wasm_valkind_t kind) {
             return 'f';
         case WASM_F64:
             return 'F';
-        /* NOTE: WASM_EXTERNREF ('r') not supported in import signatures
-         * due to WAMR bugs in invoke_native_raw for externref. */
+        case WASM_EXTERNREF:
+            return 'r';
         default:
             return 'i';
     }
@@ -1403,7 +1433,7 @@ static JSValue tjs_wasm_resolveimports(JSContext *ctx, JSValue this_val, int arg
             }
             sig[pos++] = ')';
             if (rc > 0) {
-                sig[pos++] = tjs__wasm_valkind_to_sig(wasm_func_type_get_result_valkind(ft, 0));
+                sig[pos++] = tjs__wasm_valkind_to_sig(tjs__wasm_func_type_get_result_valkind_safe(ft, 0));
             }
             sig[pos] = '\0';
 
