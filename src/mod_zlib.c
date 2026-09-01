@@ -780,6 +780,17 @@ static JSValue tjs_inflate_total_out(JSContext* ctx, JSValueConst this_val, int 
     return JS_NewInt64(ctx, i->strm.total_out);
 }
 
+/* Inflate.finished - true once the stream has seen the trailer or been finished.
+ * Exposed so callers can test the state instead of pattern-matching the
+ * "Inflate stream already finished" message that inflate()/finish() throws. */
+static JSValue tjs_inflate_finished(JSContext* ctx, JSValue this_val) {
+    TJSInflate* i = JS_GetOpaque2(ctx, this_val, tjs_inflate_class_id);
+    if (!i) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewBool(ctx, i->finished);
+}
+
 static const JSCFunctionListEntry tjs_inflate_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("inflate", 1, tjs_inflate_process, Z_NO_FLUSH),
     JS_CFUNC_MAGIC_DEF("flush", 0, tjs_inflate_process, Z_SYNC_FLUSH),
@@ -787,6 +798,7 @@ static const JSCFunctionListEntry tjs_inflate_proto_funcs[] = {
     JS_CFUNC_DEF("reset", 0, tjs_inflate_reset),
     JS_CFUNC_DEF("getTotalIn", 0, tjs_inflate_total_in),
     JS_CFUNC_DEF("getTotalOut", 0, tjs_inflate_total_out),
+    JS_CGETSET_DEF("finished", tjs_inflate_finished, NULL),
 };
 
 /* Module function list */

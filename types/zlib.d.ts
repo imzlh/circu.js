@@ -440,9 +440,20 @@ declare namespace CModuleZLib {
 
         /**
          * Finish decompression and validate the compressed stream trailer.
+         *
+         * Throws if the stream is already finished — inflate() marks the stream
+         * finished as soon as it sees the trailer, so a following finish() is a
+         * duplicate. Test {@link Inflate.finished} rather than matching on the
+         * thrown message.
          * @returns Final decompressed output
          */
         finish(): ArrayBuffer;
+
+        /**
+         * True once the trailer has been seen or finish() has run. Further
+         * inflate()/finish() calls on a finished stream throw.
+         */
+        readonly finished: boolean;
 
         /**
          * Reset decompression state for reuse

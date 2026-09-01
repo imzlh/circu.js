@@ -3,7 +3,8 @@
 .DS_Store
 
 build/
-build_test/
+build-*/
+build_*/
 build_release/
 src/version.h
 node_modules/

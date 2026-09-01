@@ -154,57 +154,9 @@ static inline uint8_t* JS_GetAnyBuffer(JSContext* ctx, size_t* psize, JSValueCon
 	size_t poffset = 0, plen = 0, pbytes_per_element = 0;
 	JSValue arrbuf;
 	if (JS_IsDataView(obj)) {
-		JSValue off_val, len_val;
-		/* buffer/byteOffset/byteLength are prototype accessors, but an own
-		 * property on the instance shadows them and would run user JS during
-		 * the JS_GetPropertyStr calls below. Callers routinely hold a raw
-		 * pointer into another argument's backing store by then, so that JS
-		 * could detach it (ArrayBuffer.prototype.transfer) and turn this into
-		 * a use-after-free. A genuine DataView never has these as own
-		 * properties, so fail closed. JS_GetOwnProperty with a NULL descriptor
-		 * is a shape lookup only and runs no JS. */
-		static const char *const dv_props[3] = { "buffer", "byteOffset", "byteLength" };
-		for (int i = 0; i < 3; i++) {
-			JSAtom a = JS_NewAtom(ctx, dv_props[i]);
-			if (a == JS_ATOM_NULL)
-				return NULL;
-			int has_own = JS_GetOwnProperty(ctx, NULL, obj, a);
-			JS_FreeAtom(ctx, a);
-			if (has_own != 0) {
-				if (has_own > 0)
-					JS_ThrowTypeError(ctx, "DataView with an own '%s' property is not accepted", dv_props[i]);
-				return NULL;
-			}
-		}
-		arrbuf = JS_GetPropertyStr(ctx, obj, "buffer");
+		arrbuf = JS_GetDataViewBuffer(ctx, obj, &poffset, &plen);
 		if (JS_IsException(arrbuf))
 			return NULL;
-		off_val = JS_GetPropertyStr(ctx, obj, "byteOffset");
-		if (JS_IsException(off_val)) {
-			JS_FreeValue(ctx, arrbuf);
-			return NULL;
-		}
-		len_val = JS_GetPropertyStr(ctx, obj, "byteLength");
-		if (JS_IsException(len_val)) {
-			JS_FreeValue(ctx, off_val);
-			JS_FreeValue(ctx, arrbuf);
-			return NULL;
-		}
-		uint64_t off64 = 0, len64 = 0;
-		if (JS_ToIndex(ctx, &off64, off_val) || JS_ToIndex(ctx, &len64, len_val)) {
-			JS_FreeValue(ctx, len_val);
-			JS_FreeValue(ctx, off_val);
-			JS_FreeValue(ctx, arrbuf);
-			return NULL;
-		}
-		JS_FreeValue(ctx, len_val);
-		JS_FreeValue(ctx, off_val);
-		if (off64 > SIZE_MAX || len64 > SIZE_MAX) {
-			JS_FreeValue(ctx, arrbuf);
-			return NULL;
-		}
-		poffset = (size_t)off64;
-		plen = (size_t)len64;
 	} else {
 		arrbuf = JS_GetTypedArrayBuffer(ctx, obj, &poffset, &plen, &pbytes_per_element);
 		if (JS_IsException(arrbuf)){

@@ -80,7 +80,7 @@ static thread_local JSClassID tjs_dir_class_id;
 typedef struct {
     JSContext *ctx;
     uv_dir_t *dir;
-    uv_dirent_t dirent;  // TODO: Use an array and an index.
+    uv_dirent_t dirent;
     JSValue path;
     bool done;
 } TJSDir;
@@ -179,6 +179,15 @@ typedef struct {
     TJSPromise result;
 } TJSReadFileReq;
 
+/* uv_fs_* may allocate path strings, result buffers, or an expanded iovec
+ * before returning a synchronous error.  The request must be cleaned up even
+ * though no completion callback will run on that path. */
+static inline void tjs_fsreq_free_immediate(JSContext *ctx, TJSFsReq *fr) {
+    if (!fr) return;
+    uv_fs_req_cleanup(&fr->req);
+    js_free(ctx, fr);
+}
+
 static JSValue tjs_new_file(JSContext *ctx, uv_file fd, const char *path) {
     TJSFile *f;
     JSValue obj;
@@ -195,6 +204,11 @@ static JSValue tjs_new_file(JSContext *ctx, uv_file fd, const char *path) {
     }
 
     f->path = JS_NewString(ctx, path);
+    if (JS_IsException(f->path)) {
+        js_free(ctx, f);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     f->ctx = ctx;
     f->fd = fd;
 
@@ -222,6 +236,11 @@ static JSValue tjs_new_dir(JSContext *ctx, uv_dir_t *dir, const char *path) {
     }
 
     d->path = JS_NewString(ctx, path);
+    if (JS_IsException(d->path)) {
+        js_free(ctx, d);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     d->ctx = ctx;
     d->dir = dir;
     d->done = false;
@@ -247,6 +266,11 @@ static JSValue tjs_new_dirent(JSContext *ctx, uv_dirent_t *dent) {
     }
 
     de->name = JS_NewString(ctx, dent->name);
+    if (JS_IsException(de->name)) {
+        js_free(ctx, de);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     de->type = dent->type;
 
     JS_SetOpaque(obj, de);
@@ -567,7 +591,7 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
      * of the I/O buffer on write). */
     uint8_t *data = js_malloc(ctx, size);
     if (!data) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         return JS_ThrowOutOfMemory(ctx);
     }
     if (magic) {
@@ -584,7 +608,7 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
     if (r != 0) {
         js_free(ctx, data);
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -616,7 +640,7 @@ static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_close(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -639,7 +663,7 @@ static JSValue tjs_file_stat(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = uv_fs_fstat(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -667,7 +691,7 @@ static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSV
 
     int r = uv_fs_ftruncate(tjs_get_loop(ctx), &fr->req, f->fd, offset, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -690,7 +714,7 @@ static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = uv_fs_fsync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -713,7 +737,7 @@ static JSValue tjs_file_datasync(JSContext *ctx, JSValue this_val, int argc, JSV
 
     int r = uv_fs_fdatasync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -741,7 +765,7 @@ static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_fchmod(tjs_get_loop(ctx), &fr->req, f->fd, mode, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -774,7 +798,7 @@ static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_fchown(tjs_get_loop(ctx), &fr->req, f->fd, uid, gid, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -808,7 +832,7 @@ static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValu
     /* Date.getTime is in ms, convert to seconds. */
     int r = uv_fs_futime(tjs_get_loop(ctx), &fr->req, f->fd, atime / 1000, mtime / 1000, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -857,7 +881,7 @@ static JSValue tjs_dir_close(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = uv_fs_closedir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, d->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -895,7 +919,7 @@ static JSValue tjs_dir_next(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     int r = uv_fs_readdir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         const char *path = JS_ToCString(ctx, d->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
@@ -1096,7 +1120,7 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1122,6 +1146,13 @@ static JSValue tjs_fs_new_stdio_file(JSContext *ctx, JSValue this_val, int argc,
 
     JSValue obj = tjs_new_file(ctx, fd, path);
 
+    if (JS_IsException(obj)) {
+        /* tjs_new_file does not take ownership when wrapper allocation fails. */
+        uv_fs_t close_req;
+        uv_fs_close(NULL, &close_req, fd, NULL);
+        uv_fs_req_cleanup(&close_req);
+    }
+
     JS_FreeCString(ctx, path);
 
     return obj;
@@ -1146,7 +1177,7 @@ static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *
         r = uv_fs_stat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     }
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1200,7 +1231,7 @@ static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int r = uv_fs_realpath(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1224,7 +1255,7 @@ static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1255,7 +1286,7 @@ static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = uv_fs_rename(tjs_get_loop(ctx), &fr->req, path, new_path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, new_path);
@@ -1281,7 +1312,7 @@ static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_mkdtemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, tpl);
         JS_FreeCString(ctx, tpl);
         return err;
@@ -1305,7 +1336,7 @@ static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_mkstemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, tpl);
         JS_FreeCString(ctx, tpl);
         return err;
@@ -1329,7 +1360,7 @@ static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     int r = uv_fs_rmdir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1361,7 +1392,7 @@ static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     int r = uv_fs_mkdir(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1419,7 +1450,7 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int r = uv_fs_copyfile(tjs_get_loop(ctx), &fr->req, path, new_path, 0, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, new_path);
@@ -1445,7 +1476,7 @@ static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     int r = uv_fs_opendir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1467,6 +1498,24 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
     CHECK_NOT_NULL(fr);
 
     JSContext *ctx = fr->ctx;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    TJSRuntime *qrt = rt ? JS_GetRuntimeOpaque(rt) : NULL;
+    if (!qrt || qrt->freeing) {
+        /* Runtime teardown drains queued work without entering JS. */
+        dbuf_free(&fr->dbuf);
+        if (rt) TJS_FreePromiseRT(rt, &fr->result);
+        if (rt) {
+            js_free_rt(rt, fr->filename);
+            js_free_rt(rt, fr);
+        } else {
+            /* This should not occur while libuv still owns the runtime, but
+             * keep the native allocation recoverable if a custom embedder
+             * invokes the callback after detaching the opaque runtime. */
+            tjs__free(fr->filename);
+            tjs__free(fr);
+        }
+        return;
+    }
     JSValue arg;
     bool is_reject = false;
 
@@ -1498,13 +1547,14 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
-    TJSReadFileReq *fr = js_malloc(ctx, sizeof(*fr));
+    TJSReadFileReq *fr = js_mallocz(ctx, sizeof(*fr));
     if (!fr) {
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
 
     fr->ctx = ctx;
+    TJS_ClearPromise(ctx, &fr->result);
     
     dbuf_init2(&fr->dbuf, NULL, tjs__dbuf_realloc);
     fr->r = -1;
@@ -1519,16 +1569,29 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     fr->req.data = fr;
     JS_FreeCString(ctx, path);
 
+    /* Create the capability before queueing work.  A worker completion can
+     * arrive after this function returns, so its result record must already
+     * be in a known state even when Promise allocation fails. */
+    JSValue promise = TJS_InitPromise(ctx, &fr->result);
+    if (JS_IsException(promise)) {
+        js_free(ctx, fr->filename);
+        dbuf_free(&fr->dbuf);
+        js_free(ctx, fr);
+        return promise;
+    }
+
     int r = uv_queue_work(tjs_get_loop(ctx), &fr->req, tjs__readfile_work_cb, tjs__readfile_after_work_cb);
     if (r != 0) {
         JSValue err = tjs_throw_errno_path(ctx, r, fr->filename);
+        TJS_FreePromise(ctx, &fr->result);
+        JS_FreeValue(ctx, promise);
         js_free(ctx, fr->filename);
         dbuf_free(&fr->dbuf);
         js_free(ctx, fr);
         return err;
     }
 
-    return TJS_InitPromise(ctx, &fr->result);
+    return promise;
 }
 
 static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
@@ -1559,7 +1622,7 @@ static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue
 
     int r = (magic == 1 ? uv_fs_lchown : uv_fs_chown)(tjs_get_loop(ctx), &fr->req, path, uid, gid, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1592,7 +1655,7 @@ static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     int r = uv_fs_chmod(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1632,7 +1695,7 @@ static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue
     int r = (magic == 1 ? uv_fs_lutime
                         : uv_fs_utime)(tjs_get_loop(ctx), &fr->req, path, atime / 1000, mtime / 1000, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1660,7 +1723,7 @@ static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     int r = uv_fs_readlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
@@ -1701,7 +1764,7 @@ static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, path2);
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         return err;
     }
     JS_FreeCString(ctx, path);
@@ -1748,7 +1811,7 @@ static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValu
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, path2);
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         return err;
     }
     JS_FreeCString(ctx, path);
@@ -1777,7 +1840,7 @@ static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (r != 0) {
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
-        js_free(ctx, fr);
+        tjs_fsreq_free_immediate(ctx, fr);
         return err;
     }
     JS_FreeCString(ctx, path);

@@ -21,6 +21,15 @@ declare namespace CModuleWorker {
          */
         postMessage(data: unknown): void;
 
+        /** Buffered messages received before an onmessage handler was installed. */
+        pendingStats(): {
+            messages: number;
+            bytes: number;
+            dropped: number;
+            maxMessages: number;
+            maxBytes: number;
+        };
+
         /**
          * Keep this pipe's underlying libuv handle referenced.
          */
@@ -40,6 +49,11 @@ declare namespace CModuleWorker {
          * Message error event handler
          */
         onmessageerror: ((error: Error) => void) | undefined;
+
+        /**
+         * Called once when the peer closes the pipe normally.
+         */
+        onclose: (() => void) | undefined;
 
         readonly [Symbol.toStringTag]: 'MessagePipe';
     }

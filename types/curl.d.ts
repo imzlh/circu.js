@@ -107,7 +107,21 @@ declare namespace CModuleCURL {
         type?: string;
     }
 
-    export type CurlOptionValue = string | number | boolean | null | undefined | string[] | ArrayBuffer | ArrayBufferView;
+    /**
+     * Values accepted by {@link CURL.setOpt}. Object-pointer options are selected
+     * by option id: copied strings, `CURLOPT_HTTPHEADER` string lists, and
+     * `CURLOPT_POSTFIELDS` bodies are supported; native pointers and callbacks
+     * are rejected.
+     */
+    export type CurlOptionValue =
+        | string
+        | number
+        | boolean
+        | null
+        | undefined
+        | string[]
+        | ArrayBuffer
+        | ArrayBufferView;
 
     /**
      * Connection pool - Manages multiple CURL connections for reuse
@@ -355,7 +369,7 @@ declare namespace CModuleCURL {
         setBearerToken(token: string): this;
 
         /**
-         * Set DNS server list (comma-separated)
+         * Set DNS server list (comma-separated; available with libcurl >= 7.24.0)
          * @param servers DNS server list (e.g., "8.8.8.8,1.1.1.1")
          * @returns Current CURL instance (supports chaining)
          */
@@ -378,9 +392,7 @@ declare namespace CModuleCURL {
          */
         setLowSpeedLimit(limit: number, time?: number): this;
 
-        /**
-         * Set a libcurl easy option by numeric id. Unsafe pointer options are rejected.
-         */
+        /** Set a supported libcurl easy option by numeric id. */
         setOpt(option: number, value: CurlOptionValue): this;
 
         /**
@@ -579,6 +591,7 @@ declare namespace CModuleCURL {
     export const CURLOPT_INFILESIZE_LARGE: number;
     export const CURLOPT_RESUME_FROM_LARGE: number;
     export const CURLOPT_LOCALPORT: number;
+    /** Available with libcurl >= 7.24.0. */
     export const CURLOPT_DNS_SERVERS: number;
     /** Available with libcurl >= 7.77.0. */
     export const CURLOPT_CAINFO_BLOB: number;

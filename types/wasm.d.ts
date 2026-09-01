@@ -87,7 +87,7 @@ declare namespace CModuleWASM {
     export interface ImportFunctionDescriptor {
         module: string;
         name: string;
-        func: (...args: WasmValue[]) => WasmValue | void;
+        func: (...args: WasmFunctionArgument[]) => WasmFunctionResult | void;
     }
 
     // Global import descriptor for resolveGlobalImports()

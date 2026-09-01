@@ -379,8 +379,10 @@ compile:
         return NULL;
     }
 
-    /* XXX: could propagate the exception */
-    js_module_set_import_meta(ctx, func_val, true, false);
+    if (js_module_set_import_meta(ctx, func_val, true, false) < 0) {
+        JS_FreeValue(ctx, func_val);
+        return NULL;
+    }
     /* the module is already referenced, so we must free it */
     m = JS_VALUE_GET_PTR(func_val);
     JS_FreeValue(ctx, func_val);

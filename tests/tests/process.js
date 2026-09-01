@@ -3,6 +3,211 @@
 const proc = import.meta.use('process');
 const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
+const os = import.meta.use('os');
+const worker = import.meta.use('worker');
+const { setTimeout, clearTimeout } = import.meta.use('timers');
+
+if (worker.isWorker && worker.workerData?.type === 'processForkProbe') {
+    let error = null;
+    try {
+        proc.fork();
+    } catch (cause) {
+        error = {
+            name: cause?.name ?? 'Error',
+            message: String(cause?.message ?? cause),
+        };
+    }
+    worker.pipe.postMessage({ ok: error !== null, error });
+    os.exit(0);
+}
+
+if (worker.isWorker && worker.workerData?.type === 'processForkHold') {
+    worker.pipe.postMessage({ ready: true });
+    await new Promise((resolve) => setTimeout(resolve, 10000));
+    os.exit(0);
+}
+
+// ========== Process Fork (Linux/POSIX) ==========
+if (os.platform === 'linux') {
+    await test('proc.fork - child continues with copied JS state', async () => {
+        const shared = { value: 41 };
+        const child = proc.fork();
+
+        if (child === null) {
+            assertEquals(shared.value, 41, 'child should see pre-fork state');
+            shared.value = 42;
+            os.exit(23);
+            return;
+        }
+
+        assert(child, 'parent should receive a Process handle');
+        assert(child.pid > 0, 'forked child should have a positive PID');
+        assertEquals(typeof child.kill, 'function', 'parent should receive a Process handle');
+        assertEquals(typeof child.wait, 'function', 'parent should receive a Process handle');
+        shared.value = 43;
+        const status = await child.wait();
+        assertEquals(status.exit_status, 23, 'child exit status should be preserved');
+        assertEquals(shared.value, 43, 'parent state should remain independent');
+    });
+
+    await test('proc.fork - parent can fork multiple children', async () => {
+        const children = [];
+        for (let index = 0; index < 2; index++) {
+            const child = proc.fork();
+            if (child === null) {
+                // Let the inherited loop run once. The second child inherited
+                // the first child's parent-side fork waiter and must disown it.
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                os.exit(30 + index);
+                return;
+            }
+            children.push(child);
+        }
+
+        const statuses = await Promise.all(children.map((child) => child.wait()));
+        assertEquals(statuses[0].exit_status, 30, 'first child exit status should be preserved');
+        assertEquals(statuses[1].exit_status, 31, 'second child exit status should be preserved');
+    });
+
+    await test('proc.fork - inherited sibling wait promise rejects in child', async () => {
+        const first = proc.fork();
+        if (first === null) {
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+            os.exit(40);
+            return;
+        }
+
+        const inheritedWait = first.wait();
+        const second = proc.fork();
+        if (second === null) {
+            let rejected = false;
+            try {
+                await inheritedWait;
+            } catch (cause) {
+                rejected = String(cause?.message ?? cause).includes('ECHILD');
+            }
+            os.exit(rejected ? 41 : 42);
+            return;
+        }
+
+        first.kill('SIGTERM');
+        const [firstStatus, secondStatus] = await Promise.all([first.wait(), second.wait()]);
+        assertEquals(firstStatus.term_signal, 'SIGTERM', 'parent should still own first child');
+        assertEquals(secondStatus.exit_status, 41,
+            'later child should reject the inherited parent-only wait promise');
+    });
+
+    await test('proc.fork - waitSync reaps the child', () => {
+        const child = proc.fork();
+        if (child === null) {
+            os.exit(24);
+            return;
+        }
+
+        const status = child.waitSync();
+        assertEquals(status.exit_status, 24, 'waitSync should preserve the child exit status');
+    });
+
+    await test('proc.fork - parent can terminate child', async () => {
+        const child = proc.fork();
+        if (child === null) {
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+            os.exit(0);
+            return;
+        }
+
+        child.kill('SIGTERM');
+        const status = await child.wait();
+        assert(status.exit_status !== 0 || status.term_signal !== null,
+            'forked child should be terminated by SIGTERM');
+    });
+
+    await test('proc.fork - worker runtime rejects fork', async () => {
+        const child = new worker.Worker({ type: 'processForkProbe' });
+        try {
+            const result = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('worker fork probe timed out')), 3000);
+                child.messagePipe.onmessage = (value) => {
+                    clearTimeout(timer);
+                    resolve(value);
+                };
+                child.messagePipe.onmessageerror = reject;
+            });
+            assert(result?.ok === true, 'worker fork should throw');
+            assert(String(result.error?.message ?? '').includes('worker'),
+                'worker fork error should explain the restriction');
+        } finally {
+            await child.terminate();
+        }
+    });
+
+    await test('proc.fork - main runtime rejects fork while a worker exists', async () => {
+        const runningWorker = new worker.Worker({ type: 'processForkHold' });
+        try {
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('worker ready probe timed out')), 3000);
+                runningWorker.messagePipe.onmessage = (value) => {
+                    if (!value?.ready) return;
+                    clearTimeout(timer);
+                    resolve();
+                };
+                runningWorker.messagePipe.onmessageerror = reject;
+            });
+
+            let error = null;
+            try {
+                proc.fork();
+            } catch (cause) {
+                error = cause;
+            }
+            assert(error, 'fork should throw while the main runtime owns a worker');
+            assert(String(error.message ?? error).includes('worker'),
+                'main-runtime fork error should explain the worker restriction');
+        } finally {
+            await runningWorker.terminate();
+        }
+    });
+
+    await test('proc.fork - rejects active spawned process handles', async () => {
+        const runningChild = proc.spawn(['sleep', '10']);
+        try {
+            let error = null;
+            try {
+                proc.fork();
+            } catch (cause) {
+                error = cause;
+            }
+            assert(error, 'fork should throw while a spawned process is active');
+            assert(String(error.message ?? error).includes('process handle'),
+                'fork error should explain the active process restriction');
+        } finally {
+            runningChild.kill('SIGKILL');
+            await runningChild.wait();
+        }
+    });
+
+    await test('proc.fork - rejects active PTY process handles', async () => {
+        const runningChild = proc.spawn([], {
+            pty: true,
+            name: '/bin/sleep',
+            argv: ['sleep', '10'],
+        });
+        try {
+            let error = null;
+            try {
+                proc.fork();
+            } catch (cause) {
+                error = cause;
+            }
+            assert(error, 'fork should throw while a PTY process is active');
+            assert(String(error.message ?? error).includes('process handle'),
+                'fork error should explain the active PTY restriction');
+        } finally {
+            runningChild.kill('SIGKILL');
+            await runningChild.wait();
+        }
+    });
+}
 
 // ========== Process Spawn ==========
 await test('proc.spawn - basic spawn', async () => {

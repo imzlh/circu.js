@@ -477,7 +477,7 @@ static int ffi_type_from_buffer(JSContext *ctx, ffi_type *type, uint8_t *buf, JS
                 return 0;
                 break;
             case FFI_TYPE_INT:
-                *val = JS_NewInt32(ctx, *(int *) buf);  // TODO maybe check architecture;
+                *val = JS_NewInt32(ctx, *(int *) buf);
                 return sizeof(int);
             case FFI_TYPE_FLOAT:
                 *val = JS_NewFloat64(ctx, (double) *(float *) buf);
@@ -886,10 +886,19 @@ static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSVa
 
 static void js_uv_lib_finalizer(JSRuntime *rt, JSValue val) {
     uv_lib_t *u = JS_GetOpaque(val, js_uv_lib_classid);
-    if (u) {
-        uv_dlclose(u);
-        js_free_rt(rt, u);
-    }
+    if (!u) return;
+    JS_SetOpaque(val, NULL);
+    uv_dlclose(u);
+    js_free_rt(rt, u);
+}
+
+static JSValue js_uv_lib_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    uv_lib_t *u = JS_GetOpaque(this_val, js_uv_lib_classid);
+    if (!u) return JS_UNDEFINED;
+    JS_SetOpaque(this_val, NULL);
+    uv_dlclose(u);
+    js_free(ctx, u);
+    return JS_UNDEFINED;
 }
 
 static JSValue js_uv_lib_dlsym(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -907,6 +916,10 @@ static JSValue js_uv_lib_dlsym(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     const char *sym = JS_ToCString(ctx, argv[0]);
+    if (!sym) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     void *ptr;
     int ret = uv_dlsym(lib, sym, &ptr);
     JS_FreeCString(ctx, sym);
@@ -926,6 +939,7 @@ JSClassDef js_uv_lib_class = {
 };
 static const JSCFunctionListEntry js_uv_lib_proto_funcs[] = {
     TJS_CFUNC_DEF("symbol", 1, js_uv_lib_dlsym),
+    TJS_CFUNC_DEF("close", 0, js_uv_lib_close),
 };
 #pragma endregion "UvLib class definition"
 
@@ -1083,6 +1097,17 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
         }
         memcpy(arg_copy, args[i], arg_sz);
         jsargs[i] = JS_NewArrayBuffer(ctx, arg_copy, arg_sz, 0, js__free_rt, NULL, true);
+        if (JS_IsException(jsargs[i])) {
+            /* JS_NewArrayBuffer does not own an externally supplied buffer
+             * when construction fails. Reclaim the copy here before the
+             * partial-argument cleanup below. */
+            js_free(ctx, arg_copy);
+            for (unsigned j = 0; j < i; j++)
+                JS_FreeValue(ctx, jsargs[j]);
+            js_free(ctx, jsargs);
+            memset(ret, 0, ffi_type_get_sz(cif->rtype));
+            return;
+        }
     }
     JSValue jsret = JS_Call(ctx, jscl->func, JS_UNDEFINED, cif->nargs, jsargs);
     for (unsigned i = 0; i < cif->nargs; i++) {

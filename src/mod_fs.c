@@ -285,8 +285,10 @@ static int64_t fs_pread(int fd, void* buf, int64_t len, int64_t off)
     ov.Offset = (DWORD) (off & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD rd = 0;
-    if (!ReadFile((HANDLE) _get_osfhandle(fd), buf, (DWORD) len, &rd, &ov))
+    if (!ReadFile((HANDLE) _get_osfhandle(fd), buf, (DWORD) len, &rd, &ov)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
         return -1;
+    }
     return rd;
 }
 static int64_t fs_pwrite(int fd, const void* buf, int64_t len, int64_t off)

@@ -373,9 +373,24 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
 }
 
 JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
-    JSValue rfuncs[2];
+    /* Callers commonly queue a libuv request before creating the promise.
+     * Keep every field in a known state before entering QuickJS: on an OOM
+     * path JS_NewPromiseCapability() returns JS_EXCEPTION and leaves its
+     * resolving_funcs output unspecified.  A late native callback must be
+     * able to observe that state and release its own resources safely. */
+    p->p = JS_UNDEFINED;
+    p->rfuncs[0] = JS_UNDEFINED;
+    p->rfuncs[1] = JS_UNDEFINED;
+
+    JSValue rfuncs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     p->p = JS_NewPromiseCapability(ctx, rfuncs);
     if (JS_IsException(p->p)) {
+        /* QuickJS is allowed to leave partially-created resolving functions
+         * in the output array when capability construction fails.  Release
+         * any such values before returning the exception. */
+        JS_FreeValue(ctx, rfuncs[0]);
+        JS_FreeValue(ctx, rfuncs[1]);
+        p->p = JS_UNDEFINED;
         return JS_EXCEPTION;
     }
     p->rfuncs[0] = rfuncs[0];
@@ -384,19 +399,30 @@ JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
 }
 
 bool TJS_IsPromisePending(JSContext *ctx, TJSPromise *p) {
-    return !JS_IsUndefined(p->p);
+    (void)ctx;
+    /* JS_EXCEPTION is never a usable promise.  Treat it as non-pending too
+     * for compatibility with callers that inspect a partially initialized
+     * request after promise allocation failed. */
+    return !JS_IsUndefined(p->p) && !JS_IsException(p->p);
 }
 
 void TJS_FreePromise(JSContext *ctx, TJSPromise *p) {
-    JS_FreeValue(ctx, p->rfuncs[0]);
-    JS_FreeValue(ctx, p->rfuncs[1]);
-    JS_FreeValue(ctx, p->p);
+    /* Detach before dropping references. JS_FreeValue() can run native
+     * finalizers, so reading from an enclosing request after the first free
+     * is not safe. Clearing first also makes repeated teardown a no-op. */
+    TJSPromise owned = *p;
+    TJS_ClearPromise(ctx, p);
+    JS_FreeValue(ctx, owned.rfuncs[0]);
+    JS_FreeValue(ctx, owned.rfuncs[1]);
+    JS_FreeValue(ctx, owned.p);
 }
 
 void TJS_FreePromiseRT(JSRuntime *rt, TJSPromise *p) {
-    JS_FreeValueRT(rt, p->rfuncs[0]);
-    JS_FreeValueRT(rt, p->rfuncs[1]);
-    JS_FreeValueRT(rt, p->p);
+    TJSPromise owned = *p;
+    TJS_ClearPromise(NULL, p);
+    JS_FreeValueRT(rt, owned.rfuncs[0]);
+    JS_FreeValueRT(rt, owned.rfuncs[1]);
+    JS_FreeValueRT(rt, owned.p);
 }
 
 void TJS_ClearPromise(JSContext *ctx, TJSPromise *p) {
@@ -412,13 +438,38 @@ void TJS_MarkPromise(JSRuntime *rt, TJSPromise *p, JS_MarkFunc *mark_func) {
 }
 
 void TJS_SettlePromise(JSContext *ctx, TJSPromise *p, bool is_reject, int argc, JSValue *argv) {
-    JSValue ret = JS_Call(ctx, p->rfuncs[is_reject], JS_UNDEFINED, argc, argv);
+    /* A native operation may have been queued before promise allocation.  If
+     * allocation failed (or teardown already cleared the promise), there is
+     * no resolver to call.  The callback still owns `argv`, so release those
+     * values and clear the record before returning. */
+    if (!TJS_IsPromisePending(ctx, p)) {
+        TJSPromise owned = *p;
+        TJS_ClearPromise(ctx, p);
+        for (int i = 0; i < argc; i++) {
+            JS_FreeValue(ctx, argv[i]);
+        }
+        /* Normally all three fields are already undefined here.  Freeing the
+         * detached copy also covers a partially-created capability and keeps
+         * this path leak-free if a future QuickJS version returns one. */
+        JS_FreeValue(ctx, owned.rfuncs[0]);
+        JS_FreeValue(ctx, owned.rfuncs[1]);
+        JS_FreeValue(ctx, owned.p);
+        return;
+    }
+
+    /* Resolving a promise invokes the host promise hook synchronously. That
+     * hook is user JS and may re-enter the native object that owns `p` (or
+     * even finalize it). Move the capability out and mark the record settled
+     * before calling JS; afterwards, never dereference `p` again. */
+    TJSPromise owned = *p;
+    TJS_ClearPromise(ctx, p);
+
+    JSValue ret = JS_Call(ctx, owned.rfuncs[is_reject], JS_UNDEFINED, argc, argv);
     for (int i = 0; i < argc; i++) {
         JS_FreeValue(ctx, argv[i]);
     }
-    JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
-    TJS_FreePromise(ctx, p);
-    TJS_ClearPromise(ctx, p);
+    JS_FreeValue(ctx, ret);
+    TJS_FreePromise(ctx, &owned);
 }
 
 void TJS_ResolvePromise(JSContext *ctx, TJSPromise *p, int argc, JSValue *argv) {
@@ -430,10 +481,18 @@ void TJS_RejectPromise(JSContext *ctx, TJSPromise *p, int argc, JSValue *argv) {
 }
 
 static inline JSValue tjs__settled_promise(JSContext *ctx, bool is_reject, int argc, JSValue *argv) {
-    JSValue promise, resolving_funcs[2], ret;
+    JSValue promise, resolving_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED }, ret;
 
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise)) {
+        /* The helper takes ownership of argv even when promise creation
+         * fails.  Release it here; otherwise every OOM on a fast-path
+         * resolved/rejected promise leaks the result value. */
+        for (int i = 0; i < argc; i++) {
+            JS_FreeValue(ctx, argv[i]);
+        }
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
         return JS_EXCEPTION;
     }
 
@@ -441,6 +500,13 @@ static inline JSValue tjs__settled_promise(JSContext *ctx, bool is_reject, int a
 
     for (int i = 0; i < argc; i++) {
         JS_FreeValue(ctx, argv[i]);
+    }
+    if (JS_IsException(ret)) {
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
     }
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, resolving_funcs[0]);

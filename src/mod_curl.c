@@ -65,6 +65,8 @@ typedef struct TJSConnPool {
     CURLM *multi_handle;
     uv_timer_t timer;
     uv_prepare_t prep;     /* one-shot "kick" so sync completions still drain */
+    bool timer_initialized;
+    bool prep_initialized;
     bool prep_active;
 
     JSContext *ctx;
@@ -96,7 +98,10 @@ typedef struct {
 
     /* Request-owned resources freed on reset()/finalize */
     struct curl_slist *request_headers;   /* CURLOPT_HTTPHEADER (setHeaders) */
-    struct curl_slist **gen_slists;       /* slists created via setOpt() */
+    struct {
+        CURLoption option;
+        struct curl_slist *list;
+    } *gen_slists;                         /* current slist per setOpt() option */
     size_t gen_slists_len;
     curl_mime *mime;                      /* setMimePost() */
     FILE *upload_fp;                      /* setUploadFile() */
@@ -180,6 +185,17 @@ static void curl_release_self(JSContext *ctx, TJSCURL *curl) {
 
 static void curl_detach_self(TJSCURL *curl) {
     curl->self_obj = JS_UNDEFINED;
+}
+
+/* `self_obj` is a strong reference used only while a transfer is in flight.
+ * Pool teardown runs outside the CURL object's finalizer, so it must release
+ * this reference with the runtime-aware API.  The field is cleared before the
+ * free because releasing it can synchronously invoke tjs_curl_finalizer(). */
+static void curl_release_self_rt(JSRuntime *rt, TJSCURL *curl) {
+    JSValue self = curl->self_obj;
+    if (JS_IsUndefined(self)) return;
+    curl->self_obj = JS_UNDEFINED;
+    JS_FreeValueRT(rt, self);
 }
 
 static int connpool_require_open(JSContext *ctx, TJSConnPool *pool) {
@@ -419,49 +435,62 @@ static size_t read_callback(char *buffer, size_t size, size_t nitems, void *user
 #pragma region Pool teardown helpers
 
 static void pool_maybe_free(TJSConnPool *pool) {
-    if (pool->freeing && pool->open_handles == 0) {
+    if (pool && pool->freeing && pool->open_handles == 0) {
         tjs__free(pool);
     }
 }
 
 static void uv_handle_closed_cb(uv_handle_t *handle) {
     TJSConnPool *pool = handle->data;
-    pool->open_handles--;
+    if (!pool) return;
+    if (pool->open_handles > 0) pool->open_handles--;
     pool_maybe_free(pool);
+}
+
+static void connpool_close_uv_handles(TJSConnPool *pool) {
+    if (!pool) return;
+    if (pool->timer_initialized) {
+        uv_timer_stop(&pool->timer);
+        if (!uv_is_closing((uv_handle_t *) &pool->timer))
+            uv_close((uv_handle_t *) &pool->timer, uv_handle_closed_cb);
+    }
+    if (pool->prep_initialized) {
+        uv_prepare_stop(&pool->prep);
+        if (!uv_is_closing((uv_handle_t *) &pool->prep))
+            uv_close((uv_handle_t *) &pool->prep, uv_handle_closed_cb);
+    }
 }
 
 /* Detach every live easy handle from the multi handle and tear it down.
  * Never calls into JS, so it is safe from the GC finalizer. Pending promises
  * are freed (not rejected) here; explicit abort()/close() reject beforehand. */
 static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
-    if (!pool->multi_handle) return;
-
     struct list_head *el, *el1;
     list_for_each_safe(el, el1, &pool->curls) {
         TJSCURL *c = list_entry(el, TJSCURL, link);
-        if (c->in_flight) {
+        if (pool->multi_handle && c->in_flight) {
             curl_multi_remove_handle(pool->multi_handle, c->handle);
             c->in_flight = false;
         }
         if (TJS_IsPromisePending(pool->ctx, &c->promise)) {
             TJS_FreePromiseRT(rt, &c->promise);
-            TJS_ClearPromise(NULL, &c->promise);
         }
-        /* c->self_obj is a dup of the CURL wrapper kept only to pin it while
-         * the request is in flight. Releasing it here can recurse into
-         * tjs_curl_finalizer() while we are still iterating pool->curls and
-         * touching `c`, which risks UAF/double-free. Detach the self-pin and
-         * let normal GC collect the wrapper later if no JS refs remain. */
-        curl_detach_self(c);
-        c->pool = NULL; /* detach: c's finalizer must not touch the multi handle */
+        /* Detach every native back-reference before releasing the self pin.
+         * JS_FreeValueRT may run the CURL finalizer immediately when this was
+         * the last reference, so nothing may touch `c` after that call. */
+        c->pool = NULL;
         list_del(&c->link);
         init_list_head(&c->link);
+        curl_release_self_rt(rt, c);
     }
 
     /* cleanup fires the socket callback with CURL_POLL_REMOVE for every active
      * socket, which uv_close()es the matching poll handle. */
-    curl_multi_cleanup(pool->multi_handle);
-    pool->multi_handle = NULL;
+    if (pool->multi_handle) {
+        CURLM *multi = pool->multi_handle;
+        curl_multi_cleanup(multi);
+        pool->multi_handle = NULL;
+    }
 }
 
 #pragma endregion
@@ -470,15 +499,25 @@ static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
 
 static void poll_close_cb(uv_handle_t *handle) {
     TJSSocketPoll *socket_poll = (TJSSocketPoll *) handle->data;
+    if (!socket_poll) return;
     TJSConnPool *pool = socket_poll->pool;
     tjs__free(socket_poll);
-    pool->open_handles--;
-    pool_maybe_free(pool);
+    if (pool) {
+        if (pool->open_handles > 0) pool->open_handles--;
+        pool_maybe_free(pool);
+    }
 }
 
 static void poll_cb(uv_poll_t *handle, int status, int events) {
     TJSSocketPoll *socket_poll = (TJSSocketPoll *) handle->data;
+    if (!socket_poll) return;
     TJSConnPool *pool = socket_poll->pool;
+    if (!pool || pool->freeing || !pool->multi_handle) {
+        uv_poll_stop(handle);
+        if (!uv_is_closing((uv_handle_t *) handle))
+            uv_close((uv_handle_t *) handle, poll_close_cb);
+        return;
+    }
 
     int ev_bitmask = 0;
     if (status < 0) {
@@ -497,10 +536,15 @@ static int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, v
     TJSConnPool *pool = (TJSConnPool *) userp;
     TJSSocketPoll *socket_poll = (TJSSocketPoll *) socketp;
 
+    (void) easy;
+    if (!pool || pool->freeing || !pool->multi_handle)
+        return -1;
+
     if (what == CURL_POLL_REMOVE) {
         if (socket_poll) {
             uv_poll_stop(&socket_poll->poll);
-            uv_close((uv_handle_t *) &socket_poll->poll, poll_close_cb);
+            if (!uv_is_closing((uv_handle_t *) &socket_poll->poll))
+                uv_close((uv_handle_t *) &socket_poll->poll, poll_close_cb);
             curl_multi_assign(pool->multi_handle, s, NULL);
         }
     } else {
@@ -516,12 +560,23 @@ static int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, v
             socket_poll->pool = pool;
             socket_poll->poll.data = socket_poll;
 
-            uv_poll_init_socket(tjs_get_loop(pool->ctx), &socket_poll->poll, s);
+            int r = uv_poll_init_socket(tjs_get_loop(pool->ctx), &socket_poll->poll, s);
+            if (r != 0) {
+                tjs__free(socket_poll);
+                return -1;
+            }
             pool->open_handles++;
             curl_multi_assign(pool->multi_handle, s, socket_poll);
         }
 
-        uv_poll_start(&socket_poll->poll, events, poll_cb);
+        int r = uv_poll_start(&socket_poll->poll, events, poll_cb);
+        if (r != 0) {
+            curl_multi_assign(pool->multi_handle, s, NULL);
+            uv_poll_stop(&socket_poll->poll);
+            if (!uv_is_closing((uv_handle_t *) &socket_poll->poll))
+                uv_close((uv_handle_t *) &socket_poll->poll, poll_close_cb);
+            return -1;
+        }
     }
 
     return 0;
@@ -538,20 +593,26 @@ static void once_prepare_cb(uv_prepare_t *handle) {
     pool->prep_active = false;
     uv_prepare_stop(handle);
 
-    if (!pool->ctx || !pool->multi_handle) return;
+    if (!pool || pool->freeing || !pool->ctx || !pool->multi_handle) return;
 
     MSACT(pool, pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
     check_multi_info(pool);
 }
 
 static void kick_prep_once(TJSConnPool *pool) {
-    if (pool->prep_active) return;
-    pool->prep_active = true;
-    uv_prepare_start(&pool->prep, once_prepare_cb);
+    if (!pool || pool->freeing || !pool->prep_initialized ||
+        !pool->multi_handle || pool->prep_active)
+        return;
+    if (uv_prepare_start(&pool->prep, once_prepare_cb) == 0)
+        pool->prep_active = true;
 }
 
 static int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
     TJSConnPool *pool = (TJSConnPool *) userp;
+
+    (void) multi;
+    if (!pool || pool->freeing || !pool->timer_initialized)
+        return -1;
 
     if (timeout_ms < 0) {
         uv_timer_stop(&pool->timer);
@@ -564,7 +625,7 @@ static int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
 
 static void timer_cb(uv_timer_t *handle) {
     TJSConnPool *pool = (TJSConnPool *) handle->data;
-    if (!pool->multi_handle) return;
+    if (!pool || pool->freeing || !pool->multi_handle) return;
 
     int running;
     MSACT(pool, pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
@@ -579,6 +640,9 @@ static void timer_cb(uv_timer_t *handle) {
  * the DynBuf storage (which is js_malloc'd via tjs_dbuf_init). */
 static JSValue body_to_arraybuffer(JSContext *ctx, DynBuf *b) {
     if (b->size == 0) {
+        /* A zero-length DynBuf can still own a small allocation (for example
+         * after a failed append). Release it before returning the empty view. */
+        dbuf_free(b);
         return JS_NewArrayBufferCopy(ctx, NULL, 0);
     }
     JSValue ab = JS_NewArrayBuffer(ctx, b->buf, b->size, 0, free_js_malloc, NULL, false);
@@ -733,7 +797,7 @@ static void curl_clear_request_resources(JSRuntime *rt, TJSCURL *curl) {
     }
     if (curl->gen_slists) {
         for (size_t i = 0; i < curl->gen_slists_len; i++) {
-            curl_slist_free_all(curl->gen_slists[i]);
+            curl_slist_free_all(curl->gen_slists[i].list);
         }
         js_free_rt(rt, curl->gen_slists);
         curl->gen_slists = NULL;
@@ -751,6 +815,20 @@ static void curl_clear_request_resources(JSRuntime *rt, TJSCURL *curl) {
         js_free_rt(rt, curl->upload_data);
         curl->upload_data = NULL;
         curl->upload_size = curl->upload_offset = 0;
+    }
+}
+
+static void curl_forget_slist(TJSCURL *curl, CURLoption option) {
+    for (size_t i = 0; i < curl->gen_slists_len; i++) {
+        if (curl->gen_slists[i].option != option) continue;
+
+        curl_slist_free_all(curl->gen_slists[i].list);
+        if (i + 1 < curl->gen_slists_len) {
+            memmove(&curl->gen_slists[i], &curl->gen_slists[i + 1],
+                    (curl->gen_slists_len - i - 1) * sizeof(*curl->gen_slists));
+        }
+        curl->gen_slists_len--;
+        return;
     }
 }
 
@@ -790,8 +868,11 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
         if (curl->pool->multi_handle && curl->in_flight) {
             curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
         }
+        curl->in_flight = false;
         list_del(&curl->link);
+        init_list_head(&curl->link);
     }
+    curl->pool = NULL;
 
     if (curl->handle) {
         curl_easy_cleanup(curl->handle);
@@ -827,10 +908,7 @@ static void tjs_connpool_finalizer(JSRuntime *rt, JSValue val) {
     pool->ctx = NULL;
     pool->freeing = true;
 
-    if (!uv_is_closing((uv_handle_t *) &pool->timer))
-        uv_close((uv_handle_t *) &pool->timer, uv_handle_closed_cb);
-    if (!uv_is_closing((uv_handle_t *) &pool->prep))
-        uv_close((uv_handle_t *) &pool->prep, uv_handle_closed_cb);
+    connpool_close_uv_handles(pool);
 
     pool_maybe_free(pool);
 }
@@ -903,11 +981,31 @@ static JSValue tjs_connpool_constructor(JSContext *ctx, JSValueConst new_target,
     curl_multi_setopt(pool->multi_handle, CURLMOPT_TIMERFUNCTION, timer_callback);
     curl_multi_setopt(pool->multi_handle, CURLMOPT_TIMERDATA, pool);
 
-    uv_timer_init(tjs_get_loop(ctx), &pool->timer);
+    int uv_r = uv_timer_init(tjs_get_loop(ctx), &pool->timer);
+    if (uv_r != 0) {
+        curl_multi_cleanup(pool->multi_handle);
+        pool->multi_handle = NULL;
+        tjs__free(pool);
+        JS_FreeValue(ctx, obj);
+        return tjs_throw_errno(ctx, uv_r);
+    }
+    pool->timer_initialized = true;
     pool->timer.data = pool;
     pool->open_handles++;
 
-    uv_prepare_init(tjs_get_loop(ctx), &pool->prep);
+    uv_r = uv_prepare_init(tjs_get_loop(ctx), &pool->prep);
+    if (uv_r != 0) {
+        /* No easy handles have been added yet. Keep the pool alive until the
+         * timer's close callback has decremented open_handles. */
+        pool->freeing = true;
+        curl_multi_cleanup(pool->multi_handle);
+        pool->multi_handle = NULL;
+        connpool_close_uv_handles(pool);
+        pool_maybe_free(pool);
+        JS_FreeValue(ctx, obj);
+        return tjs_throw_errno(ctx, uv_r);
+    }
+    pool->prep_initialized = true;
     pool->prep.data = pool;
     pool->prep_active = false;
     pool->open_handles++;
@@ -1151,62 +1249,113 @@ static JSValue tjs_curl_set_method(JSContext *ctx, JSValueConst this_val, int ar
 static JSValue tjs_curl_set_headers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
 
-    if (curl->request_headers) {
+    if (argc < 1 || !JS_IsObject(argv[0])) {
+        CURLcode rc = curl_easy_setopt(curl->handle, CURLOPT_HTTPHEADER, NULL);
+        if (rc != CURLE_OK) {
+            return JS_ThrowPlainError(ctx, "setHeaders failed: %s", curl_easy_strerror(rc));
+        }
+        curl_forget_slist(curl, CURLOPT_HTTPHEADER);
         curl_slist_free_all(curl->request_headers);
         curl->request_headers = NULL;
+        return JS_DupValue(ctx, this_val);
     }
 
-    if (JS_IsObject(argv[0])) {
-        JSPropertyEnum *props;
-        uint32_t prop_count;
-        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, argv[0],
-                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-            for (uint32_t i = 0; i < prop_count; i++) {
-                JSValue key = JS_AtomToString(ctx, props[i].atom);
-                JSValue val = JS_GetProperty(ctx, argv[0], props[i].atom);
-                const char *key_str = JS_ToCString(ctx, key);
-                const char *val_str = JS_ToCString(ctx, val);
-                if (key_str && val_str) {
-                    size_t hlen = strlen(key_str) + strlen(val_str) + 3;
-                    char *header = js_malloc(ctx, hlen);
-                    if (header) {
-                        snprintf(header, hlen, "%s: %s", key_str, val_str);
-                        /* Use temp var to preserve old list if append fails */
-                        struct curl_slist *new_headers = curl_slist_append(curl->request_headers, header);
-                        if (new_headers) {
-                            curl->request_headers = new_headers;
-                        } else {
-                            /* OOM: keep existing headers, free temp + this
-                             * iteration's values + the property enum, then
-                             * report the error. */
-                            js_free(ctx, header);
-                            JS_FreeCString(ctx, key_str);
-                            JS_FreeCString(ctx, val_str);
-                            JS_FreeValue(ctx, key);
-                            JS_FreeValue(ctx, val);
-                            js_free(ctx, props);
-                            return JS_ThrowOutOfMemory(ctx);
-                        }
-                        js_free(ctx, header);
-                    }
-                }
-                JS_FreeCString(ctx, key_str);
-                JS_FreeCString(ctx, val_str);
-                JS_FreeValue(ctx, key);
-                JS_FreeValue(ctx, val);
-            }
-            js_free(ctx, props);
-            curl_easy_setopt(curl->handle, CURLOPT_HTTPHEADER, curl->request_headers);
-        }
+    JSPropertyEnum *props = NULL;
+    uint32_t prop_count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, argv[0],
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+        return JS_EXCEPTION;
     }
+
+    struct curl_slist *headers = NULL;
+    for (uint32_t i = 0; i < prop_count; i++) {
+        JSValue key = JS_AtomToString(ctx, props[i].atom);
+        if (JS_IsException(key)) goto fail;
+
+        JSValue val = JS_GetProperty(ctx, argv[0], props[i].atom);
+        if (JS_IsException(val)) {
+            JS_FreeValue(ctx, key);
+            goto fail;
+        }
+
+        const char *key_str = JS_ToCString(ctx, key);
+        const char *val_str = key_str ? JS_ToCString(ctx, val) : NULL;
+        if (!key_str || !val_str) {
+            JS_FreeCString(ctx, key_str);
+            JS_FreeCString(ctx, val_str);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, val);
+            goto fail;
+        }
+
+        size_t key_len = strlen(key_str);
+        size_t val_len = strlen(val_str);
+        if (key_len > SIZE_MAX - 3 || val_len > SIZE_MAX - key_len - 3) {
+            JS_FreeCString(ctx, key_str);
+            JS_FreeCString(ctx, val_str);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, val);
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
+
+        size_t header_len = key_len + val_len + 3;
+        char *header = js_malloc(ctx, header_len);
+        if (!header) {
+            JS_FreeCString(ctx, key_str);
+            JS_FreeCString(ctx, val_str);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, val);
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
+        snprintf(header, header_len, "%s: %s", key_str, val_str);
+        struct curl_slist *grown = curl_slist_append(headers, header);
+        js_free(ctx, header);
+        JS_FreeCString(ctx, key_str);
+        JS_FreeCString(ctx, val_str);
+        JS_FreeValue(ctx, key);
+        JS_FreeValue(ctx, val);
+        if (!grown) {
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
+        headers = grown;
+    }
+    JS_FreePropertyEnum(ctx, props, prop_count);
+
+    CURLcode rc = curl_easy_setopt(curl->handle, CURLOPT_HTTPHEADER, headers);
+    if (rc != CURLE_OK) {
+        curl_slist_free_all(headers);
+        return JS_ThrowPlainError(ctx, "setHeaders failed: %s", curl_easy_strerror(rc));
+    }
+
+    curl_forget_slist(curl, CURLOPT_HTTPHEADER);
+    curl_slist_free_all(curl->request_headers);
+    curl->request_headers = headers;
     return JS_DupValue(ctx, this_val);
+
+fail:
+    JS_FreePropertyEnum(ctx, props, prop_count);
+    curl_slist_free_all(headers);
+    return JS_EXCEPTION;
 }
 
 static JSValue tjs_curl_get_headers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
+    struct curl_slist *headers = curl->request_headers;
+    if (!headers) {
+        for (size_t i = 0; i < curl->gen_slists_len; i++) {
+            if (curl->gen_slists[i].option == CURLOPT_HTTPHEADER) {
+                headers = curl->gen_slists[i].list;
+                break;
+            }
+        }
+    }
+
     JSValue arr = JS_NewArray(ctx);
     uint32_t i = 0;
-    for (struct curl_slist *p = curl->request_headers; p; p = p->next)
+    for (struct curl_slist *p = headers; p; p = p->next)
         JS_SetPropertyUint32(ctx, arr, i++, JS_NewString(ctx, p->data));
     return arr;
 }
@@ -1233,10 +1382,17 @@ static JSValue tjs_curl_set_body(JSContext *ctx, JSValueConst this_val, int argc
 
     /* COPYPOSTFIELDS makes libcurl strdup the buffer; size must be set first so
      * binary payloads with embedded NULs are sent verbatim. */
-    curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) len);
-    curl_easy_setopt(curl->handle, CURLOPT_COPYPOSTFIELDS, data);
+    CURLcode rc = curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) len);
+    if (rc == CURLE_OK) {
+        rc = curl_easy_setopt(curl->handle, CURLOPT_COPYPOSTFIELDS, data);
+    }
 
     if (cstr) JS_FreeCString(ctx, cstr);
+    if (rc != CURLE_OK) {
+        curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDS, NULL);
+        curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
+        return JS_ThrowPlainError(ctx, "setBody failed: %s", curl_easy_strerror(rc));
+    }
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1343,44 +1499,118 @@ static bool curl_option_is_reserved(CURLoption id) {
     }
 }
 
-static int curl_set_slist_opt(JSContext *ctx, TJSCURL *curl, CURLoption id, JSValueConst arr) {
+typedef enum {
+    CURL_OBJECT_OPTION_UNSUPPORTED,
+    CURL_OBJECT_OPTION_COPIED_STRING,
+    CURL_OBJECT_OPTION_SLIST,
+    CURL_OBJECT_OPTION_POSTFIELDS,
+} CurlObjectOptionKind;
+
+/* Object-pointer options have different ownership contracts in libcurl. */
+static CurlObjectOptionKind curl_object_option_kind(CURLoption id) {
+    switch (id) {
+        case CURLOPT_URL:
+        case CURLOPT_CUSTOMREQUEST:
+        case CURLOPT_USERAGENT:
+        case CURLOPT_ACCEPT_ENCODING:
+        case CURLOPT_USERNAME:
+        case CURLOPT_PASSWORD:
+        case CURLOPT_PROXY:
+        case CURLOPT_NOPROXY:
+        case CURLOPT_PROXYUSERNAME:
+        case CURLOPT_PROXYPASSWORD:
+        case CURLOPT_CAINFO:
+        case CURLOPT_SSLCERT:
+        case CURLOPT_SSLKEY:
+        case CURLOPT_KEYPASSWD:
+        case CURLOPT_INTERFACE:
+        case CURLOPT_COOKIEFILE:
+        case CURLOPT_COOKIEJAR:
+#if LIBCURL_VERSION_NUM >= 0x071800
+        case CURLOPT_DNS_SERVERS:
+#endif
+            return CURL_OBJECT_OPTION_COPIED_STRING;
+        case CURLOPT_HTTPHEADER:
+            return CURL_OBJECT_OPTION_SLIST;
+        case CURLOPT_POSTFIELDS:
+            return CURL_OBJECT_OPTION_POSTFIELDS;
+        default:
+            return CURL_OBJECT_OPTION_UNSUPPORTED;
+    }
+}
+
+static JSValue curl_set_slist_opt(JSContext *ctx, TJSCURL *curl, CURLoption id, JSValueConst arr) {
     struct curl_slist *slist = NULL;
     uint32_t len = 0;
     JSValue lenv = JS_GetPropertyStr(ctx, arr, "length");
-    JS_ToUint32(ctx, &len, lenv);
+    if (JS_IsException(lenv)) return JS_EXCEPTION;
+    if (JS_ToUint32(ctx, &len, lenv) < 0) {
+        JS_FreeValue(ctx, lenv);
+        return JS_EXCEPTION;
+    }
     JS_FreeValue(ctx, lenv);
 
     for (uint32_t i = 0; i < len; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, arr, i);
-        const char *s = JS_ToCString(ctx, item);
-        if (s) {
-            struct curl_slist *new_slist = curl_slist_append(slist, s);
-            if (new_slist) {
-                slist = new_slist;
-            } else {
-                /* OOM on append: free what we have and fail */
-                curl_slist_free_all(slist);
-                JS_FreeCString(ctx, s);
-                JS_FreeValue(ctx, item);
-                return -1;
-            }
-            JS_FreeCString(ctx, s);
+        if (JS_IsException(item)) {
+            curl_slist_free_all(slist);
+            return JS_EXCEPTION;
         }
+        const char *s = JS_ToCString(ctx, item);
+        if (!s) {
+            JS_FreeValue(ctx, item);
+            curl_slist_free_all(slist);
+            return JS_EXCEPTION;
+        }
+        struct curl_slist *new_slist = curl_slist_append(slist, s);
+        JS_FreeCString(ctx, s);
         JS_FreeValue(ctx, item);
+        if (!new_slist) {
+            curl_slist_free_all(slist);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        slist = new_slist;
     }
 
-    /* track for cleanup */
-    struct curl_slist **grown = js_realloc(ctx, curl->gen_slists,
-                                           (curl->gen_slists_len + 1) * sizeof(*grown));
-    if (!grown) {
+    size_t index = curl->gen_slists_len;
+    for (size_t i = 0; i < curl->gen_slists_len; i++) {
+        if (curl->gen_slists[i].option == id) {
+            index = i;
+            break;
+        }
+    }
+
+    if (index == curl->gen_slists_len) {
+        void *grown = js_realloc(ctx, curl->gen_slists,
+                                 (curl->gen_slists_len + 1) * sizeof(*curl->gen_slists));
+        if (!grown) {
+            curl_slist_free_all(slist);
+            return JS_EXCEPTION;
+        }
+        curl->gen_slists = grown;
+    }
+
+    CURLcode rc = curl_easy_setopt(curl->handle, id, slist);
+    if (rc != CURLE_OK) {
         curl_slist_free_all(slist);
-        return -1;
+        return JS_ThrowPlainError(ctx, "setOpt(%d) failed: %s",
+                                  (int) id, curl_easy_strerror(rc));
     }
-    curl->gen_slists = grown;
-    curl->gen_slists[curl->gen_slists_len++] = slist;
 
-    curl_easy_setopt(curl->handle, id, slist);
-    return 0;
+    if (index == curl->gen_slists_len) {
+        curl->gen_slists[index].option = id;
+        curl->gen_slists[index].list = slist;
+        curl->gen_slists_len++;
+    } else {
+        struct curl_slist *old = curl->gen_slists[index].list;
+        curl->gen_slists[index].list = slist;
+        curl_slist_free_all(old);
+    }
+    if (id == CURLOPT_HTTPHEADER) {
+        curl_slist_free_all(curl->request_headers);
+        curl->request_headers = NULL;
+    }
+    return JS_UNDEFINED;
 }
 
 /* setOpt(optId, value) — type dispatched by CURLOPTTYPE_* numeric range. */
@@ -1398,10 +1628,11 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
     }
 
     /* Classify option by its numeric type range (CURLOPTTYPE_*, stable since
-       curl 7.x).  OBJECTPOINT covers STRING/SLIST/CBPTR — all passed as
-       pointers via the generic curl_easy_setopt path below. */
+       curl 7.x). */
     enum { T_LONG, T_OBJ, T_FUNC, T_OFFT, T_BLOB } kind =
+#if LIBCURL_VERSION_NUM >= 0x074700
         id32 >= CURLOPTTYPE_BLOB          ? T_BLOB :
+#endif
         id32 >= CURLOPTTYPE_OFF_T         ? T_OFFT :
         id32 >= CURLOPTTYPE_FUNCTIONPOINT ? T_FUNC :
         id32 >= CURLOPTTYPE_OBJECTPOINT   ? T_OBJ  : T_LONG;
@@ -1423,22 +1654,56 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
         case T_FUNC:
             return JS_ThrowTypeError(ctx, "option %d is a function pointer — not settable from JS", id32);
         case T_OBJ: {
-            /* OBJECTPOINT: could be string, slist, cbptr, or blob-alias.
-               Distinguish by JS type. */
-            if (JS_IsArray(value)) {
-                if (curl_set_slist_opt(ctx, curl, id, value) < 0) return JS_ThrowOutOfMemory(ctx);
-                return JS_DupValue(ctx, this_val);
-            }
-            if (JS_IsNull(value) || JS_IsUndefined(value)) {
-                rc = curl_easy_setopt(curl->handle, id, NULL);
-            } else {
-                const char *s = JS_ToCString(ctx, value);
-                if (!s) return JS_EXCEPTION;
-                rc = curl_easy_setopt(curl->handle, id, s);
-                JS_FreeCString(ctx, s);
+            switch (curl_object_option_kind(id)) {
+                case CURL_OBJECT_OPTION_COPIED_STRING: {
+                    if (JS_IsNull(value) || JS_IsUndefined(value)) {
+                        rc = curl_easy_setopt(curl->handle, id, NULL);
+                        break;
+                    }
+                    if (!JS_IsString(value)) {
+                        return JS_ThrowTypeError(ctx, "setOpt(%d) expects a string", id32);
+                    }
+                    const char *s = JS_ToCString(ctx, value);
+                    if (!s) return JS_EXCEPTION;
+                    rc = curl_easy_setopt(curl->handle, id, s);
+                    JS_FreeCString(ctx, s);
+                    break;
+                }
+                case CURL_OBJECT_OPTION_SLIST:
+                    if (JS_IsNull(value) || JS_IsUndefined(value)) {
+                        rc = curl_easy_setopt(curl->handle, id, NULL);
+                        if (rc == CURLE_OK) {
+                            curl_forget_slist(curl, id);
+                            if (id == CURLOPT_HTTPHEADER) {
+                                curl_slist_free_all(curl->request_headers);
+                                curl->request_headers = NULL;
+                            }
+                        }
+                        break;
+                    }
+                    if (!JS_IsArray(value)) {
+                        return JS_ThrowTypeError(ctx, "setOpt(%d) expects an array of strings", id32);
+                    }
+                    {
+                        JSValue result = curl_set_slist_opt(ctx, curl, id, value);
+                        if (JS_IsException(result)) return result;
+                    }
+                    return JS_DupValue(ctx, this_val);
+                case CURL_OBJECT_OPTION_POSTFIELDS:
+                    if (JS_IsNull(value) || JS_IsUndefined(value)) {
+                        rc = curl_easy_setopt(curl->handle, CURLOPT_POSTFIELDS, NULL);
+                        break;
+                    }
+                    return tjs_curl_set_body(ctx, this_val, 1, argv + 1);
+                case CURL_OBJECT_OPTION_UNSUPPORTED:
+                default:
+                    return JS_ThrowTypeError(ctx,
+                                             "setOpt(%d) is not a supported object pointer option",
+                                             id32);
             }
             break;
         }
+#if LIBCURL_VERSION_NUM >= 0x074700
         case T_BLOB: {
             size_t len;
             uint8_t *data = JS_GetAnyBuffer(ctx, &len, value);
@@ -1447,6 +1712,7 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
             rc = curl_easy_setopt(curl->handle, id, &blob);
             break;
         }
+#endif
         default:
             return JS_ThrowTypeError(ctx, "option %d has an unsupported type for setOpt()", id32);
     }
@@ -1574,9 +1840,11 @@ static JSValue tjs_curl_set_cookie_jar(JSContext *ctx, JSValueConst this_val, in
 static JSValue tjs_curl_set_referer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_REFERER);
 }
+#if LIBCURL_VERSION_NUM >= 0x071800
 static JSValue tjs_curl_set_dns_servers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_DNS_SERVERS);
 }
+#endif
 static JSValue tjs_curl_set_interface(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_INTERFACE);
 }
@@ -2134,7 +2402,9 @@ static const JSCFunctionListEntry tjs_curl_proto_funcs[] = {
     /* network */
     TJS_CFUNC_DEF("setProxy", 1, tjs_curl_set_proxy),
     TJS_CFUNC_DEF("setInterface", 1, tjs_curl_set_interface),
+#if LIBCURL_VERSION_NUM >= 0x071800
     TJS_CFUNC_DEF("setDNSServers", 1, tjs_curl_set_dns_servers),
+#endif
     TJS_CFUNC_DEF("setKeepAlive", 1, tjs_curl_set_keepalive),
     TJS_CFUNC_DEF("setLowSpeedLimit", 1, tjs_curl_set_low_speed),
 
@@ -2237,7 +2507,9 @@ static void export_curlopt_table(JSContext *ctx, JSValue ns) {
         CURLOPT_ENTRY(CURLOPT_INFILESIZE_LARGE),
         CURLOPT_ENTRY(CURLOPT_RESUME_FROM_LARGE),
         CURLOPT_ENTRY(CURLOPT_AUTOREFERER),
+#if LIBCURL_VERSION_NUM >= 0x071800
         CURLOPT_ENTRY(CURLOPT_DNS_SERVERS),
+#endif
 #if LIBCURL_VERSION_NUM >= 0x074D00
         CURLOPT_ENTRY(CURLOPT_CAINFO_BLOB),
 #endif

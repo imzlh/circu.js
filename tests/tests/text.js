@@ -34,6 +34,30 @@ await test('text.Encoder.encode - empty string', () => {
     assertEquals(encoded.length, 0, 'Empty string should encode to empty array');
 });
 
+await test('text.Encoder.encode - grows for UTF-32 output', () => {
+    const encoded = new text.Encoder('UTF-32LE').encode('a'.repeat(300));
+    assertEquals(encoded.length, 1200, 'Each ASCII character should use four UTF-32 bytes');
+    for (let i = 0; i < encoded.length; i += 4) {
+        assertEquals(encoded[i], 0x61, 'UTF-32LE code point byte should be present');
+        assertEquals(encoded[i + 1], 0, 'UTF-32LE high byte should be zero');
+        assertEquals(encoded[i + 2], 0, 'UTF-32LE high byte should be zero');
+        assertEquals(encoded[i + 3], 0, 'UTF-32LE high byte should be zero');
+    }
+});
+
+await test('text.Encoder.encode - replaces unrepresentable custom output', () => {
+    const encoded = new text.Encoder('ASCII').encode('AéB');
+    assertEquals(Array.from(encoded).join(','), '65,63,66', 'Unrepresentable characters should become question marks');
+});
+
+await test('text.Encoder.encodeInto - replaces unrepresentable custom output', () => {
+    const output = new Uint8Array(2);
+    const result = new text.Encoder('ASCII').encodeInto('é', output);
+    assertEquals(result.read, 1, 'The source character should be consumed');
+    assertEquals(result.written, 1, 'The replacement should be written');
+    assertEquals(output[0], 0x3f, 'Unrepresentable characters should become question marks');
+});
+
 await test('text.Encoder.encodeInto - encode into existing buffer', () => {
     const encoder = new text.Encoder();
     const buffer = new Uint8Array(10);
@@ -104,6 +128,21 @@ await test('text.Decoder.decode - streaming mode', () => {
     
     assertEquals(decoded1, '', 'Should return empty for incomplete sequence');
     assertEquals(decoded2, '你', 'Should decode complete character');
+});
+
+await test('text.Decoder.decode - streaming mode preserves valid prefixes', () => {
+    const decoder = new text.Decoder();
+    assertEquals(decoder.decode(new Uint8Array([0x41, 0xc2]), { stream: true }), 'A');
+    assertEquals(decoder.decode(new Uint8Array([0xa2])), '¢');
+});
+
+await test('text.Decoder.decode - streaming mode rejects malformed prefixes', () => {
+    const decoder = new text.Decoder();
+    assertEquals(
+        decoder.decode(new Uint8Array([0x41, 0xe1, 0x41]), { stream: true }),
+        'A�A',
+    );
+    assertEquals(decoder.decode(), '');
 });
 
 await test('text.Decoder - BOM handling', () => {

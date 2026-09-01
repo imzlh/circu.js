@@ -2251,20 +2251,14 @@ napi_get_dataview_info(napi_env env, napi_value dataview, size_t *bytelength,
                        size_t *byte_offset) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, dataview);
     if (!JS_IsDataView(v(dataview))) return NAPI_RET(env, napi_invalid_arg);
-    JSValue ab = JS_GetPropertyStr(env->ctx, v(dataview), "buffer");
-    JSValue offv = JS_GetPropertyStr(env->ctx, v(dataview), "byteOffset");
-    JSValue lenv = JS_GetPropertyStr(env->ctx, v(dataview), "byteLength");
-    if (JS_IsException(ab) || JS_IsException(offv) || JS_IsException(lenv)) {
-        JS_FreeValue(env->ctx, ab); JS_FreeValue(env->ctx, offv); JS_FreeValue(env->ctx, lenv);
+    size_t off = 0, len = 0;
+    JSValue ab = JS_GetDataViewBuffer(env->ctx, v(dataview), &off, &len);
+    if (JS_IsException(ab)) {
         napi_capture_exception(env);
         return NAPI_RET(env, napi_pending_exception);
     }
-    uint32_t off = 0, len = 0;
-    JS_ToUint32(env->ctx, &off, offv);
-    JS_ToUint32(env->ctx, &len, lenv);
     size_t ab_len = 0;
     uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &ab_len, ab);
-    JS_FreeValue(env->ctx, offv); JS_FreeValue(env->ctx, lenv);
     if (!ptr && ab_len != 0) {
         JS_FreeValue(env->ctx, ab);
         napi_capture_exception(env);

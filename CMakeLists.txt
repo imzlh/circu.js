@@ -48,7 +48,11 @@ if(MSVC)
         /wd4456 /wd4457 /wd4458 /wd4459 /wd4200 /wd4068 /wd4310 /wd4702
         /D_CRT_SECURE_NO_WARNINGS /D_CRT_DECLARE_NONSTDC_NAMES
     )
-    list(APPEND cjs_ldflags /STACK:8388608 /WX /INCREMENTAL:NO /FORCE:MULTIPLE)
+    # Fresh's Babel parser can legitimately need more than the historical
+    # 8 MiB main-thread reserve when it transforms the generated server entry.
+    # Keep QuickJS's soft stack limit below the native guard page (the runtime
+    # clamps it), while giving that limit enough real native stack to be useful.
+    list(APPEND cjs_ldflags /STACK:16777216 /WX /INCREMENTAL:NO /FORCE:MULTIPLE)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     if (CMAKE_BUILD_TYPE MATCHES "Debug")
         list(APPEND cjs_cflags /Od)
@@ -75,8 +79,8 @@ if(ENABLE_ASAN)
     message(STATUS "AddressSanitizer enabled")
 endif()
 
-set(CJS__VERSION_MAJOR 2)
-set(CJS__VERSION_MINOR 1)
+set(CJS__VERSION_MAJOR 3)
+set(CJS__VERSION_MINOR 0)
 set(CJS__VERSION_PATCH 0)
 set(CJS__VERSION_SUFFIX "")
 configure_file(

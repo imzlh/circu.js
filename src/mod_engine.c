@@ -41,6 +41,10 @@
 #include <expat.h>
 #include <zlib.h>
 
+#ifdef CJS_HAVE_BROTLI
+#include <brotli/encode.h>
+#endif
+
 #include "../deps/quickjs/list.h"
 
 #ifdef CJS__HAS_MIMALLOC

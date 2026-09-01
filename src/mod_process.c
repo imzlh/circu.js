@@ -93,29 +93,38 @@ static bool load_conpty(void) {
 
 
 /* ============================================================
- * TJSProcess — unified normal-process + PTY
+ * TJSProcess — unified normal-process + PTY + raw fork
  *
  * Normal mode:  uv_process_t + stdio Pipe objects.
  * PTY mode:     fork+openpty (Unix) / ConPTY (Windows).
  *               p->process is NOT initialized in PTY mode.
+ * Fork mode:    raw forked PID, tracked with waitpid + a libuv timer.
+ *               p->process is NOT initialized in fork mode.
  * ============================================================ */
 static thread_local JSClassID tjs_process_class_id;
+static thread_local struct list_head tjs_fork_processes;
+static thread_local bool tjs_fork_processes_initialized;
+static thread_local size_t tjs_live_nonfork_processes;
 
 typedef struct {
     JSContext *ctx;
     JSValue    obj;        /* GC pin while live; intentionally omitted from gc_mark */
     bool pty_mode;
+    bool fork_mode;
     bool handle_initialized;
     bool closed;
     bool finalized;
+    bool counted_nonfork;
     uv_process_t process;  /* normal mode only */
     JSValue stdio[3];      /* normal mode: stdin/stdout/stderr Pipe objects */
     JSValue stdio_extra;   /* normal mode: extra fd pipes, indexed by fd */
     JSValue ipc_pipe;      /* IPC channel pipe (fd 3) */
     struct {
         bool    exited;
+        bool    lost;
         int64_t exit_status;
         int     term_signal;
+        int     wait_error;
         TJSPromise result;
     } status;
 
@@ -126,6 +135,11 @@ typedef struct {
     int     pty_cols;
     int     pty_rows;
     uv_timer_t pty_waiter;
+    pid_t   fork_pid;
+    pid_t   fork_owner_pid;
+    uv_timer_t fork_waiter;
+    struct list_head fork_link;
+    bool    fork_linked;
 #ifdef _WIN32
     HPCON  hpc;
     HANDLE pty_proc_handle; /* kept for waitSync */
@@ -137,7 +151,7 @@ typedef struct {
 #ifdef _WIN32
 static WCHAR *spawn_sync_utf8_to_wide(JSContext *ctx, const char *s);
 static WCHAR *spawn_sync_resolve_win_app(JSContext *ctx, const WCHAR *app);
-static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args);
+static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args, bool verbatim);
 static WCHAR *spawn_sync_build_win_env(JSContext *ctx, char **env);
 #endif
 
@@ -376,14 +390,27 @@ static void uv__proc_close_cb(uv_handle_t *handle) {
     TJSProcess *p = handle->data;
     CHECK_NOT_NULL(p);
     p->closed = true;
+    if (p->counted_nonfork) {
+        CHECK_GT(tjs_live_nonfork_processes, 0);
+        tjs_live_nonfork_processes--;
+        p->counted_nonfork = false;
+    }
+    if (p->fork_linked) {
+        list_del(&p->fork_link);
+        p->fork_linked = false;
+    }
     if (p->finalized) tjs__free(p);
 }
 
 static void maybe_close(TJSProcess *p) {
     if (!p->handle_initialized) return;
-    uv_handle_t *handle = p->pty_mode
-        ? (uv_handle_t *)&p->pty_waiter
-        : (uv_handle_t *)&p->process;
+    uv_handle_t *handle;
+    if (p->fork_mode)
+        handle = (uv_handle_t *)&p->fork_waiter;
+    else if (p->pty_mode)
+        handle = (uv_handle_t *)&p->pty_waiter;
+    else
+        handle = (uv_handle_t *)&p->process;
     if (!uv_is_closing(handle))
         uv_close(handle, uv__proc_close_cb);
 }
@@ -477,6 +504,95 @@ static void uv__pty_wait_cb(uv_timer_t *handle) {
 
     process_finish(p, exit_status, term_signal);
 }
+
+static JSValue make_fork_wait_error(TJSProcess *p, JSContext *ctx, int err) {
+#ifndef _WIN32
+    if (p->fork_mode && p->fork_owner_pid != getpid()) {
+        JS_ThrowInternalError(ctx,
+                              "ECHILD: forked process handle belongs to another process");
+        return JS_GetException(ctx);
+    }
+#endif
+    tjs_throw_errno(ctx, err);
+    return JS_GetException(ctx);
+}
+
+static void process_lose_fork_waiter(TJSProcess *p, int err) {
+    if (p->status.exited || p->status.lost) return;
+    p->status.lost = true;
+    p->status.wait_error = err;
+
+    if (!JS_IsUndefined(p->status.result.p)) {
+        JSValue arg = make_fork_wait_error(p, p->ctx, err);
+        TJS_SettlePromise(p->ctx, &p->status.result, true, 1, &arg);
+    }
+
+    maybe_close(p);
+    if (!JS_IsUndefined(p->obj)) {
+        JSValue obj = p->obj;
+        p->obj = JS_UNDEFINED;
+        JS_FreeValue(p->ctx, obj);
+    }
+}
+
+#ifndef _WIN32
+/* A raw fork does not create a uv_process_t, so libuv cannot deliver the
+ * normal exit callback. Poll waitpid from the runtime loop instead, matching
+ * the existing Unix PTY child path. */
+static bool fork_handle_is_foreign(const TJSProcess *p) {
+    return p->fork_mode && p->fork_owner_pid != getpid();
+}
+
+/* A later fork inherits the parent's Process wrappers and their timers. Those
+ * wrappers are still valid JS objects, but their PIDs are not children of the
+ * new process. Disarm the inherited timer as soon as it gets a turn in the
+ * child loop so it cannot spin on ECHILD or keep the child alive. */
+static void fork_disown_in_child(TJSProcess *p) {
+    uv_timer_stop(&p->fork_waiter);
+    process_lose_fork_waiter(p, uv_translate_sys_error(ECHILD));
+}
+
+static void ensure_fork_process_list(void) {
+    if (tjs_fork_processes_initialized) return;
+    init_list_head(&tjs_fork_processes);
+    tjs_fork_processes_initialized = true;
+}
+
+static void disown_inherited_fork_handles(void) {
+    struct list_head *el, *tmp;
+    list_for_each_safe(el, tmp, &tjs_fork_processes) {
+        TJSProcess *p = list_entry(el, TJSProcess, fork_link);
+        if (fork_handle_is_foreign(p)) fork_disown_in_child(p);
+    }
+}
+
+static void uv__fork_wait_cb(uv_timer_t *handle) {
+    TJSProcess *p = handle->data;
+    CHECK_NOT_NULL(p);
+    if (fork_handle_is_foreign(p)) {
+        fork_disown_in_child(p);
+        return;
+    }
+    if (p->status.exited) return;
+
+    int status;
+    pid_t result;
+    do {
+        result = waitpid(p->fork_pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+
+    if (result == 0) return;
+    if (result < 0) {
+        process_lose_fork_waiter(p, uv_translate_sys_error(errno));
+        return;
+    }
+
+    int64_t exit_status = 0;
+    int term_signal = 0;
+    if (decode_wait_status(status, &exit_status, &term_signal) < 0) return;
+    process_finish(p, exit_status, term_signal);
+}
+#endif
 
 static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
     TJSProcess *p = JS_GetOpaque(val, tjs_process_class_id);
@@ -686,7 +802,8 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     }
     char *default_argv[] = { (char *)cmd, NULL };
     wcmd = spawn_sync_build_win_cmdline(ctx,
-                                        argv_arr && argc_val > 0 ? argv_arr : default_argv);
+                                        argv_arr && argc_val > 0 ? argv_arr : default_argv,
+                                        false);
     if (!wcmd) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
     if (cwd) {
         wcwd = spawn_sync_utf8_to_wide(ctx, cwd);
@@ -1290,7 +1407,7 @@ static char *spawn_sync_quote_win_arg(JSContext *ctx, const char *arg) {
     return out;
 }
 
-static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args) {
+static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args, bool verbatim) {
     size_t total = 0;
     char **quoted = NULL;
     int count = 0;
@@ -1298,7 +1415,7 @@ static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args) {
     quoted = js_mallocz(ctx, sizeof(char *) * (count + 1));
     if (!quoted) return NULL;
     for (int i = 0; i < count; i++) {
-        quoted[i] = spawn_sync_quote_win_arg(ctx, args[i]);
+        quoted[i] = verbatim && i > 0 ? js_strdup(ctx, args[i]) : spawn_sync_quote_win_arg(ctx, args[i]);
         if (!quoted[i]) goto fail;
         total += strlen(quoted[i]) + (i ? 1 : 0);
     }
@@ -1383,7 +1500,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (out_r != INVALID_HANDLE_VALUE) SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     if (err_r != INVALID_HANDLE_VALUE) SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
 
-    wcmd = spawn_sync_build_win_cmdline(ctx, args);
+    wcmd = spawn_sync_build_win_cmdline(ctx, args, bool_prop(ctx, opts, "windowsVerbatimArguments"));
     if (!wcmd) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
 
     if (JS_IsObject(opts)) {
@@ -1611,6 +1728,8 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         p->handle_initialized = true;
         p->pty_waiter.data = p;
         CHECK_EQ(uv_timer_start(&p->pty_waiter, uv__pty_wait_cb, 0, 10), 0);
+        p->counted_nonfork = true;
+        tjs_live_nonfork_processes++;
 
         JS_SetOpaque(obj, p);
         p->obj = JS_DupValue(ctx, obj);
@@ -1678,9 +1797,14 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         JSValue js_env = JS_GetPropertyStr(ctx, arg1, "env");
         if (JS_IsObject(js_env)) options.env = parse_env_obj(ctx, js_env);
         JS_FreeValue(ctx, js_env);
-        if (bool_prop(ctx, arg1, "clearEnv") && !options.env) {
-            options.env = empty_env(ctx);
-            if (!options.env) goto fail;
+        if (bool_prop(ctx, arg1, "clearEnv")) {
+#ifdef _WIN32
+            options.flags |= UV_PROCESS_WINDOWS_EXACT_ENV;
+#endif
+            if (!options.env) {
+                options.env = empty_env(ctx);
+                if (!options.env) goto fail;
+            }
         }
 
         JSValue js_cwd = JS_GetPropertyStr(ctx, arg1, "cwd");
@@ -1826,6 +1950,11 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     options.exit_cb = uv__exit_cb;
     spawn_attempted = true;
     int r = uv_spawn(tjs_get_loop(ctx), &p->process, &options);
+    /* Even a failed uv_spawn() leaves this handle registered with the loop
+     * until the fail path's uv_close callback runs. A raw fork in that window
+     * would copy the same invalid process handle into the child. */
+    p->counted_nonfork = true;
+    tjs_live_nonfork_processes++;
     if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
     p->handle_initialized = true;
 
@@ -1863,6 +1992,148 @@ cleanup:
 }
 #undef SETUP_STDIO
 
+#ifndef _WIN32
+static void reap_fork_failure(pid_t pid) {
+    if (pid <= 0) return;
+    (void)kill(pid, SIGKILL);
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+typedef struct {
+    TJSRuntime *runtime;
+    bool found;
+} ForkHandleScan;
+
+static bool fork_is_runtime_handle(const TJSRuntime *runtime, const uv_handle_t *handle) {
+    return handle == (const uv_handle_t *) &runtime->jobs.prepare
+        || handle == (const uv_handle_t *) &runtime->jobs.idle
+        || handle == (const uv_handle_t *) &runtime->jobs.check
+        || handle == (const uv_handle_t *) &runtime->stop;
+}
+
+static void fork_scan_handle(uv_handle_t *handle, void *opaque) {
+    ForkHandleScan *scan = opaque;
+    if (!fork_is_runtime_handle(scan->runtime, handle) && uv_is_active(handle)) {
+        scan->found = true;
+    }
+}
+
+static bool fork_runtime_is_quiescent(TJSRuntime *qrt) {
+    if (uv_loop_alive(&qrt->loop) != 0
+        || JS_IsJobPending(qrt->rt)
+        || qrt->jobs.ticks_pending) {
+        return false;
+    }
+
+    /* uv_loop_alive() omits active handles after uv_unref(). */
+    ForkHandleScan scan = { .runtime = qrt, .found = false };
+    uv_walk(&qrt->loop, fork_scan_handle, &scan);
+    return !scan.found;
+}
+#endif
+
+/*
+ * fork() — duplicate the current runtime and return to JS in both branches.
+ *
+ * The child must repair libuv's inherited kernel state before any other loop
+ * operation. It deliberately returns null rather than allocating a Process
+ * wrapper; only the parent owns and reaps the new PID.
+ */
+static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    (void)this_val;
+    (void)argv;
+    if (argc != 0) return JS_ThrowTypeError(ctx, "fork() does not accept arguments");
+
+#ifdef _WIN32
+    return tjs_throw_errno(ctx, UV_ENOSYS);
+#else
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt)
+        return JS_ThrowInternalError(ctx, "fork() requires an initialized runtime");
+    if (qrt->is_worker)
+        return JS_ThrowTypeError(ctx, "fork() is unavailable inside a worker");
+    if (!list_empty(&qrt->workers) || tjs__active_worker_count() != 0)
+        return JS_ThrowTypeError(ctx, "fork() is unavailable while workers exist");
+    if (tjs_live_nonfork_processes != 0)
+        return JS_ThrowTypeError(ctx,
+                                 "fork() is unavailable while child process handles are active or closing");
+    if (!fork_runtime_is_quiescent(qrt))
+        return JS_ThrowTypeError(ctx, "fork() requires an idle event loop");
+    ensure_fork_process_list();
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+
+    if (pid == 0) {
+        int r = uv_loop_fork(tjs_get_loop(ctx));
+        /* libuv may already have partially rebuilt the inherited backend when
+         * this fails. Returning to JS would let user code continue on a loop
+         * whose invariants are unknown, so terminate only this failed child. */
+        if (r != 0) _exit(127);
+        /* A zygote forks siblings sequentially. Any Process handles already
+         * created belong only to the original parent; invalidate their copied
+         * wait promises before returning control to child JS. */
+        disown_inherited_fork_handles();
+        return JS_NULL;
+    }
+
+    JSValue obj = JS_NewObjectClass(ctx, tjs_process_class_id);
+    if (JS_IsException(obj)) {
+        reap_fork_failure(pid);
+        return obj;
+    }
+
+    TJSProcess *p = tjs__mallocz(sizeof(*p));
+    if (!p) {
+        JS_FreeValue(ctx, obj);
+        reap_fork_failure(pid);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    p->ctx          = ctx;
+    p->obj          = JS_UNDEFINED;
+    p->fork_mode    = true;
+    p->fork_pid     = pid;
+    p->fork_owner_pid = getpid();
+    init_list_head(&p->fork_link);
+    p->stdio[0]     = JS_UNDEFINED;
+    p->stdio[1]     = JS_UNDEFINED;
+    p->stdio[2]     = JS_UNDEFINED;
+    p->stdio_extra  = JS_UNDEFINED;
+    p->ipc_pipe     = JS_UNDEFINED;
+    p->pty_readable = JS_UNDEFINED;
+    p->pty_writable = JS_UNDEFINED;
+    TJS_ClearPromise(ctx, &p->status.result);
+
+    int r = uv_timer_init(tjs_get_loop(ctx), &p->fork_waiter);
+    if (r != 0) {
+        tjs__free(p);
+        JS_FreeValue(ctx, obj);
+        reap_fork_failure(pid);
+        return tjs_throw_errno(ctx, r);
+    }
+
+    p->handle_initialized = true;
+    p->fork_waiter.data = p;
+    r = uv_timer_start(&p->fork_waiter, uv__fork_wait_cb, 0, 10);
+    if (r != 0) {
+        p->finalized = true;
+        maybe_close(p);
+        JS_FreeValue(ctx, obj);
+        reap_fork_failure(pid);
+        return tjs_throw_errno(ctx, r);
+    }
+
+    JS_SetOpaque(obj, p);
+    p->obj = JS_DupValue(ctx, obj);
+    list_add(&p->fork_link, &tjs_fork_processes);
+    p->fork_linked = true;
+    return obj;
+#endif
+}
+
 
 /* ============================================================
  * Process methods
@@ -1872,7 +2143,13 @@ cleanup:
 static JSValue tjs_process_pid_get(JSContext *ctx, JSValue this_val) {
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p) return JS_EXCEPTION;
-    pid_t pid = p->pty_mode ? p->pty_pid : (pid_t)uv_process_get_pid(&p->process);
+    pid_t pid;
+    if (p->fork_mode)
+        pid = p->fork_pid;
+    else if (p->pty_mode)
+        pid = p->pty_pid;
+    else
+        pid = (pid_t)uv_process_get_pid(&p->process);
     return JS_NewInt32(ctx, pid);
 }
 
@@ -1917,12 +2194,22 @@ static JSValue tjs_process_writable_get(JSContext *ctx, JSValue this_val) {
 static JSValue tjs_process_kill(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p) return JS_EXCEPTION;
+#ifndef _WIN32
+    if (fork_handle_is_foreign(p))
+        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+#endif
     if (p->status.exited) return JS_UNDEFINED;
+    if (p->status.lost)
+        return tjs_throw_errno(ctx, p->status.wait_error);
     int sig = parse_signal(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, SIGTERM);
     if (sig < 0) return JS_EXCEPTION;
-    int r = p->pty_mode
-        ? uv_kill((int)p->pty_pid, sig)
-        : uv_process_kill(&p->process, sig);
+    int r;
+    if (p->fork_mode)
+        r = uv_kill((int)p->fork_pid, sig);
+    else if (p->pty_mode)
+        r = uv_kill((int)p->pty_pid, sig);
+    else
+        r = uv_process_kill(&p->process, sig);
     if (r != 0 && r != UV_ESRCH) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
@@ -1931,9 +2218,17 @@ static JSValue tjs_process_kill(JSContext *ctx, JSValue this_val, int argc, JSVa
 static JSValue tjs_process_wait(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p) return JS_EXCEPTION;
+#ifndef _WIN32
+    if (fork_handle_is_foreign(p))
+        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+#endif
     if (p->status.exited) {
         JSValue obj = make_exit_obj(ctx, p->status.exit_status, p->status.term_signal);
         return TJS_NewResolvedPromise(ctx, 1, &obj);
+    }
+    if (p->status.lost) {
+        JSValue err = make_fork_wait_error(p, ctx, p->status.wait_error);
+        return TJS_NewRejectedPromise(ctx, 1, &err);
     }
     if (!JS_IsUndefined(p->status.result.p))
         return JS_DupValue(ctx, p->status.result.p);
@@ -1944,12 +2239,35 @@ static JSValue tjs_process_wait(JSContext *ctx, JSValue this_val, int argc, JSVa
 static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p) return JS_EXCEPTION;
+#ifndef _WIN32
+    if (fork_handle_is_foreign(p))
+        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+#endif
     if (p->status.exited)
         return make_exit_obj(ctx, p->status.exit_status, p->status.term_signal);
+    if (p->status.lost)
+        return tjs_throw_errno(ctx, p->status.wait_error);
 
     int64_t es = 0; int ts = 0;
 
-    if (p->pty_mode) {
+    if (p->fork_mode) {
+#ifdef _WIN32
+        return JS_ThrowInternalError(ctx, "fork process unavailable on Windows");
+#else
+        int stat;
+        pid_t result;
+        do {
+            result = waitpid(p->fork_pid, &stat, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) {
+            int err = uv_translate_sys_error(errno);
+            process_lose_fork_waiter(p, err);
+            return tjs_throw_errno(ctx, err);
+        }
+        if (decode_wait_status(stat, &es, &ts) < 0)
+            return JS_ThrowInternalError(ctx, "unexpected waitpid status");
+#endif
+    } else if (p->pty_mode) {
 #ifdef _WIN32
         if (!p->pty_proc_handle)
             return JS_ThrowInternalError(ctx, "PTY process handle unavailable");
@@ -2130,6 +2448,7 @@ static const JSCFunctionListEntry tjs_process_proto_funcs[] = {
 static const JSCFunctionListEntry tjs_process_funcs[] = {
     TJS_CFUNC_DEF("spawn",     2, tjs_spawn),
     TJS_CFUNC_DEF("spawnSync", 3, tjs_spawn_sync),
+    TJS_CFUNC_DEF("fork",      0, tjs_fork),
     TJS_CFUNC_DEF("kill",      2, tjs_kill),
     TJS_CFUNC_DEF("exec",      1, tjs_exec),
 };

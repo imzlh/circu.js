@@ -118,6 +118,9 @@ declare namespace CModuleFFI {
          * @throws {InternalError} Symbol lookup failed
          */
         symbol(name: string): UvDlSym;
+
+        /** Close the shared library. Repeated calls are safe. */
+        close(): void;
     }
 
     /** 

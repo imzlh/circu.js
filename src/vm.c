@@ -474,6 +474,9 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     init_list_head(&qrt->workers);
     init_list_head(&qrt->streams);
     init_list_head(&qrt->msgpipes);
+    init_list_head(&qrt->dns_queries);
+    init_list_head(&qrt->dns_getaddrinfo);
+    init_list_head(&qrt->dns_getnameinfo);
 
     CHECK_EQ(uv_loop_init(&qrt->loop), 0);
 
@@ -602,6 +605,14 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 void TJS_FreeRuntime(TJSRuntime* qrt) {
     qrt->freeing = true;
 
+    /* Raw DNS queries retain JS callbacks and their UDP context independently
+     * of the Promise object.  Release those JS references while the runtime is
+     * still valid, then run libuv until send/close callbacks have detached and
+     * freed every native query context. */
+    tjs__mod_dns_cleanup_runtime(qrt);
+    tjs__mod_dns_drain_runtime(qrt);
+    tjs__drain_closing_handles(qrt, 64);
+
     /* Stop all workers and wait for their threads to finish before freeing
      * any shared state.  TJS_Stop is async (uv_async_send), so we must
      * join to ensure the thread has exited. The TJSWorker struct itself is
@@ -614,7 +625,6 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
             tjs__worker_stop_and_join(worker->ctx, worker);
         }
     }
-
     /* Close stream handles before freeing JS so stream_pin() self-references
      * don't survive into QuickJS leak checking as TCP/Pipe/TTY objects. */
     tjs__close_all_streams(qrt);
@@ -805,7 +815,6 @@ static void uv__maybe_idle(TJSRuntime* qrt) {
 static void uv__prepare_cb(uv_prepare_t* handle) {
     TJSRuntime* qrt = handle->data;
     CHECK_NOT_NULL(qrt);
-
     uv__maybe_idle(qrt);
 }
 

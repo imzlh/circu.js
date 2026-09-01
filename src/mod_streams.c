@@ -492,6 +492,7 @@ static void uv__write_cb(uv_write_t *req, int status) {
     TJSRuntime *qrt = s->trt;
     if (!qrt || qrt->freeing) {
         tjs_write_req_free_rt(qrt ? qrt->rt : JS_GetRuntime(ctx), wr);
+        stream_unpin(s);
         return;
     }
 
@@ -504,6 +505,7 @@ static void uv__write_cb(uv_write_t *req, int status) {
     }
 
     tjs_write_req_free(ctx, wr);
+    stream_unpin(s);
 }
 
 static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -531,6 +533,8 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     TJSWriteReq *wr = tjs__mallocz(sizeof(*wr));
     if (!wr) return JS_EXCEPTION;
     wr->req.data = wr;
+    wr->buf = JS_UNDEFINED;
+    TJS_ClearPromise(ctx, &wr->result);
     wr->buf      = JS_DupValue(ctx, argv[0]); /* pin: buf pointer must stay valid */
     wr->total    = (int)(sync + sz);          /* == original sz */
     wr->data     = tjs__malloc(sz ? sz : 1);
@@ -541,14 +545,29 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
     memcpy(wr->data, buf, sz);
 
+    /* The completion callback can run after this function returns. Create the
+     * capability before handing the request to libuv so an allocation failure
+     * never leaves a queued write with an invalid promise record. */
+    JSValue promise = TJS_InitPromise(ctx, &wr->result);
+    if (JS_IsException(promise)) {
+        tjs_write_req_free(ctx, wr);
+        return promise;
+    }
+
+    /* Keep the stream wrapper alive until uv__write_cb releases this request. */
+    stream_pin(ctx, s, this_val);
+
     b = uv_buf_init((char *)wr->data, sz);
     r = uv_write(&wr->req, &s->h.stream, &b, 1, uv__write_cb);
     if (r != 0) {
+        TJS_FreePromise(ctx, &wr->result);
+        JS_FreeValue(ctx, promise);
+        stream_unpin(s);
         tjs_write_req_free(ctx, wr);
         return tjs_throw_errno(ctx, r);
     }
 
-    return TJS_InitPromise(ctx, &wr->result);
+    return promise;
 }
 
 static void uv__read_once_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -649,6 +668,7 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     rr->buf     = JS_DupValue(ctx, argv[0]);
     rr->data    = js_malloc(ctx, sz);
     rr->data_len = sz;
+    TJS_ClearPromise(ctx, &rr->result);
     rr->tty_read_started_foreground = s->h.handle.type == UV_TTY &&
                                       stream_tty_foreground_state(s) == 1;
     if (!rr->data) {
@@ -656,18 +676,28 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
         js_free(ctx, rr);
         return JS_ThrowOutOfMemory(ctx);
     }
+    JSValue promise = TJS_InitPromise(ctx, &rr->result);
+    if (JS_IsException(promise)) {
+        JS_FreeValue(ctx, rr->buf);
+        js_free(ctx, rr->data);
+        js_free(ctx, rr);
+        return promise;
+    }
+
     s->read_req = rr;
     stream_pin(ctx, s, this_val);
 
     int r = uv_read_start(&s->h.stream, uv__read_once_alloc_cb, uv__read_once_cb);
     if (r != 0) {
         s->read_req = NULL;
+        TJS_FreePromise(ctx, &rr->result);
+        JS_FreeValue(ctx, promise);
         tjs_read_req_free(ctx, rr);
         stream_unpin(s);
         return tjs_throw_errno(ctx, r);
     }
 
-    return TJS_InitPromise(ctx, &rr->result);
+    return promise;
 }
 
 static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
@@ -708,14 +738,24 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
     if (!req) return JS_EXCEPTION;
     req->data = s;
 
+    JSValue promise = TJS_InitPromise(ctx, &s->shutdown_promise);
+    if (JS_IsException(promise)) {
+        tjs__free(req);
+        return promise;
+    }
+
+    stream_pin(ctx, s, this_val);
+
     int r = uv_shutdown(req, &s->h.stream, uv__shutdown_cb);
     if (r != 0) {
+        TJS_FreePromise(ctx, &s->shutdown_promise);
+        JS_FreeValue(ctx, promise);
+        stream_unpin(s);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
-    stream_pin(ctx, s, this_val);
-    return TJS_InitPromise(ctx, &s->shutdown_promise);
+    return promise;
 }
 
 static void uv__connect_cb(uv_connect_t *req, int status) {
@@ -916,14 +956,9 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
     for (int i = 0; i < STREAM_CB_MAX; i++)
         s->callbacks[i] = JS_UNDEFINED;
 
-    /*
-     * Set promise .p to JS_UNDEFINED so that the "already in progress" guards
-     * (`!JS_IsUndefined(s->xxx_promise.p)`) start in the correct state.
-     * The remaining fields of TJSPromise (resolve/reject) are left zeroed
-     * by tjs__mallocz; JS_FreeValueRT treats zero JSValues as no-ops.
-     */
-    s->connect_promise.p  = JS_UNDEFINED;
-    s->shutdown_promise.p = JS_UNDEFINED;
+    /* Start every capability in a fully initialized, non-pending state. */
+    TJS_ClearPromise(ctx, &s->connect_promise);
+    TJS_ClearPromise(ctx, &s->shutdown_promise);
 
     JS_SetOpaque(obj, s);
     return obj;
@@ -1090,14 +1125,24 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
 
+    JSValue promise = TJS_InitPromise(ctx, &t->connect_promise);
+    if (JS_IsException(promise)) {
+        tjs__free(req);
+        return promise;
+    }
+
+    stream_pin(ctx, t, this_val);
+
     int r = uv_tcp_connect(req, &t->h.tcp, (struct sockaddr *)&ss, uv__connect_cb);
     if (r != 0) {
+        TJS_FreePromise(ctx, &t->connect_promise);
+        JS_FreeValue(ctx, promise);
+        stream_unpin(t);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
-    stream_pin(ctx, t, this_val);
-    return TJS_InitPromise(ctx, &t->connect_promise);
+    return promise;
 }
 
 /* connectSync: blocking OS connect with timeout, hands the fd to libuv. */
@@ -1527,15 +1572,26 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
 
+    JSValue promise = TJS_InitPromise(ctx, &t->connect_promise);
+    if (JS_IsException(promise)) {
+        JS_FreeCString(ctx, name);
+        tjs__free(req);
+        return promise;
+    }
+
+    stream_pin(ctx, t, this_val);
+
     int r = uv_pipe_connect2(req, &t->h.pipe, name, len, 0, uv__connect_cb);
     JS_FreeCString(ctx, name);
     if (r != 0) {
+        TJS_FreePromise(ctx, &t->connect_promise);
+        JS_FreeValue(ctx, promise);
+        stream_unpin(t);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
     }
 
-    stream_pin(ctx, t, this_val);
-    return TJS_InitPromise(ctx, &t->connect_promise);
+    return promise;
 }
 
 /* connectSync: blocking Unix domain socket connect, hands fd to libuv. */

@@ -41,6 +41,34 @@ static TJSFsWatch *tjs_fswatch_get(JSValue obj) {
     return JS_GetOpaque(obj, tjs_fswatch_class_id);
 }
 
+static void fswatch_release_callback(JSContext *ctx, TJSFsWatch *fw) {
+    JSValue callback = fw->callback;
+    fw->callback = JS_UNDEFINED;
+    JS_FreeValue(ctx, callback);
+}
+
+static void fswatch_release_callback_rt(JSRuntime *rt, TJSFsWatch *fw) {
+    JSValue callback = fw->callback;
+    fw->callback = JS_UNDEFINED;
+    JS_FreeValueRT(rt, callback);
+}
+
+/* Drop the native self-pin. Clearing first is essential: releasing the value
+ * can synchronously run the class finalizer and free `fw`. */
+static void fswatch_release_self(JSContext *ctx, TJSFsWatch *fw) {
+    JSValue self = fw->this_val;
+    if (JS_IsUndefined(self)) return;
+    fw->this_val = JS_UNDEFINED;
+    JS_FreeValue(ctx, self);
+}
+
+static void fswatch_release_self_rt(JSRuntime *rt, TJSFsWatch *fw) {
+    JSValue self = fw->this_val;
+    if (JS_IsUndefined(self)) return;
+    fw->this_val = JS_UNDEFINED;
+    JS_FreeValueRT(rt, self);
+}
+
 static void uv__fsevent_close_cb(uv_handle_t *handle) {
     TJSFsWatch *fw = handle->data;
     if (fw) {
@@ -52,7 +80,7 @@ static void uv__fsevent_close_cb(uv_handle_t *handle) {
 }
 
 static void maybe_close(TJSFsWatch *fw) {
-    if (!uv_is_closing((uv_handle_t *) &fw->handle)) {
+    if (!fw->closed && !uv_is_closing((uv_handle_t *) &fw->handle)) {
         uv_close((uv_handle_t *) &fw->handle, uv__fsevent_close_cb);
     }
 }
@@ -60,8 +88,10 @@ static void maybe_close(TJSFsWatch *fw) {
 static void tjs_fswatch_finalizer(JSRuntime *rt, JSValue val) {
     TJSFsWatch *fw = tjs_fswatch_get(val);
     if (fw) {
-        JS_FreeValueRT(rt, fw->callback);
-        JS_FreeValueRT(rt, fw->this_val);
+        /* The wrapper itself is being finalized; its self-pin is consumed by
+         * the finalizer and must not be freed recursively. */
+        fw->this_val = JS_UNDEFINED;
+        fswatch_release_callback_rt(rt, fw);
         fw->finalized = 1;
         if (fw->closed) {
             tjs__free(fw);
@@ -92,12 +122,11 @@ static JSValue tjs_fswatch_close(JSContext *ctx, JSValue this_val, int argc, JSV
     }
     maybe_close(fw);
 
+    /* No future event callback can use the function once close was requested. */
+    fswatch_release_callback(ctx, fw);
+
     /* Release the GC-prevention self-reference so the object can be collected. */
-    if (!JS_IsUndefined(fw->this_val)) {
-        JSValue val = fw->this_val;
-        fw->this_val = JS_UNDEFINED;
-        JS_FreeValue(ctx, val);
-    }
+    fswatch_release_self(ctx, fw);
 
     return JS_UNDEFINED;
 }
@@ -143,8 +172,21 @@ static void uv__fs_event_cb(uv_fs_event_t *handle, const char *filename, int eve
     CHECK_NOT_NULL(fw);
     JSContext *ctx = fw->ctx;
 
-    // TODO: handle error case?
+    JSRuntime *rt = ctx ? JS_GetRuntime(ctx) : NULL;
+    TJSRuntime *qrt = rt ? JS_GetRuntimeOpaque(rt) : NULL;
+    if (!qrt || qrt->freeing) {
+        /* During runtime teardown no JS callback is allowed. */
+        if (rt) fswatch_release_callback_rt(rt, fw);
+        maybe_close(fw);
+        if (rt) fswatch_release_self_rt(rt, fw);
+        return;
+    }
+
+    // libuv reports watcher failures without an error callback in this API.
     if (status != 0) {
+        maybe_close(fw);
+        fswatch_release_callback(ctx, fw);
+        fswatch_release_self(ctx, fw);
         return;
     }
 
@@ -196,6 +238,9 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_ThrowOutOfMemory(ctx);
     }
 
+    fw->callback = JS_UNDEFINED;
+    fw->this_val = JS_UNDEFINED;
+
     int r = uv_fs_event_init(tjs_get_loop(ctx), &fw->handle);
     if (r != 0) {
         JS_FreeCString(ctx, path);
@@ -204,6 +249,7 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_ThrowInternalError(ctx, "couldn't initialize handle");
     }
 
+    fw->ctx = ctx;
     fw->handle.data = fw;
 
     int recursive = 0;
@@ -223,7 +269,6 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     JS_FreeCString(ctx, path);
 
-    fw->ctx = ctx;
     fw->handle.data = fw;
     fw->callback = JS_DupValue(ctx, argv[1]);
 

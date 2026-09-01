@@ -24,7 +24,7 @@ declare namespace CModuleDNS {
          */
         family: number;
 
-        /** getaddrinfo hint flags (AI_V4MAPPED, AI_ALL, AI_ADDRCONFIG). */
+        /** getaddrinfo hint flags (dns.V4MAPPED, dns.ALL, dns.ADDRCONFIG). */
         hints?: number;
 
         /**
@@ -82,6 +82,13 @@ declare namespace CModuleDNS {
     export const CAA: 257;     // Certification Authority Authorization
     /** ANY record query = 255 */
     export const ANY: 255;
+
+    /** Address family V4MAPPED (mapping V6 to V4 if V6 is not available) */
+    export const V4MAPPED: number;
+    /** Address family ALL (both IPv4 and IPv6) */
+    export const ALL: number;
+    /** Address family detected by capabilities */
+    export const ADDRCONFIG: number;
 
     /** Base DNS answer record (shared fields) */
     export interface BaseAnswer {

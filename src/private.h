@@ -109,6 +109,11 @@ struct TJSRuntime {
     struct list_head workers;
     struct list_head streams;
     struct list_head msgpipes;
+    /* Raw DNS UDP queries own a libuv handle until completion/teardown. */
+    struct list_head dns_queries;
+    /* Resolver requests are uv_req_t objects, not walkable handles. */
+    struct list_head dns_getaddrinfo;
+    struct list_head dns_getnameinfo;
 
 	bool freeing;
     struct {
@@ -203,6 +208,8 @@ typedef enum {
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
 void tjs__mod_bjson_init(JSContext *ctx, JSValue ns);
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
+void tjs__mod_dns_cleanup_runtime(TJSRuntime *trt);
+void tjs__mod_dns_drain_runtime(TJSRuntime *trt);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
@@ -306,6 +313,8 @@ void tjs__destroy_timers(TJSRuntime *qrt);
 void tjs__close_all_streams(TJSRuntime *qrt);
 void tjs__free_orphaned_streams(TJSRuntime *qrt);
 void tjs__close_all_msgpipes(TJSRuntime *qrt);
+/* Number of Worker threads whose native runtime has not fully returned. */
+size_t tjs__active_worker_count(void);
 
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);

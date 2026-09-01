@@ -53,6 +53,8 @@ declare namespace CModuleProcess {
         detached?: boolean;
         /** Hide the process window on Windows */
         background?: boolean;
+        /** Pass Windows command arguments verbatim without libuv quoting */
+        windowsVerbatimArguments?: boolean;
         /** Use PTY mode (default false) */
         pty?: T;
         /** PTY command; defaults to SHELL/COMSPEC when omitted */
@@ -172,11 +174,39 @@ declare namespace CModuleProcess {
     }
 
     /**
+     * Process handle returned by fork() in the parent branch.
+     *
+     * A forked process has no separately configured stdio or exec image; it
+     * continues from the same JS instruction point in the child branch.
+     */
+    export interface ForkedProcess {
+        /** Process ID */
+        readonly pid: number;
+        /** Wait for the forked child to exit. */
+        wait(): Promise<ExitInfo>;
+        /** Block until the forked child exits. */
+        waitSync(): ExitInfo;
+        /** Send a signal to the forked child. */
+        kill(signal?: Signal | number): void;
+    }
+
+    /**
      * Spawn child process
      * @param args Command string or argument array (first element is command to execute)
      * @param options Optional configuration
      */
     export function spawn<T extends boolean = false>(args: string | string[], options?: SpawnOptions<T>): ChildProcess<T>;
+
+    /**
+     * Fork the current Linux/POSIX runtime.
+     *
+     * The parent receives a ForkedProcess handle; the child receives null and
+     * continues execution immediately after this call. The operation does not
+     * exec a new image or modify inherited file descriptors. It throws when
+     * called on Windows, from a worker runtime, while the main runtime owns
+     * workers or spawned-process handles, or while libuv/JS work is pending.
+     */
+    export function fork(): ForkedProcess | null;
 
     /**
      * Synchronously spawn a child process using platform-native process APIs.

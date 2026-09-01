@@ -40,17 +40,25 @@
 typedef struct {
 	JSContext* ctx;
 	uv_getaddrinfo_t req;
+	TJSRuntime* trt;
 	TJSPromise result;
+	struct list_head link;
 	struct addrinfo* res;  // For sync operations
 	int status;  // For sync operations
 	bool done;   // For sync operations
+	bool linked;
+	bool tearing_down;
 } TJSGetAddrInfoReq;
 
 typedef struct {
 	JSContext* ctx;
 	uv_getnameinfo_t req;
+	TJSRuntime* trt;
 	TJSPromise result;
+	struct list_head link;
 	struct sockaddr_storage addr;
+	bool linked;
+	bool tearing_down;
 } TJSGetNameInfoReq;
 
 static JSValue tjs_addrinfo2obj(JSContext* ctx, struct addrinfo* ai) {
@@ -84,7 +92,22 @@ static int dns_ai_flags(int hints) {
 	return flags;
 }
 
-static const char* dns_gai_code(int status) {
+static const char* dns_uv_gai_code(int status) {
+	/* uv_getaddrinfo callbacks report libuv's stable UV_EAI_* values. */
+	if (status == UV_EAI_NONAME || status == UV_EAI_NODATA) return "ENOTFOUND";
+	if (status == UV_EAI_AGAIN) return "EAI_AGAIN";
+	if (status == UV_EAI_ADDRFAMILY) return "EAI_ADDRFAMILY";
+	if (status == UV_EAI_BADFLAGS) return "EAI_BADFLAGS";
+	if (status == UV_EAI_FAIL) return "EAI_FAIL";
+	if (status == UV_EAI_FAMILY) return "EAI_FAMILY";
+	if (status == UV_EAI_MEMORY) return "ENOMEM";
+	if (status == UV_EAI_SERVICE) return "EAI_SERVICE";
+	if (status == UV_EAI_SOCKTYPE) return "EAI_SOCKTYPE";
+	if (status == UV_EAI_OVERFLOW) return "EAI_OVERFLOW";
+	return "EAI_SYSTEM";
+}
+
+static const char* dns_platform_gai_code(int status) {
 #ifdef EAI_NONAME
 	if (status == EAI_NONAME) return "ENOTFOUND";
 #endif
@@ -121,17 +144,31 @@ static const char* dns_gai_code(int status) {
 	return "EAI_SYSTEM";
 }
 
-static JSValue dns_new_gai_error(JSContext* ctx, int status) {
+static JSValue dns_new_gai_error(JSContext* ctx, int status, bool from_uv) {
 	JSValue error = JS_NewError(ctx);
 	if (JS_IsException(error)) return error;
-	const char* message = gai_strerror(status);
+	const char* message = from_uv ? uv_strerror(status) : gai_strerror(status);
 	JS_DefinePropertyValueStr(ctx, error, "message",
 		JS_NewString(ctx, message ? message : "getaddrinfo failed"),
 		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 	JS_DefinePropertyValueStr(ctx, error, "code",
-		JS_NewString(ctx, dns_gai_code(status)),
+		JS_NewString(ctx, from_uv ? dns_uv_gai_code(status) : dns_platform_gai_code(status)),
 		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 	return error;
+}
+
+static void dns_getaddrinfo_unlink(TJSGetAddrInfoReq* gr) {
+	if (gr->linked) {
+		list_del(&gr->link);
+		gr->linked = false;
+	}
+}
+
+static void dns_getnameinfo_unlink(TJSGetNameInfoReq* gr) {
+	if (gr->linked) {
+		list_del(&gr->link);
+		gr->linked = false;
+	}
 }
 
 static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
@@ -139,13 +176,19 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 	CHECK_NOT_NULL(gr);
 
 	JSContext* ctx = gr->ctx;
-	TJSRuntime* qrt = TJS_GetRuntime(ctx);
+	TJSRuntime* qrt = gr->trt;
+	JSRuntime* rt = qrt ? qrt->rt : NULL;
+	dns_getaddrinfo_unlink(gr);
 
-	// Safeguard: if runtime is being freed, don't call JS functions
-	if (!qrt || qrt->freeing) {
+	/* The runtime teardown path must never call JSContext APIs. */
+	if (!ctx || !qrt || qrt->freeing || gr->tearing_down) {
 		if (res) uv_freeaddrinfo(res);
-		TJS_FreePromise(ctx, &gr->result);
-		js_free(ctx, gr);
+		if (rt) {
+			TJS_FreePromiseRT(rt, &gr->result);
+			js_free_rt(rt, gr);
+		} else {
+			free(gr);
+		}
 		return;
 	}
 
@@ -153,16 +196,19 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 	bool is_reject = status != 0;
 
 	if (status != 0) {
-		arg = tjs_new_error(ctx, status);
+		arg = dns_new_gai_error(ctx, status, true);
 	}
 	else {
 		arg = tjs_addrinfo2obj(ctx, res);
 	}
 
-	TJS_SettlePromise(ctx, &gr->result, is_reject, 1, &arg);
-
 	if (res) uv_freeaddrinfo(res);
-	js_free(ctx, gr);
+	/* Detach and free the native request before entering QuickJS. Promise hooks
+	 * can synchronously re-enter teardown, so do not read gr afterwards. */
+	TJSPromise result = gr->result;
+	TJS_ClearPromise(ctx, &gr->result);
+	js_free_rt(rt, gr);
+	TJS_SettlePromise(ctx, &result, is_reject, 1, &arg);
 }
 
 static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, JSValue* argv) {
@@ -206,6 +252,10 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 
 	gr->ctx = ctx;
+	gr->trt = TJS_GetRuntime(ctx);
+	init_list_head(&gr->link);
+	gr->linked = false;
+	gr->tearing_down = false;
 	gr->req.data = gr;
 
 	struct addrinfo hints;
@@ -230,6 +280,8 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 		js_free(ctx, gr);
 		return tjs_throw_errno(ctx, r);
 	}
+	list_add_tail(&gr->link, &gr->trt->dns_getaddrinfo);
+	gr->linked = true;
 
 	return promise;
 }
@@ -282,7 +334,7 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 
 	JSValue result;
 	if (r != 0) {
-		result = dns_new_gai_error(ctx, r);
+		result = dns_new_gai_error(ctx, r, false);
 		return JS_Throw(ctx, result);
 	} else {
 		result = tjs_addrinfo2obj(ctx, res);
@@ -300,10 +352,16 @@ static void uv__getnameinfo_cb(uv_getnameinfo_t* req, int status,
 	TJSGetNameInfoReq* gr = req->data;
 	CHECK_NOT_NULL(gr);
 	JSContext* ctx = gr->ctx;
-	TJSRuntime* qrt = TJS_GetRuntime(ctx);
-	if (!qrt || qrt->freeing) {
-		TJS_FreePromise(ctx, &gr->result);
-		js_free(ctx, gr);
+	TJSRuntime* qrt = gr->trt;
+	JSRuntime* rt = qrt ? qrt->rt : NULL;
+	dns_getnameinfo_unlink(gr);
+	if (!ctx || !qrt || qrt->freeing || gr->tearing_down) {
+		if (rt) {
+			TJS_FreePromiseRT(rt, &gr->result);
+			js_free_rt(rt, gr);
+		} else {
+			free(gr);
+		}
 		return;
 	}
 
@@ -316,8 +374,10 @@ static void uv__getnameinfo_cb(uv_getnameinfo_t* req, int status,
 		JS_SetPropertyStr(ctx, result, "hostname", JS_NewString(ctx, hostname ? hostname : ""));
 		JS_SetPropertyStr(ctx, result, "service", JS_NewString(ctx, service ? service : ""));
 	}
-	TJS_SettlePromise(ctx, &gr->result, reject, 1, &result);
-	js_free(ctx, gr);
+	TJSPromise promise = gr->result;
+	TJS_ClearPromise(ctx, &gr->result);
+	js_free_rt(rt, gr);
+	TJS_SettlePromise(ctx, &promise, reject, 1, &result);
 }
 
 static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
@@ -341,6 +401,10 @@ static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 	}
 	memset(gr, 0, sizeof(*gr));
 	gr->ctx = ctx;
+	gr->trt = TJS_GetRuntime(ctx);
+	init_list_head(&gr->link);
+	gr->linked = false;
+	gr->tearing_down = false;
 	gr->req.data = gr;
 	struct sockaddr_in addr4;
 	struct sockaddr_in6 addr6;
@@ -374,6 +438,8 @@ static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 		js_free(ctx, gr);
 		return tjs_throw_errno(ctx, r);
 	}
+	list_add_tail(&gr->link, &gr->trt->dns_getnameinfo);
+	gr->linked = true;
 	return promise;
 }
 
@@ -420,6 +486,8 @@ typedef struct {
 typedef struct {
 	uv_udp_t udp;
 	uv_udp_send_t send_req;
+	TJSRuntime* trt;
+	struct list_head link;
 	JSContext* ctx;
 	JSValue resolve_func;
 	JSValue reject_func;
@@ -431,6 +499,7 @@ typedef struct {
 	unsigned int query_len;
 	bool done;
 	bool closing;
+	bool linked;
 } dns_udp_ctx_t;
 
 // UDP DNS query context for sync operations
@@ -468,7 +537,11 @@ typedef struct {
 #define DNS_ANY     255   /* Any available record */
 
 static JSClassID tjs_dns_query_class_id;
-static JSClassDef tjs_dns_query_class = { "DNSQuery" };
+static void tjs_dns_query_finalizer(JSRuntime* rt, JSValue val);
+static JSClassDef tjs_dns_query_class = {
+	"DNSQuery",
+	.finalizer = tjs_dns_query_finalizer,
+};
 
 // ============ DNS Packet Building/Parsing ============
 
@@ -1013,8 +1086,21 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 
 // ============ UDP DNS Query ===========
 
+/* A query remains in the runtime registry until libuv has run its close
+ * callback.  This keeps the native context alive for a pending send callback
+ * (libuv cancels sends before invoking the UDP close callback). */
+static void dns_udp_unlink(dns_udp_ctx_t* ctx) {
+	if (ctx->linked) {
+		list_del(&ctx->link);
+		ctx->linked = false;
+	}
+}
+
 static void cleanup_callback(uv_handle_t* handle) {
 	dns_udp_ctx_t* ctx = (dns_udp_ctx_t*) handle->data;
+	if (!ctx) return;
+	handle->data = NULL;
+	dns_udp_unlink(ctx);
 	if (ctx->hostname) free(ctx->hostname);
 	free(ctx);
 }
@@ -1047,6 +1133,78 @@ static void dns_udp_close(dns_udp_ctx_t* ctx) {
 	}
 }
 
+/* Runtime teardown cannot use a JSContext or invoke user code.  Keep this
+ * separate from the normal path so every JS reference retained by a query is
+ * released exactly once even when its Promise was dropped before shutdown. */
+static void dns_udp_release_js_rt(dns_udp_ctx_t* ctx, JSRuntime* rt) {
+	if (!rt) return;
+	if (!JS_IsUndefined(ctx->controller)) {
+		JS_SetOpaque(ctx->controller, NULL);
+		JS_FreeValueRT(rt, ctx->controller);
+		ctx->controller = JS_UNDEFINED;
+	}
+	if (!JS_IsUndefined(ctx->resolve_func)) {
+		JS_FreeValueRT(rt, ctx->resolve_func);
+		ctx->resolve_func = JS_UNDEFINED;
+	}
+	if (!JS_IsUndefined(ctx->reject_func)) {
+		JS_FreeValueRT(rt, ctx->reject_func);
+		ctx->reject_func = JS_UNDEFINED;
+	}
+}
+
+static void dns_udp_finish_rt(dns_udp_ctx_t* ctx, JSRuntime* rt) {
+	ctx->done = true;
+	dns_udp_close(ctx);
+	dns_udp_release_js_rt(ctx, rt);
+}
+
+void tjs__mod_dns_cleanup_runtime(TJSRuntime* trt) {
+	if (!trt) return;
+	JSRuntime* rt = trt->rt;
+	struct list_head* pos;
+	list_for_each(pos, &trt->dns_queries) {
+		dns_udp_ctx_t* ctx = list_entry(pos, dns_udp_ctx_t, link);
+		/* Keep the context linked until cleanup_callback: pending UDP send
+		 * callbacks are allowed to run after uv_close() is requested. */
+		dns_udp_finish_rt(ctx, rt);
+	}
+	list_for_each(pos, &trt->dns_getaddrinfo) {
+		TJSGetAddrInfoReq* gr = list_entry(pos, TJSGetAddrInfoReq, link);
+		gr->tearing_down = true;
+		if (gr->req.type != UV_UNKNOWN_REQ)
+			uv_cancel((uv_req_t*) &gr->req);
+		TJS_FreePromiseRT(rt, &gr->result);
+	}
+	list_for_each(pos, &trt->dns_getnameinfo) {
+		TJSGetNameInfoReq* gr = list_entry(pos, TJSGetNameInfoReq, link);
+		gr->tearing_down = true;
+		if (gr->req.type != UV_UNKNOWN_REQ)
+			uv_cancel((uv_req_t*) &gr->req);
+		TJS_FreePromiseRT(rt, &gr->result);
+	}
+}
+
+void tjs__mod_dns_drain_runtime(TJSRuntime* trt) {
+	if (!trt) return;
+	/* uv_cancel() schedules the completion callback on the loop.  Keep every
+	 * request allocation alive until that callback has unregistered it; this is
+	 * required even when cancellation races with a worker already in flight. */
+	while (!list_empty(&trt->dns_getaddrinfo) ||
+		   !list_empty(&trt->dns_getnameinfo)) {
+		uv_run(&trt->loop, UV_RUN_ONCE);
+	}
+}
+
+static void tjs_dns_query_finalizer(JSRuntime* rt, JSValue val) {
+	dns_udp_ctx_t* ctx = JS_GetOpaque(val, tjs_dns_query_class_id);
+	if (!ctx) return;
+	/* Releasing the duplicate controller value below can recurse into this
+	 * finalizer.  Clear the pointer first so the nested call is a no-op. */
+	JS_SetOpaque(val, NULL);
+	dns_udp_finish_rt(ctx, rt);
+}
+
 static void dns_udp_finish(dns_udp_ctx_t* ctx) {
 	dns_udp_detach_controller(ctx);
 	dns_udp_free_callbacks(ctx);
@@ -1056,20 +1214,23 @@ static void dns_udp_finish(dns_udp_ctx_t* ctx) {
 static void dns_udp_reject_code(dns_udp_ctx_t* ctx, const char* code, const char* message) {
 	if (ctx->done) return;
 	ctx->done = true;
-	JSValue error = JS_NewError(ctx->ctx);
+	JSContext* js_ctx = ctx->ctx;
+	JSValue error = JS_NewError(js_ctx);
 	if (JS_IsException(error)) {
-		error = JS_GetException(ctx->ctx);
+		error = JS_GetException(js_ctx);
 	} else {
-		JS_DefinePropertyValueStr(ctx->ctx, error, "message", JS_NewString(ctx->ctx, message),
+		JS_DefinePropertyValueStr(js_ctx, error, "message", JS_NewString(js_ctx, message),
 			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-		JS_DefinePropertyValueStr(ctx->ctx, error, "code", JS_NewString(ctx->ctx, code),
+		JS_DefinePropertyValueStr(js_ctx, error, "code", JS_NewString(js_ctx, code),
 			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 	}
-	JSValue args[] = { error };
-	JSValue ignored = JS_Call(ctx->ctx, ctx->reject_func, JS_UNDEFINED, 1, args);
-	JS_FreeValue(ctx->ctx, ignored);
-	JS_FreeValue(ctx->ctx, args[0]);
+	JSValue reject_func = JS_DupValue(js_ctx, ctx->reject_func);
 	dns_udp_finish(ctx);
+	JSValue args[] = { error };
+	JSValue ignored = JS_Call(js_ctx, reject_func, JS_UNDEFINED, 1, args);
+	JS_FreeValue(js_ctx, ignored);
+	JS_FreeValue(js_ctx, reject_func);
+	JS_FreeValue(js_ctx, args[0]);
 }
 
 static const char* dns_parse_error_code(int status) {
@@ -1111,7 +1272,7 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 
 	// If runtime is being freed, just cleanup without touching JSContext
 	if (!qrt || qrt->freeing) {
-		dns_udp_close(ctx);
+		dns_udp_finish_rt(ctx, JS_GetRuntime(js_ctx));
 		if (buf->base) free(buf->base);
 		return;
 	}
@@ -1156,11 +1317,19 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 				JS_SetPropertyUint32(js_ctx, result, i, ans_obj);
 			}
 			free_dns_answers(answers, answer_count);
-			JSValue args[] = { result };
-			JSValue ignored = JS_Call(js_ctx, ctx->resolve_func, JS_UNDEFINED, 1, args);
-			JS_FreeValue(js_ctx, ignored);
-			JS_FreeValue(js_ctx, result);
+			/* Mark and detach the native operation before entering QuickJS.  A
+			 * promise hook can run GC/re-enter and otherwise leave the callback
+			 * observing a second completion or a freed context. */
 			ctx->done = true;
+			JSValue resolve_func = JS_DupValue(js_ctx, ctx->resolve_func);
+			dns_udp_finish(ctx);
+			JSValue args[] = { result };
+			JSValue ignored = JS_Call(js_ctx, resolve_func, JS_UNDEFINED, 1, args);
+			JS_FreeValue(js_ctx, ignored);
+			JS_FreeValue(js_ctx, resolve_func);
+			JS_FreeValue(js_ctx, result);
+			free(buf->base);
+			return;
 		} else {
 			dns_udp_reject_code(ctx, dns_parse_error_code(parse_status),
 				parse_status == DNS_PARSE_NODATA ? "DNS response contains no answers" : "Failed to parse DNS response");
@@ -1187,7 +1356,7 @@ static void udp_send_callback(uv_udp_send_t* req, int status) {
 
 	// If runtime is being freed, just cleanup without touching JSContext
 	if (!qrt || qrt->freeing) {
-		dns_udp_close(ctx);
+		dns_udp_finish_rt(ctx, JS_GetRuntime(ctx->ctx));
 		return;
 	}
 	if (status == 0 || ctx->done) return;
@@ -1262,9 +1431,11 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	req_ctx->controller = JS_UNDEFINED;
 
 	// Create promise
-	JSValue promise, callbacks[2];
+	JSValue promise, callbacks[2] = { JS_UNDEFINED, JS_UNDEFINED };
 	promise = JS_NewPromiseCapability(ctx, callbacks);
 	if (JS_IsException(promise)) {
+		JS_FreeValue(ctx, callbacks[0]);
+		JS_FreeValue(ctx, callbacks[1]);
 		if (server_is_js) JS_FreeCString(ctx, server);
 		JS_FreeCString(ctx, hostname);
 		free(req_ctx->hostname);
@@ -1353,6 +1524,13 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		return tjs_throw_errno(ctx, r);
 	}
 
+	/* Register only after uv_udp_init succeeds; cleanup_callback owns the
+	 * eventual unlink and native free. */
+	req_ctx->trt = trt;
+	init_list_head(&req_ctx->link);
+	list_add_tail(&req_ctx->link, &trt->dns_queries);
+	req_ctx->linked = true;
+
 	// Start receiving
 	r = uv_udp_recv_start(&req_ctx->udp, udp_alloc_callback, udp_recv_callback);
 	if (r < 0) {
@@ -1396,6 +1574,16 @@ static const JSCFunctionListEntry tjs_dns_funcs[] = {
 	TJS_CONST2("NAPTR", DNS_NAPTR),
 	TJS_CONST2("CAA", DNS_CAA),
 	TJS_CONST2("ANY", DNS_ANY),
+
+#ifdef AI_V4MAPPED
+	TJS_CONST2("V4MAPPED", AI_V4MAPPED),
+#endif
+#ifdef AI_ADDRCONFIG
+	TJS_CONST2("ADDRCONFIG", AI_ADDRCONFIG),
+#endif
+#ifdef AI_ALL
+	TJS_CONST2("ALL", AI_ALL),
+#endif
 
 	TJS_CFUNC_DEF("lookupService", 2, tjs_dns_lookup_service),
 	TJS_CFUNC_DEF("resolve", 2, tjs_dns_getaddrinfo),

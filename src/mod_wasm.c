@@ -36,7 +36,7 @@
 
 #define TJS__WASM_MAX_ARGS       		32
 #define TJS__WASM_ERROR_BUF_SIZE		256
-#define TJS__WASM_DEFAULT_STACK_SIZE    (16 * 1024)
+#define TJS__WASM_DEFAULT_STACK_SIZE    (64 * 1024)
 #define TJS__WASM_MAX_STACK_SIZE        (64 * 1024 * 1024)
 
 typedef struct TJSWasmImportGroup TJSWasmImportGroup;
@@ -376,7 +376,7 @@ static bool tjs__js_to_wasm_val(JSContext *ctx, JSValue jsval, wasm_valkind_t ty
 
 /* Register a JSValue as an externref. Returns the WAMR externref index via p_idx. */
 static bool tjs__externref_box(TJSWasmInstance *inst, JSContext *ctx, JSValue val, uint32_t *p_idx) {
-    if (JS_IsNull(val) || JS_IsUndefined(val)) {
+    if (JS_IsNull(val)) {
         *p_idx = NULL_REF;
         return true;
     }
@@ -400,6 +400,29 @@ static bool tjs__externref_box(TJSWasmInstance *inst, JSContext *ctx, JSValue va
 
     inst->externrefs[slot] = JS_DupValue(ctx, val);
     inst->externref_count++;
+    return true;
+}
+
+/* Box `val` and hand back the host key pointer WAMR's raw-native and
+ * wasm_val_t ABIs expect (wasm_externref_obj2ref maps it to an index).
+ *
+ * The slot is captured BEFORE the append on purpose: deriving the key
+ * afterwards from `externref_count - 1` only happens to be right while box()
+ * appends exactly one slot on every path, and nothing enforces that. */
+static bool tjs__externref_box_key(TJSWasmInstance *inst, JSContext *ctx, JSValue val, uintptr_t *p_key) {
+    if (JS_IsNull(val)) {
+        /* wasm_externref_obj2ref() treats (uintptr_t)-1 as ref.null. */
+        *p_key = UINTPTR_MAX;
+        return true;
+    }
+
+    uint32_t slot = inst->externref_count;
+    uint32_t externref_idx;
+    if (!tjs__externref_box(inst, ctx, val, &externref_idx)) {
+        return false;
+    }
+
+    *p_key = (uintptr_t) (slot + 1); /* mirrors the +1 in tjs__externref_box */
     return true;
 }
 
@@ -431,13 +454,7 @@ static JSValue tjs__externref_unbox(TJSWasmInstance *inst, uint32_t externref_id
     return tjs__externref_unbox_key(inst, key);
 }
 
-/* Raw native trampoline: called by WAMR, forwards to a JS function.
- *
- * NOTE: externref params/returns are not supported in import trampolines due to:
- * WAMR bug: invoke_native_raw passes garbage for externref params
- *    (still unfixed upstream as of 2026-06)
- * Externref works fine for exported functions, globals, and tables.
- */
+/* Raw native trampoline: called by WAMR, forwards to a JS function. */
 static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args) {
     TJSWasmImportCtx *import_ctx = wasm_runtime_get_function_attachment(exec_env);
     if (!import_ctx) {
@@ -446,6 +463,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
 
     JSContext *ctx = import_ctx->ctx;
     wasm_func_type_t func_type = import_ctx->type;
+    TJSWasmInstance *tjs__tramp_inst = wasm_runtime_get_user_data(exec_env);
 
     uint32_t param_count = wasm_func_type_get_param_count(func_type);
     uint32_t result_count = wasm_func_type_get_result_count(func_type);
@@ -487,6 +505,20 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
                 val.of.f64 = u.f;
                 break;
             }
+            case WASM_EXTERNREF: {
+                /* WAMR's raw-native ABI passes the host object pointer for an
+                 * externref.  It is the key registered by
+                 * tjs__externref_box(), so recover the original JS value from
+                 * the instance-owned keep-alive list. */
+                void *key = (void *) (uintptr_t) args[i];
+                if (!key || !tjs__tramp_inst) {
+                    js_args[i] = JS_NULL;
+                } else {
+                    js_args[i] = JS_DupValue(
+                        ctx, tjs__externref_unbox_key(tjs__tramp_inst, key));
+                }
+                continue;
+            }
             default:
                 js_args[i] = JS_UNDEFINED;
                 continue;
@@ -511,7 +543,6 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
      * Invalidate BEFORE the JS call so getMemoryBuffer() hands out a fresh
      * ArrayBuffer backed by the current memory base.
      * ------------------------------------------------------------------ */
-    TJSWasmInstance *tjs__tramp_inst = wasm_runtime_get_user_data(exec_env);
     wasm_memory_inst_t tjs__tramp_mem = NULL;
     void *tjs__tramp_mem_base = NULL;
     size_t tjs__tramp_mem_len = 0;
@@ -606,6 +637,22 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
                 } u;
                 u.f = f64;
                 args[0] = u.i;
+                break;
+            }
+            case WASM_EXTERNREF: {
+                /* WAMR reads args[0] unconditionally once this trampoline
+                 * returns: wasm_runtime_invoke_native_raw() has no exception
+                 * check between invoke_native_raw() and the return-value
+                 * conversion. So args[0] must hold a defined value on every
+                 * path, the allocation-failure one included, or WAMR registers
+                 * a leftover parameter cell as an externref. */
+                uintptr_t key = UINTPTR_MAX;
+                if (tjs__tramp_inst
+                    && !tjs__externref_box_key(tjs__tramp_inst, ctx, ret, &key)) {
+                    conv_failed = true;
+                    key = UINTPTR_MAX;
+                }
+                args[0] = (uint64_t) key;
                 break;
             }
             default:
@@ -905,29 +952,14 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
             if (!tjs__js_to_wasm_val(ctx, argv[j], param_types[j], &params[j])) {
                 return JS_EXCEPTION;
             }
-            /* For externref, box the JSValue and store the host pointer */
+            /* For externref, box the JSValue and store the host pointer WAMR
+             * converts back into an externref index (null -> UINTPTR_MAX). */
             if (param_types[j] == WASM_EXTERNREF) {
-                if (JS_IsNull(argv[j]) || JS_IsUndefined(argv[j])) {
-                    /* MEASURED DEFECT (unfixed): the guest sees this as a
-                     * NON-null externref, so `ref.is_null` on a JS null answers
-                     * false where node answers true.
-                     *
-                     * Substituting NULL_REF (0xFFFFFFFF) here was tried and
-                     * changed nothing: `of.foreign` is a host *key pointer* that
-                     * WAMR maps through wasm_externref_obj2ref, so no raw
-                     * sentinel written here reaches WAMR's internal null ref.
-                     * A real fix has to obtain the null reference from WAMR
-                     * itself rather than fabricate one. */
-                    params[j].of.foreign = (uintptr_t) (void *) NULL;
-                } else {
-                    uint32_t idx;
-                    if (!tjs__externref_box(inst, ctx, argv[j], &idx)) {
-                        return JS_ThrowInternalError(ctx, "failed to register externref");
-                    }
-                    /* Store the key pointer as foreign — WAMR will convert it to an index */
-                    uint32_t slot = inst->externref_count - 1;
-                    params[j].of.foreign = (uintptr_t) (void *) (uintptr_t) (slot + 1);
+                uintptr_t key;
+                if (!tjs__externref_box_key(inst, ctx, argv[j], &key)) {
+                    return JS_ThrowInternalError(ctx, "failed to register externref");
                 }
+                params[j].of.foreign = key;
             }
         } else {
             params[j].kind = param_types[j];
@@ -951,7 +983,10 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         }
     }
 
-    if (!wasm_runtime_call_wasm_a(inst->exec_env, func, result_count, results, param_count, params)) {
+    bool tjs__wasm_call_ok = wasm_runtime_call_wasm_a(
+        inst->exec_env, func, result_count, results, param_count, params);
+
+    if (!tjs__wasm_call_ok) {
         /* If an imported JS function threw, re-throw the original JS exception */
         if (inst->has_pending_exception) {
             JSValue exc = inst->pending_exception;
@@ -986,6 +1021,9 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         return JS_UNDEFINED;
     } else if (result_count == 1) {
         if (result_types[0] == WASM_EXTERNREF) {
+            /* wasm_runtime_call_wasm() finalizes externref results to the
+             * host object pointer before wasm_runtime_call_wasm_a() exposes
+             * them through wasm_val_t. */
             void *key = (void *) results[0].of.foreign;
             return JS_DupValue(ctx, tjs__externref_unbox_key(inst, key));
         }
@@ -995,7 +1033,8 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         for (uint32_t j = 0; j < result_count; j++) {
             if (result_types[j] == WASM_EXTERNREF) {
                 void *key = (void *) results[j].of.foreign;
-                JS_SetPropertyUint32(ctx, rets, j, JS_DupValue(ctx, tjs__externref_unbox_key(inst, key)));
+                JS_SetPropertyUint32(ctx, rets, j,
+                    JS_DupValue(ctx, tjs__externref_unbox_key(inst, key)));
             } else {
                 JS_SetPropertyUint32(ctx, rets, j, tjs__wasm_val_to_js(ctx, &results[j]));
             }
@@ -2436,7 +2475,7 @@ static JSValue tjs_wasm_tableset(JSContext *ctx, JSValue this_val, int argc, JSV
             memcpy(elem_ptr, &elem, sizeof(elem));
         }
     } else if (tbl.elem_kind == WASM_EXTERNREF) {
-        if (JS_IsNull(val) || JS_IsUndefined(val)) {
+        if (JS_IsNull(val)) {
             table_elem_type_t null_elem = (table_elem_type_t) (uint32_t) NULL_REF;
             memcpy(elem_ptr, &null_elem, sizeof(null_elem));
         } else {
@@ -2533,7 +2572,6 @@ static JSValue tjs_wasm_callfuncbyindex(JSContext *ctx, JSValue this_val, int ar
     if (JS_ToUint32(ctx, &func_idx, argv[1])) {
         return JS_EXCEPTION;
     }
-
     WASMModuleInstance *module_inst = (WASMModuleInstance *) i->module_inst;
     uint32_t total_funcs = module_inst->module->import_function_count + module_inst->module->function_count;
 

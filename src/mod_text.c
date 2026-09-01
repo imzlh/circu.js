@@ -97,15 +97,18 @@ typedef struct {
 /* Ensure at least `extra` free bytes are available. Returns 0 on success,
  * -1 on allocation failure (no exception thrown here; caller decides). */
 static int gb_ensure(JSContext *ctx, growbuf_t *gb, size_t extra) {
-    if (gb->buf && gb->len + extra <= gb->size)
+    if (extra > SIZE_MAX - gb->len)
+        return -1;
+    if (gb->buf && extra <= gb->size - gb->len)
         return 0;
-
     size_t need = gb->len + extra;
     size_t new_size = gb->size ? gb->size : INITIAL_BUFFER_SIZE;
     while (new_size < need) {
         size_t grown = new_size + (new_size >> 1); /* *1.5 */
-        if (grown <= new_size)                      /* overflow / no growth */
-            grown = new_size + INITIAL_BUFFER_SIZE;
+        if (grown <= new_size) {                    /* overflow / no growth */
+            new_size = need;
+            break;
+        }
         new_size = grown;
     }
 
@@ -215,6 +218,48 @@ static size_t encoding_unit_width(const char *enc) {
     return 1;
 }
 
+static bool encoding_is_utf8(const char *enc) {
+    return enc && strcasecmp(enc, "UTF-8") == 0;
+}
+
+/* Classify the UTF-8 sequence at p. A zero return denotes one complete,
+ * well-formed scalar, whose byte count is written to width when requested. */
+static int utf8_failure_kind(const uint8_t *p, size_t len, size_t *width) {
+    const uint8_t lead = p[0];
+    size_t need;
+    if (lead < 0x80) {
+        if (width)
+            *width = 1;
+        return 0;
+    }
+    if (lead >= 0xC2 && lead <= 0xDF)
+        need = 2;
+    else if (lead >= 0xE0 && lead <= 0xEF)
+        need = 3;
+    else if (lead >= 0xF0 && lead <= 0xF4)
+        need = 4;
+    else
+        return EILSEQ;
+
+    size_t available = len < need ? len : need;
+    for (size_t i = 1; i < available; i++) {
+        if ((p[i] & 0xC0) != 0x80)
+            return EILSEQ;
+    }
+    if (available > 1) {
+        if ((lead == 0xE0 && p[1] < 0xA0) ||
+            (lead == 0xED && p[1] >= 0xA0) ||
+            (lead == 0xF0 && p[1] < 0x90) ||
+            (lead == 0xF4 && p[1] >= 0x90))
+            return EILSEQ;
+    }
+    if (len < need)
+        return EINVAL;
+    if (width)
+        *width = need;
+    return 0;
+}
+
 /* Count UTF-16 code units in the first `n` bytes of a (valid) UTF-8 buffer.
  * Used by encodeInto() to report `read` per the WHATWG spec. iconv only ever
  * consumes whole code points, so `n` always lands on a code-point boundary. */
@@ -254,13 +299,12 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
  * ==========================================================================*/
 static int iconv_drive(JSContext *ctx, iconv_t cd,
                        const char *inbuf, size_t inlen,
-                       bool fatal, bool to_utf8, size_t unit,
+                       bool fatal, bool to_utf8, bool source_is_utf8, size_t unit,
                        growbuf_t *gb, size_t *trailing_out) {
     char *inptr = (char *)inbuf;
     size_t inleft = inlen;
     if (trailing_out)
         *trailing_out = 0;
-
     while (inleft > 0) {
         if (gb_ensure(ctx, gb, MIN_OUT_HEADROOM) < 0) {
             JS_ThrowOutOfMemory(ctx);
@@ -269,13 +313,36 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
 
         char *outptr = gb->buf + gb->len;
         size_t outleft = gb->size - gb->len;
+        errno = 0;
         size_t ret = iconv(cd, &inptr, &inleft, &outptr, &outleft);
+        int e = errno;
         gb->len = gb->size - outleft; /* commit whatever iconv produced */
+
+#ifdef _WIN32
+        /* Some libiconv builds keep errno in another CRT. An output buffer
+         * below our headroom must be retried; otherwise UTF-8 identifies the
+         * input error or an unrepresentable target character. */
+        if (ret == (size_t)-1 && e == 0) {
+            if (outleft < MIN_OUT_HEADROOM) {
+                e = E2BIG;
+            } else if (source_is_utf8 && inleft > 0) {
+                e = utf8_failure_kind((const uint8_t *)inptr, inleft, NULL);
+                if (e == 0)
+                    e = EILSEQ;
+            }
+        }
+#endif
 
         if (ret != (size_t)-1)
             break; /* all input consumed */
 
-        int e = errno;
+        /* GNU libiconv can report EINVAL for a short prefix whose next byte
+         * is already an invalid continuation. Treat that as malformed input
+         * so streaming decoders resynchronize immediately. */
+        if (e == EINVAL && source_is_utf8 && inleft > 0 &&
+            utf8_failure_kind((const uint8_t *)inptr, inleft, NULL) == EILSEQ)
+            e = EILSEQ;
+
         if (e == E2BIG) {
             /* Output full: force real growth before retrying. */
             if (gb_ensure(ctx, gb, gb->size ? gb->size : INITIAL_BUFFER_SIZE) < 0) {
@@ -300,8 +367,15 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
              * short tail (fewer than `unit` bytes left) is consumed whole so
              * one bad unit yields exactly one replacement. `unit` is >= 1 and
              * `inleft` is > 0 here, so `skip` is always >= 1 and the loop
-             * always makes progress. */
+             * always makes progress. A valid UTF-8 scalar rejected only by the
+             * target encoding is skipped as one character instead. */
             size_t skip = (inleft < unit) ? inleft : unit;
+            if (source_is_utf8 && !to_utf8) {
+                size_t utf8_width;
+                if (utf8_failure_kind((const uint8_t *)inptr, inleft,
+                                      &utf8_width) == 0)
+                    skip = utf8_width;
+            }
             inptr += skip;
             inleft -= skip;
             if (to_utf8) {
@@ -519,6 +593,7 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
     size_t trailing = 0;
     int rc = iconv_drive(ctx, dec->cd, conv_in, conv_len,
                          dec->fatal, /*to_utf8=*/true,
+                         encoding_is_utf8(dec->encoding),
                          encoding_unit_width(dec->encoding), &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
@@ -675,10 +750,10 @@ static JSValue tjs_text_encoder_encode(JSContext *ctx, JSValueConst this_val,
     /* TextEncoder never throws on bad data; unrepresentable chars in a custom
      * target encoding become '?'. */
     /* The source is always the UTF-8 C-string from JS, never enc->encoding
-     * (which is the *target*), so the resync unit is 1 byte. */
+     * (which is the *target*), so malformed input resyncs byte by byte. */
     int rc = iconv_drive(ctx, enc->cd, str, str_len,
                          /*fatal=*/false, /*to_utf8=*/enc->is_utf8,
-                         /*unit=*/1, &gb, NULL);
+                         /*source_is_utf8=*/true, /*unit=*/1, &gb, NULL);
     JS_FreeCString(ctx, str);
 
     if (rc != 0) {
@@ -724,10 +799,22 @@ static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_va
     bool hard_error = false;
 
     while (inleft > 0 && outleft > 0) {
+        errno = 0;
         size_t ret = iconv(enc->cd, &inptr, &inleft, &outptr, &outleft);
         if (ret != (size_t)-1)
             break; /* fully consumed */
         int e = errno;
+#ifdef _WIN32
+        if (e == 0) {
+            if (outleft == 0) {
+                e = E2BIG;
+            } else if (inleft > 0) {
+                e = utf8_failure_kind((const uint8_t *)inptr, inleft, NULL);
+                if (e == 0)
+                    e = EILSEQ;
+            }
+        }
+#endif
         if (e == E2BIG)
             break; /* destination full: stop without overflowing */
         if (e == EINVAL)
@@ -819,6 +906,7 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
      * (e.g. "windows-1252") `from_n` aliases into `from` and reading it after
      * the free is a use-after-free. Same reason `is_to_utf8` is computed early. */
     size_t from_unit = encoding_unit_width(from_n);
+    bool from_is_utf8 = encoding_is_utf8(from_n);
 
     /* from/to C strings are no longer needed for formatting; the data buffer is
      * acquired last and used without any further JS calls. */
@@ -835,7 +923,7 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     growbuf_t gb = {0};
     size_t trailing = 0;
     int rc = iconv_drive(ctx, cd, (const char *)inbuf, inlen,
-                         /*fatal=*/false, is_to_utf8, from_unit, &gb, &trailing);
+                         /*fatal=*/false, is_to_utf8, from_is_utf8, from_unit, &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
         /* Best-effort: stand in one replacement for the incomplete tail. */

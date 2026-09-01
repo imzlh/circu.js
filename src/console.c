@@ -1,7 +1,7 @@
 /**
  * Circu.js Console
  *
- * Copyright (c) 2025 iz
+ * Copyright (c) 2025-present iz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -103,7 +103,7 @@ static thread_local ConsoleTimer* console_timers = NULL;
 #define fprintf2(...) __mutex(fprintf(__VA_ARGS__))
 
 /* Indentation - Fixed: properly initialized */
-static const char* get_indent(int depth) {
+static inline const char* get_indent(int depth) {
     static const char spaces[] = "                                                                ";
     int offset = depth * 2;
     if (offset > 60) offset = 60;
@@ -116,7 +116,7 @@ typedef struct {
     int count;
 } VisitStack;
 
-static bool is_circular(VisitStack* stack, JSValue val) {
+static inline bool is_circular(VisitStack* stack, JSValue val) {
     if (!stack || !JS_VALUE_HAS_REF_COUNT(val)) return false;
     void* ptr = JS_VALUE_GET_PTR(val);
     for (int i = 0; i < stack->count; i++) {
@@ -125,13 +125,13 @@ static bool is_circular(VisitStack* stack, JSValue val) {
     return false;
 }
 
-static void visit_push(VisitStack* stack, JSValue val) {
+static inline void visit_push(VisitStack* stack, JSValue val) {
     if (stack && stack->count < MAX_DEPTH) {
         stack->refs[stack->count++] = val;
     }
 }
 
-static void visit_pop(VisitStack* stack) {
+static inline void visit_pop(VisitStack* stack) {
     if (stack && stack->count > 0) stack->count--;
 }
 
@@ -158,36 +158,27 @@ static void parse_inspect_options(JSContext* ctx, JSValue opts_val, InspectOptio
     if (!JS_IsObject(opts_val)) return;
 
     JSValue v;
-    v = JS_GetPropertyStr(ctx, opts_val, "depth");
-    if (JS_IsNumber(v)) {
-        JS_ToInt32(ctx, &opts->depth, v);
-        if (opts->depth < 0) opts->depth = 0;
-    }
-    JS_FreeValue(ctx, v);
+#define IF(prop, condition, action) { \
+    v = JS_GetPropertyStr(ctx, opts_val, prop); \
+    if (condition) action; \
+    JS_FreeValue(ctx, v); \
+}
+#define IF_BOOL(prop, variable) IF(prop, JS_IsBool(v), variable = JS_ToBool(ctx, v))
+#define IF_INT(prop, variable) IF(prop, JS_IsNumber(v), JS_ToInt32(ctx, variable, v))
+#define IF_STRING(prop, variable) IF(prop, JS_IsString(v), variable = JS_ToCString(ctx, v))
+    IF_INT("depth", &opts->depth);
+    IF_INT("breakLength", &opts->break_length);
+    IF_BOOL("colors", opts->colors);
+    IF_BOOL("showHidden", opts->show_hidden);
+    IF_INT("maxArrayLength", &opts->max_array_length);
+    IF_INT("maxStringLength", &opts->max_string_length);
+    IF_BOOL("compact", opts->compact);
 
-    v = JS_GetPropertyStr(ctx, opts_val, "breakLength");
-    if (JS_IsNumber(v)) JS_ToInt32(ctx, &opts->break_length, v);
-    JS_FreeValue(ctx, v);
-
-    v = JS_GetPropertyStr(ctx, opts_val, "colors");
-    if (JS_IsBool(v)) opts->colors = JS_ToBool(ctx, v);
-    JS_FreeValue(ctx, v);
-
-    v = JS_GetPropertyStr(ctx, opts_val, "showHidden");
-    if (JS_IsBool(v)) opts->show_hidden = JS_ToBool(ctx, v);
-    JS_FreeValue(ctx, v);
-
-    v = JS_GetPropertyStr(ctx, opts_val, "maxArrayLength");
-    if (JS_IsNumber(v)) JS_ToInt32(ctx, &opts->max_array_length, v);
-    JS_FreeValue(ctx, v);
-
-    v = JS_GetPropertyStr(ctx, opts_val, "maxStringLength");
-    if (JS_IsNumber(v)) JS_ToInt32(ctx, &opts->max_string_length, v);
-    JS_FreeValue(ctx, v);
-
-    v = JS_GetPropertyStr(ctx, opts_val, "compact");
-    if (JS_IsBool(v)) opts->compact = JS_ToBool(ctx, v);
-    JS_FreeValue(ctx, v);
+    if (opts->depth < 0) opts->depth = 0;
+#undef IF
+#undef IF_BOOL
+#undef IF_INT
+#undef IF_STRING
 }
 
 /* Forward declaration */
@@ -228,6 +219,7 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
     const char* str = JS_ToCString(ctx, name);
     JS_FreeValue(ctx, name);
     
+    // Plain objects do not need a constructor prefix.
     if (str && str[0] && strcmp(str, "Object") != 0) {
         char* dup = js_strdup(ctx, str);
         JS_FreeCString(ctx, str);
@@ -246,7 +238,7 @@ static inline void put_reset(DynBuf* buf, const InspectOptions* opts) {
     if (opts->colors) dbuf_putstr(buf, ANSI_RESET);
 }
 
-static void put_group_indent(DynBuf* buf) {
+static inline void put_group_indent(DynBuf* buf) {
     for (int i = 0; i < console_group_indent; i++) dbuf_putc(buf, ' ');
 }
 
@@ -581,6 +573,7 @@ static const char* function_kind(JSContext* ctx, JSValue val) {
 
     /* Not a class: distinguish the async/generator kinds via Symbol.toStringTag,
      * which the spec installs on %AsyncFunction.prototype% et al. */
+    // QuickJS exposes function kinds through Symbol.toStringTag.
     JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
     const char* tag_str = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
     const char* kind = "Function";
@@ -831,10 +824,10 @@ static int estimate_width(JSContext* ctx, JSValue val, int depth) {
 		case JS_TAG_INT:
         case JS_TAG_SHORT_BIG_INT:
         case JS_TAG_BIG_INT:
-		case JS_TAG_FLOAT64: return 10;
-		case JS_TAG_BOOL: return 5;
+		case JS_TAG_FLOAT64:    return 10;
+		case JS_TAG_BOOL:       return 5;
 		case JS_TAG_NULL:
-		case JS_TAG_UNDEFINED: return 9;
+		case JS_TAG_UNDEFINED:  return 9;
 		case JS_TAG_STRING:
         case JS_TAG_STRING_ROPE: {
 			const char* s = JS_ToCString(ctx, val);
@@ -1423,9 +1416,7 @@ static void format_set(JSContext* ctx, JSValue val, int depth, VisitStack* stack
 }
 
 static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
-	/* Node: `Promise { 1 }`, `Promise { <pending> }`, `Promise { <rejected> Error: x }`.
-	 * The old `Promise<...>` form resembled a TypeScript type annotation and
-	 * lost the fulfilled/rejected distinction entirely. */
+	/* Node: `Promise { 1 }`, `Promise { <pending> }`, `Promise { <rejected> Error: x }` */
 	JSPromiseStateEnum state = JS_PromiseState(ctx, val);
 	put_color(buf, opts, ANSI_CYAN);
 	dbuf_putstr(buf, "Promise { ");
@@ -1634,7 +1625,7 @@ static JSValue js_console_format(JSContext* ctx, JSValueConst this_val, int argc
     return ret;
 }
 
-static void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
+static inline void console_log_internal(JSContext* ctx, int argc, JSValueConst* argv,
                                 FILE* stream, int default_depth, bool show_hidden) {
     (void)default_depth;
     (void)show_hidden;
@@ -2026,13 +2017,9 @@ static const JSCFunctionListEntry console_funcs[] = {
     JS_CFUNC_DEF("format", 0, js_console_format)
 };
 
-static void stdout_mutex_init_once(void) {
+static void console_init_once(void) {
     uv_mutex_init(&stdout_mutex);
-}
 
-void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
-    /* Racy under worker threads with a plain static flag; uv_once is safe. */
-    uv_once(&stdout_mutex_once, stdout_mutex_init_once);
 #ifdef _WIN32
     // use utf-8 to display correctly in Windows
     SetConsoleOutputCP(CP_UTF8);
@@ -2045,6 +2032,11 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hOut, dwMode);
 #endif
+}
+
+void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
+    /* Racy under worker threads with a plain static flag; uv_once is safe. */
+    uv_once(&stdout_mutex_once, console_init_once);
 
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }

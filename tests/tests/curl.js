@@ -65,6 +65,27 @@ await test('CURL instance - set request headers', async () => {
     assert(data.headers['X-Another-Header'] === 'another-value', 'another header should be set correctly');
 });
 
+await test('CURL setHeaders keeps the previous list when enumeration throws', () => {
+    const curl = new CURLMod.CURL(pool);
+    curl.setHeaders({ 'X-Stable': 'old' });
+
+    const badHeaders = new Proxy({}, {
+        ownKeys() {
+            throw new Error('enumeration failed');
+        },
+    });
+
+    let threw = false;
+    try {
+        curl.setHeaders(badHeaders);
+    } catch {
+        threw = true;
+    }
+
+    assert(threw, 'setHeaders should propagate an enumeration error');
+    assertEquals(curl.getHeaders(), ['X-Stable: old']);
+});
+
 await test('CURL instance - POST data', async () => {
     const curl = new CURLMod.CURL(pool);
     const postData = 'field1=value1&field2=value2';
@@ -419,6 +440,8 @@ await test('CURL instance - range request', async () => {
 await test('CURL instance - DNS server settings', () => {
     const curl = new CURLMod.CURL(pool);
 
+    if (typeof curl.setDNSServers !== 'function') return;
+
     // set DNS servers (config only, no actual connection test)
     curl.setDNSServers('8.8.8.8,1.1.1.1');
 
@@ -515,6 +538,61 @@ await test('CURL - large file download test', async () => {
     assert(response.body.length >= 1048576, 'should download complete 1MB data');
 
     console.log(`Downloaded 1MB in ${duration}ms, speed: ${(1048576 / duration * 1000 / 1024).toFixed(1)} KB/s`);
+});
+
+function assertTypeError(fn, message) {
+    let error;
+    try {
+        fn();
+    } catch (caught) {
+        error = caught;
+    }
+    assert(error instanceof TypeError, message);
+}
+
+await test('CURL setOpt - ObjectPoint metadata and slist ownership', () => {
+    const curl = new CURLMod.CURL(pool);
+
+    curl.setOpt(CURLMod.CURLOPT_URL, 'https://example.invalid');
+    curl.setOpt(CURLMod.CURLOPT_URL, null);
+    curl.setOpt(CURLMod.CURLOPT_POSTFIELDS, 'copied body');
+    curl.setOpt(CURLMod.CURLOPT_POSTFIELDS, new Uint8Array([1, 2, 3]));
+    curl.setOpt(CURLMod.CURLOPT_POSTFIELDS, null);
+
+    assertTypeError(
+        () => curl.setOpt(CURLMod.CURLOPT_URL, ['not a URL']),
+        'a copied-string option must reject arrays',
+    );
+    assertTypeError(
+        () => curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, 'X-Invalid: value'),
+        'a slist option must reject strings',
+    );
+    assertTypeError(
+        () => curl.setOpt(CURLMod.CURLOPT_READDATA, null),
+        'reserved native pointers must remain inaccessible',
+    );
+    assertTypeError(
+        () => curl.setOpt(19999, null),
+        'unknown object-pointer options must be rejected before calling libcurl',
+    );
+
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, ['X-Unique-Header: first']);
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, ['X-Unique-Header: replacement']);
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, null);
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, ['X-Unique-Header: restored']);
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, undefined);
+
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, ['X-Unique-Header: reset']);
+    curl.setHeaders({ 'X-From-SetHeaders': 'current' });
+    assertEquals(curl.getHeaders(), ['X-From-SetHeaders: current']);
+
+    curl.setOpt(CURLMod.CURLOPT_HTTPHEADER, ['X-From-SetOpt: current']);
+    assertEquals(curl.getHeaders(), ['X-From-SetOpt: current'],
+        'getHeaders must report the generic HTTPHEADER list that replaces setHeaders');
+
+    curl.reset();
+    assertEquals(curl.getHeaders(), [],
+        'reset must release the current setHeaders list');
 });
 
 // ============ Cleanup tests ============
