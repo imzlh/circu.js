@@ -193,6 +193,9 @@ declare namespace CModuleOS {
      */
     export function exit(status?: number): void;
 
+    /** Set the natural exit status without stopping the loop; undefined/null clears it. */
+    export function setExitCode(status?: number | null): void;
+
     // ==================== System Info ====================
 
     /**

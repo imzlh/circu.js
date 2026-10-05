@@ -256,6 +256,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
 }
 
 static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected receive buffer");
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
@@ -327,6 +328,7 @@ static void uv__udp_send_cb(uv_udp_send_t *req, int status) {
 }
 
 static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected data buffer");
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
@@ -339,7 +341,7 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
     struct sockaddr_storage ss;
     struct sockaddr *sa = NULL;
     int r;
-    if (!JS_IsUndefined(argv[1])) {
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
         r = tjs_obj2addr(ctx, argv[1], &ss);
         if (r != 0) {
             return JS_EXCEPTION;
@@ -464,7 +466,7 @@ static JSValue tjs_new_udp(JSContext *ctx, int af) {
 
 static JSValue tjs_udp_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
     int af = AF_UNSPEC;
-    if (!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
         return JS_EXCEPTION;
     }
     return tjs_new_udp(ctx, af);
@@ -495,6 +497,7 @@ static JSValue tjs_udp_getsockpeername(JSContext *ctx, JSValue this_val, int arg
 }
 
 static JSValue tjs_udp_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
@@ -530,6 +533,7 @@ static JSValue tjs_udp_disconnect(JSContext *ctx, JSValue this_val, int argc, JS
 }
 
 static JSValue tjs_udp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
@@ -543,7 +547,7 @@ static JSValue tjs_udp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     int flags = 0;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) {
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) {
         return JS_EXCEPTION;
     }
 

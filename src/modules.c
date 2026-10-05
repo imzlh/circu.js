@@ -26,6 +26,7 @@
 #include "tjs.h"
 #include "utils.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #ifdef CJS_HAS_EXTRA_MODULES
@@ -537,7 +538,7 @@ static char *tjs__module_normalizer_impl(JSContext *ctx, const char *base_name, 
 
     char *filename, *p;
     const char *r;
-    int len;
+    size_t len;
 
     if (name[0] != '.') {
         /* if no initial dot, the module name is not modified */
@@ -548,7 +549,7 @@ static char *tjs__module_normalizer_impl(JSContext *ctx, const char *base_name, 
 #if defined(_WIN32)
     {
         char *p_posix = strrchr(base_name, TJS__PATHSEP_POSIX);
-        if (!p || p_posix > p) {
+        if (p_posix && (!p || p_posix > p)) {
             p = p_posix;
         }
     }
@@ -559,7 +560,12 @@ static char *tjs__module_normalizer_impl(JSContext *ctx, const char *base_name, 
         len = 0;
     }
 
-    filename = js_malloc(ctx, len + strlen(name) + 1 + 1);
+    size_t name_len = strlen(name);
+    if (len > SIZE_MAX - 2 || name_len > SIZE_MAX - len - 2) {
+        JS_ThrowRangeError(ctx, "module path is too long");
+        return NULL;
+    }
+    filename = js_malloc(ctx, len + name_len + 2);
     if (!filename) {
         return NULL;
     }

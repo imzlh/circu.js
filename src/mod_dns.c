@@ -212,6 +212,9 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 }
 
 static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, JSValue* argv) {
+	if (argc < 2 || !JS_IsObject(argv[1])) {
+		return JS_ThrowTypeError(ctx, "expected node and options object");
+	}
 	const char* node = NULL;
 
 	if (!JS_IsUndefined(argv[0])) {
@@ -287,6 +290,9 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 }
 
 static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int argc, JSValue* argv) {
+	if (argc < 2 || !JS_IsObject(argv[1])) {
+		return JS_ThrowTypeError(ctx, "expected node and options object");
+	}
 	const char* node = NULL;
 
 	if (!JS_IsUndefined(argv[0])) {
@@ -382,6 +388,7 @@ static void uv__getnameinfo_cb(uv_getnameinfo_t* req, int status,
 
 static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 	int argc, JSValue* argv) {
+	if (argc < 2) return JS_ThrowTypeError(ctx, "expected address and port");
 	const char* address = JS_ToCString(ctx, argv[0]);
 	if (!address) return JS_EXCEPTION;
 	int32_t port;
@@ -1375,6 +1382,7 @@ static JSValue tjs_dns_query_abort(JSContext* ctx, JSValueConst this_val,
 static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv) {
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	if (argc < 1) return JS_ThrowTypeError(ctx, "expected hostname");
 	const char* hostname = JS_ToCString(ctx, argv[0]);
 	if (!hostname) return JS_ThrowTypeError(ctx, "Invalid hostname");
 

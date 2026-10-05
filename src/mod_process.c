@@ -324,24 +324,56 @@ static int setup_extra_stdio(JSContext *ctx, TJSProcess *p, uv_process_options_t
     return 0;
 }
 
+static void free_str_arr(JSContext *ctx, char **arr, int len);
+
 /* Build a NULL-terminated argv array from a JS array.  Uses js_malloc / js_strdup. */
 static char **parse_argv_arr(JSContext *ctx, JSValue js_arr, int *len_out) {
-    JSValue lv = JS_GetPropertyStr(ctx, js_arr, "length");
-    int32_t len = 0; JS_ToInt32(ctx, &len, lv); JS_FreeValue(ctx, lv);
     *len_out = 0;
-    if (len <= 0) return NULL;
-    char **arr = js_mallocz(ctx, sizeof(char *) * (len + 1));
-    if (!arr) return NULL;
+    JSValue lv = JS_GetPropertyStr(ctx, js_arr, "length");
+    uint64_t len64 = 0;
+    if (JS_IsException(lv) || JS_ToIndex(ctx, &len64, lv) < 0) {
+        JS_FreeValue(ctx, lv);
+        *len_out = -1;
+        return NULL;
+    }
+    JS_FreeValue(ctx, lv);
+    if (len64 == 0) return NULL;
+    /* The process backends and free_str_arr use int lengths.  Reject an
+     * oversized JS array before narrowing or allocating its pointer table. */
+    if (len64 > INT_MAX || len64 > (uint64_t)(SIZE_MAX / sizeof(char *) - 1)) {
+        JS_ThrowRangeError(ctx, "argv array is too large");
+        *len_out = -1;
+        return NULL;
+    }
+    int32_t len = (int32_t)len64;
+    char **arr = js_mallocz(ctx, sizeof(char *) * ((size_t)len + 1));
+    if (!arr) {
+        *len_out = -1;
+        return NULL;
+    }
     int n = 0;
     for (int32_t i = 0; i < len; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, js_arr, (uint32_t)i);
+        if (JS_IsException(item)) {
+            free_str_arr(ctx, arr, n);
+            *len_out = -1;
+            return NULL;
+        }
         const char *s = JS_ToCString(ctx, item);
         JS_FreeValue(ctx, item);
-        if (s) {
-            arr[n] = js_strdup(ctx, s);
-            JS_FreeCString(ctx, s);
-            if (arr[n]) n++;
+        if (!s) {
+            free_str_arr(ctx, arr, n);
+            *len_out = -1;
+            return NULL;
         }
+        arr[n] = js_strdup(ctx, s);
+        JS_FreeCString(ctx, s);
+        if (!arr[n]) {
+            free_str_arr(ctx, arr, n);
+            *len_out = -1;
+            return NULL;
+        }
+        n++;
     }
     *len_out = n;
     return arr;
@@ -365,16 +397,27 @@ static char **tjs__parse_args(JSContext *ctx, JSValue arg0);
 static void tjs__free_args(JSContext *ctx, char **args);
 
 /* Read { cols, rows } from a JS options object, with defaults. */
-static void parse_winsize(JSContext *ctx, JSValue opts, int *cols, int *rows) {
+static int parse_winsize(JSContext *ctx, JSValue opts, int *cols, int *rows) {
     *cols = 80; *rows = 24;
-    if (!JS_IsObject(opts)) return;
+    if (!JS_IsObject(opts)) return 0;
     JSValue v;
     v = JS_GetPropertyStr(ctx, opts, "cols");
-    if (JS_IsNumber(v)) { int32_t n; JS_ToInt32(ctx, &n, v); *cols = n; }
+    if (JS_IsException(v)) { JS_FreeValue(ctx, v); return -1; }
+    if (JS_IsNumber(v)) {
+        int32_t n;
+        if (JS_ToInt32(ctx, &n, v) < 0) { JS_FreeValue(ctx, v); return -1; }
+        *cols = n;
+    }
     JS_FreeValue(ctx, v);
     v = JS_GetPropertyStr(ctx, opts, "rows");
-    if (JS_IsNumber(v)) { int32_t n; JS_ToInt32(ctx, &n, v); *rows = n; }
+    if (JS_IsException(v)) { JS_FreeValue(ctx, v); return -1; }
+    if (JS_IsNumber(v)) {
+        int32_t n;
+        if (JS_ToInt32(ctx, &n, v) < 0) { JS_FreeValue(ctx, v); return -1; }
+        *rows = n;
+    }
     JS_FreeValue(ctx, v);
+    return 0;
 }
 
 static TJSProcess *tjs_process_get(JSContext *ctx, JSValue obj) {
@@ -1663,7 +1706,11 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         int argv_len = 0;
         int cols, rows;
         bool clear_env = bool_prop(ctx, opts, "clearEnv");
-        parse_winsize(ctx, opts, &cols, &rows);
+        if (parse_winsize(ctx, opts, &cols, &rows) < 0) {
+            tjs__free(p);
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
         p->pty_cols = cols; p->pty_rows = rows;
 
         if (JS_IsObject(opts)) {
@@ -1683,6 +1730,16 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
             v = JS_GetPropertyStr(ctx, opts, "argv");
             if (JS_IsArray(v)) argv_arr = parse_argv_arr(ctx, v, &argv_len);
             JS_FreeValue(ctx, v);
+            if (argv_len < 0) {
+                if (name) JS_FreeCString(ctx, name);
+                if (cwd) JS_FreeCString(ctx, cwd);
+                free_env(ctx, env_arr);
+                JS_FreeValue(ctx, p->pty_readable);
+                JS_FreeValue(ctx, p->pty_writable);
+                tjs__free(p);
+                JS_FreeValue(ctx, obj);
+                return JS_EXCEPTION;
+            }
         }
 
         JSValue err = JS_UNDEFINED;
@@ -1798,13 +1855,16 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         if (JS_IsObject(js_env)) options.env = parse_env_obj(ctx, js_env);
         JS_FreeValue(ctx, js_env);
         if (bool_prop(ctx, arg1, "clearEnv")) {
-#ifdef _WIN32
-            options.flags |= UV_PROCESS_WINDOWS_EXACT_ENV;
-#endif
+            /* Passing a non-NULL environment array makes libuv use it as the
+             * complete child environment. This vendored libuv has no exact
+             * environment flag, so an empty array clears inheritance. */
             if (!options.env) {
                 options.env = empty_env(ctx);
                 if (!options.env) goto fail;
             }
+#ifdef _WIN32
+            options.flags |= UV_PROCESS_WINDOWS_CLEAR_ENV;
+#endif
         }
 
         JSValue js_cwd = JS_GetPropertyStr(ctx, arg1, "cwd");
@@ -2313,9 +2373,9 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 
 /* resize(cols, rows) — PTY only */
 static JSValue tjs_process_resize(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "resize(cols, rows)");
     TJSProcess *p = tjs_process_get(ctx, this_val);
     if (!p || !p->pty_mode) return JS_ThrowTypeError(ctx, "not a PTY process");
-    if (argc < 2) return JS_ThrowTypeError(ctx, "resize(cols, rows)");
     int32_t cols, rows;
     if (JS_ToInt32(ctx, &cols, argv[0]) || JS_ToInt32(ctx, &rows, argv[1]))
         return JS_EXCEPTION;
@@ -2409,7 +2469,8 @@ static JSValue tjs_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     } else if (JS_IsArray(arg0)) {
         int len = 0;
         args = parse_argv_arr(ctx, arg0, &len);
-        if (!args) return JS_EXCEPTION;
+        if (len < 0) return JS_EXCEPTION;
+        if (!args) return JS_ThrowTypeError(ctx, "exec: argv array must not be empty");
     } else {
         return JS_ThrowTypeError(ctx, "exec: expected string or array");
     }

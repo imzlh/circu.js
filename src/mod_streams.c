@@ -509,6 +509,7 @@ static void uv__write_cb(uv_write_t *req, int status) {
 }
 
 static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected data buffer");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -649,6 +650,7 @@ static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t 
 }
 
 static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected read buffer");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -776,9 +778,9 @@ static void uv__connect_cb(uv_connect_t *req, int status) {
         TJS_RejectPromise(ctx, &s->connect_promise, 1, &arg);
     }
 
-    /* Unpin unless startRead() re-pinned inside the connect handler. */
-    if (!uv_is_active(&s->h.handle))
-        stream_unpin(s);
+    /* A synchronous promise hook may start reading while we settle connect.
+     * That operation owns a separate pin; always release the connect pin. */
+    STREAM_UNPIN_FINAL(s);
 
     tjs__free(req);
 }
@@ -835,7 +837,7 @@ static JSValue tjs_stream_listen(JSContext *ctx, JSValue this_val, int argc, JSV
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
 
     uint32_t backlog = 511;
-    if (!JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
         return JS_EXCEPTION;
 
     int r = uv_listen(&s->h.stream, (int)backlog, uv__connection_cb);
@@ -850,6 +852,7 @@ static JSValue tjs_stream_listen(JSContext *ctx, JSValue this_val, int argc, JSV
 #pragma endregion
 #pragma region misc funcs
 static JSValue tjs_stream_set_blocking(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected blocking flag");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     int blocking = JS_ToBool(ctx, argv[0]);
@@ -895,6 +898,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
 #ifdef _WIN32
     return JS_ThrowTypeError(ctx, "readSync() is not supported on Windows");
 #else
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected read buffer");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -920,6 +924,7 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
 #ifdef _WIN32
     return JS_ThrowTypeError(ctx, "writeSync() is not supported on Windows.");
 #else
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected data buffer");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
@@ -1090,7 +1095,7 @@ static JSValue tjs_new_tcp(JSContext *ctx, int af) {
 
 static JSValue tjs_tcp_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
     int af = AF_UNSPEC;
-    if (!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0]))
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0]))
         return JS_EXCEPTION;
     return tjs_new_tcp(ctx, af);
 }
@@ -1114,6 +1119,7 @@ static JSValue tjs_tcp_get_sockpeername(JSContext *ctx, JSValue this_val, int ma
 }
 
 static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!JS_IsUndefined(t->connect_promise.p))
@@ -1147,6 +1153,7 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
 
 /* connectSync: blocking OS connect with timeout, hands the fd to libuv. */
 static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
@@ -1294,18 +1301,20 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
 }
 
 static JSValue tjs_tcp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
     int flags = 0;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) return JS_EXCEPTION;
     int r = uv_tcp_bind(&t->h.tcp, (struct sockaddr *)&ss, flags);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_tcp_keepalive(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "expected enable and delay");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     int enable = JS_ToBool(ctx, argv[0]);
@@ -1318,6 +1327,7 @@ static JSValue tjs_tcp_keepalive(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_tcp_nodelay(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected enable flag");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     int enable = JS_ToBool(ctx, argv[0]);
@@ -1343,6 +1353,7 @@ static JSClassDef tjs_tty_class = {
 };
 
 static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "expected file descriptor and readable flag");
     int fd, readable;
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
     if ((readable = JS_ToBool(ctx, argv[1])) == -1) return JS_EXCEPTION;
@@ -1559,6 +1570,7 @@ static JSValue tjs_pipe_getsockpeername(JSContext *ctx, JSValue this_val, int ar
 }
 
 static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected pipe name");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!JS_IsUndefined(t->connect_promise.p))
@@ -1599,6 +1611,7 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
 #ifdef _WIN32
     return JS_ThrowTypeError(ctx, "named-pipe sync connect not supported on Windows");
 #else
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected pipe name");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
@@ -1632,6 +1645,7 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
 }
 
 static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected pipe name");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
@@ -1645,6 +1659,7 @@ static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue
 }
 
 static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected file descriptor");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     int fd;

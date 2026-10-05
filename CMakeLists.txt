@@ -147,10 +147,22 @@ endif()
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Resolve the SQLite3 link item ONCE, here, so the feature checks below probe
+# exactly what libcjs links against further down. Probing SQLite3_LIBRARIES while
+# linking SQLite3::SQLite3 lets the two disagree, which is how a cross build ends
+# up checking the host SQLite and linking the target's.
+if(TARGET SQLite3::SQLite3)
+    set(CJS_SQLITE3_LINK SQLite3::SQLite3)
+elseif(TARGET SQLite::SQLite3)
+    set(CJS_SQLITE3_LINK SQLite::SQLite3)
+else()
+    set(CJS_SQLITE3_LINK sqlite3)
+endif()
+
 include(CheckCSourceCompiles)
 
 set(CMAKE_REQUIRED_INCLUDES ${SQLite3_INCLUDE_DIRS})
-set(CMAKE_REQUIRED_LIBRARIES ${SQLite3_LIBRARIES})
+set(CMAKE_REQUIRED_LIBRARIES ${CJS_SQLITE3_LINK})
 check_c_source_compiles("
     #include <sqlite3.h>
     int main() {
@@ -165,24 +177,40 @@ if(NOT SQLITE_HAS_LOAD_EXTENSION)
 endif()
 
 # sqlite3_column_origin_name/table_name/database_name exist only when SQLite was
-# built with SQLITE_ENABLE_COLUMN_METADATA. This header declares them
-# unconditionally, so a compile check alone would pass and the failure would
-# surface at link time -- check_c_source_compiles links, which is what gates it.
+# built with SQLITE_ENABLE_COLUMN_METADATA. sqlite3.h declares them
+# unconditionally, so compiling proves nothing -- only a successful LINK does.
+# Two things are required for that to actually be true:
+#   1. try_compile must produce an executable. Cross and vcpkg toolchains set
+#      CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY, which skips linking
+#      entirely; the check then passes on the declaration alone and the three
+#      symbols come back as undefined references when libcjs is linked.
+#   2. It must probe the same library libcjs links (CJS_SQLITE3_LINK above).
+# The symbol addresses are funnelled through a volatile sink so neither the
+# optimizer nor LTO can drop the references before the linker resolves them.
 # sqlite3_column_decltype needs no flag and is used unconditionally.
+set(CJS_SAVED_TRY_COMPILE_TARGET_TYPE "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
 check_c_source_compiles("
     #include <sqlite3.h>
-    int main() {
-        sqlite3_stmt *st = 0;
-        (void) sqlite3_column_origin_name(st, 0);
-        (void) sqlite3_column_table_name(st, 0);
-        (void) sqlite3_column_database_name(st, 0);
-        return 0;
+    int main(void) {
+        void * volatile sink[3];
+        sink[0] = (void *) &sqlite3_column_origin_name;
+        sink[1] = (void *) &sqlite3_column_table_name;
+        sink[2] = (void *) &sqlite3_column_database_name;
+        return sink[0] && sink[1] && sink[2] ? 0 : 1;
     }
 " SQLITE_HAS_COLUMN_METADATA)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE "${CJS_SAVED_TRY_COMPILE_TARGET_TYPE}")
+unset(CJS_SAVED_TRY_COMPILE_TARGET_TYPE)
 
 if(NOT SQLITE_HAS_COLUMN_METADATA)
     message(WARNING "SQLite3 lacks column metadata; StatementSync.columns() will report null for column/table/database.")
 endif()
+
+# Scoped to the SQLite probes only -- leaving these set would silently add
+# SQLite's includes and libraries to every later check in this file.
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
 
 find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
@@ -408,13 +436,9 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(libcjs PRIVATE util ${CMAKE_DL_LIBS})
 endif()
-if(TARGET SQLite3::SQLite3)
-    target_link_libraries(libcjs PRIVATE SQLite3::SQLite3)
-elseif(TARGET SQLite::SQLite3)
-    target_link_libraries(libcjs PRIVATE SQLite::SQLite3)
-else()
-    target_link_libraries(libcjs PRIVATE sqlite3)
-endif()
+# CJS_SQLITE3_LINK is resolved next to find_package(SQLite3) and is the same item
+# the COLUMN_METADATA check probed.
+target_link_libraries(libcjs PRIVATE ${CJS_SQLITE3_LINK})
 
 add_executable(cjs-cli
     src/cli.c

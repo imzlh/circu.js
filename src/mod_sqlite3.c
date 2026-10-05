@@ -203,6 +203,9 @@ JSValue tjs_throw_sqlite3_err_db(JSContext *ctx, sqlite3 *db, int err) {
 }
 
 static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "open(path, flags) requires a path and flags");
+    }
     const char *db_name = JS_ToCString(ctx, argv[0]);
 
     if (!db_name) {
@@ -221,6 +224,10 @@ static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSVa
     JS_FreeCString(ctx, db_name);
 
     if (r != SQLITE_OK) {
+        /* sqlite3_open_v2 may return a partially initialized handle on
+         * failure.  Always close it before propagating the error. */
+        if (handle)
+            sqlite3_close_v2(handle);
         return tjs_throw_sqlite3_errno(ctx, r);
     }
 
@@ -263,6 +270,9 @@ static JSValue tjs_sqlite3_close(JSContext *ctx, JSValue this_val, int argc, JSV
 
 #ifdef SQLITE_HAS_LOAD_EXTENSION
 static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "loadExtension(path[, entrypoint]) requires a path");
+    }
     TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
 
     if (!h) {
@@ -307,6 +317,9 @@ static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int 
 #endif
 
 static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "exec(sql) requires SQL text");
+    }
     TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
 
     if (!h) {
@@ -331,6 +344,9 @@ static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSVa
 }
 
 static JSValue tjs_sqlite3_prepare(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "prepare(sql) requires SQL text");
+    }
     TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
 
     if (!h) {
@@ -403,6 +419,9 @@ static JSValue tjs_sqlite3_interrupt(JSContext *ctx, JSValue this_val, int argc,
 }
 
 static JSValue tjs_sqlite3_busy_timeout(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "busyTimeout(milliseconds) requires a value");
+    }
     TJSSqlite3Handle *h = tjs_sqlite3_get_open(ctx, this_val);
 
     if (!h) {
@@ -1279,12 +1298,15 @@ static JSValue tjs_sqlite3_stmt_finalize(JSContext *ctx, JSValue this_val, int a
 
     sqlite3_reset(h->stmt);
 
-    int r = sqlite3_finalize(h->stmt);
+    /* sqlite3_finalize invalidates the statement even when it reports an
+     * error.  Clear the owner first so a retry or GC finalizer cannot touch
+     * the freed handle. */
+    sqlite3_stmt *stmt = h->stmt;
+    h->stmt = NULL;
+    int r = sqlite3_finalize(stmt);
     if (r != SQLITE_OK) {
         return tjs_throw_sqlite3_errno(ctx, r);
     }
-
-    h->stmt = NULL;
 
     return JS_UNDEFINED;
 }
@@ -1369,7 +1391,6 @@ static JSValue tjs__stmt2obj(JSContext *ctx, TJSSqlite3Stmt *h) {
         }
 
         if (JS_DefinePropertyValueStr(ctx, obj, name, value, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, value);
             JS_FreeValue(ctx, obj);
             return JS_EXCEPTION;
         }
@@ -1644,7 +1665,6 @@ static JSValue tjs_sqlite3_stmt_column_names(JSContext *ctx, JSValue this_val, i
             return value;
         }
         if (JS_DefinePropertyValueUint32(ctx, result, (uint32_t)i, value, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, value);
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }
@@ -1662,7 +1682,6 @@ static int tjs__sqlite3_set_str_or_null(JSContext *ctx, JSValue obj, const char 
         return -1;
     }
     if (JS_DefinePropertyValueStr(ctx, obj, key, value, JS_PROP_C_W_E) < 0) {
-        JS_FreeValue(ctx, value);
         return -1;
     }
     return 0;
@@ -1737,7 +1756,6 @@ static JSValue tjs_sqlite3_stmt_column_metadata(JSContext *ctx, JSValue this_val
         }
 
         if (JS_DefinePropertyValueUint32(ctx, result, (uint32_t)i, entry, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, entry);
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }
@@ -1782,7 +1800,6 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
             return row;
         }
         if (JS_DefinePropertyValueUint32(ctx, result, i, row, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, row);
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }

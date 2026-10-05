@@ -35,6 +35,8 @@ struct TJSTimer {
     uv_timer_t handle;
     UT_hash_handle hh;
     int interval;
+    bool in_cb;
+    bool values_pending;
     JSValue func;
     int argc;
     JSValue argv[];
@@ -42,8 +44,27 @@ struct TJSTimer {
 
 static void uv__timer_close(uv_handle_t *handle) {
     TJSTimer *th = handle->data;
-    CHECK_NOT_NULL(th);
+    if (!th) return;
+    /* libuv invokes close callbacks after the active timer callback has
+     * returned, so the in_cb guard has already been cleared by then. */
     tjs__free(th);
+}
+
+/* Release the JS values owned by a timer that has not been inserted into the
+ * runtime hash yet.  The normal destroy_timer() path also removes the hash
+ * entry and closes the uv handle, so keep this helper limited to construction
+ * failures. */
+static void free_timer_values(JSContext *ctx, TJSTimer *th) {
+    if (!th) return;
+    if (!JS_IsUndefined(th->func)) {
+        JS_FreeValue(ctx, th->func);
+        th->func = JS_UNDEFINED;
+    }
+    for (int i = 0; i < th->argc; i++) {
+        JS_FreeValue(ctx, th->argv[i]);
+        th->argv[i] = JS_UNDEFINED;
+    }
+    th->argc = 0;
 }
 
 static void destroy_timer(TJSTimer *th) {
@@ -56,14 +77,18 @@ static void destroy_timer(TJSTimer *th) {
         return;
     }
 
-    JS_FreeValue(ctx, th->func);
-    th->func = JS_UNDEFINED;
-
-    for (int i = 0; i < th->argc; i++) {
-        JS_FreeValue(ctx, th->argv[i]);
-        th->argv[i] = JS_UNDEFINED;
+    /* The callback owns the argument array while JS_Call is on the stack.
+     * Defer releasing those JS values when clearTimeout() is called from the
+     * callback itself; otherwise a refcounted object can be freed underneath
+     * QuickJS while it is still being passed as an argument. */
+    if (th->in_cb) {
+        HASH_DEL(qrt->timers.timers, th);
+        th->values_pending = true;
+        uv_close((uv_handle_t *) &th->handle, uv__timer_close);
+        return;
     }
-    th->argc = 0;
+
+    free_timer_values(ctx, th);
 
     HASH_DEL(qrt->timers.timers, th);
 
@@ -87,23 +112,40 @@ static void uv__timer_cb(uv_timer_t *handle) {
         return;
     }
 
+    th->in_cb = true;
+
     /* Micro-tasks should run before timers. */
     tjs__execute_jobs(TJS_GetRuntime(th->ctx));
 
 	/* Check again in case the timer was destroyed during job execution. */
     if (uv_is_closing((uv_handle_t *) handle)) {
+        th->in_cb = false;
+        if (th->values_pending)
+            free_timer_values(th->ctx, th);
         return;
     }
     tjs_call_handler(th->ctx, th->func, th->argc, th->argv);
 
     if (!th->interval) {
-        destroy_timer(th);
+        /* clearTimeout() from inside the callback may already have started
+         * closing this handle. Avoid a second destroy, while the in_cb guard
+         * keeps `th` valid until the close callback is complete. */
+        if (!uv_is_closing((uv_handle_t *) handle))
+            destroy_timer(th);
     }
+
+    th->in_cb = false;
+    if (th->values_pending)
+        free_timer_values(th->ctx, th);
 }
 
 static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "callback is required");
+    }
 
     int64_t delay;
     JSValue func;
@@ -130,10 +172,19 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
         nargs = 0;
     }
 
-    th = tjs__malloc(sizeof(*th) + nargs * sizeof(JSValue));
+    /* Guard the flexible-array allocation against size_t wraparound. */
+    if ((size_t)nargs > (SIZE_MAX - sizeof(*th)) / sizeof(JSValue)) {
+        return JS_ThrowRangeError(ctx, "too many timer arguments");
+    }
+    th = tjs__malloc(sizeof(*th) + (size_t)nargs * sizeof(JSValue));
     if (!th) {
         return JS_ThrowOutOfMemory(ctx);
     }
+
+    th->func = JS_UNDEFINED;
+    th->argc = 0;
+    th->in_cb = false;
+    th->values_pending = false;
 
     th->id = qrt->timers.next_timer++;
     if (qrt->timers.next_timer > MAX_SAFE_INTEGER) {
@@ -141,7 +192,11 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     th->ctx = ctx;
-    CHECK_EQ(uv_timer_init(tjs_get_loop(ctx), &th->handle), 0);
+    int uv_r = uv_timer_init(tjs_get_loop(ctx), &th->handle);
+    if (uv_r != 0) {
+        tjs__free(th);
+        return tjs_throw_errno(ctx, uv_r);
+    }
     th->handle.data = th;
     th->interval = magic;
     th->func = JS_DupValue(ctx, func);
@@ -151,7 +206,17 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     uv_update_time(tjs_get_loop(ctx));
-    CHECK_EQ(uv_timer_start(&th->handle, uv__timer_cb, delay, magic ? delay : 0 /* repeat */), 0);
+    /* libuv treats repeat=0 as a one-shot timer.  A zero-delay interval must
+     * still repeat; use libuv's minimum practical repeat period to avoid
+     * leaving a one-shot timer (and its JS callback arguments) retained in
+     * the timer table forever. */
+    uint64_t repeat = magic ? (delay == 0 ? 1u : (uint64_t)delay) : 0;
+    uv_r = uv_timer_start(&th->handle, uv__timer_cb, (uint64_t)delay, repeat);
+    if (uv_r != 0) {
+        free_timer_values(ctx, th);
+        uv_close((uv_handle_t *)&th->handle, uv__timer_close);
+        return tjs_throw_errno(ctx, uv_r);
+    }
 
     HASH_ADD_INT64(qrt->timers.timers, id, th);
 
@@ -163,6 +228,10 @@ static JSValue tjs_clearTimeout(JSContext *ctx, JSValue this_val, int argc, JSVa
     CHECK_NOT_NULL(qrt);
     int64_t timer_id;
     TJSTimer *th = NULL;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "timer id is required");
+    }
 
     if (JS_ToInt64(ctx, &timer_id, argv[0])) {
         return JS_EXCEPTION;
@@ -183,6 +252,10 @@ static JSValue tjs_timer_ref(JSContext *ctx, JSValue this_val, int argc, JSValue
     CHECK_NOT_NULL(qrt);
     int64_t timer_id;
     TJSTimer *th = NULL;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "timer id is required");
+    }
 
     if (JS_ToInt64(ctx, &timer_id, argv[0])) {
         return JS_EXCEPTION;

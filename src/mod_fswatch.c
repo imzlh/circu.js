@@ -215,6 +215,10 @@ static void uv__fs_event_cb(uv_fs_event_t *handle, const char *filename, int eve
 }
 
 static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "path and callback are required");
+    }
+
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;

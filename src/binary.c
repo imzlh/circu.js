@@ -51,8 +51,11 @@ char* tjs__get_self() {
     if (hModule) {
         /* Use wide char version for Unicode path support */
         wchar_t wpath[4096];
-        DWORD size = GetModuleFileNameW(hModule, wpath, sizeof(wpath) / sizeof(wchar_t) - 1);
-        if (size > 0) {
+        DWORD capacity = (DWORD)(sizeof(wpath) / sizeof(wchar_t));
+        DWORD size = GetModuleFileNameW(hModule, wpath, capacity);
+        /* Windows may return the capacity when the path is truncated. Never
+         * cache or use a partial executable path. */
+        if (size > 0 && size < capacity) {
             /* Convert wide char to UTF-8 */
             int conv_size = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path) - 1, NULL, NULL);
             if (conv_size > 0) {
@@ -99,17 +102,19 @@ char* tjs__get_self() {
 static uint8_t* read_file(FILE* file, size_t *file_size) {
     if (!file) return NULL;
 
-    fseek(file, 0, SEEK_END);
+    if (fseek(file, 0, SEEK_END) != 0) return NULL;
 #ifdef _WIN32
     __int64 sz = _ftelli64(file);
     if (sz < 0) return NULL;
+    if ((uintmax_t)sz > SIZE_MAX) return NULL;
     *file_size = (size_t)sz;
 #else
     off_t sz = ftello(file);
     if (sz < 0) return NULL;
+    if ((uintmax_t)sz > SIZE_MAX) return NULL;
     *file_size = (size_t)sz;
 #endif
-    fseek(file, 0, SEEK_SET);
+    if (fseek(file, 0, SEEK_SET) != 0) return NULL;
 
     if (*file_size < 4) {
         return NULL;
@@ -189,8 +194,9 @@ int tjs__build_binary(FILE* file, uint8_t *binary, uint32_t size, int create) {
         uint32_t old_binary_length;
         uint8_t *old_binary = tjs__read_attached(file, &old_binary_length);
         if (old_binary) {
-            /* Prevent underflow: check that old length is reasonable */
-            if (old_binary_length + 4 > original_size) {
+            /* Check without adding first: old_binary_length is attacker
+             * controlled file data and old_binary_length + 4 can wrap. */
+            if (original_size < 4 || old_binary_length > original_size - 4) {
                 free(old_binary);
                 free(original_data);
                 return -1;

@@ -561,6 +561,9 @@ skip:
 /* File functions */
 
 static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected a Uint8Array");
+    }
     TJSFile *f = tjs_file_get(ctx, this_val);
     if (!f) {
         return JS_EXCEPTION;
@@ -568,7 +571,7 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     /* Convert position BEFORE getting buffer pointer (JS_ToInt64 can detach buffer) */
     int64_t pos = -1;
-    if (!JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &pos, argv[1])) {
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &pos, argv[1])) {
         return JS_EXCEPTION;
     }
 
@@ -680,7 +683,7 @@ static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSV
     }
 
     int64_t offset = 0;
-    if (!JS_IsUndefined(argv[0]) && JS_ToInt64(ctx, &offset, argv[0])) {
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt64(ctx, &offset, argv[0])) {
         return JS_EXCEPTION;
     }
 
@@ -754,7 +757,7 @@ static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int mode;
-    if (JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &mode, argv[0])) {
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &mode, argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a number for mode parameter");
     }
 
@@ -782,7 +785,7 @@ static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     int uid;
-    if (JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &uid, argv[0])) {
+    if (argc < 2 || JS_IsUndefined(argv[0]) || JS_ToInt32(ctx, &uid, argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a number for uid parameter");
     }
 
@@ -809,6 +812,7 @@ static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "expected access and modification times");
     TJSFile *f = tjs_file_get(ctx, this_val);
     if (!f) {
         return JS_EXCEPTION;
@@ -1080,6 +1084,9 @@ static JSValue tjs_stat_issymlink(JSContext *ctx, JSValue this_val) {
 }
 
 static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "expected path and flags");
+    }
     const char *path;
     const char *strflags;
     size_t len;
@@ -1107,7 +1114,7 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
 
     mode = 0666;
-    if (!JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &mode, argv[2])) {
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &mode, argv[2])) {
         JS_FreeCString(ctx, path);
         return JS_EXCEPTION;
     }
@@ -1131,6 +1138,9 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
 }
 
 static JSValue tjs_fs_new_stdio_file(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "expected path and file descriptor");
+    }
     const char *path;
     uv_file fd;
 
@@ -1159,6 +1169,9 @@ static JSValue tjs_fs_new_stdio_file(JSContext *ctx, JSValue this_val, int argc,
 }
 
 static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1188,6 +1201,9 @@ static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *
 }
 
 static JSValue tjs_fs_stat_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1218,6 +1234,9 @@ static JSValue tjs_fs_stat_sync(JSContext *ctx, JSValue this_val, int argc, JSVa
 }
 
 static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1242,6 +1261,9 @@ static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1266,6 +1288,9 @@ static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue
 }
 
 static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "expected path and new path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1299,6 +1324,9 @@ static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue
 }
 
 static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected template");
+    }
     const char *tpl = JS_ToCString(ctx, argv[0]);
     if (!tpl) {
         return JS_EXCEPTION;
@@ -1323,6 +1351,9 @@ static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected template");
+    }
     const char *tpl = JS_ToCString(ctx, argv[0]);
     if (!tpl) {
         return JS_EXCEPTION;
@@ -1347,6 +1378,9 @@ static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1371,6 +1405,9 @@ static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
 }
 
 static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1403,6 +1440,9 @@ static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
 }
 
 static JSValue tjs_fs_mkdir_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1430,6 +1470,9 @@ static JSValue tjs_fs_mkdir_sync(JSContext *ctx, JSValue this_val, int argc, JSV
 }
 
 static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "expected path and destination");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1463,6 +1506,9 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1542,6 +1588,9 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
 }
 
 static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "expected path");
+    }
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) {
         return JS_EXCEPTION;
@@ -1595,7 +1644,7 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 3 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
 
@@ -1633,7 +1682,7 @@ static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue
 }
 
 static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 2 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
 
@@ -1666,7 +1715,7 @@ static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue 
 }
 
 static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 3 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
 
@@ -1706,7 +1755,7 @@ static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue
 }
 
 static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 1 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
 
@@ -1734,7 +1783,7 @@ static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 2 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
     if (!JS_IsString(argv[1])) {
@@ -1774,7 +1823,7 @@ static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *
 }
 
 static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 3 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
     if (!JS_IsString(argv[1])) {
@@ -1821,7 +1870,7 @@ static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (!JS_IsString(argv[0])) {
+    if (argc < 1 || !JS_IsString(argv[0])) {
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
     }
 

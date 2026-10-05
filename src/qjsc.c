@@ -30,7 +30,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <inttypes.h>
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
@@ -153,12 +153,13 @@ static const char *output_filename = NULL;
 
 static uint8_t* read_file_into_buffer(FILE* file, size_t *file_size) {
     if (!file) return NULL;
-    
+
     long current = ftell(file);
-    fseek(file, 0, SEEK_END);
-    *file_size = ftell(file);
-    fseek(file, current, SEEK_SET);
-    
+    if (current < 0 || fseek(file, 0, SEEK_END) != 0) return NULL;
+    long end = ftell(file);
+    if (end < 0 || (uintmax_t)end > SIZE_MAX || fseek(file, current, SEEK_SET) != 0) return NULL;
+    *file_size = (size_t)end;
+
     if (*file_size == 0) return NULL;
     
     uint8_t *buffer = malloc(*file_size);
@@ -173,10 +174,11 @@ static uint8_t* read_file_into_buffer(FILE* file, size_t *file_size) {
 }
 
 static uint8_t* extract_attached_data(uint8_t *file_data, size_t file_size, uint32_t *binary_length) {
-    if (file_size < 4) return NULL;
+    if (!file_data || !binary_length || file_size < 4) return NULL;
     
     // Last 4 bytes contain the length of attached data
-    *binary_length = *(uint32_t*)(file_data + file_size - 4);
+    /* Use memcpy to avoid alignment-dependent undefined behaviour. */
+    memcpy(binary_length, file_data + file_size - 4, sizeof(*binary_length));
     
     // Sanity check
     if (*binary_length > file_size - 4 || *binary_length == 0) return NULL;
@@ -782,7 +784,10 @@ int main(int argc, char **argv) {
         if (output_type == OUTPUT_C_MAIN) {
             fprintf(outfile, "#include \"quickjs-libc.h\"\n\n");
         } else {
-            fprintf(outfile, "#include <inttypes.h>\n\n");
+            /* The generated blob only uses fixed-width integer types.  Keep
+             * the header portable to MSVC, which provides stdint.h but not
+             * inttypes.h in some supported toolchains. */
+            fprintf(outfile, "#include <stdint.h>\n\n");
         }
     }
 

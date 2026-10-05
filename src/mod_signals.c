@@ -87,6 +87,10 @@ static void uv__signal_cb(uv_signal_t *handle, int sig_num) {
 }
 
 static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "signal(number, callback) requires two arguments");
+    }
+
     int32_t sig_num;
     if (JS_ToInt32(ctx, &sig_num, argv[0])) {
         return JS_EXCEPTION;
