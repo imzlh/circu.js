@@ -1862,9 +1862,9 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
                 options.env = empty_env(ctx);
                 if (!options.env) goto fail;
             }
-#ifdef _WIN32
-            options.flags |= UV_PROCESS_WINDOWS_CLEAR_ENV;
-#endif
+// #ifdef _WIN32
+//             options.flags |= UV_PROCESS_WINDOWS_CLEAR_ENV;
+// #endif
         }
 
         JSValue js_cwd = JS_GetPropertyStr(ctx, arg1, "cwd");
