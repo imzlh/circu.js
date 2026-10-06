@@ -331,16 +331,10 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!s) return JS_EXCEPTION;
     if (uv_is_closing(&s->h.handle)) return JS_UNDEFINED;
 
-    if (s->read_req) {
-        TJSReadReq *rr = s->read_req;
+    TJSReadReq *rr = s->read_req;
+    if (rr) {
         rr->canceled = 1;
         uv_read_stop(&s->h.stream);
-
-        if (!rr->settled) {
-            JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
-            rr->settled = 1;
-            TJS_RejectPromise(ctx, &rr->result, 1, &arg);
-        }
     }
 
     if (s->streaming_read)
@@ -349,6 +343,13 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
     s->close_pinned = true;
     stream_pin(ctx, s, this_val);
     maybe_close(s);
+
+    /* Publish closing state before a rejection hook can call close() again. */
+    if (rr && !rr->settled) {
+        JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
+        rr->settled = 1;
+        TJS_RejectPromise(ctx, &rr->result, 1, &arg);
+    }
     return JS_UNDEFINED;
 }
 

@@ -98,6 +98,7 @@ declare namespace CModuleEngine {
         CONSTRUCT,
         BEFORE_THEN,
         AFTER_THEN,
+        /** Legacy name: emitted before fulfillment or rejection. */
         FULFILLED
     }
 

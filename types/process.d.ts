@@ -41,6 +41,8 @@ declare namespace CModuleProcess {
         stdioExtra?: Array<StdioOption | null | undefined>;
         /** Working directory */
         cwd?: string;
+        /** Override argv[0] for an asynchronously spawned child */
+        argv0?: string;
         /** Environment variables */
         env?: Record<string, string>;
         /** Clear inherited environment before applying env */

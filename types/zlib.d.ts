@@ -267,7 +267,7 @@ declare namespace CModuleZLib {
         level?: number,
         strategy?: number,
         memLevel?: number
-    ): ArrayBuffer;
+    ): Uint8Array;
 
     /**
      * Compress data using GZIP format
@@ -280,7 +280,7 @@ declare namespace CModuleZLib {
         level?: number,
         strategy?: number,
         memLevel?: number
-    ): ArrayBuffer;
+    ): Uint8Array;
 
     /**
      * Compress data using raw DEFLATE (no zlib header)
@@ -293,7 +293,7 @@ declare namespace CModuleZLib {
         level?: number,
         strategy?: number,
         memLevel?: number
-    ): ArrayBuffer;
+    ): Uint8Array;
 
     // ============================================================================
     // One-Shot Decompression
@@ -304,24 +304,24 @@ declare namespace CModuleZLib {
      * @param data - Compressed data
      * @returns Decompressed data
      */
-    export function inflate(data: BufferSource): ArrayBuffer;
+    export function inflate(data: BufferSource): Uint8Array;
 
     /**
      * Decompress GZIP compressed data
      * @param data - Compressed data with gzip header/footer
      * @returns Decompressed data
      */
-    export function gunzip(data: BufferSource): ArrayBuffer;
+    export function gunzip(data: BufferSource): Uint8Array;
 
     /**
      * Decompress raw DEFLATE compressed data (no zlib header)
      * @param data - Compressed data without headers
      * @returns Decompressed data
      */
-    export function inflateRaw(data: BufferSource): ArrayBuffer;
+    export function inflateRaw(data: BufferSource): Uint8Array;
 
     /** Auto-detect and decompress zlib or gzip wrapped data. */
-    export function unzip(data: BufferSource): ArrayBuffer;
+    export function unzip(data: BufferSource): Uint8Array;
 
     // ============================================================================
     // Streaming Compression
@@ -337,21 +337,21 @@ declare namespace CModuleZLib {
          * @param flush - Flush mode (optional)
          * @returns Compressed output chunk
          */
-        deflate(data: BufferSource, flush?: number): ArrayBuffer;
+        deflate(data: BufferSource, flush?: number): Uint8Array;
 
         /**
          * Flush pending output
          * @param flush - Flush mode (optional, default: SYNC_FLUSH)
          * @returns Flushed compressed data
          */
-        flush(flush?: number): ArrayBuffer;
+        flush(flush?: number): Uint8Array;
 
         /**
          * Finish compression and flush all remaining data
          * @param data - Final input data (optional)
          * @returns Final compressed output
          */
-        finish(data?: BufferSource): ArrayBuffer;
+        finish(data?: BufferSource): Uint8Array;
 
         /**
          * Reset compression state for reuse
@@ -430,13 +430,13 @@ declare namespace CModuleZLib {
          * @param data - Compressed input chunk
          * @returns Decompressed output chunk
          */
-        inflate(data: BufferSource, flush?: number): ArrayBuffer;
+        inflate(data: BufferSource, flush?: number): Uint8Array;
 
         /**
          * Flush pending output
          * @returns Flushed decompressed data
          */
-        flush(): ArrayBuffer;
+        flush(): Uint8Array;
 
         /**
          * Finish decompression and validate the compressed stream trailer.
@@ -447,7 +447,7 @@ declare namespace CModuleZLib {
          * thrown message.
          * @returns Final decompressed output
          */
-        finish(): ArrayBuffer;
+        finish(): Uint8Array;
 
         /**
          * True once the trailer has been seen or finish() has run. Further

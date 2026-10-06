@@ -175,12 +175,14 @@ static void check_multi_info(TJSConnPool *pool);
 static void timer_cb(uv_timer_t *handle);
 static void curl_clear_request_resources(JSRuntime *rt, TJSCURL *curl);
 
+static JSValue curl_take_self(TJSCURL *curl) {
+    JSValue self = curl->self_obj;
+    curl->self_obj = JS_UNDEFINED;
+    return self;
+}
+
 static void curl_release_self(JSContext *ctx, TJSCURL *curl) {
-    if (!JS_IsUndefined(curl->self_obj)) {
-        JSValue self = curl->self_obj;
-        curl->self_obj = JS_UNDEFINED;
-        JS_FreeValue(ctx, self);
-    }
+    JS_FreeValue(ctx, curl_take_self(curl));
 }
 
 static void curl_detach_self(TJSCURL *curl) {
@@ -777,12 +779,16 @@ static void check_multi_info(TJSConnPool *pool) {
             arg = build_response(curl->ctx, curl);
         }
 
-        if (TJS_IsPromisePending(curl->ctx, &curl->promise)) {
-            TJS_SettlePromise(curl->ctx, &curl->promise, is_reject, 1, &arg);
+        /* A synchronous promise hook can start another transfer. Keep the
+         * completed transfer's pin separate from that new operation's pin. */
+        JSContext *ctx = curl->ctx;
+        JSValue self = curl_take_self(curl);
+        if (TJS_IsPromisePending(ctx, &curl->promise)) {
+            TJS_SettlePromise(ctx, &curl->promise, is_reject, 1, &arg);
         } else {
-            JS_FreeValue(curl->ctx, arg);
+            JS_FreeValue(ctx, arg);
         }
-        curl_release_self(curl->ctx, curl);
+        JS_FreeValue(ctx, self);
     }
 }
 
@@ -1053,14 +1059,32 @@ static JSValue tjs_connpool_close(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     TJSConnPool *pool = JS_GetOpaque2(ctx, this_val, tjs_connpool_class_id);
     if (!pool) return JS_EXCEPTION;
+    if (!pool->multi_handle) return JS_UNDEFINED;
 
-    /* reject any in-flight promises before we drop the transfers */
+    typedef struct {
+        TJSPromise promise;
+        JSValue self;
+    } PendingClose;
+    size_t count = 0;
     struct list_head *el;
     list_for_each(el, &pool->curls) {
         TJSCURL *c = list_entry(el, TJSCURL, link);
-        if (c->in_flight && TJS_IsPromisePending(ctx, &c->promise)) {
-            JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
-            TJS_SettlePromise(ctx, &c->promise, true, 1, &err);
+        if (TJS_IsPromisePending(ctx, &c->promise)) count++;
+    }
+    if (count > SIZE_MAX / sizeof(PendingClose)) return JS_ThrowOutOfMemory(ctx);
+    PendingClose *pending = count ? js_malloc(ctx, count * sizeof(*pending)) : NULL;
+    if (count && !pending) return JS_EXCEPTION;
+
+    /* Detach capabilities before teardown. Rejection hooks must observe a
+     * closed pool and cannot mutate the native list while it is traversed. */
+    size_t index = 0;
+    list_for_each(el, &pool->curls) {
+        TJSCURL *c = list_entry(el, TJSCURL, link);
+        if (TJS_IsPromisePending(ctx, &c->promise)) {
+            pending[index].promise = c->promise;
+            pending[index].self = curl_take_self(c);
+            TJS_ClearPromise(ctx, &c->promise);
+            index++;
         }
     }
 
@@ -1070,6 +1094,12 @@ static JSValue tjs_connpool_close(JSContext *ctx, JSValueConst this_val,
         uv_prepare_stop(&pool->prep);
         pool->prep_active = false;
     }
+    for (size_t i = 0; i < index; i++) {
+        JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
+        TJS_SettlePromise(ctx, &pending[i].promise, true, 1, &err);
+        JS_FreeValue(ctx, pending[i].self);
+    }
+    js_free(ctx, pending);
     return JS_UNDEFINED;
 }
 
@@ -2175,24 +2205,28 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
         return JS_ThrowTypeError(ctx, "Cannot abort() from within a callback");
     }
 
-    if (curl->pool && curl->pool->multi_handle) {
-        curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
-        int running = 0;
-        MSACT(curl->pool, curl->pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
-        check_multi_info(curl->pool);
-        if (curl->pool->multi_handle) kick_prep_once(curl->pool);
-    }
+    TJSConnPool *pool = curl->pool;
+    TJSPromise promise = curl->promise;
+    TJS_ClearPromise(ctx, &curl->promise);
+    JSValue self = curl_take_self(curl);
     curl->in_flight = false;
     curl->completed = true;
     curl->headers_complete_fired = false;
     curl->header_status_code = 0;
     curl->recv_paused = false;
 
-    if (TJS_IsPromisePending(ctx, &curl->promise)) {
-        JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
-        TJS_SettlePromise(ctx, &curl->promise, true, 1, &err);
+    if (pool && pool->multi_handle) {
+        curl_multi_remove_handle(pool->multi_handle, curl->handle);
+        int running = 0;
+        MSACT(pool, pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
+        if (pool->multi_handle) check_multi_info(pool);
+        if (pool->multi_handle) kick_prep_once(pool);
     }
-    curl_release_self(ctx, curl);
+    if (TJS_IsPromisePending(ctx, &promise)) {
+        JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
+        TJS_SettlePromise(ctx, &promise, true, 1, &err);
+    }
+    JS_FreeValue(ctx, self);
     return JS_UNDEFINED;
 }
 
@@ -2288,18 +2322,19 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->verbose = false;
     curl->recv_paused = false;
 
-    if (TJS_IsPromisePending(ctx, &curl->promise)) {
-        JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
-        TJS_SettlePromise(ctx, &curl->promise, true, 1, &err);
-    }
-    curl_release_self(ctx, curl);
-
     JS_FreeValue(ctx, curl->on_data); curl->on_data = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_progress); curl->on_progress = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_header); curl->on_header = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_headers_complete); curl->on_headers_complete = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_debug); curl->on_debug = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->share_obj); curl->share_obj = JS_UNDEFINED;
+
+    JSValue self = curl_take_self(curl);
+    if (TJS_IsPromisePending(ctx, &curl->promise)) {
+        JSValue err = build_error(ctx, NULL, CURLE_ABORTED_BY_CALLBACK);
+        TJS_SettlePromise(ctx, &curl->promise, true, 1, &err);
+    }
+    JS_FreeValue(ctx, self);
 
     return JS_UNDEFINED;
 }
