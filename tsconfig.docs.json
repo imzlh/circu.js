@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "lib": ["ESNext"],
+    "types": [],
+    "strict": true,
+    "skipLibCheck": false,
+    "noEmit": true
+  },
+  "include": ["types/**/*.d.ts"],
+  "typedocOptions": {
+    "name": "circu.js",
+    "entryPoints": ["types/**/*.d.ts"],
+    "entryPointStrategy": "expand",
+    "out": "api",
+    "disableSources": true
+  }
+}

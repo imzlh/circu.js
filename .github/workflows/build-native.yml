@@ -1,0 +1,125 @@
+name: Native desktop builds
+
+on:
+  workflow_call:
+    inputs:
+      native-matrix:
+        description: Native targets; release callers provide both macOS and all Windows architectures.
+        type: string
+        default: >-
+          [{"platform":"linux","arch":"x86_64","runner":"ubuntu-24.04"},
+           {"platform":"macos","arch":"arm64","runner":"macos-15"},
+           {"platform":"windows","arch":"x86_64","runner":"windows-2022"}]
+      include-asan:
+        description: Also run the separate Linux AddressSanitizer build.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supported release runners: macos-15-intel (x86_64), macos-15
+        # (arm64), windows-2022 (x86_64/x86), windows-11-arm (native arm64).
+        include: ${{ fromJSON(inputs.native-matrix) }}
+    env:
+      CJS_PLATFORM: ${{ matrix.platform }}
+      CJS_ARCH: ${{ matrix.arch }}
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          architecture: ${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libcurl4-openssl-dev libltdl-dev libffi-dev libsqlite3-dev \
+            libssl-dev zlib1g-dev libexpat1-dev libbrotli-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja pkgconf libffi sqlite openssl@3 zlib expat curl brotli
+          prefixes="$(brew --prefix)"
+          for formula in libffi sqlite openssl@3 zlib expat curl brotli; do
+            prefixes="$prefixes;$(brew --prefix "$formula")"
+          done
+          printf 'CJS_CMAKE_PREFIX_PATH=%s\n' "$prefixes" >> "$GITHUB_ENV"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.arch == 'x86_64' && 'x64' || matrix.arch }}
+
+      - uses: lukka/run-vcpkg@v11
+        if: runner.os == 'Windows'
+        with:
+          # Keep in sync with this repository's vcpkg.json builtin-baseline.
+          vcpkgGitCommitId: '1460b31b08c42cc2e9ac2c79f45ec8707e2675e2'
+          vcpkgJsonGlob: 'vcpkg.json'
+
+      - name: Build and stage cjs and cjsc
+        run: node scripts/ci/native.mjs build
+
+      - name: Smoke test native runtime and bytecode compiler
+        run: node scripts/ci/native.mjs smoke
+
+      - name: Package
+        run: node scripts/ci/native.mjs package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cjs-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/cjs-${{ matrix.platform }}-${{ matrix.arch }}.*
+          if-no-files-found: error
+
+  asan:
+    name: Linux x86_64 AddressSanitizer
+    if: inputs.include-asan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CJS_PLATFORM: linux
+      CJS_ARCH: x86_64
+      CJS_ASAN: '1'
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libcurl4-openssl-dev libltdl-dev libffi-dev libsqlite3-dev \
+            libssl-dev zlib1g-dev libexpat1-dev libbrotli-dev
+      - name: Build Debug runtime with AddressSanitizer
+        run: node scripts/ci/native.mjs build
+      - name: Smoke test with AddressSanitizer
+        run: node scripts/ci/native.mjs smoke
+      - name: Package sanitizer build
+        run: node scripts/ci/native.mjs package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cjs-linux-x86_64-asan
+          path: artifacts/cjs-linux-x86_64-asan.tar.gz
+          if-no-files-found: error

@@ -2,169 +2,53 @@ name: CI
 
 on:
   push:
-    branches:
-      - '**'
-    tags-ignore:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      all-release-targets:
+        description: Also compile all Linux release architectures
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  docs:
-    name: Deploy API Docs
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
-    concurrency:
-      group: "pages"
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: '.nvmrc'
-      - uses: pnpm/action-setup@v4
-        with:
-          version: latest
-      - name: Install dependencies
-        run: pnpm install
-      - name: Build TypeDoc
-        run: pnpm run api-docs
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: './api'
-      - name: Deploy to GitHub Pages
-        uses: actions/deploy-pages@v4
-        
-  build-linux-x86_64:
-    name: Test Build - Linux x86_64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake ninja-build \
-            libcurl4-openssl-dev libltdl-dev libffi-dev \
-            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-linux-x86_64-test
-          path: build/cjs
+  native:
+    uses: ./.github/workflows/build-native.yml
 
-  build-linux-x86_64-asan:
-    name: Test Build - Linux x86_64 (ASan)
-    runs-on: ubuntu-latest
+  i386:
+    name: Linux i386
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake ninja-build \
-            libcurl4-openssl-dev libltdl-dev libffi-dev \
-            libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev
-      - name: Build with AddressSanitizer
-        run: |
-          cmake -B build-asan -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DENABLE_ASAN=ON
-          cmake --build build-asan
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: docker/setup-qemu-action@v3
         with:
-          name: cjs-linux-x86_64-asan
-          path: build-asan/cjs
-
-  build-macos-arm64:
-    name: Test Build - macOS ARM64
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install dependencies
-        run: |
-          brew install cmake ninja libffi sqlite3 openssl@3 zlib expat curl
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
-          cmake --build build
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-macos-arm64-test
-          path: build/cjs
-
-  build-linux-i386:
-    name: Test Build - Linux i386
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Build in i386 container
+          platforms: '386'
+      - name: Build and smoke test
         run: |
           docker run --rm --platform linux/386 \
-            -v ${{ github.workspace }}:/work -w /work \
-            debian:bookworm-slim bash -c "
-              apt update && apt install -y cmake ninja-build gcc g++ \
-                libcurl4-openssl-dev libltdl-dev libffi-dev \
-                libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev && \
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && \
-              cmake --build build"
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=4 \
+            debian:bookworm-slim sh scripts/ci/build-linux.sh glibc i386
       - uses: actions/upload-artifact@v4
         with:
           name: cjs-linux-i386-test
-          path: build/cjs
+          path: artifacts/cjs-linux-i386.tar.gz
+          if-no-files-found: error
 
-  build-windows-x86_64:
-    name: Test Build - Windows x86_64
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
-      - name: Install dependencies via vcpkg
-        run: |
-          vcpkg install sqlite3:x64-windows openssl:x64-windows zlib:x64-windows expat:x64-windows curl:x64-windows libffi:x64-windows libiconv:x64-windows
-      - name: Build
-        shell: cmd
-        run: |
-          cmake -B build -G "Visual Studio 18 2026" ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_CURL=ON
-          cmake --build build
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cjs-windows-x86_64-test
-          path: build/Release/cjs.exe
+  linux:
+    if: inputs.all-release-targets == true
+    uses: ./.github/workflows/build-linux.yml
+
+  cross:
+    if: inputs.all-release-targets == true
+    uses: ./.github/workflows/build-cross-linux.yml

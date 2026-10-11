@@ -4,15 +4,17 @@
   "description": "Utilities for circu.js",
   "private": true,
   "scripts": {
-    "api-docs": "typedoc --tsconfig tsconfig.json",
-    "api-docs-watch": "typedoc --tsconfig tsconfig.json --watch --preserveWatchOutput --logLevel Verbose",
+    "api-docs": "typedoc --tsconfig tsconfig.docs.json",
+    "api-docs-watch": "typedoc --tsconfig tsconfig.docs.json --watch --preserveWatchOutput --logLevel Verbose",
     "deploy-api-docs": "gh-pages -d api -e api -u \"github-actions-bot <support+actions@github.com>\""
   },
   "license": "MIT",
+  "packageManager": "pnpm@10.17.1",
   "dependencies": {
-    "gh-pages": "^6.3.0"
+    "gh-pages": "6.3.0"
   },
   "devDependencies": {
-    "typedoc": "0.28.19"
+    "typedoc": "0.28.19",
+    "typescript": "5.9.3"
   }
 }

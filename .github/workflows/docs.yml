@@ -1,0 +1,90 @@
+name: API Docs
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '.github/workflows/docs.yml'
+      - '.nvmrc'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig.docs.json'
+      - 'types/**'
+      - '**/README.md'
+      - '**/readme.md'
+  pull_request:
+    paths:
+      - '.github/workflows/docs.yml'
+      - '.nvmrc'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig.docs.json'
+      - 'types/**'
+      - '**/README.md'
+      - '**/readme.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build API documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: pnpm/action-setup@v4
+      # This repository does not track a pnpm lockfile yet. Direct tool versions
+      # are pinned in package.json; do not assume a frozen install can succeed.
+      - name: Install documentation tools
+        run: pnpm install --no-frozen-lockfile
+      - name: Build TypeDoc
+        run: pnpm run api-docs
+      - name: Check generated entry page
+        run: test -s api/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cjs-api-docs
+          path: api/
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs: build
+    # Set Pages source to GitHub Actions and repository variable DEPLOY_DOCS=true
+    # to enable publication. Documentation builds need neither Pages nor secrets.
+    if: >-
+      vars.DEPLOY_DOCS == 'true' &&
+      github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cjs-api-docs
+          path: api
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: api
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

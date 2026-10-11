@@ -5,270 +5,100 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ── Linux glibc ──────────────────────────────────────────────────────────────
-  # x86/ARM: Docker Debian in native/compat mode, no real emulation
-  build-linux-glibc:
-    name: Linux ${{ matrix.target }} (glibc)
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64, platform: linux/amd64,  runner: ubuntu-latest      }
-          - { target: i386,   platform: linux/386,    runner: ubuntu-latest      }
-          - { target: arm64,  platform: linux/arm64,  runner: ubuntu-24.04-arm   }
-          - { target: armv7,  platform: linux/arm/v7, runner: ubuntu-24.04-arm   }
-          - { target: armv6,  platform: linux/arm/v6, runner: ubuntu-24.04-arm   }
+  linux:
+    uses: ./.github/workflows/build-linux.yml
+  cross:
+    uses: ./.github/workflows/build-cross-linux.yml
+  native:
+    uses: ./.github/workflows/build-native.yml
+    with:
+      include-asan: false
+      native-matrix: >-
+        [{"platform":"macos","arch":"x86_64","runner":"macos-15-intel"},
+         {"platform":"macos","arch":"arm64","runner":"macos-15"},
+         {"platform":"windows","arch":"x86_64","runner":"windows-2022"},
+         {"platform":"windows","arch":"x86","runner":"windows-2022"},
+         {"platform":"windows","arch":"arm64","runner":"windows-11-arm"}]
+
+  types:
+    name: Type declarations
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: docker/setup-qemu-action@v3
-      - name: Build
-        run: |
-          docker run --rm --platform ${{ matrix.platform }} \
-            -v ${{ github.workspace }}:/work -w /work \
-            debian:bookworm-slim bash -c "
-              apt update && apt install -y cmake ninja-build gcc g++ \
-                libcurl4-openssl-dev libltdl-dev libffi-dev \
-                libsqlite3-dev libssl-dev zlib1g-dev libexpat1-dev &&
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release &&
-              cmake --build build &&
-              strip build/cjs"
-      - name: Package
-        run: tar czf cjs-linux-${{ matrix.target }}.tar.gz -C build cjs
+      - name: Package standalone declarations
+        run: tar -czf cjs-types.tar.gz types
       - uses: actions/upload-artifact@v4
         with:
-          name: cjs-linux-${{ matrix.target }}
-          path: cjs-linux-${{ matrix.target }}.tar.gz
+          name: cjs-types
+          path: cjs-types.tar.gz
+          if-no-files-found: error
 
-  # ── Linux musl (Alpine, static) ───────────────────────────────────────────────
-  # Same native/compat trick; Alpine uses musl natively
-  build-linux-musl:
-    name: Linux ${{ matrix.target }} (musl)
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64,  platform: linux/amd64,  runner: ubuntu-latest    }
-          - { target: i386,    platform: linux/386,    runner: ubuntu-latest    }
-          - { target: aarch64, platform: linux/arm64,  runner: ubuntu-24.04-arm }
-          - { target: armv7,   platform: linux/arm/v7, runner: ubuntu-24.04-arm }
-          - { target: armv6,   platform: linux/arm/v6, runner: ubuntu-24.04-arm }
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: docker/setup-qemu-action@v3
-      - name: Build
-        run: |
-          docker run --rm --platform ${{ matrix.platform }} \
-            -v ${{ github.workspace }}:/work -w /work \
-            alpine:3.21 sh -c "
-              apk add --no-cache cmake ninja-build gcc g++ musl-dev \
-                sqlite-dev sqlite-static \
-                openssl-dev openssl-libs-static \
-                zlib-dev zlib-static \
-                curl-dev curl-static \
-                libffi-dev expat-dev expat-static libtool-dev &&
-              cmake -B build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_EXE_LINKER_FLAGS='-static' &&
-              cmake --build build &&
-              strip build/cjs"
-      - name: Package
-        run: tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz -C build cjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cjs-linux-musl-${{ matrix.target }}
-          path: cjs-linux-musl-${{ matrix.target }}.tar.gz
-
-  # ── Linux musl exotic (cross, static) ────────────────────────────────────────
-  # No container support; musl.cc toolchain + sqlite amalgamation cross-compiled
-  build-linux-musl-exotic:
-    name: Linux ${{ matrix.target }} (musl-exotic)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: mips,    toolchain: mips-linux-musl          }
-          - { target: mipsel,  toolchain: mipsel-linux-musl        }
-          - { target: mips64,  toolchain: mips64-linux-musl        }
-          - { target: riscv64, toolchain: riscv64-linux-musl       }
-          - { target: armv5,   toolchain: armv5te-linux-musleabi   }
-    env:
-      TC: /opt/${{ matrix.toolchain }}-cross
-      SQLITE_VER: sqlite-amalgamation-3450100
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup musl.cc toolchain
-        run: |
-          wget -qP /tmp "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
-          tar xzf "/tmp/${{ matrix.toolchain }}-cross.tgz" -C /tmp
-          sudo mv "/tmp/${{ matrix.toolchain }}-cross" /opt/
-          echo "${{ env.TC }}/bin" >> $GITHUB_PATH
-
-      - name: Cross-compile sqlite3 amalgamation
-        run: |
-          wget -q "https://www.sqlite.org/2024/${{ env.SQLITE_VER }}.zip"
-          unzip -q "${{ env.SQLITE_VER }}.zip"
-          cd "${{ env.SQLITE_VER }}"
-          ${{ env.TC }}/bin/${{ matrix.toolchain }}-gcc \
-            -DSQLITE_OMIT_LOAD_EXTENSION -O2 \
-            -c sqlite3.c -o sqlite3.o
-          ${{ env.TC }}/bin/${{ matrix.toolchain }}-ar rcs libsqlite3.a sqlite3.o
-          sudo cp libsqlite3.a ${{ env.TC }}/lib/
-          sudo cp sqlite3.h   ${{ env.TC }}/include/
-
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_C_COMPILER=${{ env.TC }}/bin/${{ matrix.toolchain }}-gcc \
-            -DCMAKE_CXX_COMPILER=${{ env.TC }}/bin/${{ matrix.toolchain }}-g++ \
-            -DCMAKE_AR=${{ env.TC }}/bin/${{ matrix.toolchain }}-ar \
-            -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_WITH_CURL=OFF \
-            -DSQLite3_INCLUDE_DIR=${{ env.TC }}/include \
-            -DSQLite3_LIBRARY=${{ env.TC }}/lib/libsqlite3.a
-          cmake --build build
-
-      - name: Package
-        run: |
-          ${{ env.TC }}/bin/${{ matrix.toolchain }}-strip build/cjs
-          tar czf cjs-linux-musl-${{ matrix.target }}.tar.gz -C build cjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cjs-linux-musl-${{ matrix.target }}
-          path: cjs-linux-musl-${{ matrix.target }}.tar.gz
-
-  # ── macOS ─────────────────────────────────────────────────────────────────────
-  build-macos:
-    name: macOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: x86_64, runner: macos-13      }
-          - { arch: arm64,  runner: macos-latest  }
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install dependencies
-        run: brew install cmake ninja libffi sqlite3 openssl zlib expat curl
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
-          cmake --build build
-      - name: Package
-        run: |
-          strip build/cjs
-          tar czf cjs-macos-${{ matrix.arch }}.tar.gz -C build cjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cjs-macos-${{ matrix.arch }}
-          path: cjs-macos-${{ matrix.arch }}.tar.gz
-
-  build-macos-universal:
-    name: macOS Universal
-    needs: build-macos
-    runs-on: macos-latest
+  universal:
+    name: macOS universal
+    needs: native
+    runs-on: macos-15
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: cjs-macos-*
           merge-multiple: true
-      - name: Build universal binary
+      - name: Combine both runtime and bytecode compiler
         run: |
-          mkdir x86 arm
-          tar xzf cjs-macos-x86_64.tar.gz -C x86
-          tar xzf cjs-macos-arm64.tar.gz  -C arm
-          lipo -create x86/cjs arm/cjs -output cjs
-          strip cjs
-          tar czf cjs-macos-universal.tar.gz cjs
+          mkdir x86 arm universal
+          tar -xzf cjs-macos-x86_64.tar.gz -C x86
+          tar -xzf cjs-macos-arm64.tar.gz -C arm
+          mkdir universal/lib
+          for library in arm/lib/*.dylib; do
+            name="$(basename "$library")"
+            test -f "x86/lib/$name"
+            lipo -create "x86/lib/$name" "$library" -output "universal/lib/$name"
+            codesign --force --sign - "universal/lib/$name"
+            lipo -verify_arch x86_64 arm64 "universal/lib/$name"
+          done
+          for library in x86/lib/*.dylib; do
+            test -f "universal/lib/$(basename "$library")"
+          done
+          for binary in cjs cjsc; do
+            lipo -create "x86/$binary" "arm/$binary" -output "universal/$binary"
+            codesign --force --sign - "universal/$binary"
+            lipo -verify_arch x86_64 arm64 "universal/$binary"
+          done
+          cp -R arm/types universal/types
+          cp arm/LICENSE arm/RUNTIME.txt universal/
+          tar -czf cjs-macos-universal.tar.gz -C universal cjs cjsc types lib LICENSE RUNTIME.txt
       - uses: actions/upload-artifact@v4
         with:
           name: cjs-macos-universal
           path: cjs-macos-universal.tar.gz
+          if-no-files-found: error
 
-  # ── Windows ───────────────────────────────────────────────────────────────────
-  build-windows:
-    name: Windows ${{ matrix.arch }}
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: x86_64, msvc: x64,   gen: x64,   triplet: x64-windows   }
-          - { arch: x86,    msvc: x86,   gen: Win32, triplet: x86-windows   }
-          - { arch: arm64,  msvc: arm64, gen: ARM64, triplet: arm64-windows }
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc }}
-      - uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '0b88aacde46a853151730fbe7d0b7ee45f4b6864'
-      - name: Install dependencies
-        run: |
-          vcpkg install sqlite3:${{ matrix.triplet }} openssl:${{ matrix.triplet }} zlib:${{ matrix.triplet }} expat:${{ matrix.triplet }} curl:${{ matrix.triplet }} libffi:${{ matrix.triplet }}
-      - name: Build
-        shell: cmd
-        run: |
-          cmake -B build -G "Visual Studio 18 2026" -A ${{ matrix.gen }} ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DBUILD_WITH_CURL=ON
-          cmake --build build --config Release
-      - name: Package
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory dist\cjs-windows-${{ matrix.arch }}
-          Copy-Item build\Release\cjs.exe dist\cjs-windows-${{ matrix.arch }}\
-          Compress-Archive -Path dist\cjs-windows-${{ matrix.arch }} -DestinationPath cjs-windows-${{ matrix.arch }}.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cjs-windows-${{ matrix.arch }}
-          path: cjs-windows-${{ matrix.arch }}.zip
-
-  # ── Release ───────────────────────────────────────────────────────────────────
   release:
-    name: Create Release
-    needs:
-      - build-linux-glibc
-      - build-linux-musl
-      - build-linux-musl-exotic
-      - build-macos
-      - build-macos-universal
-      - build-windows
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    name: Publish release
+    needs: [linux, cross, native, types, universal]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: artifacts
           pattern: cjs-*
-      - name: Flatten artifacts
-        run: find dist -mindepth 2 \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum ./*.tar.gz ./*.zip > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+          fail_on_unmatched_files: true
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

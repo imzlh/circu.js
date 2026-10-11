@@ -32,6 +32,9 @@
 #else
     #include <unistd.h>
     #include <limits.h>
+    #ifdef __APPLE__
+        #include <mach-o/dyld.h>
+    #endif
 #endif
 
 #include <stdio.h>
