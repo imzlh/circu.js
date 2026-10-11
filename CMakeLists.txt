@@ -26,7 +26,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # level, strip symbols/debug info at link time, and enable LTO.
 if(NOT MSVC AND NOT CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_options(-Os -ffunction-sections -fdata-sections)
-    add_link_options(-Wl,--gc-sections -s)
+    if(APPLE)
+        # Apple's linker uses -dead_strip and does not accept GNU ld's
+        # --gc-sections. Keep exported host symbols available to native modules.
+        add_link_options(-Wl,-dead_strip)
+    else()
+        add_link_options(-Wl,--gc-sections -s)
+    endif()
     include(CheckIPOSupported)
     check_ipo_supported(RESULT _cjs_ipo_supported OUTPUT _cjs_ipo_error LANGUAGES C)
     if(_cjs_ipo_supported)
