@@ -547,12 +547,7 @@ static JSValue js_ffi_type_to_buffer(JSContext *ctx, JSValue this_val, int argc,
         js_free(ctx, buf);
         return JS_EXCEPTION;
     }
-    JSValue result = TJS_NewUint8Array(ctx, buf, sz);
-    if (JS_IsException(result)) {
-        js_free(ctx, buf);
-        return result;
-    }
-    return result;
+    return TJS_NewUint8Array(ctx, buf, sz);
 }
 
 static int ffi_type_from_buffer(JSContext *ctx, ffi_type *type, uint8_t *buf, JSValue *val) {
@@ -903,12 +898,7 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     ffi_call(&cif->ffi_cif, func, rptr, aval);
     js_free(ctx, aval);
 
-    JSValue result = TJS_NewUint8Array(ctx, rptr, retsz);
-    if (JS_IsException(result)) {
-        js_free(ctx, rptr);
-        return result;
-    }
-    return result;
+    return TJS_NewUint8Array(ctx, rptr, retsz);
 }
 static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
     TJS_CFUNC_DEF("call", 1, js_ffi_cif_call),

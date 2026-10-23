@@ -399,14 +399,13 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         return result;
     }
     JSValue addr = TJS_NewUint8Array(ctx, (uint8_t *) msg.msg_name, msg.msg_namelen);
+    msg.msg_name = NULL;
     if (JS_IsException(addr)) {
         JS_FreeValue(ctx, result);
-        js_free(ctx, msg.msg_name);
         js_free(ctx, msg.msg_control);
         js_free(ctx, iov.iov_base);
         return JS_EXCEPTION;
     }
-    msg.msg_name = NULL;
     if (JS_SetPropertyStr(ctx, result, "addr", addr) < 0) {
         JS_FreeValue(ctx, result);
         js_free(ctx, msg.msg_control);
@@ -415,13 +414,12 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
     if (msg.msg_control) {
         JSValue control = TJS_NewUint8Array(ctx, msg.msg_control, msg.msg_controllen);
+        msg.msg_control = NULL;
         if (JS_IsException(control)) {
             JS_FreeValue(ctx, result);
-            js_free(ctx, msg.msg_control);
             js_free(ctx, iov.iov_base);
             return JS_EXCEPTION;
         }
-        msg.msg_control = NULL;
         if (JS_SetPropertyStr(ctx, result, "control", control) < 0) {
             JS_FreeValue(ctx, result);
             js_free(ctx, iov.iov_base);
@@ -429,12 +427,11 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         }
     }
     JSValue data = TJS_NewUint8Array(ctx, iov.iov_base, ret);
+    iov.iov_base = NULL;
     if (JS_IsException(data)) {
         JS_FreeValue(ctx, result);
-        js_free(ctx, iov.iov_base);
         return JS_EXCEPTION;
     }
-    iov.iov_base = NULL;
     if (JS_SetPropertyStr(ctx, result, "data", data) < 0) {
         JS_FreeValue(ctx, result);
         return JS_EXCEPTION;

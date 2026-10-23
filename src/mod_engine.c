@@ -489,7 +489,10 @@ static JSValue js_module_dump(JSContext *ctx, JSValueConst this_val, int argc, J
     uint8_t *data = JS_WriteObject(ctx, &len, JS_MKPTR(JS_TAG_MODULE, mt->def), flags);
     if(!data) return JS_EXCEPTION;
 
-    return JS_NewArrayBuffer(ctx, data, len, 0, free_js_malloc, NULL, false);
+    JSValue buffer = JS_NewArrayBuffer(ctx, data, len, 0, free_js_malloc, NULL, false);
+    if (JS_IsException(buffer))
+        js_free(ctx, data);
+    return buffer;
 }
 
 static JSValue js_module_get_meta(JSContext* ctx, JSValueConst this_val){
@@ -865,7 +868,7 @@ static JSValue tjs_serialize(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (!buf) {
         return JS_EXCEPTION;
     }
-    /* TJS_NewUint8Array takes ownership of buf and frees it (via tjs__buf_free)
+    /* TJS_NewUint8Array takes ownership of buf and frees it (via tjs__buf_realloc)
      * on every path, including failure. No manual js_free here. */
     return TJS_NewUint8Array(ctx, buf, len);
 }

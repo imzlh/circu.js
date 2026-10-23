@@ -533,7 +533,16 @@ static void* tjs__buf_realloc(JSRuntime *rt, void *opaque, void *ptr, size_t siz
 }
 
 JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size) {
-    return JS_NewUint8Array(ctx, data, size, tjs__buf_realloc, NULL, false);
+    /* JS_NewUint8Array only consumes data once its ArrayBuffer was created.
+     * Split the two allocations so this helper consumes data on every path. */
+    JSValue buffer = JS_NewArrayBuffer(ctx, data, size, 0, tjs__buf_realloc, NULL, false);
+    if (JS_IsException(buffer)) {
+        js_free(ctx, data);
+        return buffer;
+    }
+    JSValue array = JS_NewTypedArray(ctx, 1, &buffer, JS_TYPED_ARRAY_UINT8);
+    JS_FreeValue(ctx, buffer);
+    return array;
 }
 
 const char *tjs_signal_map[] = {

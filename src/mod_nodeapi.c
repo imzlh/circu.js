@@ -2277,9 +2277,15 @@ napi_create_buffer(napi_env env, size_t length, void **data, napi_value *result)
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
     uint8_t *buf = length ? malloc(length) : NULL;
     if (length && !buf) return NAPI_RET(env, napi_generic_failure);
-    JSValue b = JS_NewUint8Array(env->ctx, buf, length, napi_raw_ab_free, NULL, false);
-    if (JS_IsException(b)) {
+    JSValue ab = JS_NewArrayBuffer(env->ctx, buf, length, 0, napi_raw_ab_free, NULL, false);
+    if (JS_IsException(ab)) {
         free(buf);
+        napi_capture_exception(env);
+        return NAPI_RET(env, napi_pending_exception);
+    }
+    JSValue b = JS_NewTypedArray(env->ctx, 1, &ab, JS_TYPED_ARRAY_UINT8);
+    JS_FreeValue(env->ctx, ab);
+    if (JS_IsException(b)) {
         napi_capture_exception(env);
         return NAPI_RET(env, napi_pending_exception);
     }

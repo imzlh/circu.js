@@ -128,6 +128,7 @@ void TJS_RejectPromise(JSContext *ctx, TJSPromise *p, int argc, JSValue *argv);
 JSValue TJS_NewResolvedPromise(JSContext *ctx, int argc, JSValue *argv);
 JSValue TJS_NewRejectedPromise(JSContext *ctx, int argc, JSValue *argv);
 
+/* Consumes js_malloc'd data on success and failure. */
 JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size);
 
 extern const char *tjs_signal_map[];

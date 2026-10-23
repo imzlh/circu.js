@@ -400,6 +400,18 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
         args[0] = TJS_NewUint8Array(ctx, s->read_buf, nread);
         args[1] = JS_UNDEFINED;
         s->read_buf = NULL;
+        if (JS_IsException(args[0])) {
+            args[0] = JS_UNDEFINED;
+            args[1] = JS_GetException(ctx);
+            /* QuickJS falls back to throwing null if even the error object
+             * cannot be allocated. The backing store is now freed, so retry
+             * before passing a falsy error to the JavaScript read handler. */
+            if (JS_IsNull(args[1])) {
+                JS_ThrowOutOfMemory(ctx);
+                args[1] = JS_GetException(ctx);
+            }
+            nread = UV_ENOMEM;
+        }
     }
 
     bool release_stream_pin = false;
