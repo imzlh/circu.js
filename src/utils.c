@@ -44,10 +44,6 @@
 #include <string.h>
 
 #if defined(_WIN32)
-/* utils.h -> <uv.h> -> uv/win.h already defines _WIN32_WINNT as 0x0A00
- * (deps/libuv/include/uv/win.h:23), so GetCurrentThreadStackLimits — which
- * needs >= 0x0602 — is declared. This matters because the build compiles with
- * /W4 /WX (CMakeLists.txt:46), where an implicit declaration is a hard error. */
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <pthread.h>

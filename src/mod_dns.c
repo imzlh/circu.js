@@ -145,16 +145,10 @@ static const char* dns_platform_gai_code(int status) {
 }
 
 static JSValue dns_new_gai_error(JSContext* ctx, int status, bool from_uv) {
-	JSValue error = JS_NewError(ctx);
-	if (JS_IsException(error)) return error;
 	const char* message = from_uv ? uv_strerror(status) : gai_strerror(status);
-	JS_DefinePropertyValueStr(ctx, error, "message",
-		JS_NewString(ctx, message ? message : "getaddrinfo failed"),
-		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-	JS_DefinePropertyValueStr(ctx, error, "code",
+	return tjs_new_coded_error(ctx, NULL,
 		JS_NewString(ctx, from_uv ? dns_uv_gai_code(status) : dns_platform_gai_code(status)),
-		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-	return error;
+		JS_NewString(ctx, message ? message : "getaddrinfo failed"));
 }
 
 static void dns_getaddrinfo_unlink(TJSGetAddrInfoReq* gr) {
@@ -1222,14 +1216,10 @@ static void dns_udp_reject_code(dns_udp_ctx_t* ctx, const char* code, const char
 	if (ctx->done) return;
 	ctx->done = true;
 	JSContext* js_ctx = ctx->ctx;
-	JSValue error = JS_NewError(js_ctx);
+	JSValue error = tjs_new_coded_error(js_ctx, NULL,
+		JS_NewString(js_ctx, code), JS_NewString(js_ctx, message));
 	if (JS_IsException(error)) {
 		error = JS_GetException(js_ctx);
-	} else {
-		JS_DefinePropertyValueStr(js_ctx, error, "message", JS_NewString(js_ctx, message),
-			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-		JS_DefinePropertyValueStr(js_ctx, error, "code", JS_NewString(js_ctx, code),
-			JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 	}
 	JSValue reject_func = JS_DupValue(js_ctx, ctx->reject_func);
 	dns_udp_finish(ctx);

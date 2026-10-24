@@ -732,13 +732,8 @@ static JSValue tjs__curl_new_os_string(JSContext *ctx, const char *s) {
 }
 
 static JSValue build_error(JSContext *ctx, const char *error_buffer, CURLcode code) {
-    JSValue error = JS_NewError(ctx);
     const char *msg = (error_buffer && error_buffer[0]) ? error_buffer : curl_easy_strerror(code);
-    JS_DefinePropertyValueStr(ctx, error, "message",
-        tjs__curl_new_os_string(ctx, msg), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    JS_DefinePropertyValueStr(ctx, error, "code",
-        JS_NewInt32(ctx, code), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    return error;
+    return tjs_new_coded_error(ctx, NULL, JS_NewInt32(ctx, code), tjs__curl_new_os_string(ctx, msg));
 }
 
 #pragma endregion

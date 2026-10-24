@@ -282,6 +282,9 @@ void tjs_win_stat_times_from_path(const char* path, int follow_symlinks, tjs_win
 void tjs_win_stat_times_from_fd(int fd, tjs_win_stat_times_t* out);
 #endif
 
+/* Takes ownership of code and msg. */
+JSValue tjs_new_coded_error(JSContext *ctx, const char *name, JSValue code, JSValue msg);
+JSValue tjs_throw_coded_error(JSContext *ctx, const char *name, JSValue code, JSValue msg);
 JSValue tjs_new_error(JSContext *ctx, int err);
 JSValue tjs_new_error_path(JSContext *ctx, int err, const char *path);
 JSValue tjs_throw_errno(JSContext *ctx, int err);
