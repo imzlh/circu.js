@@ -255,6 +255,13 @@ if(EXPAT_FOUND)
 endif()
 
 option(libuv_buildtests "" OFF)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv/include/uv/version.h"
+    _cjs_libuv_major REGEX "^#define UV_VERSION_MAJOR ")
+if(NOT _cjs_libuv_major MATCHES "UV_VERSION_MAJOR +1$")
+    message(FATAL_ERROR
+        "circu.js requires libuv 1.x. Use the stable v1.53.0 tag; "
+        "libuv 2.x has incompatible file descriptor and other APIs.")
+endif()
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_library(libcjs STATIC
