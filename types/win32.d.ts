@@ -86,6 +86,7 @@ declare namespace CModuleWin32 {
      * @param hive  Root handle, e.g. `HKCU`
      * @param key   Subkey path, e.g. `'Software\\MyApp'`
      * @param name  Value name
+     * @throws Catchable `IOError` with a numeric libuv `code` on system errors.
      *
      * @example
      * ```ts

@@ -330,6 +330,17 @@ void tjs__dispatch_event2(JSContext *ctx, TJSEvents ev, JSValue data) {
     JSValue ret = tjs__dispatch_event(ctx, ev, data);
 	JS_FreeValue(ctx, ret);
 }
+
+void tjs__stop_uncatchable_error(JSContext *ctx, JSValueConst error) {
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    CHECK_NOT_NULL(trt);
+    if (!trt->explicit_exit) {
+        tjs_dump_error(ctx, error);
+        trt->exit_code = 1;
+    }
+    TJS_Stop(trt);
+}
+
 void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
     JSValue ret, func1;
     TJSRuntime *trt = TJS_GetRuntime(ctx);
@@ -351,8 +362,7 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
 		// alias to jobexception
 		JSValue err = JS_GetException(ctx);
         if (JS_IsUncatchableError(err)) {
-            CHECK_NOT_NULL(trt);
-            TJS_Stop(trt);
+            tjs__stop_uncatchable_error(ctx, err);
             JS_FreeValue(ctx, err);
             JS_FreeValue(ctx, ret);
             return;

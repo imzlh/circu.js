@@ -1032,7 +1032,7 @@ void tjs__run_next_ticks(TJSRuntime* trt) {
          * the error already takes, diagnostic and exit code included. */
         JSValue js_err = JS_GetException(ctx);
         if (JS_IsUncatchableError(js_err)) {
-            TJS_Stop(trt);
+            tjs__stop_uncatchable_error(ctx, js_err);
         } else {
             JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, js_err);
             if (JS_IsEqual(ctx, retv, JS_FALSE)) {

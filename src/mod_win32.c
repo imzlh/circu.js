@@ -31,13 +31,24 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "crypt32.lib")
 
+static JSValue throw_win32_error(JSContext *ctx, DWORD code) {
+    return tjs_throw_errno(ctx, uv_translate_sys_error(code));
+}
+
+#define THROW_WIN32() throw_win32_error(ctx, GetLastError())
+
 /* ── String helpers ─────────────────────────────────────────── */
 
 static WCHAR *to_wcs(JSContext *ctx, JSValue v) {
     const char *s = JS_ToCString(ctx, v);
     if (!s) return NULL;
     int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (n <= 0) { JS_FreeCString(ctx, s); return NULL; }
+    if (n <= 0) {
+        DWORD error = GetLastError();
+        JS_FreeCString(ctx, s);
+        throw_win32_error(ctx, error);
+        return NULL;
+    }
     WCHAR *w = js_malloc(ctx, n * sizeof(WCHAR));
     if (!w) { JS_FreeCString(ctx, s); return NULL; }
     MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
@@ -46,8 +57,9 @@ static WCHAR *to_wcs(JSContext *ctx, JSValue v) {
 }
 
 static JSValue from_wcs(JSContext *ctx, const WCHAR *w, int nchars) {
+    if (nchars == 0) return JS_NewString(ctx, "");
     int n = WideCharToMultiByte(CP_UTF8, 0, w, nchars, NULL, 0, NULL, NULL);
-    if (n < 0) return JS_ThrowInternalError(ctx, "invalid UTF-16 string");
+    if (n <= 0) return THROW_WIN32();
     char *s = js_malloc(ctx, (size_t) n + 1);
     if (!s) return JS_EXCEPTION;
     WideCharToMultiByte(CP_UTF8, 0, w, nchars, s, n, NULL, NULL);
@@ -57,22 +69,24 @@ static JSValue from_wcs(JSContext *ctx, const WCHAR *w, int nchars) {
     return v;
 }
 
-#define THROW_WIN32() JS_ThrowInternalError(ctx, "Win32 error %lu", GetLastError())
-
-/* HKEY predefined handles stored as int32; JS_ToUint32 recovers correctly */
+/* Predefined HKEY values are signed LONGs widened to pointers by Windows. */
 static inline HKEY to_hkey(JSContext *ctx, JSValue v) {
-    uint32_t u; JS_ToUint32(ctx, &u, v);
-    return (HKEY)(uintptr_t)u;
+    int32_t value;
+    if (JS_ToInt32(ctx, &value, v)) return NULL;
+    if (value == 0) { tjs_throw_errno(ctx, UV_EBADF); return NULL; }
+    return (HKEY)(intptr_t)value;
 }
 
 /* Open a registry key; sets JS exception and returns NULL on failure */
 static HKEY open_key(JSContext *ctx, JSValue hive_v, JSValue key_v, REGSAM access) {
+    HKEY hive = to_hkey(ctx, hive_v);
+    if (!hive) return NULL;
     WCHAR *key = to_wcs(ctx, key_v);
     if (!key) return NULL;
     HKEY hk;
-    LONG r = RegOpenKeyExW(to_hkey(ctx, hive_v), key, 0, access, &hk);
+    LONG r = RegOpenKeyExW(hive, key, 0, access, &hk);
     js_free(ctx, key);
-    if (r != ERROR_SUCCESS) { THROW_WIN32(); return NULL; }
+    if (r != ERROR_SUCCESS) { throw_win32_error(ctx, r); return NULL; }
     return hk;
 }
 
@@ -110,6 +124,7 @@ static JSValue reg_to_js(JSContext *ctx, DWORD type, const BYTE *data, DWORD sz)
 /* ── reg_read(hive, key, name) ──────────────────────────────── */
 
 static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and value name");
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_READ);
     if (!hk) return JS_EXCEPTION;
 
@@ -117,14 +132,14 @@ static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
     DWORD type, size;
     LONG r = RegQueryValueExW(hk, name, NULL, &type, NULL, &size);
-    if (r != ERROR_SUCCESS) { js_free(ctx, name); RegCloseKey(hk); return THROW_WIN32(); }
+    if (r != ERROR_SUCCESS) { js_free(ctx, name); RegCloseKey(hk); return throw_win32_error(ctx, r); }
 
     BYTE *data = js_malloc(ctx, size + 2);  /* +2: guard missing null terminator */
     if (!data) { js_free(ctx, name); RegCloseKey(hk); return JS_EXCEPTION; }
     memset(data + size, 0, 2);
     r = RegQueryValueExW(hk, name, NULL, &type, data, &size);
     js_free(ctx, name); RegCloseKey(hk);
-    if (r != ERROR_SUCCESS) { js_free(ctx, data); return THROW_WIN32(); }
+    if (r != ERROR_SUCCESS) { js_free(ctx, data); return throw_win32_error(ctx, r); }
 
     JSValue result = reg_to_js(ctx, type, data, size);
     js_free(ctx, data);
@@ -135,6 +150,7 @@ static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue 
 /* value: string → REG_SZ, number → REG_DWORD, Uint8Array → REG_BINARY */
 
 static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 4) return JS_ThrowTypeError(ctx, "expected hive, key, value name and value");
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_WRITE);
     if (!hk) return JS_EXCEPTION;
 
@@ -168,19 +184,20 @@ static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue
     LONG r = RegSetValueExW(hk, name, 0, type, data, size);
     js_free(ctx, name); RegCloseKey(hk);
     if (wbuf) js_free(ctx, wbuf);
-    return r == ERROR_SUCCESS ? JS_UNDEFINED : THROW_WIN32();
+    return r == ERROR_SUCCESS ? JS_UNDEFINED : throw_win32_error(ctx, r);
 }
 
 /* ── reg_delete(hive, key, name) ────────────────────────────── */
 
 static JSValue tjs_reg_delete(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and value name");
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_WRITE);
     if (!hk) return JS_EXCEPTION;
     WCHAR *name = to_wcs(ctx, argv[2]);
     if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
     LONG r = RegDeleteValueW(hk, name);
     js_free(ctx, name); RegCloseKey(hk);
-    return r == ERROR_SUCCESS ? JS_UNDEFINED : THROW_WIN32();
+    return r == ERROR_SUCCESS ? JS_UNDEFINED : throw_win32_error(ctx, r);
 }
 
 /* ── RegWatch class ──────────────────────────────────────────── */
@@ -293,12 +310,17 @@ static const JSCFunctionListEntry tjs_regwatch_proto_funcs[] = {
 /* ── reg_watch(hive, key, callback) → RegWatch ──────────────── */
 
 static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and callback");
     TJS_CHECK_ARG_RET(ctx, JS_IsFunction(ctx, argv[2]), 2, "function");
     HKEY hk = open_key(ctx, argv[0], argv[1], KEY_NOTIFY);
     if (!hk) return JS_EXCEPTION;
 
     HANDLE event = CreateEventW(NULL, false, false, NULL);
-    if (!event) { RegCloseKey(hk); return THROW_WIN32(); }
+    if (!event) {
+        DWORD error = GetLastError();
+        RegCloseKey(hk);
+        return throw_win32_error(ctx, error);
+    }
 
     tjs_regwatch_t *w = tjs__mallocz(sizeof(*w));
     if (!w) {
@@ -356,8 +378,9 @@ static JSValue tjs_get_certs(JSContext *ctx, JSValue this_val, int argc, JSValue
         store_name = store_cstr = JS_ToCString(ctx, argv[0]);
 
     HCERTSTORE store = CertOpenSystemStoreA(0, store_name);
+    DWORD error = store ? ERROR_SUCCESS : GetLastError();
     if (store_cstr) JS_FreeCString(ctx, store_cstr);
-    if (!store) return THROW_WIN32();
+    if (!store) return throw_win32_error(ctx, error);
 
     JSValue arr = JS_NewArray(ctx);
     uint32_t i = 0;

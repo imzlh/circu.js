@@ -71,6 +71,7 @@ static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
 
     if (trt && trt->is_worker) {
         // In a worker: stop only this worker and unwind JS without user catch.
+        trt->explicit_exit = true;
         trt->exit_code = status;
         TJS_Stop(trt);
         JSValue err = JS_NewInternalError(ctx, "worker exit");

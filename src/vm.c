@@ -832,7 +832,7 @@ static bool tjs__execute_pending_jobs(TJSRuntime* trt) {
             if (err < 0) {
                 JSValue js_err = JS_GetException(ctx1);
                 if (JS_IsUncatchableError(js_err)) {
-                    TJS_Stop(trt);
+                    tjs__stop_uncatchable_error(ctx1, js_err);
                     JS_FreeValue(ctx1, js_err);
                     return true;
                 }

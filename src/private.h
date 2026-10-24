@@ -85,6 +85,8 @@ struct TJSRuntime {
     uv_async_t stop;
 
     bool is_worker;
+    /* Worker exit uses an uncatchable exception only to unwind JS. */
+    bool explicit_exit;
     int exit_code;
     /* `process.exitCode = N` pushed in from JS by os.setExitCode().
      *
@@ -294,6 +296,7 @@ void tjs__execute_jobs(TJSRuntime *trt);
 /* Runs the JS-side process.nextTick drain if one is registered and ticks are
  * pending. Defined in mod_engine.c, called from tjs__execute_jobs() in vm.c. */
 void tjs__run_next_ticks(TJSRuntime *trt);
+void tjs__stop_uncatchable_error(JSContext *ctx, JSValueConst error);
 int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename);
 
 JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst* value);
