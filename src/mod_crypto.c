@@ -1171,6 +1171,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new(pkey, NULL);
     if (!pctx || EVP_PKEY_encrypt_init(pctx) != 1) {
+        EVP_PKEY_CTX_free(pctx);
         EVP_PKEY_free(pkey);
         return JS_ThrowInternalError(ctx, "Failed to init encrypt");
     }
@@ -1194,11 +1195,12 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
         EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, label_copy, label_len);
     }
     
+    /* Reinitializing here would reset the OAEP padding, hash and label. */
     size_t out_len;
     if (EVP_PKEY_encrypt(pctx, NULL, &out_len, data, data_len) != 1) {
         EVP_PKEY_CTX_free(pctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Encrypt failed");
+        return JS_ThrowTypeError(ctx, "RSA-OAEP encryption failed");
     }
     
     uint8_t* out = js_malloc(ctx, out_len);
@@ -1215,7 +1217,9 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     
     if (ret != 1) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Encrypt failed");
+        /* Oversized plaintext must reject WebCrypto's promise, not raise an
+         * engine-uncatchable InternalError. */
+        return JS_ThrowTypeError(ctx, "RSA-OAEP encryption failed");
     }
     
     JSValue result = js_fastab(ctx, out, out_len);

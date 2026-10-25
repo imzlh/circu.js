@@ -699,9 +699,17 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
             break;
         }
         
+        /* Corrupt input is an ordinary, catchable failure (zlib streams throw
+         * on bad data). An InternalError is uncatchable in this engine, so a
+         * catchable type is used whenever the input caused the error; only a
+         * Z_STREAM_ERROR (bad parameters / stream state) stays internal. */
         if (ret != Z_OK && ret != Z_BUF_ERROR) {
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Inflate failed");
+            if (ret == Z_STREAM_ERROR) {
+                return JS_ThrowInternalError(ctx, "Inflate failed");
+            }
+            return JS_ThrowTypeError(ctx, "Inflate failed: %s",
+                                      i->strm.msg ? i->strm.msg : "zlib error");
         }
         
         if (i->strm.avail_out == 0) {
@@ -726,8 +734,10 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
 
     if (flush == Z_FINISH && ret != Z_STREAM_END) {
+        /* Ended mid-member: truncated input. */
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Inflate failed");
+        return JS_ThrowTypeError(ctx, "Inflate failed: %s",
+                                  i->strm.msg ? i->strm.msg : "zlib error");
     }
     
     size_t produced = out_size - i->strm.avail_out;
