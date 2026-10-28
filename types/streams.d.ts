@@ -356,9 +356,4 @@ declare namespace CModuleStreams {
 
     /** TTY mode: raw mode + Windows VT input (supports bracketed paste) */
     export const TTY_MODE_RAW_VT: number;
-
-    /** Injected by cno/src/utils/stdio.ts, not native. */
-    export const stdin: StdioStream;
-    export const stdout: StdioStream;
-    export const stderr: StdioStream;
 }
