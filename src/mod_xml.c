@@ -25,8 +25,20 @@
 #include "private.h"
 #include "tjs.h"
 #include <expat.h>
-#include <string.h>
 #include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+/* Expat 2.9 added the fixed-width location APIs and deprecated the original
+ * APIs. Keep using the originals when building against older releases. */
+#if XML_MAJOR_VERSION > 2 ||                                              \
+    (XML_MAJOR_VERSION == 2 && XML_MINOR_VERSION >= 9)
+#define CJS_XML_CURRENT_LINE(parser) XML_GetCurrentLineNumber64(parser)
+#define CJS_XML_CURRENT_COLUMN(parser) XML_GetCurrentColumnNumber64(parser)
+#else
+#define CJS_XML_CURRENT_LINE(parser) XML_GetCurrentLineNumber(parser)
+#define CJS_XML_CURRENT_COLUMN(parser) XML_GetCurrentColumnNumber(parser)
+#endif
 
 /* Parser state structure */
 typedef struct {
@@ -304,9 +316,10 @@ static JSValue tjs_xml_parser_parse(JSContext *ctx, JSValueConst this_val,
     
     if (!status && !state->stopped) {
         enum XML_Error error = XML_GetErrorCode(state->parser);
-        return JS_ThrowTypeError(ctx, "XML parse error: %s at line %lu",
+        return JS_ThrowTypeError(ctx, "XML parse error: %s at line %llu",
                                 XML_ErrorString(error),
-                                XML_GetCurrentLineNumber(state->parser));
+                                (unsigned long long)
+                                    CJS_XML_CURRENT_LINE(state->parser));
     }
     
     return JS_NewBool(ctx, status);
@@ -349,14 +362,14 @@ static JSValue tjs_xml_parser_reset(JSContext *ctx, JSValueConst this_val,
 static JSValue tjs_xml_parser_get_line(JSContext *ctx, JSValueConst this_val) {
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
-    return JS_NewInt64(ctx, XML_GetCurrentLineNumber(state->parser));
+    return JS_NewInt64(ctx, (int64_t) CJS_XML_CURRENT_LINE(state->parser));
 }
 
 /* Getter: parser.column */
 static JSValue tjs_xml_parser_get_column(JSContext *ctx, JSValueConst this_val) {
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
-    return JS_NewInt64(ctx, XML_GetCurrentColumnNumber(state->parser));
+    return JS_NewInt64(ctx, (int64_t) CJS_XML_CURRENT_COLUMN(state->parser));
 }
 
 /* Utility: XML.escape(str) */
