@@ -213,6 +213,15 @@ declare namespace CModuleFFI {
      */
     export function ptrToBuffer(ptr: Pointer, size: number): Uint8Array;
 
+    /**
+     * Get the current runtime thread's libuv event loop address.
+     *
+     * @warning The pointer is owned by the runtime and is valid only for the
+     * current environment's lifetime. It must not be freed or used from a
+     * different thread.
+     */
+    export function getCurrentEventLoop(): Pointer;
+
     /** Platform C standard library name. */
     export const LIBC_NAME: string;
 
