@@ -572,16 +572,12 @@ static void js_sandbox_finalizer(JSRuntime *rt, JSValueConst val) {
     JS_FreeValueRT(rt, sb->global);
     sb->global = JS_UNDEFINED;
 
-    if (!sb->trt->freeing){
-        /* Only when JS_FreeRuntime not running, we free it manually */
+    if (!sb->trt->freeing) {
         App *app = sb->app;
-        if (app) {
-            TJSRuntime *trt = app->trt;
-            if (!trt->freeing) {
-                JS_FreeContext(app->ctx);
-                list_del(&app->link);
-                tjs__free(app);
-            }
+        if (app && !app->context_released) {
+            tjs__mod_evbus_cleanup_context(app);
+            JS_FreeContext(app->ctx);
+            app->context_released = true;
             sb->app = NULL;
         }
     }

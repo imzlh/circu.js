@@ -54,6 +54,7 @@ enum {
 };
 
 typedef struct TJSTimer TJSTimer;
+typedef struct TJSEvBus TJSEvBus;
 
 typedef struct DebugControlBlock DebugControlBlock;
 
@@ -85,6 +86,7 @@ struct TJSRuntime {
     uv_async_t stop;
 
     bool is_worker;
+    TJSEvBus *evbus;
     /* Worker exit uses an uncatchable exception only to unwind JS. */
     bool explicit_exit;
     int exit_code;
@@ -162,6 +164,7 @@ struct TJSApp {
     JSContext *ctx;
 
     bool is_sandbox;
+    bool context_released;
     struct list_head link;
 };
 
@@ -213,6 +216,9 @@ void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
 void tjs__mod_dns_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_dns_drain_runtime(TJSRuntime *trt);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
+void tjs__mod_evbus_init(JSContext *ctx, JSValue ns);
+void tjs__mod_evbus_cleanup_context(App *app);
+void tjs__mod_evbus_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
 void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns);

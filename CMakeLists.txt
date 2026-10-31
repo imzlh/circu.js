@@ -281,6 +281,7 @@ add_library(libcjs STATIC
     src/mod_bjson.c
     src/mod_dns.c
     src/mod_engine.c
+    src/mod_evbus.c
     src/mod_ffi.c
     src/mod_fs.c
     src/mod_asyncfs.c

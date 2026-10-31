@@ -5,6 +5,7 @@
 interface TjsModules {
     dns: typeof CModuleDNS,
     engine: typeof CModuleEngine,
+    evbus: typeof CModuleEvBus,
     error: typeof CModuleError,
     ffi: typeof CModuleFFI,
     asyncfs: typeof CModuleAsyncFS,

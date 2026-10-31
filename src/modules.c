@@ -60,6 +60,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "debug", tjs__mod_debug_init, true },
 	{ "dns", tjs__mod_dns_init, true },
 	{ "engine", tjs__mod_engine_init, true },
+	{ "evbus", tjs__mod_evbus_init, true },
 	{ "error", tjs__mod_error_init, true },
 	{ "ffi", tjs__mod_ffi_init, true },
 	{ "fs", tjs__mod_fs_init, true },

@@ -55,13 +55,73 @@ const engine = import.meta.use('engine');
 Common built-ins include:
 
 ```text
-algorithm, asyncfs, console, crypto, curl, debug, dns, engine, ffi, fs,
+algorithm, asyncfs, console, crypto, curl, debug, dns, engine, evbus, ffi, fs,
 fswatch, http, nodeapi, os, process, signals, sourcemap, sqlite3,
 ssl, streams, text, timers, udp, wasm, win32, worker, xml, zlib
 ```
 
 Check `types/*.d.ts` for the exposed TypeScript shape and `src/mod_*.c` for the
 native implementation.
+
+### Runtime-Local Event Bus
+
+Bootstrap code can use `evbus` to share values and dispatch synchronous
+events inside one QuickJS runtime. See the [type declarations](types/evbus.d.ts)
+and [native implementation](src/mod_evbus.c):
+
+```ts
+const evbus = import.meta.use('evbus');
+const state = { count: 0 };
+
+evbus.set('example.app', 'state', state);
+const unsubscribe = evbus.on<typeof state>('example.app', 'update', value => {
+    value.count++;
+});
+evbus.emit('example.app', 'update', state); // true; state.count is now 1
+unsubscribe();                            // safe to call more than once
+evbus.delete('example.app', 'state');
+```
+
+- `set(namespace, key, value)` stores a value by identity and returns
+  `undefined`. `get` returns the value or `undefined`; use `has` to distinguish
+  a stored `undefined` from a missing key. `delete` returns whether a key
+  existed. `clear(namespace)` removes values in that namespace, not listeners.
+- `on(namespace, event, callback)` returns an idempotent unsubscribe function
+  for that registration. There is no separate `off` or `once` method or
+  numeric token. To implement once-only behavior, unsubscribe before running
+  the callback body so recursive emits do not invoke it again.
+- `emit(namespace, event, payload?)` calls a snapshot in registration order,
+  synchronously, with exactly one argument (`undefined` if omitted). It
+  returns `false` for an empty snapshot and `true` otherwise. The first
+  synchronously thrown value propagates and stops dispatch; listener return
+  values and promises are ignored. A listener added or unsubscribed during
+  dispatch affects later emits, including nested emits, but not the current
+  snapshot.
+- Namespace, key and event names must be strings (empty strings are allowed);
+  a missing value for `set` or a non-callable listener throws `TypeError`.
+  TypeScript payload and `get<T>` types are conventions between callers, not
+  runtime validation.
+
+Values and listeners are strongly retained. Dropping an unsubscribe function
+does not remove the listener; call it when the registration is no longer
+needed. Values belong to the context of their most recent `set`, and listeners
+to the context that registered them. When a sandbox is finalized, its owned
+entries are removed; runtime shutdown removes all entries. An in-flight
+dispatch can still invoke an already-snapshotted listener. A retained value or
+callback can itself keep other objects reachable, so cleanup is not a
+substitute for releasing resources explicitly.
+
+Sandboxes that have access to the module share their runtime's bus and values
+by identity. Workers have separate QuickJS runtimes and separate buses. The bus
+is not a sandbox security boundary, and its events are not automatically
+connected to `engine.onEvent` or runtime lifecycle events.
+
+`evbus` is built in on the current runtime, including workers. On an older
+runtime, `import.meta.use('evbus')` may return `null`; callers supporting both
+versions must check for availability and provide their own fallback. A
+realm-local global or `Symbol.for()` slot does not provide cross-context
+sharing. As with other built-ins, `import.meta.use()` is subject to symbol mode
+in the root `cno-cli` build.
 
 ## Symbol Mode In cno-cli
 

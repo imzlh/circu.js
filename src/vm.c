@@ -697,6 +697,9 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     JS_FreeValue(ctx, qrt->debug.onBreak);
     JS_FreeValue(ctx, qrt->debug.onException);
 
+    /* Remove runtime-owned values before contexts and their atoms are freed. */
+    tjs__mod_evbus_cleanup_runtime(qrt);
+
     /* Destroy all timers and drain the Promise job queue. */
     JSContext *job_ctx;
     tjs__destroy_timers(qrt);
@@ -720,25 +723,36 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     JS_RunGC(qrt->rt);
     tjs__drain_closing_handles(qrt, 64);
 
-    /* Cleanup all contexts: main app first, then sandbox apps.
-     * The list is headed by &main_app->link (created in
-     * TJS_NewRuntimeInternal).  Sandbox apps are appended via
-     * list_add_tail in TJS_NewAppInternal. */
+    /* Release the runtime's context references. Sandbox wrapper finalizers may
+     * already have released their reference, while callbacks can keep the
+     * realm alive until JS_FreeRuntime tears down the remaining JS graph. */
+    App* main_app = TJS_GetApp(ctx);
     {
-        App* main_app = TJS_GetApp(ctx);
         JS_FreeContext(main_app->ctx);
         struct list_head *cur, *tmp;
         list_for_each_safe(cur, tmp, &main_app->link) {
             App* app = list_entry(cur, App, link);
-            JS_FreeContext(app->ctx);
+            if (!app->context_released) {
+                JS_FreeContext(app->ctx);
+                app->context_released = true;
+            }
+        }
+    }
+
+    /* Destroy the JS engine. */
+    JS_FreeRuntime(qrt->rt);
+
+    /* Context opaque pointers remain valid through JS_FreeRuntime finalizers;
+     * App storage itself has no QuickJS references and can now be released. */
+    {
+        struct list_head *cur, *tmp;
+        list_for_each_safe(cur, tmp, &main_app->link) {
+            App* app = list_entry(cur, App, link);
             list_del(&app->link);
             tjs__free(app);
         }
         tjs__free(main_app);
     }
-
-    /* Destroy the JS engine. */
-    JS_FreeRuntime(qrt->rt);
     tjs__drain_closing_handles(qrt, 64);
     tjs__free_orphaned_streams(qrt);
 
