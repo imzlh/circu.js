@@ -11,13 +11,29 @@
  * finalized, and all entries are removed at runtime shutdown.
  */
 declare namespace CModuleEvBus {
+    /** Native runtime events are published under this namespace and event. */
+    export const RUNTIME_NAMESPACE: "circu.runtime";
+    export const RUNTIME_EVENT: "event";
+
+    export interface RuntimeEventContext {
+        handled: boolean;
+        dispatched: boolean;
+        rejectionEmitted: boolean;
+    }
+
+    export interface RuntimeEvent<T = unknown> {
+        name: number;
+        data: T;
+        context: RuntimeEventContext;
+    }
+
     /**
      * A listener called synchronously with one payload and an undefined
      * `this` argument. `T` is a caller-supplied convention, not runtime validation;
      * an emit with no payload supplies `undefined`. Return values are ignored,
      * including promises, which are not awaited.
      */
-    export type Listener<T = unknown> = (this: void, payload: T) => void;
+    export type Listener<T = unknown, R = void> = (this: void, payload: T) => R;
 
     /**
      * An idempotent function that removes one registration. Dropping the
@@ -61,12 +77,16 @@ declare namespace CModuleEvBus {
     /**
      * Register a listener and return its unsubscribe function. Each call is a
      * separate registration, including repeated calls with the same callback.
+     * Priority affects only the native runtime-event channel; higher values run
+     * first and equal values retain registration order. Other events always use
+     * registration order.
      * @throws {TypeError} If a name is not a string or listener is not callable.
      */
-    export function on<T = unknown>(
+    export function on<T = unknown, R = void>(
         namespace: string,
         event: string,
-        listener: Listener<T>,
+        listener: Listener<T, R>,
+        priority?: number,
     ): Unsubscribe;
 
     /**
@@ -79,4 +99,10 @@ declare namespace CModuleEvBus {
      * @throws {TypeError} If a name is not a string.
      */
     export function emit<T = unknown>(namespace: string, event: string, payload?: T): boolean;
+
+    /**
+     * Dispatch a runtime event through the same native path used by the core.
+     * Intended for lifecycle bridges and tests; ordinary publishers use emit().
+     */
+    export function dispatchRuntimeEvent<T = unknown>(eventName: number, data?: T): boolean;
 }

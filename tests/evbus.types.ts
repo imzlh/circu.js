@@ -11,7 +11,8 @@ type BuiltinExport = Assert<Equal<typeof evbus, typeof CModuleEvBus>>;
 type ListedModule = Assert<Equal<TjsModules['evbus'], typeof CModuleEvBus>>;
 type PublicMethods = Assert<Equal<
     keyof typeof evbus,
-    'set' | 'get' | 'has' | 'delete' | 'clear' | 'on' | 'emit'
+    'RUNTIME_NAMESPACE' | 'RUNTIME_EVENT' | 'set' | 'get' | 'has' | 'delete' |
+    'clear' | 'on' | 'emit' | 'dispatchRuntimeEvent'
 >>;
 
 const setResult = evbus.set('app', 'counter', 1);
@@ -22,6 +23,7 @@ const hasCounter = evbus.has('app', 'counter');
 const deleted = evbus.delete('app', 'counter');
 const delivered = evbus.emit('app', 'changed', { count: 1 });
 const deliveredWithoutPayload = evbus.emit('app', 'changed');
+const runtimeResult = evbus.dispatchRuntimeEvent(2, 0);
 type SetResult = Assert<Equal<typeof setResult, void>>;
 type ClearResult = Assert<Equal<typeof clearResult, void>>;
 type DefaultGet = Assert<Equal<typeof missingOrUnknown, unknown>>;
@@ -30,6 +32,14 @@ type HasResult = Assert<Equal<typeof hasCounter, boolean>>;
 type DeleteResult = Assert<Equal<typeof deleted, boolean>>;
 type EmitResult = Assert<Equal<typeof delivered, boolean>>;
 type EmitWithoutPayloadResult = Assert<Equal<typeof deliveredWithoutPayload, boolean>>;
+type RuntimeResult = Assert<Equal<typeof runtimeResult, boolean>>;
+
+evbus.on<CModuleEvBus.RuntimeEvent, boolean | undefined>(
+    evbus.RUNTIME_NAMESPACE,
+    evbus.RUNTIME_EVENT,
+    frame => frame.name === 1 ? true : undefined,
+    100,
+);
 
 const unsubscribe: CModuleEvBus.Unsubscribe = evbus.on<{ count: number }>(
     'app', 'changed', value => {
@@ -83,4 +93,4 @@ evbus.once('app', 'changed', () => {});
 evbus.deleteValue('app', 'counter');
 
 void [setResult, clearResult, missingOrUnknown, counter, hasCounter, deleted,
-    delivered, deliveredWithoutPayload, token];
+    delivered, deliveredWithoutPayload, runtimeResult, token];

@@ -5,7 +5,8 @@
 
 const { use } = import.meta;
 const console = use('console');
-const { onEvent, onModule, EventType, versions } = use('engine');
+const { onModule, EventType, versions } = use('engine');
+const evbus = use('evbus');
 const { exit, args, uname, exePath } = use('os');
 const { realpath } = use('fs');
 const worker = use('worker');
@@ -14,10 +15,10 @@ Reflect.set(globalThis, 'use', use);
 
 // override promise reject event handler
 const currentExceptions = [];
-onEvent((name, data) => {
+evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, ({ name, data }) => {
     if (name == EventType.UNHANDLED_REJECTION) {
         if (currentExceptions.some(e => e[0] === data[0])) {
-            return true;    // prevent duplicate error messages
+            return false;   // rejection handling continues only on explicit false
         }
 
         if (in_test) return;    // no log
@@ -29,7 +30,7 @@ onEvent((name, data) => {
         currentExceptions.push(data[0]);
         new Promise(() => void 0).then(() => currentExceptions.length = 0);
     }
-});
+}, 0);
 
 onModule({
     init(name, meta) {

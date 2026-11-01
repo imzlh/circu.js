@@ -944,19 +944,6 @@ static JSValue tjs__override_module_options(JSContext *ctx, JSValue this_val, in
 #undef IFOPT
 #undef IFOPT2
 
-static JSValue tjs__set_event_receiver(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    CHECK_IF_IN_SANDBOX();
-    
-    if (argc == 0 || !JS_IsFunction(ctx, argv[0])){
-        return JS_ThrowTypeError(ctx, "argument must be a function");
-    }
-
-    TJSRuntime* trt = TJS_GetRuntime(ctx);
-    JS_FreeValue(ctx, trt->builtins.dispatch_event_fn);
-    trt->builtins.dispatch_event_fn = JS_DupValue(ctx, argv[0]);
-    return JS_UNDEFINED;
-}
-
 static JSValue tjs__getset_promise_hook(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     CHECK_IF_IN_SANDBOX();
     TJSRuntime* trt = TJS_GetRuntime(ctx);
@@ -1031,7 +1018,10 @@ void tjs__run_next_ticks(TJSRuntime* trt) {
             tjs__stop_uncatchable_error(ctx, js_err);
         } else {
             JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, js_err);
-            if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+            if (JS_IsException(retv)) {
+                TJS_DumpException(ctx);
+            }
+            if (JS_IsException(retv) || (JS_IsBool(retv) && !JS_VALUE_GET_BOOL(retv))) {
                 TJS_Stop(trt);
             }
             JS_FreeValue(ctx, retv);
@@ -1351,7 +1341,6 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
     TJS_CFUNC_DEF("evalCompiled", 1, tjs_eval_compiled),
     TJS_CFUNC_DEF("onModule", 1, tjs__override_module_options),
-    TJS_CFUNC_DEF("onEvent", 1, tjs__set_event_receiver),
 	TJS_CFUNC_DEF("promiseHook", 2, tjs__getset_promise_hook),
     TJS_CFUNC_DEF("setNextTickDrain", 1, tjs__set_nexttick_drain),
     TJS_CFUNC_DEF("notifyNextTick", 0, tjs__notify_nexttick),

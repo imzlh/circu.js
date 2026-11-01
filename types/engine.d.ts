@@ -106,14 +106,18 @@ declare namespace CModuleEngine {
         UNHANDLED_REJECTION = 0,
         JOB_EXCEPTION,
         EXIT,
-        LOAD
+        LOAD,
+        BEFORE_UNLOAD,
+        BEFORE_EXIT
     }
 
     export interface GlobalEvents {
         [EventType.EXIT]: number,
         [EventType.UNHANDLED_REJECTION]: [this: Promise<unknown>, reason: unknown],
         [EventType.JOB_EXCEPTION]: Error | unknown,
-        [EventType.LOAD]: undefined
+        [EventType.LOAD]: undefined,
+        [EventType.BEFORE_UNLOAD]: undefined,
+        [EventType.BEFORE_EXIT]: number
     }
 
     /**
@@ -392,16 +396,6 @@ declare namespace CModuleEngine {
          */
         attrchk?: (attr: Record<string, unknown>) => void;
     }): void;
-
-    /**
-     * Replace the runtime event handler.
-     *
-     * Return true to mark handled, otherwise runtime may process the event
-     * itself (for example, exit behavior). Only one handler is active.
-     */
-    export function onEvent(cb:
-        <T extends EventType>(eventName: T, eventData: GlobalEvents[T]) => boolean
-    ): void;
 
     /**
      * Get/Set Promise hook

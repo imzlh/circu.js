@@ -312,14 +312,10 @@ JSValue tjs__dispatch_event(JSContext *ctx, TJSEvents ev, JSValue data) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
 
-    if (qrt->freeing || JS_IsUndefined(qrt->builtins.dispatch_event_fn)) {
+    if (qrt->freeing) {
         return JS_UNDEFINED;
     }
-
-    JSValue ret = JS_Call(ctx, qrt->builtins.dispatch_event_fn, JS_NULL, 2, (JSValueConst[]){
-		JS_NewInt32(ctx, ev), data
-	});
-    return ret;
+    return tjs__mod_evbus_dispatch_runtime_event(ctx, ev, data);
 }
 
 void tjs__dispatch_event2(JSContext *ctx, TJSEvents ev, JSValue data) {
@@ -364,7 +360,10 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
             return;
         }
 		JSValue retv = tjs__dispatch_event(ctx, EV_JOB_EXCEPTION, err);
-		if (JS_IsEqual(ctx, retv, JS_FALSE)) {
+        if (JS_IsException(retv)) {
+            TJS_DumpException(ctx);
+        }
+		if (JS_IsException(retv) || (JS_IsBool(retv) && !JS_VALUE_GET_BOOL(retv))) {
 			CHECK_NOT_NULL(trt);
 #ifdef DEBUG
 			fprintf(stderr, "[CORE] CALLED: ");

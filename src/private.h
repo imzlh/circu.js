@@ -125,7 +125,6 @@ struct TJSRuntime {
         int64_t next_timer;
     } timers;
     struct {
-        JSValue dispatch_event_fn;
         JSValue promise_hook_fn;
 		JSValue message_pipe;	// for worker messaging
 		JSValue worker_udata;	// user-data passed from parent
@@ -217,6 +216,8 @@ void tjs__mod_dns_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_dns_drain_runtime(TJSRuntime *trt);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_evbus_init(JSContext *ctx, JSValue ns);
+JSValue tjs__mod_evbus_dispatch_runtime_event(JSContext *ctx, int32_t event_name,
+                                              JSValueConst data);
 void tjs__mod_evbus_cleanup_context(App *app);
 void tjs__mod_evbus_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);

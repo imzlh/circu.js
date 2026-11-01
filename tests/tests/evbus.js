@@ -3,6 +3,78 @@ const engine = import.meta.use('engine');
 
 const namespacePrefix = `circu.tests.evbus.${Date.now()}`;
 
+await test('evbus - runtime nested snapshots preserve sticky cancellation', () => {
+    let nested = false;
+    let calls = 0;
+    const offFirst = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, () => {
+        if (!nested) {
+            nested = true;
+            assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.BEFORE_UNLOAD), true);
+        }
+        return true;
+    }, 100);
+    const offLast = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, () => {
+        calls++;
+        offFirst();
+        engine.gc.run();
+        return false;
+    }, -100);
+    try {
+        assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.BEFORE_UNLOAD), true);
+        assertEquals(calls, 2, 'both nested snapshots must finish');
+    } finally {
+        offFirst();
+        offLast();
+    }
+});
+
+await test('evbus - same-realm runtime lifecycle exceptions retain identity', () => {
+    for (const name of ['BEFORE_EXIT', 'BEFORE_UNLOAD']) {
+        const marker = new Error(name);
+        let off = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, () => {
+            off();
+            engine.gc.run();
+            throw marker;
+        });
+        let caught;
+        try {
+            evbus.dispatchRuntimeEvent(engine.EventType[name]);
+        } catch (error) {
+            caught = error;
+        } finally {
+            off();
+        }
+        assert(caught === marker, 'lifecycle dispatch must preserve the pending exception');
+    }
+});
+
+await test('evbus - detached runtime snapshot consumes exceptions before releasing realms', () => {
+    for (const name of ['BEFORE_EXIT', 'BEFORE_UNLOAD', 'JOB_EXCEPTION']) {
+        let sandbox = new engine.Sandbox();
+        sandbox.global.evbus = evbus;
+        const marker = new Error(name);
+        sandbox.global.marker = marker;
+        const off = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, () => {
+            sandbox = null;
+            engine.gc.run();
+        }, 100);
+        sandbox.call(`evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, () => {
+            throw marker;
+        })`);
+        let caught;
+        try {
+            evbus.dispatchRuntimeEvent(engine.EventType[name]);
+        } catch (error) {
+            caught = error;
+        } finally {
+            off();
+        }
+        assert(caught === (name === 'JOB_EXCEPTION' ? undefined : marker),
+            'only lifecycle listener exceptions propagate');
+        engine.gc.run();
+    }
+});
+
 function assertTypeError(fn, message) {
     let thrown;
     try {
@@ -85,6 +157,17 @@ await test('evbus - listeners are synchronous, ordered, and isolated', () => {
     assertEquals(evbus.emit(namespace, 'message', payload), false, 'unsubscribe must be idempotent');
 });
 
+await test('evbus - application events ignore runtime listener priority', () => {
+    const namespace = `${namespacePrefix}.application-priority`;
+    const calls = [];
+    const offFirst = evbus.on(namespace, 'event', () => calls.push('first'), -100);
+    const offSecond = evbus.on(namespace, 'event', () => calls.push('second'), 100);
+    evbus.emit(namespace, 'event');
+    assertEquals(calls.join(','), 'first,second');
+    offFirst();
+    offSecond();
+});
+
 await test('evbus - dispatch uses a stable listener snapshot', () => {
     const namespace = `${namespacePrefix}.snapshot`;
     const calls = [];
@@ -137,6 +220,37 @@ await test('evbus - listener failures propagate and stop dispatch', () => {
     assertEquals(evbus.emit(namespace, 'event'), true);
     assertEquals(laterCalls, 1, 'remaining listeners must stay registered after an error');
     offLater();
+});
+
+await test('evbus - runtime events are prioritized and independently removable', () => {
+    const calls = [];
+    let sharedContext;
+    const offLow = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, frame => {
+        calls.push('low');
+        assert(frame.context === sharedContext, 'runtime listeners must share one context');
+        return false;
+    }, -10);
+    const offHigh = evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, frame => {
+        calls.push('high');
+        sharedContext = frame.context;
+        frame.context.handled = true;
+        return true;
+    }, 10);
+
+    assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.JOB_EXCEPTION, new Error('test')), false);
+    assertEquals(calls.join(','), 'high,low', 'higher priority listeners run first');
+
+    calls.length = 0;
+    sharedContext = undefined;
+    offLow();
+    assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.JOB_EXCEPTION, new Error('test')), true);
+    assertEquals(calls.join(','), 'high', 'unsubscribing one listener leaves the other installed');
+    offHigh();
+
+    assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.UNHANDLED_REJECTION, []), false,
+        'an event with no listeners uses its native default');
+    assertEquals(evbus.dispatchRuntimeEvent(engine.EventType.JOB_EXCEPTION, new Error('test')), true,
+        'job exceptions default to non-fatal without listeners');
 });
 
 await test('evbus - sandboxes share the runtime bus and release owned entries', () => {

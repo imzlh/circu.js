@@ -113,8 +113,11 @@ substitute for releasing resources explicitly.
 
 Sandboxes that have access to the module share their runtime's bus and values
 by identity. Workers have separate QuickJS runtimes and separate buses. The bus
-is not a sandbox security boundary, and its events are not automatically
-connected to `engine.onEvent` or runtime lifecycle events.
+is not a sandbox security boundary. Native runtime events are published on
+`evbus.RUNTIME_NAMESPACE` / `evbus.RUNTIME_EVENT`; listeners can be removed with
+the unsubscribe function, so no module owns a global single receiver. The
+optional fourth argument to `on()` is a priority for that native channel only;
+ordinary application events remain registration ordered.
 
 `evbus` is built in on the current runtime, including workers. On an older
 runtime, `import.meta.use('evbus')` may return `null`; callers supporting both

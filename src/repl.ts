@@ -26,6 +26,7 @@ const os = import.meta.use('os');
 const streams = import.meta.use('streams');
 const signal = import.meta.use('signals');
 const engine = import.meta.use('engine');
+const evbus = import.meta.use('evbus');
 const console = import.meta.use('console');
 const fs = import.meta.use('asyncfs');
 const sfs = import.meta.use('fs');
@@ -1078,8 +1079,11 @@ class CJSRepl {
     }
 }
 
-// prevent default unhandled rejections
-engine.onEvent(e => false);
+// Keep the REPL alive after asynchronous errors.
+evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, ({ name }) =>
+    name === engine.EventType.JOB_EXCEPTION ? true : false,
+    -100,
+);
 
 // Load History — must complete before REPL starts
 let home: undefined | string;

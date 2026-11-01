@@ -310,7 +310,8 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
         JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)
     });
 
-    JSValue ret = tjs__dispatch_event(ctx, EV_UNHANDLED_REJECTION, args);
+    JSValue ret = JS_IsException(args) ? JS_EXCEPTION
+        : tjs__dispatch_event(ctx, EV_UNHANDLED_REJECTION, args);
     JS_FreeValue(ctx, args);
 
     if (JS_IsException(ret)) {
@@ -519,7 +520,6 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 
     /* Load some builtin references for easy access */
     qrt->builtins.promise_hook_fn = JS_UNDEFINED;
-    qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
     qrt->builtins.worker_udata = JS_UNDEFINED;
     qrt->builtins.message_pipe = JS_UNDEFINED;
     qrt->builtins.nexttick_drain_fn = JS_UNDEFINED;
@@ -659,8 +659,6 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* remove built-in data */
     JS_FreeValue(ctx, qrt->builtins.worker_udata);
     qrt->builtins.worker_udata = JS_UNDEFINED;
-    JS_FreeValue(ctx, qrt->builtins.dispatch_event_fn);
-    qrt->builtins.dispatch_event_fn = JS_UNDEFINED;
     /* Unregister before freeing the function: the hook fires from
      * js_promise_new and fulfill_or_reject_promise, both of which are still
      * reachable from the job drain and GC below. Leaving rt->promise_hook
@@ -851,7 +849,10 @@ static bool tjs__execute_pending_jobs(TJSRuntime* trt) {
                     return true;
                 }
                 JSValue retv = tjs__dispatch_event(ctx1, EV_JOB_EXCEPTION, js_err);
-                bool stop = JS_IsEqual(ctx1, retv, JS_FALSE);
+                if (JS_IsException(retv)) {
+                    TJS_DumpException(ctx1);
+                }
+                bool stop = JS_IsException(retv) || (JS_IsBool(retv) && !JS_VALUE_GET_BOOL(retv));
                 if (stop) {
 #ifdef DEBUG
                     fprintf(stderr, "[CORE] JOB: ");
@@ -1012,17 +1013,9 @@ static bool tjs__has_new_work(TJSRuntime* qrt) {
  * Returns true when the caller must give the loop another pass.
  *
  * RETURN-VALUE POLARITY: only an explicit JS `true` means "cancelled, keep
- * running". This is forced by the JS side, not a free choice. The multiplexer
- * that owns the native receiver ends every dispatch with
- * `typeof ret === 'boolean' ? ret : defaultReturn(name)`, and defaultReturn
- * (cts/src/runtime/event-mux.ts:104-107) yields `false` for every id except
- * EV_JOB_EXCEPTION. No receiver knows EV_BEFORE_UNLOAD, so an un-bridged mux
- * returns `false` on every dispatch. Had `false` meant "cancelled" (as the
- * other two sites' polarities might suggest) every single run would re-dispatch
- * forever and never exit. Choosing `true` also makes both degenerate returns
- * safe: tjs__dispatch_event yields JS_UNDEFINED when the runtime is freeing or
- * no receiver is installed, and JS_EXCEPTION when a listener throws — neither
- * is JS_TRUE, so both fall through to teardown instead of hanging. */
+ * running". Runtime events use evbus snapshots; BEFORE_UNLOAD cancellation
+ * is sticky across listeners. No listeners means false. Listener exceptions
+ * from BEFORE_EXIT/BEFORE_UNLOAD are handled before teardown continues. */
 static bool tjs__lifecycle_drain(TJSRuntime* qrt) {
     if (qrt->unload_dispatched)
         return false;
@@ -1085,11 +1078,8 @@ static bool tjs__lifecycle_drain(TJSRuntime* qrt) {
      * teardown path where a pending exception has no later consumer.
      *
      * Two OBSERVED consequences of the loose form, both against the documented
-     * contract above. `engine.onEvent` is a single-slot setter reachable from
-     * user JS (Symbol.for('cjs.internal.use')('engine'), because
-     * CJS_USE_SYMBOL_INTERNAL puts `use` on a global symbol), so a receiver that
-     * is not the multiplexer is not hypothetical -- the REPL shipped one, see
-     * src/commands/repl/index.ts.
+     * contract above. Runtime receivers are ordinary evbus subscriptions, so
+     * user code can still return arbitrary values here.
      *   1. '1', [1], new Boolean(true) and 1 all cancelled teardown, so the
      *      "only an explicit JS `true`" contract was not enforced.
      *   2. For an object receiver, js_eq_slow reaches JS_ToPrimitiveFree and runs
