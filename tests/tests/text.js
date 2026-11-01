@@ -262,3 +262,29 @@ await test('text.Decoder - invalid data in non-fatal mode', () => {
     const decoded = decoder.decode(invalidData);
     assert(typeof decoded === 'string', 'Should return string even with invalid data');
 });
+
+await test('text.Decoder - truncated sequence yields one replacement', () => {
+    const decoder = new text.Decoder();
+    assertEquals(decoder.decode(new Uint8Array([0xe2, 0x82, 0x41])), '�A',
+        'E2 82 41 should decode to a single U+FFFD followed by "A"');
+});
+
+await test('text.Encoder.encode - lone surrogate yields one U+FFFD', () => {
+    const encoder = new text.Encoder();
+    const encoded = encoder.encode('\ud800');
+    assertEquals(encoded.length, 3, 'Lone surrogate should encode to 3 bytes');
+    assertEquals(encoded[0], 0xef, 'First byte of U+FFFD');
+    assertEquals(encoded[1], 0xbf, 'Second byte of U+FFFD');
+    assertEquals(encoded[2], 0xbd, 'Third byte of U+FFFD');
+});
+
+await test('text.Encoder.encodeInto - lone surrogate writes U+FFFD', () => {
+    const encoder = new text.Encoder();
+    const dest = new Uint8Array(8);
+    const result = encoder.encodeInto('\ud800', dest);
+    assertEquals(result.read, 1, 'Should read one UTF-16 unit');
+    assertEquals(result.written, 3, 'Should write 3 bytes');
+    assertEquals(dest[0], 0xef, 'First byte of U+FFFD');
+    assertEquals(dest[1], 0xbf, 'Second byte of U+FFFD');
+    assertEquals(dest[2], 0xbd, 'Third byte of U+FFFD');
+});

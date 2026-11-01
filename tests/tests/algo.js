@@ -353,3 +353,14 @@ await test('algo - invalid input handling', () => {
         assert(e instanceof Error, 'Should throw Error');
     }
 });
+
+await test('algo.XoshiroRNG - methods throw TypeError on foreign this', () => {
+    for (const name of ['next', 'nextDouble', 'jump', 'longJump', 'clone']) {
+        try {
+            algo.XoshiroRNG.prototype[name].call({});
+            assert(false, `${name} should throw for a non-XoshiroRNG receiver`);
+        } catch (e) {
+            assert(e instanceof TypeError, `${name} should throw TypeError`);
+        }
+    }
+});

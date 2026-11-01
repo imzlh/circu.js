@@ -1345,7 +1345,7 @@ static JSValue xoshiro_constructor(JSContext *ctx, JSValueConst new_target, int 
 }
 
 static JSValue xoshiro_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    XoshiroRNG *rng = JS_GetOpaque(this_val, xoshiro_class_id);
+    XoshiroRNG *rng = JS_GetOpaque2(ctx, this_val, xoshiro_class_id);
     if (!rng) return JS_EXCEPTION;
     
     uint64_t result = xoshiro256_next(&rng->state);
@@ -1353,7 +1353,7 @@ static JSValue xoshiro_next(JSContext *ctx, JSValueConst this_val, int argc, JSV
 }
 
 static JSValue xoshiro_next_double(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    XoshiroRNG *rng = JS_GetOpaque(this_val, xoshiro_class_id);
+    XoshiroRNG *rng = JS_GetOpaque2(ctx, this_val, xoshiro_class_id);
     if (!rng) return JS_EXCEPTION;
     
     uint64_t result = xoshiro256_next(&rng->state);
@@ -1362,7 +1362,7 @@ static JSValue xoshiro_next_double(JSContext *ctx, JSValueConst this_val, int ar
 }
 
 static JSValue xoshiro_jump(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    XoshiroRNG *rng = JS_GetOpaque(this_val, xoshiro_class_id);
+    XoshiroRNG *rng = JS_GetOpaque2(ctx, this_val, xoshiro_class_id);
     if (!rng) return JS_EXCEPTION;
     
     xoshiro256_jump(&rng->state);
@@ -1371,7 +1371,7 @@ static JSValue xoshiro_jump(JSContext *ctx, JSValueConst this_val, int argc, JSV
 }
 
 static JSValue xoshiro_long_jump(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    XoshiroRNG *rng = JS_GetOpaque(this_val, xoshiro_class_id);
+    XoshiroRNG *rng = JS_GetOpaque2(ctx, this_val, xoshiro_class_id);
     if (!rng) return JS_EXCEPTION;
     
     xoshiro256_long_jump(&rng->state);
@@ -1380,7 +1380,7 @@ static JSValue xoshiro_long_jump(JSContext *ctx, JSValueConst this_val, int argc
 }
 
 static JSValue xoshiro_clone(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    XoshiroRNG *rng = JS_GetOpaque(this_val, xoshiro_class_id);
+    XoshiroRNG *rng = JS_GetOpaque2(ctx, this_val, xoshiro_class_id);
     if (!rng) return JS_EXCEPTION;
     
     XoshiroRNG *new_rng = js_mallocz(ctx, sizeof(*new_rng));

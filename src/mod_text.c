@@ -223,7 +223,9 @@ static bool encoding_is_utf8(const char *enc) {
 }
 
 /* Classify the UTF-8 sequence at p. A zero return denotes one complete,
- * well-formed scalar, whose byte count is written to width when requested. */
+ * well-formed scalar. When width is requested it receives the byte count of
+ * that scalar, or, for EILSEQ/EINVAL, the length of the maximal valid prefix
+ * (WHATWG "maximal subpart"; at least 1), so one replacement can cover it. */
 static int utf8_failure_kind(const uint8_t *p, size_t len, size_t *width) {
     const uint8_t lead = p[0];
     size_t need;
@@ -238,23 +240,36 @@ static int utf8_failure_kind(const uint8_t *p, size_t len, size_t *width) {
         need = 3;
     else if (lead >= 0xF0 && lead <= 0xF4)
         need = 4;
-    else
+    else {
+        if (width)
+            *width = 1;
         return EILSEQ;
+    }
 
     size_t available = len < need ? len : need;
+    size_t valid = 1;
     for (size_t i = 1; i < available; i++) {
-        if ((p[i] & 0xC0) != 0x80)
-            return EILSEQ;
+        uint8_t lo = 0x80, hi = 0xBF;
+        if (i == 1) {
+            if (lead == 0xE0) lo = 0xA0;
+            else if (lead == 0xED) hi = 0x9F;
+            else if (lead == 0xF0) lo = 0x90;
+            else if (lead == 0xF4) hi = 0x8F;
+        }
+        if (p[i] < lo || p[i] > hi)
+            break;
+        valid++;
     }
-    if (available > 1) {
-        if ((lead == 0xE0 && p[1] < 0xA0) ||
-            (lead == 0xED && p[1] >= 0xA0) ||
-            (lead == 0xF0 && p[1] < 0x90) ||
-            (lead == 0xF4 && p[1] >= 0x90))
-            return EILSEQ;
+    if (valid < available) {
+        if (width)
+            *width = valid;
+        return EILSEQ;
     }
-    if (len < need)
+    if (len < need) {
+        if (width)
+            *width = valid;
         return EINVAL;
+    }
     if (width)
         *width = need;
     return 0;
@@ -290,7 +305,10 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
  *  - On EILSEQ: if `fatal`, throws and returns -1; otherwise emits one
  *    replacement (U+FFFD for UTF-8 targets, '?' otherwise) and resyncs by
  *    skipping one source code unit -- `unit` bytes, from
- *    encoding_unit_width() of the *input* encoding.
+ *    encoding_unit_width() of the *input* encoding. For UTF-8 input the skip
+ *    is the maximal invalid prefix instead, so a truncated sequence yields one
+ *    replacement; `whole_surrogate` (encoder only) also skips a complete
+ *    ED A0..BF 80..BF lone-surrogate triplet as one unit.
  *  - On EINVAL (incomplete trailing sequence): stops and reports the number of
  *    unconsumed trailing bytes via *trailing_out (caller decides whether to
  *    buffer them for streaming or treat them as an error / replacement).
@@ -300,6 +318,7 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
 static int iconv_drive(JSContext *ctx, iconv_t cd,
                        const char *inbuf, size_t inlen,
                        bool fatal, bool to_utf8, bool source_is_utf8, size_t unit,
+                       bool whole_surrogate,
                        growbuf_t *gb, size_t *trailing_out) {
     char *inptr = (char *)inbuf;
     size_t inleft = inlen;
@@ -370,11 +389,15 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
              * always makes progress. A valid UTF-8 scalar rejected only by the
              * target encoding is skipped as one character instead. */
             size_t skip = (inleft < unit) ? inleft : unit;
-            if (source_is_utf8 && !to_utf8) {
-                size_t utf8_width;
-                if (utf8_failure_kind((const uint8_t *)inptr, inleft,
-                                      &utf8_width) == 0)
+            if (source_is_utf8) {
+                const uint8_t *ip = (const uint8_t *)inptr;
+                size_t utf8_width = 0;
+                int kind = utf8_failure_kind(ip, inleft, &utf8_width);
+                if (kind == EILSEQ || (kind == 0 && !to_utf8))
                     skip = utf8_width;
+                if (whole_surrogate && inleft >= 3 && ip[0] == 0xED &&
+                    ip[1] >= 0xA0 && ip[1] <= 0xBF && (ip[2] & 0xC0) == 0x80)
+                    skip = 3; /* lone surrogate: one replacement, not three */
             }
             inptr += skip;
             inleft -= skip;
@@ -594,7 +617,8 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
     int rc = iconv_drive(ctx, dec->cd, conv_in, conv_len,
                          dec->fatal, /*to_utf8=*/true,
                          encoding_is_utf8(dec->encoding),
-                         encoding_unit_width(dec->encoding), &gb, &trailing);
+                         encoding_unit_width(dec->encoding),
+                         /*whole_surrogate=*/false, &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
         /* Incomplete sequence at the end of input. */
@@ -753,7 +777,8 @@ static JSValue tjs_text_encoder_encode(JSContext *ctx, JSValueConst this_val,
      * (which is the *target*), so malformed input resyncs byte by byte. */
     int rc = iconv_drive(ctx, enc->cd, str, str_len,
                          /*fatal=*/false, /*to_utf8=*/enc->is_utf8,
-                         /*source_is_utf8=*/true, /*unit=*/1, &gb, NULL);
+                         /*source_is_utf8=*/true, /*unit=*/1,
+                         /*whole_surrogate=*/true, &gb, NULL);
     JS_FreeCString(ctx, str);
 
     if (rc != 0) {
@@ -820,11 +845,18 @@ static JSValue tjs_text_encoder_encode_into(JSContext *ctx, JSValueConst this_va
         if (e == EINVAL)
             break; /* incomplete trailing unit: leave it unread */
         if (e == EILSEQ) {
-            /* Unrepresentable char in a custom target encoding. */
-            if (outleft == 0)
+            /* Lone surrogate (UTF-8 target: U+FFFD) or a char the custom
+             * target encoding cannot represent ('?'). */
+            size_t rlen = enc->is_utf8 ? sizeof kUtf8Replacement : 1;
+            if (outleft < rlen)
                 break;
-            *outptr++ = '?';
-            outleft--;
+            if (enc->is_utf8) {
+                memcpy(outptr, kUtf8Replacement, rlen);
+                outptr += rlen;
+            } else {
+                *outptr++ = '?';
+            }
+            outleft -= rlen;
             /* Skip one whole UTF-8 code point in the source. */
             unsigned char c = (unsigned char)*inptr;
             size_t adv = (c < 0x80) ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
@@ -923,7 +955,8 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     growbuf_t gb = {0};
     size_t trailing = 0;
     int rc = iconv_drive(ctx, cd, (const char *)inbuf, inlen,
-                         /*fatal=*/false, is_to_utf8, from_is_utf8, from_unit, &gb, &trailing);
+                         /*fatal=*/false, is_to_utf8, from_is_utf8, from_unit,
+                         /*whole_surrogate=*/false, &gb, &trailing);
 
     if (rc == 0 && trailing > 0) {
         /* Best-effort: stand in one replacement for the incomplete tail. */
