@@ -312,6 +312,51 @@ await test('ConnPool - advanced config', () => {
     pool.close();
 });
 
+await test('ConnPool - perform after close throws', () => {
+    const closedPool = new CURLMod.ConnPool();
+    const curl = new CURLMod.CURL(closedPool);
+    closedPool.close();
+
+    let threw = false;
+    try {
+        curl.setUrl('http://127.0.0.1:9/').perform();
+    } catch (e) {
+        threw = e instanceof TypeError;
+    }
+    assert(threw, 'perform() after pool.close() should throw a TypeError');
+});
+
+await test('CURL instance - getInfo ignores pointer-typed infos', () => {
+    const curl = new CURLMod.CURL(pool);
+    const CURLINFO_PRIVATE = 0x100000 + 21;  // CURLINFO_STRING + 21
+    const CURLINFO_CERTINFO = 0x400000 + 34; // CURLINFO_PTR + 34
+    assertEquals(curl.getInfo(CURLINFO_PRIVATE), null);
+    assertEquals(curl.getInfo(CURLINFO_CERTINFO), null);
+    assert(Array.isArray(curl.getInfo(CURLMod.CURLINFO_COOKIELIST)), 'COOKIELIST should be an array');
+});
+
+await test('CURL instance - setMimePost rejects bad parts', () => {
+    const curl = new CURLMod.CURL(pool);
+
+    let threw = false;
+    try {
+        curl.setMimePost([{ name: 'a', data: 'ok' }, 42]);
+    } catch (e) {
+        threw = e instanceof TypeError;
+    }
+    assert(threw, 'non-object part should throw a TypeError');
+
+    threw = false;
+    try {
+        curl.setMimePost([{ name: 'a', data: {} }]);
+    } catch (e) {
+        threw = e instanceof TypeError;
+    }
+    assert(threw, 'invalid part data should throw a TypeError');
+
+    curl.setMimePost([{ name: 'a', data: 'ok' }]); // valid input still works
+});
+
 // ============ Advanced feature tests ===========
 
 await test('CURL instance - SSL/TLS options', async () => {

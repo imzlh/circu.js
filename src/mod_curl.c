@@ -75,6 +75,7 @@ typedef struct TJSConnPool {
     struct list_head curls; /* live TJSCURL handles (TJSCURL.link) */
 
     int open_handles;       /* outstanding uv handles (timer, prep, socket polls) */
+    int callback_depth;     /* JS calls currently running from libcurl callbacks */
     bool freeing;           /* finalizer ran; free the struct once open_handles == 0 */
 } TJSConnPool;
 
@@ -200,6 +201,17 @@ static void curl_release_self_rt(JSRuntime *rt, TJSCURL *curl) {
     JS_FreeValueRT(rt, self);
 }
 
+/* libcurl rejects multi API calls made from inside its own callbacks
+ * (CURLM_RECURSIVE_API_CALL), so close()/abort()/reset() must not tear state
+ * down while a JS callback invoked from libcurl is running. */
+static void pool_enter_callback(TJSConnPool *pool) {
+    if (pool) pool->callback_depth++;
+}
+
+static void pool_leave_callback(TJSConnPool *pool) {
+    if (pool && pool->callback_depth > 0) pool->callback_depth--;
+}
+
 static int connpool_require_open(JSContext *ctx, TJSConnPool *pool) {
     if (!pool->multi_handle) {
         JS_ThrowTypeError(ctx, "ConnPool is closed");
@@ -242,8 +254,11 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         args[0] = JS_NewArrayBufferCopy(curl->ctx, (const uint8_t *) ptr, realsize);
 
         // Mark that we're inside a callback to prevent reentry destruction
+        TJSConnPool *pool = curl->pool; /* may become NULL during the call */
         curl->in_callback = true;
+        pool_enter_callback(pool);
         JSValue ret = JS_Call(curl->ctx, curl->on_data, JS_UNDEFINED, 1, args);
+        pool_leave_callback(pool);
         curl->in_callback = false;
         JS_FreeValue(curl->ctx, args[0]);
 
@@ -307,8 +322,11 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     if (!JS_IsUndefined(curl->on_header)) {
         JSValue args[1];
         args[0] = JS_NewStringLen(curl->ctx, ptr, realsize);
+        TJSConnPool *pool = curl->pool; /* may become NULL during the call */
         curl->in_callback = true;
+        pool_enter_callback(pool);
         JSValue ret = JS_Call(curl->ctx, curl->on_header, JS_UNDEFINED, 1, args);
+        pool_leave_callback(pool);
         curl->in_callback = false;
         JS_FreeValue(curl->ctx, args[0]);
         if (JS_IsException(ret)) {
@@ -350,8 +368,11 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
                                       curl->response_headers.size)
                     : JS_NewString(curl->ctx, ""),
             };
+            TJSConnPool *pool = curl->pool; /* may become NULL during the call */
             curl->in_callback = true;
+            pool_enter_callback(pool);
             JSValue ret = JS_Call(curl->ctx, curl->on_headers_complete, JS_UNDEFINED, 2, args);
+            pool_leave_callback(pool);
             curl->in_callback = false;
             JS_FreeValue(curl->ctx, args[0]);
             JS_FreeValue(curl->ctx, args[1]);
@@ -377,8 +398,11 @@ static int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow
             JS_NewInt64(curl->ctx, ultotal),
             JS_NewInt64(curl->ctx, ulnow),
         };
+        TJSConnPool *pool = curl->pool; /* may become NULL during the call */
         curl->in_callback = true;
+        pool_enter_callback(pool);
         JSValue ret = JS_Call(curl->ctx, curl->on_progress, JS_UNDEFINED, 4, args);
+        pool_leave_callback(pool);
         curl->in_callback = false;
         for (int i = 0; i < 4; i++) JS_FreeValue(curl->ctx, args[i]);
 
@@ -404,8 +428,11 @@ static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t s
         JS_NewInt32(curl->ctx, (int32_t) type),
         JS_NewArrayBufferCopy(curl->ctx, (const uint8_t *) data, size),
     };
+    TJSConnPool *pool = curl->pool; /* may become NULL during the call */
     curl->in_callback = true;
+    pool_enter_callback(pool);
     JSValue ret = JS_Call(curl->ctx, curl->on_debug, JS_UNDEFINED, 2, args);
+    pool_leave_callback(pool);
     curl->in_callback = false;
     JS_FreeValue(curl->ctx, args[0]);
     JS_FreeValue(curl->ctx, args[1]);
@@ -471,7 +498,13 @@ static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
     list_for_each_safe(el, el1, &pool->curls) {
         TJSCURL *c = list_entry(el, TJSCURL, link);
         if (pool->multi_handle && c->in_flight) {
+            /* Removal can emit debug output; JS must not run from here. */
+            curl_easy_setopt(c->handle, CURLOPT_VERBOSE, 0L);
+            curl_easy_setopt(c->handle, CURLOPT_DEBUGFUNCTION, NULL);
             curl_multi_remove_handle(pool->multi_handle, c->handle);
+            curl_easy_setopt(c->handle, CURLOPT_DEBUGFUNCTION, debug_callback);
+            curl_easy_setopt(c->handle, CURLOPT_VERBOSE,
+                             (c->verbose || !JS_IsUndefined(c->on_debug)) ? 1L : 0L);
             c->in_flight = false;
         }
         if (TJS_IsPromisePending(pool->ctx, &c->promise)) {
@@ -658,9 +691,11 @@ static JSValue body_to_arraybuffer(JSContext *ctx, DynBuf *b) {
 
 static JSValue get_response_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSValue body = JS_GetPropertyStr(ctx, this_val, "body");
+    if (JS_IsException(body)) return JS_EXCEPTION;
+    if (JS_IsUndefined(body)) return JS_NewString(ctx, "");
     size_t len = 0;
-    uint8_t *p = JS_IsUndefined(body) ? NULL : JS_GetArrayBuffer(ctx, &len, body);
-    JSValue s = p ? JS_NewStringLen(ctx, (const char *) p, len) : JS_NewString(ctx, "");
+    uint8_t *p = JS_GetArrayBuffer(ctx, &len, body);
+    JSValue s = p ? JS_NewStringLen(ctx, (const char *) p, len) : JS_EXCEPTION;
     JS_FreeValue(ctx, body);
     return s;
 }
@@ -764,12 +799,14 @@ static void check_multi_info(TJSConnPool *pool) {
             curl->effective_url = js_strdup(curl->ctx, url);
         }
 
+        /* msg points into multi-owned storage that removal invalidates. */
+        CURLcode result = msg->data.result;
         curl_multi_remove_handle(pool->multi_handle, easy);
 
         JSValue arg;
-        bool is_reject = (msg->data.result != CURLE_OK);
+        bool is_reject = (result != CURLE_OK);
         if (is_reject) {
-            arg = build_error(curl->ctx, curl->error_buffer, msg->data.result);
+            arg = build_error(curl->ctx, curl->error_buffer, result);
         } else {
             arg = build_response(curl->ctx, curl);
         }
@@ -867,6 +904,11 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     /* unlink from the pool's live list if still attached */
     if (curl->pool && !list_empty(&curl->link)) {
         if (curl->pool->multi_handle && curl->in_flight) {
+            /* Removal can emit debug output; JS must not run from a finalizer. */
+            if (curl->handle) {
+                curl_easy_setopt(curl->handle, CURLOPT_VERBOSE, 0L);
+                curl_easy_setopt(curl->handle, CURLOPT_DEBUGFUNCTION, NULL);
+            }
             curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
         }
         curl->in_flight = false;
@@ -876,6 +918,8 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     curl->pool = NULL;
 
     if (curl->handle) {
+        curl_easy_setopt(curl->handle, CURLOPT_VERBOSE, 0L);
+        curl_easy_setopt(curl->handle, CURLOPT_DEBUGFUNCTION, NULL);
         curl_easy_cleanup(curl->handle);
     }
 
@@ -1044,9 +1088,24 @@ static JSValue tjs_connpool_get_active_count(JSContext *ctx, JSValueConst this_v
     if (!pool) return JS_EXCEPTION;
     if (!pool->multi_handle) return JS_NewInt32(ctx, 0);
 
-    /* read the running-transfer count without driving IO as a side effect */
+    /* Inside a libcurl callback the multi handle must not be re-entered. */
+    if (pool->callback_depth > 0) {
+        int32_t active = 0;
+        struct list_head *el;
+        list_for_each(el, &pool->curls) {
+            if (list_entry(el, TJSCURL, link)->in_flight) active++;
+        }
+        return JS_NewInt32(ctx, active);
+    }
+
+    /* Read `running` before check_multi_info(): settling promises can run JS
+     * that closes the pool. Then drain completions like the other drivers. */
     int running = 0;
-    curl_multi_socket_action(pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
+    MSACT(pool, pool->multi_handle, CURL_SOCKET_TIMEOUT, 0, &running);
+    if (pool->multi_handle) {
+        check_multi_info(pool);
+        if (pool->multi_handle) kick_prep_once(pool);
+    }
     return JS_NewInt32(ctx, running);
 }
 
@@ -1055,6 +1114,8 @@ static JSValue tjs_connpool_close(JSContext *ctx, JSValueConst this_val,
     TJSConnPool *pool = JS_GetOpaque2(ctx, this_val, tjs_connpool_class_id);
     if (!pool) return JS_EXCEPTION;
     if (!pool->multi_handle) return JS_UNDEFINED;
+    if (pool->callback_depth > 0)
+        return JS_ThrowTypeError(ctx, "Cannot close() a ConnPool from within a callback");
 
     typedef struct {
         TJSPromise promise;
@@ -1387,6 +1448,8 @@ static JSValue tjs_curl_get_headers(JSContext *ctx, JSValueConst this_val, int a
 
 static JSValue tjs_curl_set_body(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
+    if (curl->in_flight)
+        return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
 
     size_t len = 0;
     const uint8_t *data = NULL;
@@ -1752,6 +1815,8 @@ static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
     switch (info & CURLINFO_TYPEMASK) {
         case CURLINFO_STRING: {
             char *s = NULL;
+            /* PRIVATE yields the TJSCURL pointer, not a C string. */
+            if (info == CURLINFO_PRIVATE) return JS_NULL;
             if (curl_easy_getinfo(handle, info, &s) != CURLE_OK || !s) return JS_NULL;
             return JS_NewString(ctx, s);
         }
@@ -1771,6 +1836,10 @@ static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
             return JS_NewInt64(ctx, (int64_t) v);
         }
         case CURLINFO_SLIST: {
+            /* CURLINFO_PTR shares this type bit (CERTINFO, TLS_SESSION,
+             * TLS_SSL_PTR); those are not curl_slist results that we may
+             * walk or free. Only the real slist infos are allowed. */
+            if (info != CURLINFO_COOKIELIST && info != CURLINFO_SSL_ENGINES) return JS_NULL;
             struct curl_slist *list = NULL;
             if (curl_easy_getinfo(handle, info, &list) != CURLE_OK) return JS_NULL;
             JSValue arr = JS_NewArray(ctx);
@@ -2026,6 +2095,8 @@ static JSValue tjs_curl_set_share(JSContext *ctx, JSValueConst this_val, int arg
 
 static JSValue tjs_curl_set_upload_data(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
+    if (curl->in_flight)
+        return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
 
     size_t len = 0;
     const uint8_t *data;
@@ -2057,6 +2128,8 @@ static JSValue tjs_curl_set_upload_data(JSContext *ctx, JSValueConst this_val, i
 
 static JSValue tjs_curl_set_upload_file(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
+    if (curl->in_flight)
+        return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
@@ -2085,57 +2158,103 @@ static JSValue tjs_curl_set_upload_file(JSContext *ctx, JSValueConst this_val, i
 /* setMimePost([{ name, data?|file?, filename?, type? }, ...]) */
 static JSValue tjs_curl_set_mime_post(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
+    if (curl->in_flight)
+        return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
     if (!JS_IsObject(argv[0])) return JS_ThrowTypeError(ctx, "setMimePost expects an array of parts");
 
-    curl_clear_body_resources(JS_GetRuntime(ctx), curl);
+    /* Property reads can run JS, so the existing body is replaced only after
+     * the new mime tree is fully built. */
+    uint32_t len = 0;
+    JSValue lenv = JS_GetPropertyStr(ctx, argv[0], "length");
+    if (JS_IsException(lenv)) return JS_EXCEPTION;
+    if (JS_ToUint32(ctx, &len, lenv) < 0) {
+        JS_FreeValue(ctx, lenv);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, lenv);
+
     curl_mime *mime = curl_mime_init(curl->handle);
     if (!mime) return JS_ThrowOutOfMemory(ctx);
 
-    uint32_t len = 0;
-    JSValue lenv = JS_GetPropertyStr(ctx, argv[0], "length");
-    JS_ToUint32(ctx, &len, lenv);
-    JS_FreeValue(ctx, lenv);
-
     for (uint32_t i = 0; i < len; i++) {
         JSValue part = JS_GetPropertyUint32(ctx, argv[0], i);
+        if (JS_IsException(part)) goto fail;
+        if (!JS_IsObject(part)) {
+            JS_FreeValue(ctx, part);
+            JS_ThrowTypeError(ctx, "setMimePost parts must be objects");
+            goto fail;
+        }
         curl_mimepart *mp = curl_mime_addpart(mime);
+        if (!mp) {
+            JS_FreeValue(ctx, part);
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
 
         JSValue jn = JS_GetPropertyStr(ctx, part, "name");
-        const char *name = JS_IsString(jn) ? JS_ToCString(ctx, jn) : NULL;
-        if (name) curl_mime_name(mp, name);
-
         JSValue jfile = JS_GetPropertyStr(ctx, part, "file");
         JSValue jdata = JS_GetPropertyStr(ctx, part, "data");
-        if (JS_IsString(jfile)) {
+        JSValue jfn = JS_GetPropertyStr(ctx, part, "filename");
+        JSValue jtype = JS_GetPropertyStr(ctx, part, "type");
+        bool ok = !JS_IsException(jn) && !JS_IsException(jfile) && !JS_IsException(jdata) &&
+                  !JS_IsException(jfn) && !JS_IsException(jtype);
+
+        if (ok && JS_IsString(jn)) {
+            const char *name = JS_ToCString(ctx, jn);
+            if (name) { curl_mime_name(mp, name); JS_FreeCString(ctx, name); }
+            else ok = false;
+        }
+        if (ok && JS_IsString(jfile)) {
             const char *f = JS_ToCString(ctx, jfile);
             if (f) { curl_mime_filedata(mp, f); JS_FreeCString(ctx, f); }
-        } else if (!JS_IsUndefined(jdata)) {
+            else ok = false;
+        } else if (ok && !JS_IsUndefined(jdata)) {
             size_t dlen = 0;
             const char *cstr = NULL;
             const uint8_t *data;
             if (JS_IsString(jdata)) { cstr = JS_ToCStringLen(ctx, &dlen, jdata); data = (const uint8_t *) cstr; }
             else data = JS_GetAnyBuffer(ctx, &dlen, jdata);
-            if (data) curl_mime_data(mp, (const char *) data, dlen);
+            if (data) {
+                curl_mime_data(mp, (const char *) data, dlen);
+            } else {
+                if (!JS_HasException(ctx))
+                    JS_ThrowTypeError(ctx, "mime part data must be a string, ArrayBuffer or TypedArray");
+                ok = false;
+            }
             if (cstr) JS_FreeCString(ctx, cstr);
         }
+        if (ok && JS_IsString(jfn)) {
+            const char *fn = JS_ToCString(ctx, jfn);
+            if (fn) { curl_mime_filename(mp, fn); JS_FreeCString(ctx, fn); }
+            else ok = false;
+        }
+        if (ok && JS_IsString(jtype)) {
+            const char *t = JS_ToCString(ctx, jtype);
+            if (t) { curl_mime_type(mp, t); JS_FreeCString(ctx, t); }
+            else ok = false;
+        }
 
-        JSValue jfn = JS_GetPropertyStr(ctx, part, "filename");
-        if (JS_IsString(jfn)) { const char *fn = JS_ToCString(ctx, jfn); if (fn) { curl_mime_filename(mp, fn); JS_FreeCString(ctx, fn); } }
-        JSValue jtype = JS_GetPropertyStr(ctx, part, "type");
-        if (JS_IsString(jtype)) { const char *t = JS_ToCString(ctx, jtype); if (t) { curl_mime_type(mp, t); JS_FreeCString(ctx, t); } }
-
-        if (name) JS_FreeCString(ctx, name);
         JS_FreeValue(ctx, jn);
         JS_FreeValue(ctx, jfile);
         JS_FreeValue(ctx, jdata);
         JS_FreeValue(ctx, jfn);
         JS_FreeValue(ctx, jtype);
         JS_FreeValue(ctx, part);
+        if (!ok) goto fail;
     }
 
+    if (curl->in_flight) { /* a getter started a transfer */
+        JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
+        goto fail;
+    }
+    curl_clear_body_resources(JS_GetRuntime(ctx), curl);
     curl->mime = mime;
     curl_easy_setopt(curl->handle, CURLOPT_MIMEPOST, mime);
     return JS_DupValue(ctx, this_val);
+
+fail:
+    curl_mime_free(mime);
+    return JS_EXCEPTION;
 }
 
 #pragma endregion
@@ -2151,6 +2270,7 @@ static void curl_reset_buffers(TJSCURL *curl) {
     curl->headers_complete_fired = false;
     curl->header_status_code = 0;
     curl->upload_offset = 0;
+    curl->recv_pause_requested = false;
     if (curl->upload_fp) fseek(curl->upload_fp, 0, SEEK_SET);
 }
 
@@ -2158,7 +2278,8 @@ static JSValue tjs_curl_perform(JSContext *ctx, JSValueConst this_val, int argc,
     CURL_THIS(ctx, this_val);
 
     TJSConnPool *pool = curl->pool;
-    if (!pool || connpool_require_open(ctx, pool) < 0)
+    if (!pool) return JS_ThrowTypeError(ctx, "ConnPool is closed");
+    if (connpool_require_open(ctx, pool) < 0)
         return JS_EXCEPTION;
     if (curl->in_flight || TJS_IsPromisePending(ctx, &curl->promise))
         return JS_ThrowTypeError(ctx, "Request already in progress");
@@ -2199,6 +2320,9 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     if (curl->in_callback) {
         return JS_ThrowTypeError(ctx, "Cannot abort() from within a callback");
     }
+    if (curl->pool && curl->pool->callback_depth > 0) {
+        return JS_ThrowTypeError(ctx, "Cannot abort() from within a ConnPool callback");
+    }
 
     TJSConnPool *pool = curl->pool;
     TJSPromise promise = curl->promise;
@@ -2209,6 +2333,7 @@ static JSValue tjs_curl_abort(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->headers_complete_fired = false;
     curl->header_status_code = 0;
     curl->recv_paused = false;
+    curl->recv_pause_requested = false;
 
     if (pool && pool->multi_handle) {
         curl_multi_remove_handle(pool->multi_handle, curl->handle);
@@ -2295,6 +2420,10 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     if (curl->in_callback) {
         return JS_ThrowTypeError(ctx, "Cannot reset() from within a callback");
     }
+    /* Only an in-flight reset calls curl_multi_remove_handle(). */
+    if (curl->in_flight && curl->pool && curl->pool->callback_depth > 0) {
+        return JS_ThrowTypeError(ctx, "Cannot reset() from within a ConnPool callback");
+    }
 
     if (curl->in_flight && curl->pool && curl->pool->multi_handle) {
         curl_multi_remove_handle(curl->pool->multi_handle, curl->handle);
@@ -2316,6 +2445,7 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     curl->stream_mode = false;
     curl->verbose = false;
     curl->recv_paused = false;
+    curl->recv_pause_requested = false;
 
     JS_FreeValue(ctx, curl->on_data); curl->on_data = JS_UNDEFINED;
     JS_FreeValue(ctx, curl->on_progress); curl->on_progress = JS_UNDEFINED;
