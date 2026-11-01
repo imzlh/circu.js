@@ -271,11 +271,47 @@ await test('fs.rmdir - error on nonempty directory', () => {
     }
 });
 
+await test('fs.copy - same file is rejected and source survives', () => {
+    const src = TEST_DIR + '/copy_self.txt';
+    const alias = TEST_DIR + '/copy_self_link';
+    fs.writeFile(src, encode('keep me'));
+    fs.symlink(src, alias);
+    try {
+        fs.copy(src, alias);
+        assert(false, 'Should throw when source and destination are the same file');
+    } catch (e) {
+        assert(e instanceof Error, 'Should throw Error');
+    }
+    assertEquals(decoder.decode(new Uint8Array(fs.readFile(src))), 'keep me',
+        'Source content must be intact');
+    fs.unlink(alias);
+    fs.unlink(src);
+});
+
+await test('fs.copy - overwrites a longer destination', () => {
+    const src = TEST_DIR + '/copy_src.txt';
+    const dst = TEST_DIR + '/copy_dst.txt';
+    fs.writeFile(src, encode('short'));
+    fs.writeFile(dst, encode('a much longer destination'));
+    fs.copy(src, dst);
+    assertEquals(decoder.decode(new Uint8Array(fs.readFile(dst))), 'short',
+        'Destination should be truncated to the copied content');
+    fs.unlink(src);
+    fs.unlink(dst);
+});
+
+await test('fs.utimes - negative fractional time', () => {
+    const f = TEST_DIR + '/utimes_neg.txt';
+    fs.writeFile(f, encode('x'));
+    fs.utimes(f, -1.5, -1.5);
+    fs.unlink(f);
+});
+
 // Cleanup
 await test('fs - cleanup test files', () => {
     try {
         // Remove all test files
-        const files = [TEST_FILE, TEST_DIR + '/link', TEST_DIR + '/symlink', TEST_DIR + '/hardlink'];
+        const files = [TEST_FILE, TEST_DIR + '/copy_self.txt', TEST_DIR + '/copy_self_link', TEST_DIR + '/copy_src.txt', TEST_DIR + '/copy_dst.txt', TEST_DIR + '/utimes_neg.txt', TEST_DIR + '/link', TEST_DIR + '/symlink', TEST_DIR + '/hardlink'];
         for (const f of files) {
             try { fs.unlink(f); } catch (e) {}
         }

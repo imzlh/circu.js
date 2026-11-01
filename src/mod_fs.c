@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -285,8 +286,17 @@ static int64_t fs_pread(int fd, void* buf, int64_t len, int64_t off)
     ov.Offset = (DWORD) (off & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD rd = 0;
-    if (!ReadFile((HANDLE) _get_osfhandle(fd), buf, (DWORD) len, &rd, &ov)) {
-        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+    HANDLE h = (HANDLE) _get_osfhandle(fd);
+    /* An OVERLAPPED offset still moves the file pointer of a synchronous
+     * handle; save it so pread() leaves the position untouched. */
+    LARGE_INTEGER orig = { 0 }, zero = { 0 };
+    BOOL have_pos = SetFilePointerEx(h, zero, &orig, FILE_CURRENT);
+    BOOL ok = ReadFile(h, buf, (DWORD) len, &rd, &ov);
+    DWORD last = GetLastError();
+    if (have_pos) SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
+    if (!ok) {
+        if (last == ERROR_HANDLE_EOF) return 0;
+        SetLastError(last);
         return -1;
     }
     return rd;
@@ -297,8 +307,16 @@ static int64_t fs_pwrite(int fd, const void* buf, int64_t len, int64_t off)
     ov.Offset = (DWORD) (off & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD wr = 0;
-    if (!WriteFile((HANDLE) _get_osfhandle(fd), buf, (DWORD) len, &wr, &ov))
+    HANDLE h = (HANDLE) _get_osfhandle(fd);
+    LARGE_INTEGER orig = { 0 }, zero = { 0 };
+    BOOL have_pos = SetFilePointerEx(h, zero, &orig, FILE_CURRENT);
+    BOOL ok = WriteFile(h, buf, (DWORD) len, &wr, &ov);
+    DWORD last = GetLastError();
+    if (have_pos) SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
+    if (!ok) {
+        SetLastError(last);
         return -1;
+    }
     return wr;
 }
 #else
@@ -308,6 +326,7 @@ typedef off_t fs_off_t;
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
 #ifndef __APPLE__
 #include <sys/sendfile.h>
 #endif
@@ -384,6 +403,8 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
 
 #ifdef _WIN32
     flags |= O_BINARY | O_NOINHERIT;  /* Always binary mode on Windows */
+#else
+    flags |= O_CLOEXEC;  /* Do not leak fds into spawned children */
 #endif
 
     return flags;
@@ -1105,15 +1126,12 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
 #ifndef _WIN32
-                // Wait for data to be available
-                fd_set readfds;
-                FD_ZERO(&readfds);
-                FD_SET(fd, &readfds);
-
-                int ret = select(fd + 1, &readfds, NULL, NULL, NULL);
+                // Wait for data to be available (poll: select() overflows fd_set at fd >= 1024)
+                struct pollfd pfd = { .fd = fd, .events = POLLIN };
+                int ret = poll(&pfd, 1, -1);
                 if (ret < 0) {
                     if (errno == EINTR) continue;
-                    THROW("select");
+                    THROW("poll");
                 }
                 continue;
 #else
@@ -1155,14 +1173,11 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
 #ifndef _WIN32
-                fd_set writefds;
-                FD_ZERO(&writefds);
-                FD_SET(fd, &writefds);
-
-                int ret = select(fd + 1, NULL, &writefds, NULL, NULL);
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                int ret = poll(&pfd, 1, -1);
                 if (ret < 0) {
                     if (errno == EINTR) continue;
-                    THROW("select");
+                    THROW("poll");
                 }
                 continue;
 #else
@@ -1294,7 +1309,7 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     fd = tjs__wopen_shared(wpath, O_RDONLY | O_BINARY, 0);
     free(wpath);
 #else
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
 #endif
     if (fd < 0) {
         JSValue err = tjs_throw_errno_path(ctx, fs_errno2uv(errno), path);
@@ -1441,7 +1456,7 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
     fd = tjs__wopen_shared(wpath, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
     free(wpath);
 #else
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
 #endif
 
     if (fd < 0) {
@@ -2018,7 +2033,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     ssize_t bytes_copied;
 
     // Open source file (read-only)
-    src_fd = open(src_path, O_RDONLY);
+    src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
     if (src_fd == -1) {
         int uv_err = fs_errno2uv(errno);
         JSValue err = tjs_throw_errno_path(ctx, uv_err, src_path);
@@ -2043,11 +2058,40 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "Source is not a regular file");
     }
 
-    // Open destination file (create, write-only, with same permissions as source)
-    dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
+    // Open destination file (create, write-only, with same permissions as source).
+    // No O_TRUNC here: truncating before the identity check below would destroy
+    // the source when dest is the same file.
+    dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_CLOEXEC, src_stat.st_mode);
     if (dest_fd == -1) {
         int uv_err = fs_errno2uv(errno);
         close(src_fd);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return err;
+    }
+
+    struct stat dest_stat;
+    if (fstat(dest_fd, &dest_stat) == -1) {
+        int uv_err = fs_errno2uv(errno);
+        close(src_fd);
+        close(dest_fd);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return err;
+    }
+    if (dest_stat.st_dev == src_stat.st_dev && dest_stat.st_ino == src_stat.st_ino) {
+        close(src_fd);
+        close(dest_fd);
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_ThrowTypeError(ctx, "Source and destination are the same file");
+    }
+    if (S_ISREG(dest_stat.st_mode) && ftruncate(dest_fd, 0) == -1) {
+        int uv_err = fs_errno2uv(errno);
+        close(src_fd);
+        close(dest_fd);
         JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
@@ -2060,6 +2104,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     off_t offset = 0;
     // Loop to handle partial writes and EINTR
     bytes_copied = 0;
+    int copy_errno = 0;
     while (offset < src_stat.st_size) {
         size_t to_send = (size_t) (src_stat.st_size - offset);
         // Limit chunk size to avoid issues with large files on 32-bit systems
@@ -2067,6 +2112,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
         ssize_t ret = sendfile(dest_fd, src_fd, &offset, to_send);
         if (ret < 0) {
             if (errno == EINTR) continue;
+            copy_errno = errno;
             bytes_copied = -1;
             break;
         }
@@ -2081,10 +2127,12 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     char buffer[65536]; // 64KB buffer
     ssize_t bytes_read;
     bytes_copied = 0;
+    int copy_errno = 0;
 
     while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) != 0) {
         if (bytes_read < 0) {
             if (errno == EINTR) continue;
+            copy_errno = errno;
             bytes_copied = -1;
             break;
         }
@@ -2093,6 +2141,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
             ssize_t bytes_written = write(dest_fd, buffer + total_written, bytes_read - total_written);
             if (bytes_written < 0) {
                 if (errno == EINTR) continue;
+                copy_errno = errno;
                 bytes_copied = -1;
                 break;
             }
@@ -2104,31 +2153,23 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
 #endif
 
     // Close file descriptors
-    int close_ret1 = close(src_fd);
-    int close_ret2 = close(dest_fd);
-    int saved_errno = 0;
-    if (bytes_copied < 0) {
-        saved_errno = errno;
-    }
-    else if (close_ret1 < 0 || close_ret2 < 0) {
-        saved_errno = errno;
+    // Capture errno right after each failing call; later calls overwrite it.
+    int close_errno = 0;
+    if (close(src_fd) < 0) close_errno = errno;
+    if (close(dest_fd) < 0 && !close_errno) close_errno = errno;
+    int saved_errno = copy_errno;
+    if (bytes_copied >= 0 && close_errno) {
+        saved_errno = close_errno;
         bytes_copied = -1;
     }
 
     // Check if copy was successful (bytes_copied should match file size)
     if (bytes_copied < 0 || bytes_copied != src_stat.st_size) {
-        // Clean up partial destination file on error
-        int saved_errno2 = errno;
+        // Clean up partial destination file on error (dest is known not to be src)
         unlink(dest_path);
 
         if (saved_errno != 0) {
             JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(saved_errno), src_path);
-            JS_FreeCString(ctx, src_path);
-            JS_FreeCString(ctx, dest_path);
-            return err;
-        }
-        if (saved_errno2 != 0 && saved_errno2 != ENOENT) {
-            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(saved_errno2), src_path);
             JS_FreeCString(ctx, src_path);
             JS_FreeCString(ctx, dest_path);
             return err;
@@ -2231,6 +2272,12 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     }
 
 #ifdef _WIN32
+    if (path[0] == '\0') {
+        /* "" + "\\*" would list the current drive root */
+        JSValue err = tjs_throw_errno_path(ctx, UV_ENOENT, path);
+        JS_FreeCString(ctx, path);
+        return err;
+    }
     WCHAR *wpath = utf8_to_wcs(path);
     if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
@@ -2364,12 +2411,23 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
     }
 
     /* 2. get final path (resolved symlinks, ., and ..) */
-    WCHAR wbuf[MAX_PATH * 4];
-    DWORD len = GetFinalPathNameByHandleW(hFile, wbuf, sizeof(wbuf) / sizeof(WCHAR),
-        VOLUME_NAME_DOS);
+    /* Query the required size (in WCHARs, including the NUL) first. */
+    DWORD need = GetFinalPathNameByHandleW(hFile, NULL, 0, VOLUME_NAME_DOS);
+    WCHAR *wbuf = NULL;
+    DWORD len = 0;
+    if (need != 0) {
+        wbuf = js_malloc(ctx, (size_t) need * sizeof(WCHAR));
+        if (!wbuf) {
+            CloseHandle(hFile);
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        len = GetFinalPathNameByHandleW(hFile, wbuf, need, VOLUME_NAME_DOS);
+    }
     CloseHandle(hFile);
-    if (len == 0 || len >= sizeof(wbuf) / sizeof(WCHAR)) {
+    if (len == 0 || len >= need) {
         DWORD err = (len == 0) ? ERROR_GEN_FAILURE : ERROR_INSUFFICIENT_BUFFER;
+        js_free(ctx, wbuf);
         JSValue err_val = tjs_throw_errno_path(ctx, uv_translate_sys_error(err), path);
         JS_FreeCString(ctx, path);
         return err_val;
@@ -2382,13 +2440,16 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
         if (wcsncmp(out, L"UNC\\", 4) == 0) {
             // Convert \\?\UNC\server\share to \\server\share
             // We need to modify the buffer, so use a non-const pointer
+            // out points at "UNC\server\share"; the 'C' is two WCHARs ahead and
+            // is followed by '\', so overwriting it with '\' gives "\\server\share".
             WCHAR* out_mut = (WCHAR*) out;
-            out_mut -= 2;
+            out_mut += 2;
             *out_mut = L'\\';
             out = out_mut;
         }
     }
     char *utf8_out = wcs_to_utf8(out, -1);
+    js_free(ctx, wbuf);
     if (!utf8_out) {
         JSValue err_val = tjs_throw_errno_path(ctx, fs_errno2uv(errno), path);
         JS_FreeCString(ctx, path);
@@ -2450,10 +2511,11 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
         }
 
         if (!LockFileEx(hFile, flags, 0, MAXDWORD, MAXDWORD, &overlapped)) {
-            if (GetLastError() == ERROR_LOCK_VIOLATION && (operation & 4)) {
-                errno = EWOULDBLOCK;
-            }
-            THROW("lock")
+            /* LockFileEx sets a Win32 error, not CRT errno; translate that. */
+            DWORD werr = GetLastError();
+            if (werr == ERROR_LOCK_VIOLATION && (operation & 4))
+                return tjs_throw_errno(ctx, UV_EAGAIN);
+            return tjs_throw_errno(ctx, uv_translate_sys_error(werr));
         }
     }
 #else
@@ -2621,11 +2683,16 @@ static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int a
         THROW2("ftruncate")
     }
 
-    LARGE_INTEGER li;
+    LARGE_INTEGER li, orig = { 0 }, zero = { 0 };
     li.QuadPart = length;
 
-    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) || !SetEndOfFile(hFile)) {
-        THROW2("ftruncate")
+    /* Truncating moves the file pointer to `length`; put it back afterwards. */
+    BOOL have_pos = SetFilePointerEx(hFile, zero, &orig, FILE_CURRENT);
+    BOOL trunc_ok = SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) && SetEndOfFile(hFile);
+    DWORD trunc_err = trunc_ok ? 0 : GetLastError();
+    if (have_pos) SetFilePointerEx(hFile, orig, NULL, FILE_BEGIN);
+    if (!trunc_ok) {
+        return tjs_throw_errno(ctx, uv_translate_sys_error(trunc_err));
     }
 #else
     if (ftruncate(fd, length) < 0) {
@@ -2861,9 +2928,9 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
     JS_FreeCString(ctx, path);
 #else
     struct timeval times[2];
-    times[0].tv_sec = (time_t) atime;
+    times[0].tv_sec = (time_t) floor(atime);
     times[0].tv_usec = (suseconds_t) ((atime - times[0].tv_sec) * 1000000);
-    times[1].tv_sec = (time_t) mtime;
+    times[1].tv_sec = (time_t) floor(mtime);
     times[1].tv_usec = (suseconds_t) ((mtime - times[1].tv_sec) * 1000000);
 
     int ret = utimes(path, times);
@@ -2916,9 +2983,9 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
     }
 #else
     struct timeval times[2];
-    times[0].tv_sec = (time_t) atime;
+    times[0].tv_sec = (time_t) floor(atime);
     times[0].tv_usec = (suseconds_t) ((atime - times[0].tv_sec) * 1000000);
-    times[1].tv_sec = (time_t) mtime;
+    times[1].tv_sec = (time_t) floor(mtime);
     times[1].tv_usec = (suseconds_t) ((mtime - times[1].tv_sec) * 1000000);
 
     if (futimes(fd, times) < 0) {
