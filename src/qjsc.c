@@ -609,9 +609,14 @@ static void check_hasarg(int optind, int argc, char opt) {
 static void detect_output_type(const char *filename) {
     if (!filename) return;
     
-    // Check for .exe (Windows) or no extension -> ATTACH mode
-    size_t len = strlen(filename);
-    
+    // Extension detection must ignore dots in directory names.
+    const char *base = strrchr(filename, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(filename, '\\');
+    if (bs && (!base || bs > base)) base = bs;
+#endif
+    base = base ? base + 1 : filename;
+
     // Check if it's an executable file (no recognizable source extension)
     if (js__has_suffix(filename, ".jsc")) {
         output_type = OUTPUT_RAW;
@@ -623,7 +628,7 @@ static void detect_output_type(const char *filename) {
         output_type = OUTPUT_C_MAIN;  // Default to main for .c, can be overridden by -e
         printf("Auto-detected: C source mode (.c)\n");
     } else if (js__has_suffix(filename, ".exe") || 
-               !strchr(filename, '.')) {
+               !strchr(base, '.')) {
         // No extension or .exe -> attach mode
         output_type = OUTPUT_ATTACH;
         printf("Auto-detected: Self-attach mode (no extension or .exe)\n");
