@@ -356,14 +356,14 @@ static JSValue tjs_brotli_decompress(JSContext *ctx, JSValueConst this_val, int 
         if (ret == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
             BrotliDecoderDestroyInstance(state);
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Brotli decompression incomplete input");
+            return JS_ThrowTypeError(ctx, "Brotli decompression incomplete input");
         }
 
         BrotliDecoderErrorCode ec = BrotliDecoderGetErrorCode(state);
         const char *msg = BrotliDecoderErrorString(ec);
         BrotliDecoderDestroyInstance(state);
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Brotli decompression failed: %s", msg);
+        return JS_ThrowTypeError(ctx, "Brotli decompression failed: %s", msg);
     }
 
     BrotliDecoderDestroyInstance(state);
@@ -510,7 +510,7 @@ static JSValue tjs_brotli_compress_process(JSContext *ctx, JSValueConst this_val
         return JS_EXCEPTION;
 
     if (c->finished)
-        return JS_ThrowInternalError(ctx, "Brotli compress stream already finished");
+        return JS_ThrowTypeError(ctx, "Brotli compress stream already finished");
 
     BrotliEncoderOperation op = magic;
 
@@ -615,7 +615,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
         return JS_EXCEPTION;
 
     if (d->finished && magic != 1)
-        return JS_ThrowInternalError(ctx, "Brotli decompress stream already finished");
+        return JS_ThrowTypeError(ctx, "Brotli decompress stream already finished");
     if (d->finished)
         return tjs_brotli_empty_buffer(ctx);
 
@@ -662,7 +662,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
 
         if (ret == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT && magic == 1) {
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Brotli decompression incomplete input");
+            return JS_ThrowTypeError(ctx, "Brotli decompression incomplete input");
         }
 
         if (ret == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT)
@@ -691,7 +691,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
         BrotliDecoderErrorCode ec = BrotliDecoderGetErrorCode(d->state);
         const char *msg = BrotliDecoderErrorString(ec);
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Brotli decompression failed: %s", msg);
+        return JS_ThrowTypeError(ctx, "Brotli decompression failed: %s", msg);
     }
 
     d->total_in += data_len - avail_in;

@@ -326,3 +326,52 @@ await test('zlib - invalid compression level throws', () => {
         assert(e instanceof Error, 'Should throw Error');
     }
 });
+
+// ========== Regression: params(), truncated input, catchable stream errors ==========
+await test('zlib.Deflate.params - changes level mid-stream and round-trips', () => {
+    const deflate = zlib.createDeflate(zlib.BEST_SPEED);
+    const a = encode('hello world '.repeat(500));
+    const b = encode('goodbye world '.repeat(500));
+    const parts = [deflate.deflate(a)];
+    const flushed = deflate.params(zlib.BEST_COMPRESSION, zlib.DEFAULT_STRATEGY);
+    assert(flushed instanceof Uint8Array, 'params() should return a Uint8Array');
+    parts.push(flushed);
+    parts.push(deflate.deflate(b));
+    parts.push(deflate.finish());
+
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const joined = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { joined.set(p, off); off += p.length; }
+
+    const expected = new Uint8Array(a.length + b.length);
+    expected.set(a, 0);
+    expected.set(b, a.length);
+    assert(arraysEqual(zlib.inflate(joined), expected), 'Round-trip after params() failed');
+});
+
+await test('zlib.inflate - truncated input throws a catchable TypeError', () => {
+    const full = zlib.deflate(encode('truncate me '.repeat(200)));
+    const cut = full.subarray(0, full.length >> 1);
+    let thrown = null;
+    try {
+        zlib.inflate(cut);
+    } catch (e) {
+        thrown = e;
+    }
+    assert(thrown instanceof TypeError, 'Truncated one-shot inflate should throw TypeError');
+});
+
+await test('zlib.Inflate - finished stream error is catchable', () => {
+    const inflate = zlib.createInflate();
+    inflate.inflate(zlib.deflate(encode('abc')));
+    assert(inflate.finished, 'Stream should be finished');
+    let thrown = null;
+    try {
+        inflate.inflate(new Uint8Array([1]));
+    } catch (e) {
+        thrown = e;
+    }
+    assert(thrown instanceof TypeError, 'Inflating after finish should throw a catchable TypeError');
+});

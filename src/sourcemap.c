@@ -132,15 +132,17 @@ static inline int base64_decode_char(char c) {
 static int decode_vlq(const char **input, int *value) {
     uint32_t result = 0;
     int shift = 0, digit;
+    int complete = 0;
     while (**input) {
         digit = base64_decode_char(**input);
         if (digit == -1) return 0;
         (*input)++;
         result |= (uint32_t)(digit & 31) << shift;
-        if (!(digit & 32)) break;
+        if (!(digit & 32)) { complete = 1; break; }
         shift += 5;
         if (shift > 30) return 0;  /* guard malformed input */
     }
+    if (!complete) return 0;  /* input ended with the continuation bit set */
     /* Lowest bit is the sign; remaining bits are the magnitude. */
     if (result & 1) {
         *value = -(int)(result >> 1);
@@ -150,17 +152,23 @@ static int decode_vlq(const char **input, int *value) {
     return 1;
 }
 
-static char **parse_json_array(JSContext *ctx, JSValue array, int *count) {
+/* Returns the array (NULL when empty) and sets *count. Entries keep their
+ * original index: non-string entries become "" so mapping indices stay aligned.
+ * Returns NULL with *err = 1 (and a pending JS exception) on failure. */
+static char **parse_json_array(JSContext *ctx, JSValue array, int *count, int *err) {
     *count = 0;
+    *err = 0;
     if (!JS_IsArray(array)) return NULL;
 
     JSValue len_val = JS_GetPropertyStr(ctx, array, "length");
     int32_t len = 0;
-    if (JS_ToInt32(ctx, &len, len_val) < 0 || len <= 0) {
+    if (JS_IsException(len_val) || JS_ToInt32(ctx, &len, len_val) < 0) {
         JS_FreeValue(ctx, len_val);
+        *err = 1;
         return NULL;
     }
     JS_FreeValue(ctx, len_val);
+    if (len <= 0) return NULL;
 
     if ((size_t) len > SIZE_MAX / sizeof(char *)) return NULL;
     char **result = malloc((size_t) len * sizeof(char *));
@@ -169,20 +177,27 @@ static char **parse_json_array(JSContext *ctx, JSValue array, int *count) {
     int actual = 0;
     for (int i = 0; i < len; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, array, i);
+        if (JS_IsException(item)) goto fail;
+        const char *str = NULL;
         if (JS_IsString(item)) {
-            const char *str = JS_ToCString(ctx, item);
-            if (str) {
-                char *dup = strdup(str);
-                JS_FreeCString(ctx, str);
-                if (dup) result[actual++] = dup;
-                /* OOM: skip entry; index gaps are handled by range checks */
-            }
+            str = JS_ToCString(ctx, item);
+            if (!str) { JS_FreeValue(ctx, item); goto fail; }
         }
+        char *dup = strdup(str ? str : "");
+        if (str) JS_FreeCString(ctx, str);
         JS_FreeValue(ctx, item);
+        if (!dup) { JS_ThrowOutOfMemory(ctx); goto fail; }
+        result[actual++] = dup;
     }
 
     *count = actual;
     return result;
+
+fail:
+    for (int i = 0; i < actual; i++) free(result[i]);
+    free(result);
+    *err = 1;
+    return NULL;
 }
 
 /* ---------- FileSourceMap lifecycle ---------- */
@@ -325,8 +340,10 @@ static int cmp_node_ptr(const void *a, const void *b) {
     const MappingNode *na = *(const MappingNode *const *)a;
     const MappingNode *nb = *(const MappingNode *const *)b;
     if (na->mapping.generated_line != nb->mapping.generated_line)
-        return na->mapping.generated_line - nb->mapping.generated_line;
-    return na->mapping.generated_column - nb->mapping.generated_column;
+        return (na->mapping.generated_line > nb->mapping.generated_line) -
+               (na->mapping.generated_line < nb->mapping.generated_line);
+    return (na->mapping.generated_column > nb->mapping.generated_column) -
+           (na->mapping.generated_column < nb->mapping.generated_column);
 }
 
 /* Rebuild sorted[] from the linked list.  O(n log n), called once per batch. */
@@ -386,8 +403,11 @@ static int parse_mappings(FileSourceMap *map, const char *mappings_str) {
     if (!mappings_str) return 0;
 
     const char *p = mappings_str;
-    int gen_line = 0, gen_col = 0;
-    int src_idx  = 0, orig_line = 0, orig_col = 0, name_idx = 0;
+    int gen_line = 0;
+    /* Fields are cumulative deltas: accumulate wide, then reject any segment
+     * whose running value no longer fits in an int. */
+    int64_t gen_col = 0;
+    int64_t src_idx = 0, orig_line = 0, orig_col = 0, name_idx = 0;
 
     while (*p) {
         if (*p == ';') { gen_line++; gen_col = 0; p++; continue; }
@@ -413,20 +433,28 @@ static int parse_mappings(FileSourceMap *map, const char *mappings_str) {
         }
 
         if (cnt >= 4) {
-            gen_col   += values[0];
-            src_idx   += values[1];
-            orig_line += values[2];
-            orig_col  += values[3];
+            int64_t n_gc = gen_col   + values[0];
+            int64_t n_si = src_idx   + values[1];
+            int64_t n_ol = orig_line + values[2];
+            int64_t n_oc = orig_col  + values[3];
+            int64_t n_ni = name_idx  + (cnt >= 5 ? values[4] : 0);
+            if (n_gc < INT32_MIN || n_gc > INT32_MAX || n_si < INT32_MIN || n_si > INT32_MAX ||
+                n_ol < INT32_MIN || n_ol > INT32_MAX || n_oc < INT32_MIN || n_oc > INT32_MAX ||
+                n_ni < INT32_MIN || n_ni > INT32_MAX)
+                continue;  /* out-of-int field: discard the segment */
+            gen_col = n_gc; src_idx = n_si; orig_line = n_ol; orig_col = n_oc;
 
-            int sidx = (src_idx  >= 0 && src_idx  < map->sources_count) ? src_idx  : -1;
+            int sidx = (src_idx  >= 0 && src_idx  < map->sources_count) ? (int)src_idx  : -1;
             int nidx = -1;
             if (cnt >= 5) {
-                name_idx += values[4];
-                nidx = (name_idx >= 0 && name_idx < map->names_count) ? name_idx : -1;
+                name_idx = n_ni;
+                nidx = (name_idx >= 0 && name_idx < map->names_count) ? (int)name_idx : -1;
             }
-            insert_mapping(map, gen_line, gen_col, orig_line, orig_col, sidx, nidx);
+            insert_mapping(map, gen_line, (int)gen_col, (int)orig_line, (int)orig_col, sidx, nidx);
         } else if (cnt == 1) {
-            gen_col += values[0];
+            int64_t n_gc = gen_col + values[0];
+            if (n_gc >= INT32_MIN && n_gc <= INT32_MAX)
+                gen_col = n_gc;
         }
     }
     return 1;
@@ -455,47 +483,72 @@ bool js_has_sourcemap(MappingContext *ctx, const char *file_path) {
     return file_path && find_file_map(ctx, file_path) != NULL;
 }
 
+/* Returns 1 on success, 0 when nothing could be loaded, -1 with a pending JS
+ * exception. All JS-visible reads (getters, Proxy traps, toString) happen into
+ * locals first; the map is only touched afterwards, so re-entrant load() or
+ * remove() calls from that JS cannot leave it half-updated. */
 int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx,
                        const char *file_path, JSValue sm_obj) {
     if (!ctx || !file_path || !JS_IsObject(sm_obj)) return 0;
 
+    char **sources = NULL, **names = NULL;
+    int sources_count = 0, names_count = 0, err = 0;
+    const char *mappings_str = NULL;
+
+    JSValue v = JS_GetPropertyStr(js_ctx, sm_obj, "sources");
+    if (JS_IsException(v)) return -1;
+    if (JS_IsArray(v))
+        sources = parse_json_array(js_ctx, v, &sources_count, &err);
+    JS_FreeValue(js_ctx, v);
+    if (err) return -1;
+
+    v = JS_GetPropertyStr(js_ctx, sm_obj, "names");
+    if (JS_IsException(v)) goto fail;
+    if (JS_IsArray(v))
+        names = parse_json_array(js_ctx, v, &names_count, &err);
+    JS_FreeValue(js_ctx, v);
+    if (err) goto fail;
+
+    v = JS_GetPropertyStr(js_ctx, sm_obj, "mappings");
+    if (JS_IsException(v)) goto fail;
+    mappings_str = JS_ToCString(js_ctx, v);
+    JS_FreeValue(js_ctx, v);
+    if (!mappings_str) goto fail;
+
+    /* No JS runs past this point. */
     FileSourceMap *map = get_or_create_file_map(ctx, file_path);
-    if (!map) return 0;
+    if (!map) {
+        JS_FreeCString(js_ctx, mappings_str);
+        FREE_STR_ARRAY(sources, sources_count);
+        FREE_STR_ARRAY(names, names_count);
+        return 0;
+    }
 
     clear_mappings(map);
     FREE_STR_ARRAY(map->sources, map->sources_count);
     FREE_STR_ARRAY(map->names,   map->names_count);
+    map->sources = sources;
+    map->sources_count = sources_count;
+    map->names = names;
+    map->names_count = names_count;
 
-    JSValue sources = JS_GetPropertyStr(js_ctx, sm_obj, "sources");
-    if (JS_IsArray(sources))
-        map->sources = parse_json_array(js_ctx, sources, &map->sources_count);
-    JS_FreeValue(js_ctx, sources);
-
-    JSValue names = JS_GetPropertyStr(js_ctx, sm_obj, "names");
-    if (JS_IsArray(names))
-        map->names = parse_json_array(js_ctx, names, &map->names_count);
-    JS_FreeValue(js_ctx, names);
-
-    int success = 0;
-    JSValue mappings_val = JS_GetPropertyStr(js_ctx, sm_obj, "mappings");
-    const char *mappings_str = JS_ToCString(js_ctx, mappings_val);
-    if (mappings_str) {
-        success = parse_mappings(map, mappings_str);
-        JS_FreeCString(js_ctx, mappings_str);
-    }
-    JS_FreeValue(js_ctx, mappings_val);
-    /* Release the loader's temp ref taken by get_or_create_file_map. If JS
-     * re-entered and removed this path, this is the free; otherwise the
-     * ctx->files[] slot keeps it alive. */
+    int success = parse_mappings(map, mappings_str);
+    JS_FreeCString(js_ctx, mappings_str);
+    /* Release the temp ref taken by get_or_create_file_map. */
     free_file_map(map);
     return success;
+
+fail:
+    FREE_STR_ARRAY(sources, sources_count);
+    FREE_STR_ARRAY(names, names_count);
+    return -1;
 }
 
 static int js_load_sourcemap_json(MappingContext *ctx, JSContext *js_ctx,
                                    const char *file_path, const char *json_str, size_t json_len) {
 	if (!ctx || !file_path || !json_str) return 0;
 	JSValue json_obj = JS_ParseJSON(js_ctx, json_str, json_len, "<sourcemap>");
-	if (JS_IsException(json_obj)) return 0;
+	if (JS_IsException(json_obj)) return -1;
 	int result = js_load_sourcemap(ctx, js_ctx, file_path, json_obj);
 	JS_FreeValue(js_ctx, json_obj);
 	return result;
@@ -552,7 +605,7 @@ bool js_remove_sourcemap(MappingContext *ctx, const char *file_path) {
 
 static JSValue tjs__has_sourcemap(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv) {
-    if (argc < 1) return JS_EXCEPTION;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "has() requires 1 argument: file_path");
     const char *fp = JS_ToCString(ctx, argv[0]);
     if (!fp) return JS_EXCEPTION;
     TJSRuntime *rt = TJS_GetRuntime(ctx);
@@ -563,18 +616,19 @@ static JSValue tjs__has_sourcemap(JSContext *ctx, JSValueConst this_val,
 
 static JSValue tjs__load_sourcemap(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv) {
-    if (argc < 2) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "load() requires 2 arguments: file_path and sourcemap");
     const char *fp = JS_ToCString(ctx, argv[0]);
     if (!fp) return JS_EXCEPTION;
     TJSRuntime *rt = TJS_GetRuntime(ctx);
     int ret = js_load_sourcemap(rt->module.mapctx, ctx, fp, argv[1]);
     JS_FreeCString(ctx, fp);
+    if (ret < 0) return JS_EXCEPTION;
     return JS_NewInt32(ctx, ret);
 }
 
 static JSValue tjs__load_sourcemap_cjson(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv) {
-    if (argc < 2) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "loadJSON() requires 2 arguments: file_path and json");
     const char *fp = JS_ToCString(ctx, argv[0]);
     const char *js = JS_ToCString(ctx, argv[1]);
     if (!fp || !js) {
@@ -586,12 +640,13 @@ static JSValue tjs__load_sourcemap_cjson(JSContext *ctx, JSValueConst this_val,
     int ret = js_load_sourcemap_cjson(rt->module.mapctx, ctx, fp, js);
     JS_FreeCString(ctx, fp);
     JS_FreeCString(ctx, js);
+	if (ret < 0) return JS_EXCEPTION;
 	return JS_NewInt32(ctx, ret);
 }
 
 static JSValue tjs__load_sourcemap_json_bytes(JSContext *ctx, JSValueConst this_val,
                                                 int argc, JSValueConst *argv) {
-	if (argc < 2) return JS_EXCEPTION;
+	if (argc < 2) return JS_ThrowTypeError(ctx, "loadJSONBytes() requires 2 arguments: file_path and json_bytes");
 	const char *fp = JS_ToCString(ctx, argv[0]);
 	size_t json_len = 0;
 	uint8_t *json = JS_GetAnyBuffer(ctx, &json_len, argv[1]);
@@ -633,12 +688,13 @@ static JSValue tjs__load_sourcemap_json_bytes(JSContext *ctx, JSValueConst this_
 	int ret = js_load_sourcemap_json(rt->module.mapctx, ctx, fp, (const char *)json, json_len);
 	free(copy);
 	JS_FreeCString(ctx, fp);
+	if (ret < 0) return JS_EXCEPTION;
 	return JS_NewInt32(ctx, ret);
 }
 
 static JSValue tjs__get_source_mapping(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv) {
-    if (argc < 3) return JS_EXCEPTION;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "getMapping() requires 3 arguments: file_path, line and column");
     const char *fp = JS_ToCString(ctx, argv[0]);
     int line, col;
     if (!fp || JS_ToInt32(ctx, &line, argv[1]) || JS_ToInt32(ctx, &col, argv[2])) {
@@ -649,20 +705,43 @@ static JSValue tjs__get_source_mapping(JSContext *ctx, JSValueConst this_val,
     MappingResult res = js_get_source_mapping(rt->module.mapctx, fp, line, col);
     JS_FreeCString(ctx, fp);
 
+    /* res.original_file / function_name point into the map's own storage. Build
+     * both strings before any property write, and define (not set) the
+     * properties so Object.prototype setters cannot run JS that remove()s the
+     * map and frees those strings mid-way. */
+    JSValue file_val = JS_NewString(ctx, res.original_file ? res.original_file : "");
+    if (JS_IsException(file_val)) return JS_EXCEPTION;
+    JSValue name_val = JS_NewString(ctx, res.function_name ? res.function_name : "");
+    if (JS_IsException(name_val)) {
+        JS_FreeValue(ctx, file_val);
+        return JS_EXCEPTION;
+    }
+
     JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "original_file",
-        JS_NewString(ctx, res.original_file   ? res.original_file   : ""));
-    JS_SetPropertyStr(ctx, obj, "original_line",   JS_NewInt32(ctx, res.original_line));
-    JS_SetPropertyStr(ctx, obj, "original_column", JS_NewInt32(ctx, res.original_column));
-    JS_SetPropertyStr(ctx, obj, "function_name",
-        JS_NewString(ctx, res.function_name   ? res.function_name   : ""));
-    JS_SetPropertyStr(ctx, obj, "found", JS_NewBool(ctx, res.found));
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, file_val);
+        JS_FreeValue(ctx, name_val);
+        return obj;
+    }
+    /* JS_DefinePropertyValueStr consumes the value even when it fails. */
+    if (JS_DefinePropertyValueStr(ctx, obj, "original_file", file_val, JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, obj, "original_line", JS_NewInt32(ctx, res.original_line), JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, obj, "original_column", JS_NewInt32(ctx, res.original_column), JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, name_val);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    if (JS_DefinePropertyValueStr(ctx, obj, "function_name", name_val, JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, obj, "found", JS_NewBool(ctx, res.found), JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     return obj;
 }
 
 static JSValue tjs__remove_sourcemap(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
-    if (argc < 1) return JS_EXCEPTION;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "remove() requires 1 argument: file_path");
     const char *fp = JS_ToCString(ctx, argv[0]);
     if (!fp) return JS_EXCEPTION;
     TJSRuntime *rt = TJS_GetRuntime(ctx);

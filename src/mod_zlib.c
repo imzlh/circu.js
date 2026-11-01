@@ -24,6 +24,7 @@
 #include "private.h"
 #include "utils.h"
 #include <zlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -224,11 +225,17 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
         }
         
         if (ret != Z_OK && ret != Z_BUF_ERROR) {
+            /* Corrupt input is catchable (an InternalError is not); copy
+             * strm.msg before inflateEnd frees the state that owns it. */
+            char msg[96];
+            snprintf(msg, sizeof(msg), "%s", strm.msg ? strm.msg : "zlib error");
             inflateEnd(&strm);
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Decompression failed");
+            if (ret == Z_STREAM_ERROR || ret == Z_MEM_ERROR)
+                return JS_ThrowInternalError(ctx, "Decompression failed");
+            return JS_ThrowTypeError(ctx, "Decompression failed: %s", msg);
         }
-        
+
         if (strm.avail_out == 0) {
             /* Need more output space */
             /* Limit max decompressed size to prevent decompression bombs (256MB) */
@@ -256,11 +263,14 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
         } else {
             /* Output space remains but inflate made no further progress
              * (input exhausted without Z_STREAM_END, i.e. a truncated
-             * stream).  Break instead of spinning forever on Z_BUF_ERROR. */
-            break;
+             * stream).  Do not spin on Z_BUF_ERROR, and do not hand back
+             * partial output as if it were complete. */
+            inflateEnd(&strm);
+            js_free(ctx, out);
+            return JS_ThrowTypeError(ctx, "Unexpected end of compressed data");
         }
     }
-    
+
     inflateEnd(&strm);
     
     size_t out_len = strm.total_out;
@@ -472,6 +482,14 @@ static JSValue tjs_zlib_create_inflate(JSContext* ctx, JSValueConst this_val, in
     return obj;
 }
 
+/* Drop the stream's references to caller/output memory between calls. */
+static void tjs_deflate_detach(z_stream* strm) {
+    strm->next_in = Z_NULL;
+    strm->avail_in = 0;
+    strm->next_out = Z_NULL;
+    strm->avail_out = 0;
+}
+
 /* Deflate.deflate() - process data */
 static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     TJSDeflate* d = JS_GetOpaque2(ctx, this_val, tjs_deflate_class_id);
@@ -480,7 +498,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     if (d->finished) {
-        return JS_ThrowInternalError(ctx, "Deflate stream already finished");
+        return JS_ThrowTypeError(ctx, "Deflate stream already finished");
     }
     
     size_t data_len = 0;
@@ -530,6 +548,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         ret = deflate(&d->strm, flush);
 
         if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            tjs_deflate_detach(&d->strm);
             js_free(ctx, out);
             return JS_ThrowInternalError(ctx, "Deflate failed");
         }
@@ -546,19 +565,24 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         }
 
         if (out_size > SIZE_MAX / 2) {
+            tjs_deflate_detach(&d->strm);
             js_free(ctx, out);
             return JS_ThrowInternalError(ctx, "Deflated output too large");
         }
         size_t new_size = out_size * 2;
         uint8_t* new_out = js_realloc(ctx, out, new_size);
         if (!new_out) {
+            tjs_deflate_detach(&d->strm);
             js_free(ctx, out);
             return JS_EXCEPTION;
         }
         out = new_out;
         out_size = new_size;
     }
-    
+    /* The stream must not keep pointers into `out` (freed below) or into the
+     * caller's JS buffer: deflateParams() may run deflate() again later. */
+    tjs_deflate_detach(&d->strm);
+
     if (produced == 0) {
         js_free(ctx, out);
         return tjs_zlib_empty_buffer(ctx);
@@ -609,11 +633,61 @@ static JSValue tjs_deflate_params(JSContext* ctx, JSValueConst this_val, int arg
         return JS_EXCEPTION;
     }
     
-    if (deflateParams(&d->strm, level, strategy) != Z_OK) {
+    /* deflateParams() may run deflate(Z_BLOCK) when the compression function
+     * changes, so it needs a live output buffer of its own. Grow it and retry
+     * on Z_BUF_ERROR with a full buffer, and return whatever was flushed. */
+    size_t out_size = 1024;
+    size_t produced = 0;
+    uint8_t* out = js_malloc(ctx, out_size);
+    if (!out) {
+        return JS_EXCEPTION;
+    }
+
+    int ret;
+    while (1) {
+        d->strm.next_in = (Bytef*)"";
+        d->strm.avail_in = 0;
+        d->strm.next_out = out + produced;
+        d->strm.avail_out = out_size - produced;
+
+        ret = deflateParams(&d->strm, level, strategy);
+        produced = out_size - d->strm.avail_out;
+
+        if (ret == Z_OK) {
+            break;
+        }
+        if (ret != Z_BUF_ERROR || d->strm.avail_out != 0 || out_size > SIZE_MAX / 2) {
+            break;
+        }
+        uint8_t* new_out = js_realloc(ctx, out, out_size * 2);
+        if (!new_out) {
+            tjs_deflate_detach(&d->strm);
+            js_free(ctx, out);
+            return JS_EXCEPTION;
+        }
+        out = new_out;
+        out_size *= 2;
+    }
+    tjs_deflate_detach(&d->strm);
+
+    if (ret != Z_OK) {
+        js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "Failed to change deflate parameters");
     }
-    
-    return JS_UNDEFINED;
+
+    if (produced == 0) {
+        js_free(ctx, out);
+        return tjs_zlib_empty_buffer(ctx);
+    }
+    uint8_t* out_copy = js_malloc(ctx, produced);
+    if (!out_copy) {
+        js_free(ctx, out);
+        return JS_EXCEPTION;
+    }
+    memcpy(out_copy, out, produced);
+    js_free(ctx, out);
+
+    return TJS_NewUint8Array(ctx, out_copy, produced);
 }
 
 /* Deflate.getTotalIn() */
@@ -652,7 +726,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     }
     
     if (i->finished) {
-        return JS_ThrowInternalError(ctx, "Inflate stream already finished");
+        return JS_ThrowTypeError(ctx, "Inflate stream already finished");
     }
     
     if (argc < 1 && magic == Z_NO_FLUSH) {
@@ -713,7 +787,12 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         }
         
         if (i->strm.avail_out == 0) {
-            /* Need more output space */
+            /* Need more output space. Cap per call to stop decompression
+             * bombs (256MB), matching the one-shot path. */
+            if (out_size > 256 * 1024 * 1024) {
+                js_free(ctx, out);
+                return JS_ThrowRangeError(ctx, "Decompressed output exceeds maximum size (256MB)");
+            }
             size_t new_size = out_size * 2;
             if (new_size < out_size) {
                 js_free(ctx, out);

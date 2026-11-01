@@ -362,8 +362,10 @@ declare namespace CModuleZLib {
          * Change compression parameters on the fly
          * @param level - New compression level
          * @param strategy - New compression strategy
+         * @returns Compressed bytes flushed by the change (usually empty); they
+         * belong to the stream output and must be kept by the caller.
          */
-        params(level: number, strategy: number): void;
+        params(level: number, strategy: number): Uint8Array;
 
         /**
          * Get total bytes processed (input)
