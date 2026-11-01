@@ -259,6 +259,34 @@ test("console.inspect (non-standard)", () => {
     console.log("inspect result:", result);
 });
 
+test("console.inspect regressions (G18)", () => {
+    // C1: empty Symbol.toStringTag used to free the tag value twice.
+    const tagged = { [Symbol.toStringTag]: "" };
+    console.inspect(tagged);
+    console.inspect({ a: { b: { c: { [Symbol.toStringTag]: "" } } } });
+
+    // C2: self-referencing function property must not recurse forever.
+    const f = function selfRef() {};
+    f.self = f;
+    const fs = console.inspect(f);
+    assert(fs.includes("[Circular]"), "function cycle should print [Circular]: " + fs);
+
+    // C3: DataView dump honours byteOffset/byteLength and keeps the buffer alive.
+    const dv = new DataView(new Uint8Array([1, 2, 3, 4, 5, 6]).buffer, 2, 3);
+    const ds = console.inspect(dv);
+    assert(ds.includes("DataView(3)"), "DataView length: " + ds);
+    assert(ds.includes("03 04 05"), "DataView bytes: " + ds);
+
+    // C4: a throwing toString under %s must not leave a pending exception.
+    const bad = { toString() { throw new Error("boom"); } };
+    console.log("%s", bad);
+
+    // C6: Infinity / null mean unlimited depth.
+    const deep = { a: { b: { c: { d: { e: 1 } } } } };
+    assert(console.inspect(deep, { depth: Infinity }).includes("e: 1"), "depth Infinity");
+    assert(console.inspect(deep, { depth: null }).includes("e: 1"), "depth null");
+});
+
 test("mixed output test", () => {
     console.log("=== Mixed output test ===");
     const mixed = {

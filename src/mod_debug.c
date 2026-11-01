@@ -266,7 +266,11 @@ static DebugControlBlock *dcb_alloc(void) {
 static void dcb_decref(DebugControlBlock *cb) {
     if (!cb) return;
     if (atomic_fetch_sub(&cb->refcount, 1u) == 1u) {
-        /* we were the last holder */
+        /* we were the last holder: release heap payloads still queued in
+         * either ring (inline payloads need no cleanup). */
+        RingMsg m;
+        while (ring_pop(&cb->to_main, &m))   ring_msg_free(&m);
+        while (ring_pop(&cb->to_worker, &m)) ring_msg_free(&m);
         tjs_sem_destroy(&cb->main_sem);
         tjs_sem_destroy(&cb->worker_sem);
         tjs__free(cb);
@@ -574,7 +578,13 @@ do_break:;
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
     if (cb) atomic_store(&cb->state, DCB_STATE_PAUSED);
-    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
+    /* onBreak may call debug.stop()/start() or dc.stop(), which free the
+     * callback and can drop the last ref on the channel: hold the callback
+     * across the call and re-read the weak channel pointer afterwards. */
+    JSValue on_break = JS_DupValue(ctx, trt->debug.onBreak);
+    JSValue ret = JS_Call(ctx, on_break, JS_UNDEFINED, 6, argv);
+    JS_FreeValue(ctx, on_break);
+    cb = trt->debug.channel;
     if (cb) atomic_store(&cb->state, DCB_STATE_RUNNING);
     tjs__in_debug_break = prev_in_break;
     for (int i = 0; i < 6; i++) JS_FreeValue(ctx, argv[i]);
@@ -650,7 +660,10 @@ static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, int throw
     tjs__in_debug_break = true;
     DebugControlBlock *cb = trt->debug.channel;
     if (cb) atomic_store(&cb->state, DCB_STATE_PAUSED);
-    JSValue ret = JS_Call(ctx, trt->debug.onBreak, JS_UNDEFINED, 6, argv);
+    JSValue on_break = JS_DupValue(ctx, trt->debug.onBreak);
+    JSValue ret = JS_Call(ctx, on_break, JS_UNDEFINED, 6, argv);
+    JS_FreeValue(ctx, on_break);
+    cb = trt->debug.channel;
     if (cb) atomic_store(&cb->state, DCB_STATE_RUNNING);
     if (JS_IsException(ret)) {
         JSValue cb_exception = JS_GetException(ctx);
@@ -835,7 +848,9 @@ static JSValue tjs_debug_set_variable(JSContext *ctx, JSValue this_val, int argc
     }
     if (scopeNumber == 2) {
         /* CDP global scope — set property on the global object. */
-        int ret = JS_SetPropertyStr(ctx, JS_GetGlobalObject(ctx), name, JS_DupValue(ctx, argv[2]));
+        JSValue global = JS_GetGlobalObject(ctx);
+        int ret = JS_SetPropertyStr(ctx, global, name, JS_DupValue(ctx, argv[2]));
+        JS_FreeValue(ctx, global);
         JS_FreeCString(ctx, name);
         if (ret < 0) return JS_EXCEPTION;
         return JS_UNDEFINED;
@@ -910,8 +925,13 @@ static void tjs_dc_main_finalizer(JSRuntime *rt, JSValue val) {
 #ifdef _WIN32
         if (h->stop_event) CloseHandle(h->stop_event);
 #endif
-        /* Note: relies on debug.stop()/dc.stop() having already cleared the
-         * weak trt->debug.channel pointer before the handle is collected. */
+        /* debug.stop()/dc.stop() normally clear the weak trt->debug.channel
+         * pointer first; a handle collected without that must not leave it
+         * dangling. h->cb is NULL once dc.stop() ran (ref already released). */
+        if (h->cb) {
+            TJSRuntime *trt = JS_GetRuntimeOpaque(rt);
+            if (trt && trt->debug.channel == h->cb) trt->debug.channel = NULL;
+        }
         dcb_decref(h->cb);
         tjs__free(h);
     }
@@ -919,10 +939,23 @@ static void tjs_dc_main_finalizer(JSRuntime *rt, JSValue val) {
 
 static JSClassDef tjs_dc_main_class = { "DebugChannel", .finalizer = tjs_dc_main_finalizer };
 
+/* Fetch the main-thread handle; throws (and returns NULL) when `this` is not
+ * a DebugChannel or the channel was already stopped. */
+static TJSDCMain *tjs_dc_main_get(JSContext *ctx, JSValueConst this_val) {
+    TJSDCMain *h = JS_GetOpaque2(ctx, this_val, tjs_dc_main_class_id);
+    if (!h) return NULL;
+    if (!h->cb) {
+        JS_ThrowTypeError(ctx, "debug channel is closed");
+        return NULL;
+    }
+    return h;
+}
+
 /* dc.notify(evType, payload) →main ←?worker; payload serialized with JS_WriteObject (true if enqueued) */
 static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCMain *h = tjs_dc_main_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "missing arguments");
     int32_t ev_type;
     if (JS_ToInt32(ctx, &ev_type, argv[0])) return JS_EXCEPTION;
     size_t len;
@@ -939,8 +972,8 @@ static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JS
  *   { kind: 'inspect', id, method, params }
  *   { kind: 'resume',  step }                                                */
 static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCMain *h = tjs_dc_main_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     TJSRuntime *trt = TJS_GetRuntime(ctx);
     DebugControlBlock *cb = h->cb;
     for (;;) {
@@ -1007,8 +1040,9 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
 
 /* dc.reply(id, result) →main ←?worker; result serialized with JS_WriteObject */
 static JSValue tjs_dc_main_reply(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCMain *h = JS_GetOpaque(this_val, tjs_dc_main_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCMain *h = tjs_dc_main_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "missing arguments");
     int32_t id;
     if (JS_ToInt32(ctx, &id, argv[0])) return JS_EXCEPTION;
     size_t len;
@@ -1119,22 +1153,35 @@ static bool dc_push_control(DebugControlBlock *cb, uint32_t type, uint32_t id,
     return ok;
 }
 
+/* Fetch the worker handle; throws (and returns NULL) when `this` is not a
+ * DebugChannelWorker or the channel was already stopped. */
+static TJSDCWorker *tjs_dc_worker_get(JSContext *ctx, JSValueConst this_val) {
+    TJSDCWorker *h = JS_GetOpaque2(ctx, this_val, tjs_dc_worker_class_id);
+    if (!h) return NULL;
+    if (!h->cb) {
+        JS_ThrowTypeError(ctx, "debug channel is closed");
+        return NULL;
+    }
+    return h;
+}
+
 static JSValue tjs_dc_worker_interrupt(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     atomic_store(&h->cb->interrupt, 1u);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_state(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     return JS_NewInt32(ctx, (int)atomic_load(&h->cb->state));
 }
 
 static JSValue tjs_dc_worker_add_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc < 2) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "missing arguments");
     const char *file = JS_ToCString(ctx, argv[0]);
     if (!file) return JS_EXCEPTION;
     uint32_t line = 0, col = (uint32_t)-1;
@@ -1148,14 +1195,16 @@ static JSValue tjs_dc_worker_add_breakpoint(JSContext *ctx, JSValue this_val, in
     memcpy(buf + flen, &line, 4);
     memcpy(buf + flen + 4, &col, 4);
     JS_FreeCString(ctx, file);
-    dc_push_control(h->cb, MSG_ADD_BP, 0, buf, plen);
+    bool ok = dc_push_control(h->cb, MSG_ADD_BP, 0, buf, plen);
     free(buf);
+    if (!ok) return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_remove_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc < 2) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "missing arguments");
     const char *file = JS_ToCString(ctx, argv[0]);
     if (!file) return JS_EXCEPTION;
     uint32_t line = 0;
@@ -1167,49 +1216,58 @@ static JSValue tjs_dc_worker_remove_breakpoint(JSContext *ctx, JSValue this_val,
     memcpy(buf, file, flen);
     memcpy(buf + flen, &line, 4);
     JS_FreeCString(ctx, file);
-    dc_push_control(h->cb, MSG_REMOVE_BP, 0, buf, plen);
+    bool ok = dc_push_control(h->cb, MSG_REMOVE_BP, 0, buf, plen);
     free(buf);
+    if (!ok) return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_clear_breakpoints(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
-    dc_push_control(h->cb, MSG_CLEAR_BP, 0, NULL, 0);
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (!dc_push_control(h->cb, MSG_CLEAR_BP, 0, NULL, 0))
+        return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_set_exception_bp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc == 0) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc == 0) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
     if (tjs__debug_exception_mode_from_arg(ctx, argv[0], &mode))
         return JS_EXCEPTION;
-    dc_push_control(h->cb, MSG_SET_EXC_BP, 0, (const uint8_t *)&mode, 4);
+    if (!dc_push_control(h->cb, MSG_SET_EXC_BP, 0, (const uint8_t *)&mode, 4))
+        return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_set_step(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc == 0) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc == 0) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t mode = 0;
     JS_ToUint32(ctx, &mode, argv[0]);
-    dc_push_control(h->cb, MSG_SET_STEP, 0, (const uint8_t *)&mode, 4);
+    if (!dc_push_control(h->cb, MSG_SET_STEP, 0, (const uint8_t *)&mode, 4))
+        return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_dc_worker_set_breakpoints_active(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc == 0) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc == 0) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t active = JS_ToBool(ctx, argv[0]) ? 1 : 0;
-    dc_push_control(h->cb, MSG_SET_BP_ACTIVE, 0, (const uint8_t *)&active, 4);
+    if (!dc_push_control(h->cb, MSG_SET_BP_ACTIVE, 0, (const uint8_t *)&active, 4))
+        return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
 }
 
 /* dc.send(id, method, params) →inspect request: worker ←?main; params serialized with JS_WriteObject */
 static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb || argc < 3) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t id = 0;
     JS_ToUint32(ctx, &id, argv[0]);
     const char *method = JS_ToCString(ctx, argv[1]);
@@ -1234,8 +1292,8 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
 
 /* dc.recv() ←?{ kind, type, id, payload? } | null →non-blocking */
 static JSValue tjs_dc_worker_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     RingMsg m;
     if (!ring_pop(&h->cb->to_worker, &m)) return JS_NULL;
     tjs_sem_trywait(&h->cb->worker_sem);   /* keep sem ~ queue length */
@@ -1253,8 +1311,8 @@ static JSValue tjs_dc_worker_recv(JSContext *ctx, JSValue this_val, int argc, JS
 
 /* dc.waitRecv(timeoutMs) ←?boolean →timed-wait on worker_sem */
 static JSValue tjs_dc_worker_wait_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     uint32_t ms = 1;
     if (argc > 0) JS_ToUint32(ctx, &ms, argv[0]);
     int ret = tjs_sem_timedwait(&h->cb->worker_sem, ms);
@@ -1263,8 +1321,8 @@ static JSValue tjs_dc_worker_wait_recv(JSContext *ctx, JSValue this_val, int arg
 
 /* dc.resume(step) →push MSG_RESUME into to_main + post main_sem */
 static JSValue tjs_dc_worker_resume(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSDCWorker *h = JS_GetOpaque(this_val, tjs_dc_worker_class_id);
-    if (!h || !h->cb) return JS_EXCEPTION;
+    TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     uint32_t step = 0;
     if (argc > 0) JS_ToUint32(ctx, &step, argv[0]);
     bool ok = ring_push(&h->cb->to_main, MSG_RESUME, 0, (uint8_t *)&step, 4);
@@ -1311,8 +1369,8 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
         return JS_ThrowTypeError(ctx, "null debug channel pointer");
 
     /* Worker claims the second baked-in ref (refcount started at 2) →do NOT
-     * increment here, and do NOT detach: detaching would not affect the shared
-     * DCB, and the 8 handle bytes are harmless to leave in place. */
+     * increment here. The handle bytes are cleared once the claim succeeds
+     * (see the end of this function). */
 
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_dc_worker_proto_funcs, countof(tjs_dc_worker_proto_funcs));
@@ -1326,6 +1384,11 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
     JS_SetOpaque(obj, h);
     JS_SetPrototype(ctx, obj, proto);
     JS_FreeValue(ctx, proto);
+    /* The pointer carries exactly one baked-in ref. Zero the handle bytes so a
+     * second getDebugChannel() on the same buffer fails instead of claiming
+     * (and later releasing) that ref again. */
+    data = (uint8_t *)JS_GetArrayBuffer(ctx, &byte_len, argv[0]);
+    if (data && byte_len == sizeof(void *)) memset(data, 0, byte_len);
     return obj;
 }
 

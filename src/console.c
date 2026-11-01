@@ -119,15 +119,19 @@ typedef struct {
 static inline bool is_circular(VisitStack* stack, JSValue val) {
     if (!stack || !JS_VALUE_HAS_REF_COUNT(val)) return false;
     void* ptr = JS_VALUE_GET_PTR(val);
-    for (int i = 0; i < stack->count; i++) {
+    int n = stack->count < MAX_DEPTH ? stack->count : MAX_DEPTH;
+    for (int i = 0; i < n; i++) {
         if (JS_VALUE_GET_PTR(stack->refs[i]) == ptr) return true;
     }
     return false;
 }
 
 static inline void visit_push(VisitStack* stack, JSValue val) {
-    if (stack && stack->count < MAX_DEPTH) {
-        stack->refs[stack->count++] = val;
+    /* count always tracks the nesting level so visit_pop stays balanced;
+     * only the first MAX_DEPTH entries are recorded for cycle detection. */
+    if (stack) {
+        if (stack->count < MAX_DEPTH) stack->refs[stack->count] = val;
+        stack->count++;
     }
 }
 
@@ -166,8 +170,16 @@ static void parse_inspect_options(JSContext* ctx, JSValue opts_val, InspectOptio
 #define IF_BOOL(prop, variable) IF(prop, JS_IsBool(v), variable = JS_ToBool(ctx, v))
 #define IF_INT(prop, variable) IF(prop, JS_IsNumber(v), JS_ToInt32(ctx, variable, v))
 #define IF_STRING(prop, variable) IF(prop, JS_IsString(v), variable = JS_ToCString(ctx, v))
-    IF_INT("depth", &opts->depth);
-    IF_INT("breakLength", &opts->break_length);
+    /* Node treats Infinity (and null for depth) as unlimited; JS_ToInt32 would
+     * turn Infinity into 0. */
+#define IF_LIMIT(prop, variable) IF(prop, JS_IsNumber(v) || JS_IsNull(v), { \
+        double d_ = 0; \
+        if (JS_IsNull(v)) *(variable) = INT32_MAX; \
+        else if (JS_ToFloat64(ctx, &d_, v) == 0 && d_ >= (double)INT32_MAX) *(variable) = INT32_MAX; \
+        else JS_ToInt32(ctx, variable, v); \
+    })
+    IF_LIMIT("depth", &opts->depth);
+    IF_LIMIT("breakLength", &opts->break_length);
     IF_BOOL("colors", opts->colors);
     IF_BOOL("showHidden", opts->show_hidden);
     IF_INT("maxArrayLength", &opts->max_array_length);
@@ -179,6 +191,7 @@ static void parse_inspect_options(JSContext* ctx, JSValue opts_val, InspectOptio
 #undef IF_BOOL
 #undef IF_INT
 #undef IF_STRING
+#undef IF_LIMIT
 }
 
 /* Forward declaration */
@@ -192,6 +205,7 @@ static char* get_class_name(JSContext* ctx, JSValue obj) {
     if (!JS_IsException(tag) && JS_IsString(tag)) {
         const char* str = JS_ToCString(ctx, tag);
         JS_FreeValue(ctx, tag);
+        tag = JS_UNDEFINED;
         if (str && str[0]) {
             char* dup = js_strdup(ctx, str);
             JS_FreeCString(ctx, str);
@@ -414,6 +428,10 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
         else format_value_with_depth(ctx, argv[i], buf, 2, false, stream);
         wrote = true;
     }
+    /* %s/%d/%f conversions can leave a pending exception (throwing toString,
+     * valueOf, Symbol.toPrimitive); drop it like format_value does so the
+     * caller does not return normally with an exception set. */
+    JS_FreeValue(ctx, JS_GetException(ctx));
     return true;
 }
 
@@ -589,7 +607,13 @@ static const char* function_kind(JSContext* ctx, JSValue val) {
     return kind;
 }
 
-static void format_function(JSContext* ctx, JSValue val, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
+static void format_function(JSContext* ctx, JSValue val, int depth, VisitStack* stack, DynBuf* buf, const InspectOptions* opts) {
+    if (is_circular(stack, val)) {
+        put_color(buf, opts, ANSI_CYAN);
+        dbuf_putstr(buf, "[Circular]");
+        put_reset(buf, opts);
+        return;
+    }
     JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     bool has_name = name_str && name_str[0];
@@ -637,6 +661,7 @@ static void format_function(JSContext* ctx, JSValue val, VisitStack* stack, DynB
         }
         if (extra > 0) {
             dbuf_putstr(buf, " {");
+            visit_push(stack, val);
             uint32_t shown = 0;
             for (uint32_t i = 0; i < count; i++) {
                 const char* k = JS_AtomToCString(ctx, props[i].atom);
@@ -657,10 +682,11 @@ static void format_function(JSContext* ctx, JSValue val, VisitStack* stack, DynB
                     dbuf_putstr(buf, "[Exception]");
                     continue;
                 }
-                format_value(ctx, v, 1, stack, buf, true, opts);
+                format_value(ctx, v, depth + 1, stack, buf, true, opts);
                 JS_FreeValue(ctx, v);
                 shown++;
             }
+            visit_pop(stack);
             dbuf_putstr(buf, " }");
         }
         JS_FreePropertyEnum(ctx, props, count);
@@ -1252,20 +1278,44 @@ static void format_dataview(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
     if (!JS_IsException(buffer) && JS_IsArrayBuffer(buffer)) {
         data = JS_GetArrayBuffer(ctx, &size, buffer);
     }
-    JS_FreeValue(ctx, buffer);
+
+    /* Restrict the dump to the view's own window. The getters can run user
+     * code, so clamp against the size captured above and re-validate nothing
+     * else afterwards: `data` stays valid because `buffer` is still held. */
+    size_t view_off = 0, view_len = size;
+    if (data) {
+        int64_t off = 0, len = 0;
+        JSValue ov = JS_GetPropertyStr(ctx, val, "byteOffset");
+        JSValue lv = JS_GetPropertyStr(ctx, val, "byteLength");
+        bool ok = !JS_IsException(ov) && !JS_IsException(lv) &&
+                  JS_ToInt64(ctx, &off, ov) == 0 && JS_ToInt64(ctx, &len, lv) == 0 &&
+                  off >= 0 && len >= 0;
+        if (!ok) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, ov);
+        JS_FreeValue(ctx, lv);
+        if (ok && (uint64_t)off <= size) {
+            view_off = (size_t)off;
+            view_len = (uint64_t)len <= size - view_off ? (size_t)len : size - view_off;
+        }
+        /* The getters may have detached or resized the buffer. */
+        data = JS_GetArrayBuffer(ctx, &size, buffer);
+        if (!data || view_off > size) { data = NULL; view_len = 0; }
+        else if (view_len > size - view_off) view_len = size - view_off;
+    }
 
     put_color(buf, opts, ANSI_MAGENTA);
-    dbuf_printf(buf, "DataView(%zu) {", size);
-    if (size > 0 && data) {
-        size_t show = size < 32 ? size : 32;
+    dbuf_printf(buf, "DataView(%zu) {", view_len);
+    if (view_len > 0 && data) {
+        size_t show = view_len < 32 ? view_len : 32;
         for (size_t i = 0; i < show; i++) {
             if (i > 0) dbuf_putc(buf, ' ');
-            dbuf_printf(buf, "%02x", data[i]);
+            dbuf_printf(buf, "%02x", data[view_off + i]);
         }
-        if (size > show) dbuf_printf(buf, " ... %zu more bytes", size - show);
+        if (view_len > show) dbuf_printf(buf, " ... %zu more bytes", view_len - show);
     }
     dbuf_putstr(buf, " }");
     put_reset(buf, opts);
+    JS_FreeValue(ctx, buffer);
 }
 
 static void format_map(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
@@ -1457,7 +1507,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
             dbuf_printf(buf, "[Array(%lld)]", (long long)alen);
         } else if (JS_IsFunction(ctx, val)) {
             /* Functions are never collapsed by depth in node — render in full. */
-            format_function(ctx, val, stack, buf, opts);
+            format_function(ctx, val, depth, stack, buf, opts);
             put_reset(buf, opts);
             return;
         } else if (JS_GetTypedArrayType(val) != -1) {
@@ -1533,7 +1583,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			} else if (JS_IsRegExp(val)) {
 				format_regexp(ctx, val, buf, opts);
 			} else if (JS_IsFunction(ctx, val)) {
-				format_function(ctx, val, stack, buf, opts);
+				format_function(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsError(val)) {
 				format_error(ctx, val, depth, buf, opts);
 			} else if (JS_IsArrayBuffer(val)) {
