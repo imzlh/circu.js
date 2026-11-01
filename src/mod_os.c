@@ -35,6 +35,7 @@
 #define STDERR_FILENO 2
 #include <io.h>
 #include <fcntl.h>
+#include <errno.h>
 #else
 #include <unistd.h>
 #include <sys/socket.h>
@@ -721,7 +722,12 @@ static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue 
 #endif
 
     if (r != 0) {
-        return tjs_throw_errno(ctx, r);
+        /* pipe()/_pipe() return -1 and set errno; tjs_throw_errno wants a negative uv code. */
+#ifdef _WIN32
+        return tjs_throw_errno(ctx, errno == EMFILE ? UV_EMFILE : (errno == ENFILE ? UV_ENFILE : UV_EINVAL));
+#else
+        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+#endif
     }
 
     JSValue arr = JS_NewArray(ctx);
@@ -772,7 +778,7 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     ssize_t ret = sendmsg(sock_fd, &msg, 0);
     if (ret < 0) {
-        return tjs_throw_errno(ctx, errno);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
     }
 
     return JS_NewInt32(ctx, (int)ret);
@@ -812,7 +818,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     ret = recvmsg(sock_fd, &msg, 0);
     if (ret < 0) {
-        return tjs_throw_errno(ctx, errno);
+        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
     }
     if (msg.msg_flags & MSG_CTRUNC) {
         tjs_close_received_fds(&msg);

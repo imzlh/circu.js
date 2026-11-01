@@ -107,17 +107,32 @@ static JSValue reg_to_js(JSContext *ctx, DWORD type, const BYTE *data, DWORD sz)
         return JS_NewInt64(ctx, *(const int64_t *)data);
     case REG_MULTI_SZ: {
         JSValue arr = JS_NewArray(ctx);
+        if (JS_IsException(arr)) return arr;
+        /* The registry data is not guaranteed to be double-NUL terminated; stay within sz. */
         const WCHAR *p = (const WCHAR *)data;
+        const WCHAR *end = p + sz / sizeof(WCHAR);
         uint32_t i = 0;
-        while (*p) { JS_SetPropertyUint32(ctx, arr, i++, from_wcs(ctx, p, -1)); p += wcslen(p) + 1; }
+        while (p < end && *p) {
+            const WCHAR *q = p;
+            while (q < end && *q) q++;
+            JSValue str = from_wcs(ctx, p, (int)(q - p));
+            if (JS_IsException(str)) {
+                JS_FreeValue(ctx, arr);
+                return JS_EXCEPTION;
+            }
+            /* JS_SetPropertyUint32 consumes str even on failure. */
+            if (JS_SetPropertyUint32(ctx, arr, i++, str) < 0) {
+                JS_FreeValue(ctx, arr);
+                return JS_EXCEPTION;
+            }
+            p = q < end ? q + 1 : q;
+        }
         return arr;
     }
-    default: {
-        uint8_t *copy = js_malloc(ctx, sz);
-        if (!copy) return JS_ThrowOutOfMemory(ctx);
-        memcpy(copy, data, sz);
-        return TJS_NewUint8Array(ctx, copy, sz);
-    }
+    default:
+        /* js_malloc(0) can return NULL (reported as OOM) for empty REG_BINARY/REG_NONE;
+         * JS_NewUint8ArrayCopy handles len 0. */
+        return JS_NewUint8ArrayCopy(ctx, data, sz);
     }
 }
 
@@ -233,8 +248,8 @@ static void reg_watch_thread(void *arg) {
 static void reg_watch_async_cb(uv_async_t *handle) {
     tjs_regwatch_t *w = uv_handle_get_data((uv_handle_t *)handle);
     if (InterlockedCompareExchange(&w->stopped, 0, 0) || JS_IsUndefined(w->callback)) return;
-    JSValue ret = JS_Call(w->jsctx, w->callback, JS_UNDEFINED, 0, NULL);
-    JS_FreeValue(w->jsctx, ret);
+    /* The callback may call close(), which frees w->callback; tjs_call_handler holds its own ref. */
+    tjs_call_handler(w->jsctx, w->callback, 0, NULL);
 }
 
 static void regwatch_close_cb(uv_handle_t *handle);

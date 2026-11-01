@@ -466,9 +466,12 @@ int ffi_type_to_buffer(JSContext *ctx, JSValue val, ffi_type *type, uint8_t *buf
             JS_ThrowTypeError(ctx, "expected argument 1 to be array");
             return -1;
         }
-        ffi_type **ptr = type->elements;
-        unsigned i = 0;
-        int sz = 0;
+        if (type->size > INT_MAX) {
+            JS_ThrowRangeError(ctx, "struct value is too large");
+            return -1;
+        }
+        size_t count = 0;
+        while (type->elements[count] != NULL) count++;
         size_t arrlen;
         JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
         if (JS_TO_SIZE_T(ctx, &arrlen, len_val) < 0) {
@@ -476,32 +479,46 @@ int ffi_type_to_buffer(JSContext *ctx, JSValue val, ffi_type *type, uint8_t *buf
             return -1;
         }
         JS_FreeValue(ctx, len_val);
-        while (*ptr != NULL) {
-            if (i >= arrlen) {
-                JS_ThrowRangeError(ctx, "array is too short");
-                return -1;
-            }
-            JSValue elem = JS_GetPropertyUint32(ctx, val, i);
-            int ret = ffi_type_to_buffer(ctx, elem, *ptr, buf);
-            JS_FreeValue(ctx, elem);
-            if (ret < 0) {
-                return -1;
-            } else {
-                if (ret > INT_MAX - sz) {
-                    JS_ThrowRangeError(ctx, "struct value is too large");
-                    return -1;
-                }
-                sz += ret;
-                buf += ret;
-            }
-            ptr++;
-            i++;
+        if (count > arrlen) {
+            JS_ThrowRangeError(ctx, "array is too short");
+            return -1;
         }
-        if (i < arrlen) {
+        if (count < arrlen) {
             JS_ThrowRangeError(ctx, "array is too long");
             return -1;
         }
-        return sz;
+        /* Fields must be written at their ABI offsets (with padding), the same
+         * layout libffi uses, not packed back to back. */
+        size_t *offsets = NULL;
+        if (count > 0) {
+            if (count > SIZE_MAX / sizeof(size_t)) {
+                JS_ThrowRangeError(ctx, "too many struct fields");
+                return -1;
+            }
+            offsets = js_malloc(ctx, sizeof(size_t) * count);
+            if (!offsets) return -1;
+            ffi_status st = ffi_get_struct_offsets(FFI_DEFAULT_ABI, type, offsets);
+            if (st != FFI_OK) {
+                js_free(ctx, offsets);
+                JS_ThrowTypeError(ctx, "ffi_get_struct_offsets failed: %s", ffi_strerror(st));
+                return -1;
+            }
+        }
+        for (size_t i = 0; i < count; i++) {
+            JSValue elem = JS_GetPropertyUint32(ctx, val, i);
+            if (JS_IsException(elem)) {
+                js_free(ctx, offsets);
+                return -1;
+            }
+            int ret = ffi_type_to_buffer(ctx, elem, type->elements[i], buf + offsets[i]);
+            JS_FreeValue(ctx, elem);
+            if (ret < 0) {
+                js_free(ctx, offsets);
+                return -1;
+            }
+        }
+        js_free(ctx, offsets);
+        return (int) type->size;
     } else {
         switch (type->type) {
             case FFI_TYPE_VOID:
@@ -599,7 +616,7 @@ static JSValue js_ffi_type_to_buffer(JSContext *ctx, JSValue this_val, int argc,
         return JS_EXCEPTION;
     }
     size_t sz = ffi_type_get_sz(type->ffi_type);
-    uint8_t *buf = js_malloc(ctx, sz);
+    uint8_t *buf = js_mallocz(ctx, sz);
     if (!buf) {
         return JS_ThrowOutOfMemory(ctx);
     }
@@ -922,6 +939,12 @@ static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSVal
     for (unsigned i = 0; i < ffi_arg_cnt; i++) {
         void *ptr;
         if (JS_IS_PTR(ctx, func_argv[i])) {
+            /* The pointer is stored in an 8-byte slot; libffi would read past
+             * it for a larger declared parameter type. */
+            if (ffi_type_get_sz(cif->ffi_cif.arg_types[i]) > sizeof(void *)) {
+                js_free(ctx, aval);
+                return JS_ThrowRangeError(ctx, "argument %d is larger than a pointer; pass a buffer", i + 1);
+            }
             ptr = &aval[ffi_arg_cnt + i];
             if (js_to_uintptr(ctx, ptr, func_argv[i]) < 0) {
                 js_free(ctx, aval);
@@ -1076,6 +1099,8 @@ static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSVa
     JS_FreeCString(ctx, dlname);
     if (ret != 0) {
         JS_ThrowInternalError(ctx, "Deno.dlopen failed: %s", errmsg ? errmsg : uv_dlerror(lib));
+        /* Releases lib->errmsg (and a handle, if any); no loader refcount was taken on failure. */
+        uv_dlclose(lib);
         js_free(ctx, lib);
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
@@ -1132,6 +1157,12 @@ static JSValue js_uv_lib_dlsym(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    /* The symbol address is only valid while the library stays loaded. Keep
+     * the UvLib alive from the symbol so GC cannot dlclose it underneath. */
+    if (JS_DefinePropertyValueStr(ctx, obj, "_lib", JS_DupValue(ctx, this_val), 0) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     JS_SetOpaque(obj, ptr);
     return obj;
 }
@@ -1156,6 +1187,25 @@ static JSValue js_libc_errno(JSContext *ctx, JSValue this_val, int argc, JSValue
     return JS_NEW_INT(ctx, errno);
 }
 
+#ifndef _WIN32
+/* GNU strerror_r: returns the message, which may not use buf. */
+static const char *js_ffi_strerror_gnu(char *rv, char *buf, size_t n, int err) {
+    (void) buf;
+    (void) n;
+    (void) err;
+    return rv ? rv : "Unknown error";
+}
+
+/* XSI strerror_r: returns 0 on success and fills buf. */
+static const char *js_ffi_strerror_xsi(int rv, char *buf, size_t n, int err) {
+    if (rv != 0) snprintf(buf, n, "Unknown error %d", err);
+    return buf;
+}
+
+#define JS_FFI_STRERROR_RESULT(call, buf, n, err)                                                                      \
+    _Generic((call), char *: js_ffi_strerror_gnu, default: js_ffi_strerror_xsi)((call), (buf), (n), (err))
+#endif
+
 static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) {
         return JS_ThrowTypeError(ctx, "error number is required");
@@ -1165,12 +1215,18 @@ static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSVa
     JS_TO_INT(ctx, &err, argv[0]);
     // Use thread-safe strerror_r instead of strerror (worker threads safety)
     char buf[256];
+    buf[0] = '\0';
 #ifdef _WIN32
-    strerror_s(buf, sizeof(buf), err);
-#else
-    assert(strerror_r(err, buf, sizeof(buf)) == 0);
-#endif
+    if (strerror_s(buf, sizeof(buf), err) != 0) {
+        snprintf(buf, sizeof(buf), "Unknown error %d", err);
+    }
     return JS_NewString(ctx, buf);
+#else
+    /* strerror_r is GNU (returns char *) or XSI (returns int) depending on
+     * the libc. It must not be called inside assert(): NDEBUG drops the call. */
+    const char *msg = JS_FFI_STRERROR_RESULT(strerror_r(err, buf, sizeof(buf)), buf, sizeof(buf), err);
+    return JS_NewString(ctx, msg);
+#endif
 }
 #pragma endregion "Libc helpers"
 
@@ -1341,15 +1397,23 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
             return;
         }
     }
-    JSValue jsret = JS_Call(ctx, jscl->func, JS_UNDEFINED, cif->nargs, jsargs);
-    for (unsigned i = 0; i < cif->nargs; i++) {
+    /* The callback may drop the last reference to its own FfiClosure, which
+     * frees jscl->func and the cif that 'cif' points into. Hold both for the
+     * duration of the call and cache nargs, as tjs_call_handler does. */
+    unsigned nargs = cif->nargs;
+    JSValue func_ref = JS_DupValue(ctx, jscl->func);
+    JSValue cif_ref = JS_DupValue(ctx, jscl->cif);
+    JSValue jsret = JS_Call(ctx, func_ref, JS_UNDEFINED, nargs, jsargs);
+    for (unsigned i = 0; i < nargs; i++) {
         JS_FreeValue(ctx, jsargs[i]);
     }
     js_free(ctx, jsargs);
+    JS_FreeValue(ctx, func_ref);
     if (JS_IsException(jsret)) {
         fprintf(stderr, "js_ffi_closure_invoke: function returned exception\n");
         TJS_DumpException(ctx);
         if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
+        JS_FreeValue(ctx, cif_ref);
         return;
     }
     size_t sz;
@@ -1359,18 +1423,21 @@ void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) 
         TJS_DumpException(ctx);
         if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
         JS_FreeValue(ctx, jsret);
+        JS_FreeValue(ctx, cif_ref);
         return;
     }
     if (sz != return_sz) {
         fprintf(stderr, "js_ffi_closure_invoke: return buffer size mismatch (expected %zu, got %zu)\n", return_sz, sz);
         if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
         JS_FreeValue(ctx, jsret);
+        JS_FreeValue(ctx, cif_ref);
         return;
     }
     /* libffi owns the callback return storage. It is only guaranteed to fit
      * the declared C type, not ffi_arg, so never widen writes here. */
     if (return_sz > 0 && ret != NULL) memcpy(ret, buf, return_sz);
     JS_FreeValue(ctx, jsret);
+    JS_FreeValue(ctx, cif_ref);
 }
 
 static JSValue js_ffi_closure_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
