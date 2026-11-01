@@ -85,7 +85,19 @@ declare namespace CModuleProcess {
         stderr: ArrayBuffer | null;
         status: number | null;
         signal: string | null;
+        resourceUsage: ResourceUsage;
         error?: Error;
+    }
+
+    export interface ResourceUsage {
+        contextSwitches: { voluntary: number; involuntary: number };
+        cpuTime: { user: bigint; system: bigint; total: bigint };
+        maxRSS: number;
+        messages: { sent: number; received: number };
+        ops: { in: number; out: number };
+        shmSize: number;
+        signalCount: number;
+        swapCount: number;
     }
 
     /**

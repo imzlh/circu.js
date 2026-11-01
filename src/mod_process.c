@@ -36,6 +36,7 @@
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
     #include <io.h>
+    #include <psapi.h>
     #include <process.h>
     typedef int pid_t;
     #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -49,6 +50,7 @@
 #else
     #include <unistd.h>
     #include <fcntl.h>
+    #include <sys/resource.h>
     #include <sys/types.h>
     #include <sys/socket.h>
     #include <sys/wait.h>
@@ -165,6 +167,62 @@ static JSValue make_exit_obj(JSContext *ctx, int64_t es, int ts) {
     JS_DefinePropertyValueStr(ctx, obj, "exit_status", JS_NewInt64(ctx, es), JS_PROP_C_W_E);
     JSValue sig = ts == 0 ? JS_NULL : JS_NewString(ctx, tjs_getsig(ts));
     JS_DefinePropertyValueStr(ctx, obj, "term_signal", sig, JS_PROP_C_W_E);
+    return obj;
+}
+
+static JSValue make_rusage_obj(JSContext *ctx, const uv_rusage_t *usage) {
+    if (!usage) return JS_UNDEFINED;
+
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    uint64_t user_us = (uint64_t)usage->ru_utime.tv_sec * 1000000ULL
+        + (uint64_t)usage->ru_utime.tv_usec;
+    uint64_t system_us = (uint64_t)usage->ru_stime.tv_sec * 1000000ULL
+        + (uint64_t)usage->ru_stime.tv_usec;
+    JSValue user = JS_NewBigUint64(ctx, user_us);
+    JSValue system = JS_NewBigUint64(ctx, system_us);
+    if (JS_IsException(obj) || JS_IsException(user) || JS_IsException(system)) {
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, user);
+        JS_FreeValue(ctx, system);
+        return JS_EXCEPTION;
+    }
+
+#define SET_U64(target, name, value)                                           \
+    JS_DefinePropertyValueStr(ctx, target, name,                               \
+                              JS_NewInt64(ctx, (int64_t)(value)), JS_PROP_C_W_E)
+
+    JSValue switches = JS_NewObjectProto(ctx, JS_NULL);
+    SET_U64(switches, "voluntary", usage->ru_nvcsw);
+    SET_U64(switches, "involuntary", usage->ru_nivcsw);
+    JS_DefinePropertyValueStr(ctx, obj, "contextSwitches", switches, JS_PROP_C_W_E);
+
+    JSValue cpu = JS_NewObjectProto(ctx, JS_NULL);
+    JS_DefinePropertyValueStr(ctx, cpu, "user", JS_DupValue(ctx, user), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, cpu, "system", JS_DupValue(ctx, system), JS_PROP_C_W_E);
+    JSValue sum = JS_NewBigUint64(ctx, user_us + system_us);
+    JS_FreeValue(ctx, user);
+    JS_FreeValue(ctx, system);
+    if (JS_IsException(sum)) {
+        JS_FreeValue(ctx, cpu);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    JS_DefinePropertyValueStr(ctx, cpu, "total", sum, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "cpuTime", cpu, JS_PROP_C_W_E);
+
+    SET_U64(obj, "maxRSS", usage->ru_maxrss);
+    JSValue messages = JS_NewObjectProto(ctx, JS_NULL);
+    SET_U64(messages, "sent", usage->ru_msgsnd);
+    SET_U64(messages, "received", usage->ru_msgrcv);
+    JS_DefinePropertyValueStr(ctx, obj, "messages", messages, JS_PROP_C_W_E);
+    JSValue ops = JS_NewObjectProto(ctx, JS_NULL);
+    SET_U64(ops, "in", usage->ru_inblock);
+    SET_U64(ops, "out", usage->ru_oublock);
+    JS_DefinePropertyValueStr(ctx, obj, "ops", ops, JS_PROP_C_W_E);
+    SET_U64(obj, "shmSize", usage->ru_ixrss);
+    SET_U64(obj, "signalCount", usage->ru_nsignals);
+    SET_U64(obj, "swapCount", usage->ru_nswap);
+#undef SET_U64
     return obj;
 }
 
@@ -1082,7 +1140,8 @@ static const char *spawn_sync_stdio_mode(JSContext *ctx, JSValue opts, const cha
 
 static JSValue spawn_sync_make_result(JSContext *ctx, int pid, int64_t status, int signal,
                                       TJSSpawnSyncBuf *out, TJSSpawnSyncBuf *err,
-                                      bool capture_out, bool capture_err) {
+                                      bool capture_out, bool capture_err,
+                                      const uv_rusage_t *usage) {
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
     if (JS_IsException(obj)) return obj;
 
@@ -1107,6 +1166,12 @@ static JSValue spawn_sync_make_result(JSContext *ctx, int pid, int64_t status, i
     JS_DefinePropertyValueStr(ctx, obj, "stdout", stdout_val, JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, obj, "stderr", stderr_val, JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, obj, "output", output, JS_PROP_C_W_E);
+    JSValue rusage = make_rusage_obj(ctx, usage);
+    if (JS_IsException(rusage)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    JS_DefinePropertyValueStr(ctx, obj, "resourceUsage", rusage, JS_PROP_C_W_E);
     return obj;
 }
 
@@ -1275,9 +1340,11 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     bool child_done = false;
     int wait_status = 0;
+    struct rusage child_usage;
+    memset(&child_usage, 0, sizeof(child_usage));
     while (out_pipe[0] != -1 || err_pipe[0] != -1 || in_pipe[1] != -1 || !child_done) {
         if (!child_done) {
-            pid_t wr = waitpid(pid, &wait_status, WNOHANG);
+            pid_t wr = wait4(pid, &wait_status, WNOHANG, &child_usage);
             if (wr == pid) child_done = true;
             else if (wr < 0 && errno != EINTR) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
         }
@@ -1294,7 +1361,8 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         if (maxfd < 0) {
             if (!child_done) {
                 pid_t wr;
-                do { wr = waitpid(pid, &wait_status, 0); } while (wr < 0 && errno == EINTR);
+                do { wr = wait4(pid, &wait_status, 0, &child_usage); }
+                while (wr < 0 && errno == EINTR);
                 if (wr == pid) child_done = true;
                 else { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
             }
@@ -1328,7 +1396,31 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     int ts = 0;
     if (WIFEXITED(wait_status)) es = WEXITSTATUS(wait_status);
     else if (WIFSIGNALED(wait_status)) { ts = WTERMSIG(wait_status); es = 128 + ts; }
-    ret = spawn_sync_make_result(ctx, (int)pid, es, ts, &out, &err, cap_out, cap_err);
+    uv_rusage_t normalized_usage;
+    memset(&normalized_usage, 0, sizeof(normalized_usage));
+    normalized_usage.ru_utime.tv_sec = child_usage.ru_utime.tv_sec;
+    normalized_usage.ru_utime.tv_usec = child_usage.ru_utime.tv_usec;
+    normalized_usage.ru_stime.tv_sec = child_usage.ru_stime.tv_sec;
+    normalized_usage.ru_stime.tv_usec = child_usage.ru_stime.tv_usec;
+    normalized_usage.ru_maxrss = child_usage.ru_maxrss;
+    normalized_usage.ru_ixrss = child_usage.ru_ixrss;
+    normalized_usage.ru_idrss = child_usage.ru_idrss;
+    normalized_usage.ru_isrss = child_usage.ru_isrss;
+    normalized_usage.ru_minflt = child_usage.ru_minflt;
+    normalized_usage.ru_majflt = child_usage.ru_majflt;
+    normalized_usage.ru_nswap = child_usage.ru_nswap;
+    normalized_usage.ru_inblock = child_usage.ru_inblock;
+    normalized_usage.ru_oublock = child_usage.ru_oublock;
+    normalized_usage.ru_msgsnd = child_usage.ru_msgsnd;
+    normalized_usage.ru_msgrcv = child_usage.ru_msgrcv;
+    normalized_usage.ru_nsignals = child_usage.ru_nsignals;
+    normalized_usage.ru_nvcsw = child_usage.ru_nvcsw;
+    normalized_usage.ru_nivcsw = child_usage.ru_nivcsw;
+#if defined(__APPLE__)
+    normalized_usage.ru_maxrss /= 1024;
+#endif
+    ret = spawn_sync_make_result(ctx, (int)pid, es, ts, &out, &err, cap_out, cap_err,
+                                 &normalized_usage);
 
 cleanup:
     if (in_pipe[0] != -1) close(in_pipe[0]);
@@ -1619,7 +1711,30 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     DWORD code = 0;
     GetExitCodeProcess(pi.hProcess, &code);
-    ret = spawn_sync_make_result(ctx, (int)pi.dwProcessId, (int64_t)code, 0, &out, &err, cap_out, cap_err);
+    uv_rusage_t child_usage;
+    memset(&child_usage, 0, sizeof(child_usage));
+    FILETIME create_time, exit_time, kernel_time, user_time;
+    PROCESS_MEMORY_COUNTERS mem_counters;
+    IO_COUNTERS io_counters;
+    if (GetProcessTimes(pi.hProcess, &create_time, &exit_time, &kernel_time, &user_time) &&
+        GetProcessMemoryInfo(pi.hProcess, &mem_counters, sizeof(mem_counters)) &&
+        GetProcessIoCounters(pi.hProcess, &io_counters)) {
+        ULARGE_INTEGER ticks;
+        ticks.LowPart = user_time.dwLowDateTime;
+        ticks.HighPart = user_time.dwHighDateTime;
+        child_usage.ru_utime.tv_sec = (long)(ticks.QuadPart / 10000000ULL);
+        child_usage.ru_utime.tv_usec = (long)((ticks.QuadPart % 10000000ULL) / 10ULL);
+        ticks.LowPart = kernel_time.dwLowDateTime;
+        ticks.HighPart = kernel_time.dwHighDateTime;
+        child_usage.ru_stime.tv_sec = (long)(ticks.QuadPart / 10000000ULL);
+        child_usage.ru_stime.tv_usec = (long)((ticks.QuadPart % 10000000ULL) / 10ULL);
+        child_usage.ru_majflt = mem_counters.PageFaultCount;
+        child_usage.ru_maxrss = (uint64_t)mem_counters.PeakWorkingSetSize / 1024;
+        child_usage.ru_oublock = io_counters.WriteOperationCount;
+        child_usage.ru_inblock = io_counters.ReadOperationCount;
+    }
+    ret = spawn_sync_make_result(ctx, (int)pi.dwProcessId, (int64_t)code, 0, &out, &err,
+                                 cap_out, cap_err, &child_usage);
 
 cleanup:
     if (spawned && JS_IsException(ret) && pi.hProcess) {
