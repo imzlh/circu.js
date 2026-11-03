@@ -18,8 +18,9 @@ declare namespace CModuleWorker {
         /**
          * Send message
          * @param data Data to send
+         * @param transferList ArrayBuffers to transfer rather than clone
          */
-        postMessage(data: unknown): void;
+        postMessage(data: unknown, transferList?: ArrayBuffer[]): void;
 
         /** Buffered messages received before an onmessage handler was installed. */
         pendingStats(): {
@@ -65,8 +66,9 @@ declare namespace CModuleWorker {
         /**
          * Create a Worker
          * @param user_data Any object (including functions, but dangerous!)
+         * @param transferList ArrayBuffers to transfer rather than clone
          */
-        constructor(user_data: unknown);
+        constructor(user_data: unknown, transferList?: ArrayBuffer[]);
 
         /** Request termination without waiting for the worker thread to join. */
         stop(): void;
