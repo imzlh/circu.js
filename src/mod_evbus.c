@@ -630,7 +630,7 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
         JS_FreeAtom(ctx, event_atom);
         return JS_EXCEPTION;
     }
-    if (namespace_atom == runtime_namespace && event_atom == runtime_event) {
+    if (namespace_atom == runtime_namespace && event_atom == runtime_event && count > 1) {
         qsort(snapshot, count, sizeof(*snapshot), evbus_listener_compare);
     }
     JS_FreeAtom(ctx, runtime_namespace);
@@ -730,7 +730,9 @@ JSValue tjs__mod_evbus_dispatch_runtime_event(JSContext *ctx, int32_t event_name
             snapshot[index++] = listener;
         }
     }
-    qsort(snapshot, count, sizeof(*snapshot), evbus_listener_compare);
+    if (count > 1) {
+        qsort(snapshot, count, sizeof(*snapshot), evbus_listener_compare);
+    }
 
     JSRuntime *rt = JS_GetRuntime(ctx);
     evbus_dispatch_enter(bus);

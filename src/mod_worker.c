@@ -45,11 +45,10 @@ enum {
 
 static thread_local JSClassID tjs_msgpipe_class_id;
 
-/* Bound messages received before an onmessage listener is installed. This
- * preserves startup buffering while preventing a silent peer from retaining an
- * unbounded number of deserialized JS values in a long-lived runtime. */
-#define MSGPIPE_PENDING_MAX_MESSAGES 1024
-#define MSGPIPE_PENDING_MAX_BYTES (16 * 1024 * 1024)
+/* Messages received before an onmessage listener is installed remain pending
+ * until the listener is attached. Do not cap this queue: a MessagePipe has
+ * message-delivery semantics, so silently discarding a burst here is worse
+ * than retaining it (the JS Worker layer has its own startup queue too). */
 
 /* A Worker wrapper can be finalized before its thread returns, so qrt->workers
  * is not a complete fork-safety guard. Keep a process-wide count until the
@@ -116,7 +115,6 @@ typedef struct {
     size_t pending_count;
     size_t pending_cap;
     size_t pending_bytes;
-    size_t pending_dropped;
 } TJSMessagePipe;
 
 typedef struct {
@@ -158,7 +156,6 @@ static void msgpipe_clear_js_rt(JSRuntime *rt, TJSMessagePipe *p) {
     p->pending = NULL;
     p->pending_cap = 0;
     p->pending_bytes = 0;
-    p->pending_dropped = 0;
 }
 
 static void msgpipe_clear_js(TJSMessagePipe *p) {
@@ -178,7 +175,6 @@ static void msgpipe_clear_js(TJSMessagePipe *p) {
     p->pending = NULL;
     p->pending_cap = 0;
     p->pending_bytes = 0;
-    p->pending_dropped = 0;
 }
 
 static void msgpipe_close_handle(TJSMessagePipe *p) {
@@ -240,6 +236,18 @@ static TJSMessagePipe *tjs_msgpipe_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_msgpipe_class_id);
 }
 
+/* Message delivery runs from a libuv callback, not from a JS call frame. An
+ * exception left on the context there would have no caller to observe it, so
+ * make an allocation failure follow the runtime's existing uncatchable-error
+ * path rather than silently losing the message. */
+static void msgpipe_oom(TJSMessagePipe *p) {
+    JSContext *ctx = p->ctx;
+    JS_ThrowOutOfMemory(ctx);
+    JSValue error = JS_GetException(ctx);
+    tjs__stop_uncatchable_error(ctx, error);
+    JS_FreeValue(ctx, error);
+}
+
 static JSValue emit_event(JSContext *ctx, int argc, JSValue *argv) {
     CHECK_EQ(argc, 2);
 
@@ -260,27 +268,41 @@ static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg, size_t
     JSValue event_func = p->events[event];
     if (!JS_IsFunction(ctx, event_func)) {
         if (event == MSGPIPE_EVENT_MESSAGE) {
-            bool count_full = p->pending_count >= MSGPIPE_PENDING_MAX_MESSAGES;
-            bool bytes_full = message_bytes > MSGPIPE_PENDING_MAX_BYTES - p->pending_bytes;
-            if (count_full || bytes_full) {
-                p->pending_dropped++;
-                return;
-            }
             if (p->pending_count >= p->pending_cap) {
-                size_t new_cap = p->pending_cap ? p->pending_cap * 2 : 8;
-                if (new_cap > MSGPIPE_PENDING_MAX_MESSAGES) {
-                    new_cap = MSGPIPE_PENDING_MAX_MESSAGES;
+                size_t new_cap;
+                if (p->pending_cap == 0) {
+                    new_cap = 8;
+                } else if (p->pending_cap > SIZE_MAX / 2) {
+                    new_cap = SIZE_MAX;
+                } else {
+                    new_cap = p->pending_cap * 2;
+                }
+                if (new_cap > SIZE_MAX / sizeof(*p->pending)) {
+                    new_cap = SIZE_MAX / sizeof(*p->pending);
+                }
+                if (new_cap <= p->pending_cap) {
+                    /* This is only reachable after exhausting addressable
+                     * memory; report OOM instead of silently losing a value. */
+                    msgpipe_oom(p);
+                    return;
                 }
                 JSValue *grown = js_realloc(ctx, p->pending, new_cap * sizeof(JSValue));
                 if (!grown) {
-                    p->pending_dropped++;
+                    /* Allocation failure is exceptional, unlike a queue cap.
+                     * Keep the existing queue intact and surface the failure
+                     * through the runtime's normal OOM path. */
+                    msgpipe_oom(p);
                     return;
                 }
                 p->pending = grown;
                 p->pending_cap = new_cap;
             }
             p->pending[p->pending_count++] = JS_DupValue(ctx, arg);
-            p->pending_bytes += message_bytes;
+            if (message_bytes > SIZE_MAX - p->pending_bytes) {
+                p->pending_bytes = SIZE_MAX;
+            } else {
+                p->pending_bytes += message_bytes;
+            }
         }
         return;
     }
@@ -650,9 +672,11 @@ static JSValue tjs_msgpipe_pending_stats(JSContext *ctx, JSValue this_val, int a
     }
     JS_SetPropertyStr(ctx, stats, "messages", JS_NewInt64(ctx, (int64_t) p->pending_count));
     JS_SetPropertyStr(ctx, stats, "bytes", JS_NewInt64(ctx, (int64_t) p->pending_bytes));
-    JS_SetPropertyStr(ctx, stats, "dropped", JS_NewInt64(ctx, (int64_t) p->pending_dropped));
-    JS_SetPropertyStr(ctx, stats, "maxMessages", JS_NewInt64(ctx, MSGPIPE_PENDING_MAX_MESSAGES));
-    JS_SetPropertyStr(ctx, stats, "maxBytes", JS_NewInt64(ctx, MSGPIPE_PENDING_MAX_BYTES));
+    /* A zero limit denotes unlimited buffering. Keep these fields for callers
+     * of the diagnostic API written against the old bounded implementation. */
+    JS_SetPropertyStr(ctx, stats, "dropped", JS_NewInt64(ctx, 0));
+    JS_SetPropertyStr(ctx, stats, "maxMessages", JS_NewInt64(ctx, 0));
+    JS_SetPropertyStr(ctx, stats, "maxBytes", JS_NewInt64(ctx, 0));
     return stats;
 }
 
