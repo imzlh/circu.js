@@ -198,6 +198,53 @@ declare namespace CModuleAlgorithm {
     export function xxHash32(data: Uint8Array, seed?: number): number;
 
     /**
+     * Computes the xxHash64 hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0n.
+     * @returns The 64-bit hash value as a BigInt.
+     */
+    export function xxHash64(data: Uint8Array, seed?: bigint): bigint;
+
+    /**
+     * Computes the wyhash (v4.2, Zig-compatible) hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0n.
+     * @returns The 64-bit hash value as a BigInt.
+     */
+    export function wyhash(data: Uint8Array, seed?: bigint): bigint;
+
+    /**
+     * Computes the MurmurHash2 32-bit hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0.
+     * @returns The 32-bit hash value.
+     */
+    export function murmur32v2(data: Uint8Array, seed?: number): number;
+
+    /**
+     * Computes the MurmurHash2 64-bit hash of the given data.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0n.
+     * @returns The 64-bit hash value as a BigInt.
+     */
+    export function murmur64v2(data: Uint8Array, seed?: bigint): bigint;
+
+    /**
+     * Computes the CityHash 32-bit hash of the given data.
+     * @param data The data to hash.
+     * @returns The 32-bit hash value.
+     */
+    export function cityHash32(data: Uint8Array): number;
+
+    /**
+     * Computes the CityHash 64-bit hash of the given data, Bun-seeded.
+     * @param data The data to hash.
+     * @param seed The seed value. Defaults to 0n.
+     * @returns The 64-bit hash value as a BigInt.
+     */
+    export function cityHash64(data: Uint8Array, seed?: bigint): bigint;
+
+    /**
      * A class for generating random numbers using the Xoshiro256++ algorithm.
      */
     export class XoshiroRNG {

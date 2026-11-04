@@ -58,6 +58,12 @@ static inline uint32_t read_u32_le(const uint8_t *p) {
     return v;
 }
 
+static inline uint64_t read_u64_le(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
 static void ws_mask_bytes(const uint8_t *inbuf, size_t inbuflen, const uint8_t *keybuf, uint8_t *outbuf) {
     uint32_t key32;
     memcpy(&key32, keybuf, 4);
@@ -1620,6 +1626,617 @@ static JSValue tjs_hash_xxhash32(JSContext *ctx, JSValueConst this_val, int argc
     return JS_NewUint32(ctx, result);
 }
 
+/* MurmurHash2, xxHash64, CityHash and wyhash (Zig-compatible v4.2), ported
+ * from the Bun.hash polyfill implementations. */
+
+static uint32_t murmur2_32(const uint8_t *data, size_t len, uint32_t seed) {
+    const uint32_t m = 0x5bd1e995u;
+    uint32_t h = seed ^ (uint32_t)len;
+    size_t offset = 0;
+
+    for (; offset + 4 <= len; offset += 4) {
+        uint32_t k = read_u32_le(data + offset) * m;
+        k ^= k >> 24;
+        k *= m;
+        h = h * m ^ k;
+    }
+
+    size_t remaining = len - offset;
+    if (remaining >= 3) {
+        h ^= (uint32_t)data[offset + 2] << 16;
+    }
+    if (remaining >= 2) {
+        h ^= (uint32_t)data[offset + 1] << 8;
+    }
+    if (remaining >= 1) {
+        h = (h ^ data[offset]) * m;
+    }
+
+    h ^= h >> 13;
+    h *= m;
+    return h ^ (h >> 15);
+}
+
+static uint64_t murmur2_64(const uint8_t *data, size_t len, uint64_t seed) {
+    const uint64_t m = 0xc6a4a7935bd1e995ull;
+    uint64_t h = seed ^ ((uint64_t)len * m);
+    size_t offset = 0;
+
+    for (; offset + 8 <= len; offset += 8) {
+        uint64_t k = read_u64_le(data + offset) * m;
+        k ^= k >> 47;
+        k *= m;
+        h ^= k;
+        h *= m;
+    }
+
+    if (offset < len) {
+        uint64_t tail = 0;
+        for (size_t i = 0; offset + i < len; i++) {
+            tail |= (uint64_t)data[offset + i] << (i * 8);
+        }
+        h ^= tail;
+        h *= m;
+    }
+
+    h ^= h >> 47;
+    h *= m;
+    return h ^ (h >> 47);
+}
+
+static const uint64_t XXH_PRIME64_1 = 0x9e3779b185ebca87ull;
+static const uint64_t XXH_PRIME64_2 = 0xc2b2ae3d27d4eb4full;
+static const uint64_t XXH_PRIME64_3 = 0x165667b19e3779f9ull;
+static const uint64_t XXH_PRIME64_4 = 0x85ebca77c2b2ae63ull;
+static const uint64_t XXH_PRIME64_5 = 0x27d4eb2f165667c5ull;
+
+static uint64_t xxh64_round(uint64_t acc, uint64_t input) {
+    acc += input * XXH_PRIME64_2;
+    acc = (acc << 31) | (acc >> 33);
+    acc *= XXH_PRIME64_1;
+    return acc;
+}
+
+static uint64_t xxh64_merge(uint64_t acc, uint64_t value) {
+    acc ^= xxh64_round(0, value);
+    return acc * XXH_PRIME64_1 + XXH_PRIME64_4;
+}
+
+static uint64_t xxHash64(const uint8_t *input, size_t len, uint64_t seed) {
+    const uint8_t *p = input;
+    const uint8_t *const bEnd = input + len;
+    uint64_t h64;
+
+    if (len >= 32) {
+        const uint8_t *const limit = bEnd - 32;
+        uint64_t v1 = seed + XXH_PRIME64_1 + XXH_PRIME64_2;
+        uint64_t v2 = seed + XXH_PRIME64_2;
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - XXH_PRIME64_1;
+
+        do {
+            v1 = xxh64_round(v1, read_u64_le(p));
+            p += 8;
+            v2 = xxh64_round(v2, read_u64_le(p));
+            p += 8;
+            v3 = xxh64_round(v3, read_u64_le(p));
+            p += 8;
+            v4 = xxh64_round(v4, read_u64_le(p));
+            p += 8;
+        } while (p <= limit);
+
+        h64 = (v1 << 1) | (v1 >> 63);
+        h64 += (v2 << 7) | (v2 >> 57);
+        h64 += (v3 << 12) | (v3 >> 52);
+        h64 += (v4 << 18) | (v4 >> 46);
+        h64 = xxh64_merge(h64, v1);
+        h64 = xxh64_merge(h64, v2);
+        h64 = xxh64_merge(h64, v3);
+        h64 = xxh64_merge(h64, v4);
+    } else {
+        h64 = seed + XXH_PRIME64_5;
+    }
+
+    h64 += (uint64_t)len;
+
+    while (p + 8 <= bEnd) {
+        uint64_t k = xxh64_round(0, read_u64_le(p));
+        h64 = (((h64 ^ k) << 27) | ((h64 ^ k) >> 37)) * XXH_PRIME64_1 + XXH_PRIME64_4;
+        p += 8;
+    }
+    if (p + 4 <= bEnd) {
+        uint64_t k = (uint64_t)read_u32_le(p) * XXH_PRIME64_1;
+        h64 = (((h64 ^ k) << 23) | ((h64 ^ k) >> 41)) * XXH_PRIME64_2 + XXH_PRIME64_3;
+        p += 4;
+    }
+    while (p < bEnd) {
+        h64 = (((h64 ^ (*p * XXH_PRIME64_5)) << 11) | ((h64 ^ (*p * XXH_PRIME64_5)) >> 53)) * XXH_PRIME64_1;
+        p++;
+    }
+
+    h64 ^= h64 >> 33;
+    h64 *= XXH_PRIME64_2;
+    h64 ^= h64 >> 29;
+    h64 *= XXH_PRIME64_3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+
+/* 64x64 -> 128 multiply: __uint128_t where available, 32-bit limbs otherwise. */
+static inline uint64_t mul64x128(uint64_t a, uint64_t b, uint64_t *hi) {
+#if defined(__SIZEOF_INT128__)
+    __uint128_t p = (__uint128_t)a * b;
+    *hi = (uint64_t)(p >> 64);
+    return (uint64_t)p;
+#else
+    uint32_t a0 = (uint32_t)a, a1 = (uint32_t)(a >> 32);
+    uint32_t b0 = (uint32_t)b, b1 = (uint32_t)(b >> 32);
+    uint64_t p00 = (uint64_t)a0 * b0;
+    uint64_t p01 = (uint64_t)a0 * b1;
+    uint64_t p10 = (uint64_t)a1 * b0;
+    uint64_t p11 = (uint64_t)a1 * b1;
+    uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull);
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    return (p00 & 0xffffffffull) | (mid << 32);
+#endif
+}
+
+#define WYHASH_SECRET0 0xa0761d6478bd642full
+#define WYHASH_SECRET1 0xe7037ed1a0b428dbull
+#define WYHASH_SECRET2 0x8ebc6af09c88c6e3ull
+#define WYHASH_SECRET3 0x589965cc75374cc3ull
+
+static uint64_t wyhash_mix(uint64_t a, uint64_t b) {
+    uint64_t hi;
+    uint64_t lo = mul64x128(a, b, &hi);
+    return lo ^ hi;
+}
+
+static uint64_t wyhash(const uint8_t *data, size_t len, uint64_t seed) {
+    uint64_t a, b;
+
+    seed ^= wyhash_mix(seed ^ WYHASH_SECRET0, WYHASH_SECRET1);
+
+    if (len <= 16) {
+        if (len >= 4) {
+            uint64_t quarter = (len >> 3) << 2;
+            size_t end = len - 4;
+            a = ((uint64_t)read_u32_le(data) << 32) | read_u32_le(data + quarter);
+            b = ((uint64_t)read_u32_le(data + end) << 32) | read_u32_le(data + end - quarter);
+        } else if (len > 0) {
+            a = ((uint64_t)data[0] << 16) | ((uint64_t)data[len >> 1] << 8) | data[len - 1];
+            b = 0;
+        } else {
+            a = 0;
+            b = 0;
+        }
+    } else {
+        uint64_t s0 = seed, s1 = seed, s2 = seed;
+        size_t offset = 0;
+
+        if (len >= 48) {
+            while (offset + 48 < len) {
+                s0 = wyhash_mix(read_u64_le(data + offset) ^ WYHASH_SECRET1,
+                                read_u64_le(data + offset + 8) ^ s0);
+                s1 = wyhash_mix(read_u64_le(data + offset + 16) ^ WYHASH_SECRET2,
+                                read_u64_le(data + offset + 24) ^ s1);
+                s2 = wyhash_mix(read_u64_le(data + offset + 32) ^ WYHASH_SECRET3,
+                                read_u64_le(data + offset + 40) ^ s2);
+                offset += 48;
+            }
+            s0 ^= s1 ^ s2;
+        }
+
+        size_t remaining = len - offset;
+        while (remaining > 16) {
+            s0 = wyhash_mix(read_u64_le(data + offset) ^ WYHASH_SECRET1,
+                            read_u64_le(data + offset + 8) ^ s0);
+            offset += 16;
+            remaining -= 16;
+        }
+
+        a = read_u64_le(data + len - 16);
+        b = read_u64_le(data + len - 8);
+        seed = s0;
+    }
+
+    a ^= WYHASH_SECRET1;
+    b ^= seed;
+    uint64_t hi;
+    uint64_t lo = mul64x128(a, b, &hi);
+    return wyhash_mix(lo ^ WYHASH_SECRET0 ^ (uint64_t)len, hi ^ WYHASH_SECRET1);
+}
+
+/* CityHash32 */
+
+#define CITY_C1 0xcc9e2d51u
+#define CITY_C2 0x1b873593u
+
+static inline uint32_t city_ror32(uint32_t v, int shift) {
+    return shift == 0 ? v : (v >> shift) | (v << (32 - shift));
+}
+
+static inline uint32_t city_bswap32(uint32_t v) {
+#if defined(_MSC_VER)
+    return _byteswap_ulong(v);
+#else
+    return __builtin_bswap32(v);
+#endif
+}
+
+static inline uint64_t city_bswap64(uint64_t v) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#else
+    return __builtin_bswap64(v);
+#endif
+}
+
+static uint32_t city_fmix32(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x85ebca6bu;
+    value ^= value >> 13;
+    value *= 0xc2b2ae35u;
+    value ^= value >> 16;
+    return value;
+}
+
+static uint32_t city_mur(uint32_t value, uint32_t hash) {
+    value *= CITY_C1;
+    value = (value >> 17) | (value << 15);
+    value *= CITY_C2;
+    hash ^= value;
+    hash = (hash >> 19) | (hash << 13);
+    return hash * 5 + 0xe6546b64u;
+}
+
+static uint32_t city32_length0to4(const uint8_t *data, size_t len) {
+    uint32_t b = 0;
+    uint32_t c = 9;
+    for (size_t i = 0; i < len; i++) {
+        b = b * CITY_C1 + (uint32_t)(int8_t)data[i];
+        c ^= b;
+    }
+    return city_fmix32(city_mur(b, city_mur((uint32_t)len, c)));
+}
+
+static uint32_t city32_length5to12(const uint8_t *data, size_t len) {
+    uint32_t a = (uint32_t)len;
+    uint32_t b = (uint32_t)(len * 5);
+    uint32_t c = 9;
+    uint32_t d = b;
+    a += read_u32_le(data);
+    b += read_u32_le(data + len - 4);
+    c += read_u32_le(data + ((len >> 1) & 4));
+    return city_fmix32(city_mur(c, city_mur(b, city_mur(a, d))));
+}
+
+static uint32_t city32_length13to24(const uint8_t *data, size_t len) {
+    uint32_t a = read_u32_le(data + ((len >> 1) - 4));
+    uint32_t b = read_u32_le(data + 4);
+    uint32_t c = read_u32_le(data + len - 8);
+    uint32_t d = read_u32_le(data + (len >> 1));
+    uint32_t e = read_u32_le(data);
+    uint32_t f = read_u32_le(data + len - 4);
+    return city_fmix32(city_mur(f, city_mur(e, city_mur(d, city_mur(c, city_mur(b, city_mur(a, (uint32_t)len)))))));
+}
+
+static uint32_t cityHash32(const uint8_t *data, size_t len) {
+    if (len <= 24) {
+        if (len <= 4) {
+            return city32_length0to4(data, len);
+        }
+        return len <= 12 ? city32_length5to12(data, len) : city32_length13to24(data, len);
+    }
+
+    uint32_t hash = (uint32_t)len;
+    uint32_t g = CITY_C1 * (uint32_t)len;
+    uint32_t f = g;
+    uint32_t a0 = city_ror32(read_u32_le(data + len - 4) * CITY_C1, 17) * CITY_C2;
+    uint32_t a1 = city_ror32(read_u32_le(data + len - 8) * CITY_C1, 17) * CITY_C2;
+    uint32_t a2 = city_ror32(read_u32_le(data + len - 16) * CITY_C1, 17) * CITY_C2;
+    uint32_t a3 = city_ror32(read_u32_le(data + len - 12) * CITY_C1, 17) * CITY_C2;
+    uint32_t a4 = city_ror32(read_u32_le(data + len - 20) * CITY_C1, 17) * CITY_C2;
+
+    hash ^= a0;
+    hash = city_ror32(hash, 19) * 5 + 0xe6546b64u;
+    hash ^= a2;
+    hash = city_ror32(hash, 19) * 5 + 0xe6546b64u;
+    g ^= a1;
+    g = city_ror32(g, 19) * 5 + 0xe6546b64u;
+    g ^= a3;
+    g = city_ror32(g, 19) * 5 + 0xe6546b64u;
+    f += a4;
+    f = city_ror32(f, 19) * 5 + 0xe6546b64u;
+
+    size_t offset = 0;
+    size_t iterations = (len - 1) / 20;
+    do {
+        uint32_t x0 = city_ror32(read_u32_le(data + offset) * CITY_C1, 17) * CITY_C2;
+        uint32_t x1 = read_u32_le(data + offset + 4);
+        uint32_t x2 = city_ror32(read_u32_le(data + offset + 8) * CITY_C1, 17) * CITY_C2;
+        uint32_t x3 = city_ror32(read_u32_le(data + offset + 12) * CITY_C1, 17) * CITY_C2;
+        uint32_t x4 = read_u32_le(data + offset + 16);
+        hash ^= x0;
+        hash = city_ror32(hash, 18) * 5 + 0xe6546b64u;
+        f = city_ror32(f + x1, 19) * CITY_C1;
+        g += x2;
+        g = city_ror32(g, 18) * 5 + 0xe6546b64u;
+        uint32_t merged = x3 + x1;
+        hash ^= merged;
+        hash = city_ror32(hash, 19) * 5 + 0xe6546b64u;
+        g ^= x4;
+        g = city_bswap32(g) * 5;
+        hash = city_bswap32(hash + x4 * 5);
+        f += x0;
+        uint32_t swap = hash;
+        hash = f;
+        f = g;
+        g = swap;
+        offset += 20;
+    } while (--iterations != 0);
+
+    g = city_ror32(g, 11) * CITY_C1;
+    g = city_ror32(g, 17) * CITY_C1;
+    f = city_ror32(f, 11) * CITY_C1;
+    f = city_ror32(f, 17) * CITY_C1;
+    hash = city_ror32(hash + g, 19) * 5 + 0xe6546b64u;
+    hash = city_ror32(hash, 17) * CITY_C1;
+    hash = city_ror32(hash + f, 19) * 5 + 0xe6546b64u;
+    return city_ror32(hash, 17) * CITY_C1;
+}
+
+/* CityHash64 */
+
+#define CITY_K0 0xc3a5c85c97cb3127ull
+#define CITY_K1 0xb492b66fbe98f273ull
+#define CITY_K2 0x9ae16a3b2f90404full
+
+static uint64_t city_shift_mix(uint64_t value) {
+    return value ^ (value >> 47);
+}
+
+static uint64_t city_hash_len16(uint64_t left, uint64_t right, uint64_t multiplier) {
+    uint64_t a = (left ^ right) * multiplier;
+    a ^= a >> 47;
+    uint64_t b = (right ^ a) * multiplier;
+    b ^= b >> 47;
+    return b * multiplier;
+}
+
+static uint64_t city_hash_len16_default(uint64_t left, uint64_t right) {
+    return city_hash_len16(left, right, 0x9ddfea08eb382d69ull);
+}
+
+static uint64_t city_hash_0to16(const uint8_t *data, size_t len) {
+    if (len >= 8) {
+        uint64_t multiplier = CITY_K2 + (uint64_t)len * 2;
+        uint64_t a = read_u64_le(data) + CITY_K2;
+        uint64_t b = read_u64_le(data + len - 8);
+        uint64_t c = ((b >> 37) | (b << 27)) * multiplier + a;
+        uint64_t d = (((a >> 25) | (a << 39)) + b) * multiplier;
+        return city_hash_len16(c, d, multiplier);
+    }
+    if (len >= 4) {
+        uint64_t multiplier = CITY_K2 + (uint64_t)len * 2;
+        uint64_t a = read_u32_le(data);
+        return city_hash_len16((uint64_t)len + (a << 3), read_u32_le(data + len - 4), multiplier);
+    }
+    if (len > 0) {
+        uint64_t y = data[0] + ((uint64_t)data[len >> 1] << 8);
+        uint64_t z = (uint64_t)len + ((uint64_t)data[len - 1] << 2);
+        return city_shift_mix(y * CITY_K2 ^ z * CITY_K0) * CITY_K2;
+    }
+    return CITY_K2;
+}
+
+static uint64_t city_hash_17to32(const uint8_t *data, size_t len) {
+    uint64_t multiplier = CITY_K2 + (uint64_t)len * 2;
+    uint64_t a = read_u64_le(data) * CITY_K1;
+    uint64_t b = read_u64_le(data + 8);
+    uint64_t c = read_u64_le(data + len - 8) * multiplier;
+    uint64_t d = read_u64_le(data + len - 16) * CITY_K2;
+    uint64_t left = ((a + b) >> 43) | ((a + b) << 21);
+    left += (c >> 30) | (c << 34);
+    left += d;
+    uint64_t right = a + (((b + CITY_K2) >> 18) | ((b + CITY_K2) << 46)) + c;
+    return city_hash_len16(left, right, multiplier);
+}
+
+static void city_weak_hash32(const uint8_t *data, size_t offset, uint64_t a, uint64_t b, uint64_t out[2]) {
+    uint64_t w = read_u64_le(data + offset);
+    uint64_t x = read_u64_le(data + offset + 8);
+    uint64_t y = read_u64_le(data + offset + 16);
+    uint64_t z = read_u64_le(data + offset + 24);
+    a += w;
+    b = ((b + a + z) >> 21) | ((b + a + z) << 43);
+    uint64_t c = a;
+    a += x + y;
+    b += (a >> 44) | (a << 20);
+    out[0] = a + z;
+    out[1] = b + c;
+}
+
+static uint64_t city_hash_33to64(const uint8_t *data, size_t len) {
+    uint64_t mul = CITY_K2 + (uint64_t)len * 2;
+    uint64_t a = read_u64_le(data) * CITY_K2;
+    uint64_t b = read_u64_le(data + 8);
+    uint64_t c = read_u64_le(data + len - 24);
+    uint64_t d = read_u64_le(data + len - 32);
+    uint64_t e = read_u64_le(data + 16) * CITY_K2;
+    uint64_t f = read_u64_le(data + 24) * 9;
+    uint64_t g = read_u64_le(data + len - 8);
+    uint64_t h = read_u64_le(data + len - 16) * mul;
+    uint64_t u = ((a + g) >> 43) | ((a + g) << 21);
+    u += (((b >> 30) | (b << 34)) + c) * 9;
+    uint64_t v = ((a + g) ^ d) + f + 1;
+    uint64_t w = city_bswap64((u + v) * mul) + h;
+    uint64_t x = ((e + f) >> 42) | ((e + f) << 22);
+    x += c;
+    uint64_t y = (city_bswap64((v + w) * mul) + g) * mul;
+    uint64_t z = e + f + c;
+    a = city_bswap64((x + z) * mul + y) + b;
+    b = city_shift_mix((z + a) * mul + d + h) * mul;
+    return b + x;
+}
+
+static uint64_t city_hash_long(const uint8_t *data, size_t len) {
+    uint64_t x = read_u64_le(data + len - 40);
+    uint64_t y = read_u64_le(data + len - 16) + read_u64_le(data + len - 56);
+    uint64_t z = city_hash_len16_default(read_u64_le(data + len - 48) + (uint64_t)len, read_u64_le(data + len - 24));
+    uint64_t v[2], w[2];
+    city_weak_hash32(data, len - 64, (uint64_t)len, z, v);
+    city_weak_hash32(data, len - 32, y + CITY_K1, x, w);
+
+    x = x * CITY_K1 + read_u64_le(data);
+    size_t end = ((len - 1) / 64) * 64;
+    size_t offset = 0;
+    do {
+        uint64_t rx = x + y + v[0] + read_u64_le(data + offset + 8);
+        x = ((rx >> 37) | (rx << 27)) * CITY_K1;
+        uint64_t ry = y + v[1] + read_u64_le(data + offset + 48);
+        y = ((ry >> 42) | (ry << 22)) * CITY_K1;
+        x ^= w[1];
+        y += v[0] + read_u64_le(data + offset + 40);
+        uint64_t rz = z + w[0];
+        z = ((rz >> 33) | (rz << 31)) * CITY_K1;
+        city_weak_hash32(data, offset, v[1] * CITY_K1, x + w[0], v);
+        city_weak_hash32(data, offset + 32, z + w[1], y + read_u64_le(data + offset + 16), w);
+        uint64_t swap = z;
+        z = x;
+        x = swap;
+        offset += 64;
+    } while (offset != end);
+
+    return city_hash_len16_default(
+        city_hash_len16_default(v[0], w[0]) + city_shift_mix(y) * CITY_K1 + z,
+        city_hash_len16_default(v[1], w[1]) + x);
+}
+
+static uint64_t cityHash64WithSeed(const uint8_t *data, size_t len, uint64_t seed) {
+    uint64_t unseeded;
+    if (len <= 16) {
+        unseeded = city_hash_0to16(data, len);
+    } else if (len <= 32) {
+        unseeded = city_hash_17to32(data, len);
+    } else if (len <= 64) {
+        unseeded = city_hash_33to64(data, len);
+    } else {
+        unseeded = city_hash_long(data, len);
+    }
+    return city_hash_len16_default(unseeded - CITY_K2, seed);
+}
+
+static JSValue tjs_hash_wyhash(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint64_t seed = 0;
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        int64_t s;
+        if (JS_ToBigInt64(ctx, &s, argv[1])) {
+            return JS_EXCEPTION;
+        }
+        seed = (uint64_t)s;
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewBigUint64(ctx, wyhash(data, len, seed));
+}
+
+static JSValue tjs_hash_murmur2_32(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint32_t seed = 0;
+    if (argc >= 2 && JS_IsNumber(argv[1])) {
+        if (JS_ToUint32(ctx, &seed, argv[1])) {
+            return JS_EXCEPTION;
+        }
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewUint32(ctx, murmur2_32(data, len, seed));
+}
+
+static JSValue tjs_hash_murmur2_64(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint64_t seed = 0;
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        int64_t s;
+        if (JS_ToBigInt64(ctx, &s, argv[1])) {
+            return JS_EXCEPTION;
+        }
+        seed = (uint64_t)s;
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewBigUint64(ctx, murmur2_64(data, len, seed));
+}
+
+static JSValue tjs_hash_cityhash32(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewUint32(ctx, cityHash32(data, len));
+}
+
+static JSValue tjs_hash_cityhash64(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint64_t seed = 0;
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        int64_t s;
+        if (JS_ToBigInt64(ctx, &s, argv[1])) {
+            return JS_EXCEPTION;
+        }
+        seed = (uint64_t)s;
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewBigUint64(ctx, cityHash64WithSeed(data, len, seed));
+}
+
+static JSValue tjs_hash_xxhash64(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !tjs_is_uint8_array(argv[0])) {
+        return JS_ThrowTypeError(ctx, "Expected Uint8Array");
+    }
+    uint64_t seed = 0;
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        int64_t s;
+        if (JS_ToBigInt64(ctx, &s, argv[1])) {
+            return JS_EXCEPTION;
+        }
+        seed = (uint64_t)s;
+    }
+    size_t len;
+    uint8_t *data = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!data) {
+        return JS_EXCEPTION;
+    }
+    return JS_NewBigUint64(ctx, xxHash64(data, len, seed));
+}
+
 static const JSCFunctionListEntry tjs_algorithm_funcs[] = {
 	TJS_CFUNC_DEF("wsMask", 2, tjs_ws_mask),
 	TJS_CFUNC_DEF("wsMaskInto", 4, tjs_ws_mask_into),
@@ -1650,7 +2267,13 @@ static const JSCFunctionListEntry tjs_algorithm_funcs[] = {
     TJS_CFUNC_DEF("fnv1a32", 1, tjs_hash_fnv1a32),
     TJS_CFUNC_DEF("fnv1a64", 1, tjs_hash_fnv1a64),
     TJS_CFUNC_DEF("murmur3", 2, tjs_hash_murmur3),
+    TJS_CFUNC_DEF("murmur32v2", 2, tjs_hash_murmur2_32),
+    TJS_CFUNC_DEF("murmur64v2", 2, tjs_hash_murmur2_64),
     TJS_CFUNC_DEF("xxHash32", 2, tjs_hash_xxhash32),
+    TJS_CFUNC_DEF("xxHash64", 2, tjs_hash_xxhash64),
+    TJS_CFUNC_DEF("wyhash", 2, tjs_hash_wyhash),
+    TJS_CFUNC_DEF("cityHash32", 1, tjs_hash_cityhash32),
+    TJS_CFUNC_DEF("cityHash64", 2, tjs_hash_cityhash64),
 };
 
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns){
