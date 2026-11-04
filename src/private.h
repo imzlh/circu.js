@@ -218,8 +218,8 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
 void tjs__mod_evbus_init(JSContext *ctx, JSValue ns);
 JSValue tjs__mod_evbus_dispatch_runtime_event(JSContext *ctx, int32_t event_name,
                                               JSValueConst data);
-void tjs__mod_evbus_cleanup_context(App *app);
-void tjs__mod_evbus_cleanup_runtime(TJSRuntime *trt);
+void tjs__evbus_cleanup(App *app);
+void tjs__evbus_cleanup_rt(TJSRuntime *trt);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
 void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns);

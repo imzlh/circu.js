@@ -696,7 +696,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     JS_FreeValue(ctx, qrt->debug.onException);
 
     /* Remove runtime-owned values before contexts and their atoms are freed. */
-    tjs__mod_evbus_cleanup_runtime(qrt);
+    tjs__evbus_cleanup_rt(qrt);
 
     /* Destroy all timers and drain the Promise job queue. */
     JSContext *job_ctx;

@@ -575,7 +575,7 @@ static void js_sandbox_finalizer(JSRuntime *rt, JSValueConst val) {
     if (!sb->trt->freeing) {
         App *app = sb->app;
         if (app && !app->context_released) {
-            tjs__mod_evbus_cleanup_context(app);
+            tjs__evbus_cleanup(app);
             JS_FreeContext(app->ctx);
             app->context_released = true;
             sb->app = NULL;

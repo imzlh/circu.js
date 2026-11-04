@@ -550,7 +550,7 @@ static void evbus_cleanup_released_contexts(TJSEvBus *bus) {
         if (!owner) {
             return;
         }
-        tjs__mod_evbus_cleanup_context(owner);
+        tjs__evbus_cleanup(owner);
     }
 }
 
@@ -865,7 +865,7 @@ void tjs__mod_evbus_init(JSContext *ctx, JSValue ns) {
     }
 }
 
-void tjs__mod_evbus_cleanup_context(App *app) {
+void tjs__evbus_cleanup(App *app) {
     if (!app || !app->trt || !app->trt->evbus || app->trt->evbus->disposed) {
         return;
     }
@@ -897,7 +897,7 @@ void tjs__mod_evbus_cleanup_context(App *app) {
     }
 }
 
-void tjs__mod_evbus_cleanup_runtime(TJSRuntime *trt) {
+void tjs__evbus_cleanup_rt(TJSRuntime *trt) {
     if (!trt || !trt->evbus) {
         return;
     }
