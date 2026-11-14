@@ -1,386 +1,236 @@
-/**
- * WebAssembly low-level bindings for txiki.js
- * Loaded via import.meta.use('wasm')
- *
- * This is a low-level API that directly exposes WAMR capabilities.
- * Unlike the standard WebAssembly JS API, this requires manual import resolution.
- *
- * @example
- * const wasm = import.meta.use('wasm');
- * if (!wasm) throw new Error('wasm module is unavailable');
- *
- * // Parse module
- * const module = wasm.parseModule(bytes);
- *
- * // Get imports info
- * const imports = wasm.moduleImports(module);
- *
- * // Resolve function imports
- * const importDescs = imports.map(imp => ({
- *     module: imp.module,
- *     name: imp.name,
- *     func: myImportFunc
- * }));
- * wasm.resolveImports(module, importDescs);
- *
- * // Set WASI options (optional)
- * wasm.setWasiOptions(module, ['arg1', 'arg2'], { ENV_VAR: 'value' }, { '/guest': '/host' });
- *
- * // Build instance
- * const instance = wasm.buildInstance(module);
- *
- * // Call exported function
- * const result = instance.callFunction('exportedFunc', arg1, arg2);
- */
+/** Low-level, object-oriented WAMR bindings. */
 declare namespace CModuleWASM {
-    // Error types
     export type WasmErrorName = 'CompileError' | 'LinkError' | 'RuntimeError' | 'RangeError';
+    export type ValueType = 'i32' | 'i64' | 'f32' | 'f64' | 'v128' | 'externref' | 'funcref' | 'unknown';
+    export type RunningMode = 'interpreter' | 'fast-jit' | 'llvm-jit' | 'multi-tier-jit';
 
-    /**
-     * Module object - represents a parsed WebAssembly module
-     * Created via parseModule(), not a constructor
-     */
-    export interface Module {
-        /** Opaque handle - do not access directly */
-        readonly _opaque: unique symbol;
-    }
-
-    /**
-     * Instance object - represents a WebAssembly instance
-     * Created via buildInstance(), not a constructor
-     */
-    export interface Instance {
-        /**
-         * Call an exported function by name
-         * @param name The exported function name
-         * @param args Arguments to pass to the function
-         * @returns The function result (or array of results for multi-return)
-         */
-        callFunction(name: string, ...args: WasmFunctionArgument[]): WasmFunctionResult;
-
-        /** Opaque handle - do not access directly */
-        readonly _opaque: unique symbol;
-    }
-
-    // WebAssembly value types
     export type WasmValue = number | bigint;
     export type WasmExternRef = null | undefined | object | string | number | boolean | bigint | symbol;
     export type WasmFunctionArgument = WasmValue | WasmExternRef;
     export type WasmFunctionResult = WasmValue | WasmExternRef | WasmFunctionResult[] | undefined;
     export type WasmGlobalValue = WasmValue | WasmExternRef | ArrayBuffer | ArrayBufferView;
-    export type WasmTableValue = number | null | WasmExternRef;
+    export interface WasmFuncref {
+        /** Instance whose function index space owns this slot. */
+        owner: Instance;
+        index: number;
+    }
+    export type WasmTableValue = number | WasmFuncref | null | WasmExternRef;
 
-    // Export descriptor from moduleExports()
-    export interface ModuleExportDescriptor {
-        name: string;
-        kind: 'function' | 'table' | 'memory' | 'global';
+    export interface FunctionType {
+        parameters: ValueType[];
+        results: ValueType[];
     }
 
-    // Import descriptor from moduleImports()
-    export interface ModuleImportDescriptor {
-        module: string;
-        name: string;
-        kind: 'function' | 'table' | 'memory' | 'global';
+    export interface GlobalType {
+        value: ValueType;
+        mutable: boolean;
     }
 
-    // Import function descriptor for resolveImports()
+    export interface MemoryType {
+        initial: number;
+        maximum: number;
+        shared: boolean;
+    }
+
+    export interface TableType {
+        element: ValueType;
+        initial: number;
+        maximum: number;
+        shared: boolean;
+    }
+
+    type ExportBase = { name: string; externIndex: number };
+    export type ModuleExportDescriptor =
+        | (ExportBase & { kind: 'function' } & FunctionType)
+        | (ExportBase & { kind: 'global' } & GlobalType)
+        | (ExportBase & { kind: 'memory' } & MemoryType)
+        | (ExportBase & { kind: 'table' } & TableType);
+
+    type ImportBase = { module: string; name: string; linked: boolean; externIndex: number };
+    export type ModuleImportDescriptor =
+        | (ImportBase & { kind: 'function' } & FunctionType)
+        | (ImportBase & { kind: 'global' } & GlobalType)
+        | (ImportBase & { kind: 'memory' } & MemoryType)
+        | (ImportBase & { kind: 'table' } & TableType);
+
     export interface ImportFunctionDescriptor {
         module: string;
         name: string;
         func: (...args: WasmFunctionArgument[]) => WasmFunctionResult | void;
+        /** Native provider for a wasm-origin function import. */
+        provider?: Instance;
+        /** Function index in provider. */
+        sourceIndex?: number;
+        /** Original high-level wasm function wrapper, retained for re-exports. */
+        owner?: unknown;
     }
 
-    // Global import descriptor for resolveGlobalImports()
     export interface GlobalImportDescriptor {
         module: string;
         name: string;
         value: number | bigint;
         type: 'i32' | 'i64' | 'f32' | 'f64';
         mutable: boolean;
+        provider?: Instance;
+        sourceIndex?: number;
+        sourceImportIndex?: number;
+        owner?: unknown;
     }
 
-    // Table import descriptor for resolveTableImports()
     export interface TableImportDescriptor {
         module: string;
         name: string;
         element: 'funcref' | 'externref';
         initial: number;
         maximum?: number;
+        /** Standalone table contents. Null funcref elements require no native seeding. */
+        values?: WasmTableValue[];
+        provider?: Instance;
+        sourceIndex?: number;
+        sourceImportIndex?: number;
+        owner?: unknown;
     }
 
-    // Memory import descriptor for resolveMemoryImports()
     export interface MemoryImportDescriptor {
         module: string;
         name: string;
         initial: number;
         maximum?: number;
+        provider?: Instance;
+        sourceIndex?: number;
+        sourceImportIndex?: number;
+        owner?: unknown;
     }
 
-    // Global info from getGlobalInfo()
     export interface GlobalInfo {
-        type: 'i32' | 'i64' | 'f32' | 'f64' | 'externref' | 'funcref' | 'unknown';
+        type: ValueType;
         mutable: boolean;
     }
 
-    // Table info from getTableInfo()
     export interface TableInfo {
         element: 'funcref' | 'externref' | 'unknown';
         cur_size: number;
         max_size: number;
     }
 
-    // WASI environment variables
-    export interface WasiEnv {
-        [key: string]: string;
+    export interface WasiOptions {
+        args?: string[] | null;
+        env?: Record<string, string> | null;
+        preopens?: Record<string, string> | null;
     }
 
-    // WASI preopens (directory mappings)
-    export interface WasiPreopens {
-        [guestPath: string]: string;
+    export interface InstantiateOptions {
+        /** WAMR execution stack size, 16 KiB through 64 MiB. */
+        stackSize?: number;
+        /** Optional WAMR host-managed heap size in bytes. */
+        hostManagedHeapSize?: number;
+        /** Override max linear-memory pages; zero keeps WAMR's default. */
+        maxMemoryPages?: number;
+        runningMode?: RunningMode;
+        boundsChecks?: boolean;
+        /** Per-instance host callbacks, matched to function import occurrences. */
+        functions?: ImportFunctionDescriptor[];
     }
 
-    // ============================================
-    // Module functions
-    // ============================================
+    export interface ModuleInfo {
+        packageType: 'bytecode' | 'aot' | 'unknown';
+        packageVersion: number;
+        name: string;
+    }
 
-    /**
-     * Parse a WebAssembly binary into a Module
-     * @param buffer ArrayBuffer or TypedArray containing WASM binary
-     * @returns Parsed Module object
-     * @throws CompileError if parsing fails
-     */
-    export function parseModule(buffer: ArrayBuffer | ArrayBufferView): Module;
+    export interface RuntimeInfo {
+        major: number;
+        minor: number;
+        patch: number;
+        runningModes: RunningMode[];
+    }
 
-    /**
-     * Get the content of a custom section by name
-     * @param module The Module to inspect
-     * @param sectionName The name of the custom section
-     * @returns Every matching section content in module order
-     */
-    export function moduleCustomSections(module: Module, sectionName: string): ArrayBuffer[];
+    export interface MemoryInfo {
+        currentPages: number;
+        maximumPages: number;
+        bytesPerPage: number;
+        shared: boolean;
+    }
 
-    /**
-     * Get list of exports from a Module
-     * @param module The Module to inspect
-     * @returns Array of export descriptors
-     */
-    export function moduleExports(module: Module): ModuleExportDescriptor[];
+    export interface AddressRange {
+        start: number;
+        end: number;
+    }
 
-    /**
-     * Get list of imports from a Module
-     * @param module The Module to inspect
-     * @returns Array of import descriptors
-     */
-    export function moduleImports(module: Module): ModuleImportDescriptor[];
+    /** Loaded WAMR module. Created by load(), not a public constructor. */
+    export interface Module {
+        info(): ModuleInfo;
+        setName(name: string): void;
+        exports(): ModuleExportDescriptor[];
+        imports(): ModuleImportDescriptor[];
+        customSections(name: string): ArrayBuffer[];
+        resolveFunctions(descriptors: ImportFunctionDescriptor[]): void;
+        resolveGlobals(descriptors: GlobalImportDescriptor[]): void;
+        resolveTables(descriptors: TableImportDescriptor[]): void;
+        resolveMemories(descriptors: MemoryImportDescriptor[]): void;
+        configureWasi(options?: WasiOptions): void;
+        instantiate(options?: InstantiateOptions): Instance;
+        readonly _opaque: unique symbol;
+    }
 
-    /**
-     * Resolve function imports for a Module
-     * Must be called before buildInstance()
-     * @param module The Module to resolve imports for
-     * @param importDescs Array of import function descriptors
-     * @throws LinkError if resolution fails
-     */
-    export function resolveImports(module: Module, importDescs: ImportFunctionDescriptor[]): void;
+    /** Instantiated WAMR module and execution environment. */
+    export interface Instance {
+        call(name: string, ...args: WasmFunctionArgument[]): WasmFunctionResult;
+        callByIndex(index: number, ...args: WasmFunctionArgument[]): WasmFunctionResult;
+        functionIndex(name: string): number;
 
-    /**
-     * Resolve global imports for a Module
-     * Must be called before buildInstance()
-     * @param module The Module to resolve imports for
-     * @param globalDescs Array of global import descriptors
-     * @throws LinkError if resolution fails
-     */
-    export function resolveGlobalImports(module: Module, globalDescs: GlobalImportDescriptor[]): void;
+        /** Return the original imported extern when its identity is reusable. */
+        importedExtern(kind: ModuleExportDescriptor['kind'], externIndex: number): unknown;
 
-    /**
-     * Resolve table imports for a Module
-     * Must be called before buildInstance()
-     * @param module The Module to resolve imports for
-     * @param tableDescs Array of table import descriptors
-     * @throws LinkError if resolution fails
-     * @throws TypeError if element type is invalid
-     * @throws RangeError if size constraints are invalid
-     */
-    export function resolveTableImports(module: Module, tableDescs: TableImportDescriptor[]): void;
+        /** Live default-memory view; detached after memory growth. */
+        memoryBuffer(): ArrayBuffer;
+        memoryInfo(): MemoryInfo;
+        /** Bounds-checked Uint8Array over an app-memory offset range. */
+        memoryView(offset: number, length: number): Uint8Array;
+        growMemory(pages: number): number;
+        memoryBufferAt(externIndex: number): ArrayBuffer;
+        memoryInfoAt(externIndex: number): MemoryInfo;
+        growMemoryAt(externIndex: number, pages: number): number;
 
-    /**
-     * Resolve memory imports for a Module
-     * Must be called before buildInstance()
-     * @param module The Module to resolve imports for
-     * @param memoryDescs Array of memory import descriptors
-     * @throws LinkError if resolution fails
-     * @throws RangeError if size constraints are invalid
-     */
-    export function resolveMemoryImports(module: Module, memoryDescs: MemoryImportDescriptor[]): void;
+        /** Allocate from WAMR's app heap and return a linear-memory offset. */
+        malloc(size: number): number;
+        free(offset: number): void;
+        /** Copy bytes into WAMR's app heap and return their offset. */
+        dupData(data: ArrayBuffer | ArrayBufferView): number;
+        validateAddress(offset: number, size?: number): boolean;
+        addressRange(offset: number): AddressRange | null;
 
-    /**
-     * Set WASI options for a Module
-     * Must be called before buildInstance()
-     * @param module The Module to set WASI options for
-     * @param args Command-line arguments (argv)
-     * @param env Environment variables
-     * @param preopens Directory mappings { guestPath: hostPath }
-     */
-    export function setWasiOptions(
-        module: Module,
-        args: string[] | null,
-        env: WasiEnv | null,
-        preopens: WasiPreopens | null
-    ): void;
+        getGlobal(name: string): WasmGlobalValue;
+        setGlobal(name: string, value: WasmGlobalValue): void;
+        globalInfo(name: string): GlobalInfo;
+        tableInfo(name: string): TableInfo;
+        tableSize(name: string): number;
+        tableGet(name: string, index: number): WasmTableValue;
+        tableSet(name: string, index: number, value: WasmTableValue): void;
+        tableGrow(name: string, delta: number): number;
+        getGlobalAt(externIndex: number): WasmGlobalValue;
+        setGlobalAt(externIndex: number, value: WasmGlobalValue): void;
+        globalInfoAt(externIndex: number): GlobalInfo;
+        tableInfoAt(externIndex: number): TableInfo;
+        tableSizeAt(externIndex: number): number;
+        tableGetAt(externIndex: number, index: number): WasmTableValue;
+        tableSetAt(externIndex: number, index: number, value: WasmTableValue): void;
+        tableGrowAt(externIndex: number, delta: number, init?: WasmTableValue): number;
 
-    /**
-     * Build an Instance from a Module
-     * Requires resolveImports() and setWasiOptions() to be called first if needed
-     * @param module The Module to instantiate
-     * @returns New Instance object
-     * @throws LinkError if instantiation fails
-     */
-    export function buildInstance(module: Module): Instance;
+        runningMode(): RunningMode | 'unknown';
+        setRunningMode(mode: RunningMode): void;
+        boundsChecks(): boolean;
+        setBoundsChecks(enabled: boolean): void;
+        isWasiMode(): boolean;
+        wasiExitCode(): number;
+        exception(): string | null;
+        setException(message: string | null): void;
+        clearException(): void;
+        terminate(): void;
+        readonly _opaque: unique symbol;
+    }
 
-    /**
-     * Validate a WebAssembly binary
-     * @param buffer Uint8Array containing WASM binary
-     * @returns true if valid, false otherwise
-     */
-    export function validate(buffer: Uint8Array): boolean;
-
-    /**
-     * Set the WAMR execution stack size used by subsequently created instances.
-     * Existing instances keep their original stack size.
-     * Valid range is 16 KiB through 64 MiB.
-     */
-    export function setStackSize(bytes: number): void;
-
-    /** Get the WAMR execution stack size used for new instances. */
-    export function getStackSize(): number;
-
-    // ============================================
-    // Instance functions
-    // ============================================
-
-    /**
-     * Get the memory buffer from an Instance
-     *
-     * The returned ArrayBuffer is a live view over WAMR linear memory. It is
-     * detached when growMemory() or an internal memory.grow moves the memory.
-     * Request a fresh buffer after any call that may grow memory.
-     *
-     * @param instance The Instance to get memory from
-     * @returns ArrayBuffer backed by WASM linear memory
-     * @throws RuntimeError if no memory instance
-     */
-    export function getMemoryBuffer(instance: Instance): ArrayBuffer;
-
-    /**
-     * Grow the memory of an Instance
-     * @param instance The Instance to grow memory for
-     * @param delta Number of pages to grow (65536 bytes per page)
-     * @returns Previous page count
-     * @throws RuntimeError if no memory instance
-     * @throws RangeError if memory cannot grow
-     */
-    export function growMemory(instance: Instance, delta: number): number;
-
-    /**
-     * Get a global value from an Instance
-     * @param instance The Instance to get global from
-     * @param name The exported global name
-     * @returns The global value; externref can be any JS value, v128 is a copied 16-byte Uint8Array
-     * @throws RuntimeError if global not found
-     */
-    export function getGlobal(instance: Instance, name: string): WasmGlobalValue;
-
-    /**
-     * Set a global value on an Instance
-     * @param instance The Instance to set global on
-     * @param name The exported global name
-     * @param value The new value
-     * @throws RuntimeError if global not found
-     * @throws TypeError if global is immutable
-     */
-    export function setGlobal(instance: Instance, name: string, value: WasmGlobalValue): void;
-
-    /**
-     * Get info about a global in an Instance
-     * @param instance The Instance to inspect
-     * @param name The exported global name
-     * @returns Global info object
-     * @throws RuntimeError if global not found
-     */
-    export function getGlobalInfo(instance: Instance, name: string): GlobalInfo;
-
-    // ============================================
-    // Table functions
-    // ============================================
-
-    /**
-     * Get info about a table in an Instance
-     * @param instance The Instance to inspect
-     * @param name The exported table name
-     * @returns Table info object
-     * @throws RuntimeError if table not found
-     */
-    export function getTableInfo(instance: Instance, name: string): TableInfo;
-
-    /**
-     * Get the size of a table
-     * @param instance The Instance containing the table
-     * @param name The exported table name
-     * @returns Current table size
-     * @throws RuntimeError if table not found
-     */
-    export function tableSize(instance: Instance, name: string): number;
-
-    /**
-     * Get an element from a table
-     * @param instance The Instance containing the table
-     * @param name The exported table name
-     * @param index The element index
-     * @returns For funcref: function index (number) or null; For externref: JS value
-     * @throws RuntimeError if table not found
-     * @throws RangeError if index out of bounds
-     */
-    export function tableGet(instance: Instance, name: string, index: number): WasmTableValue;
-
-    /**
-     * Set an element in a table
-     * @param instance The Instance containing the table
-     * @param name The exported table name
-     * @param index The element index
-     * @param value For funcref: function index (number) or null; For externref: JS value
-     * @throws RuntimeError if table not found
-     * @throws RangeError if index out of bounds
-     */
-    export function tableSet(instance: Instance, name: string, index: number, value: WasmTableValue): void;
-
-    /**
-     * Grow a table
-     * @param instance The Instance containing the table
-     * @param name The exported table name
-     * @param delta Number of elements to grow
-     * @returns Previous table size, or -1 on failure
-     * @throws RuntimeError if table not found
-     */
-    export function tableGrow(instance: Instance, name: string, delta: number): number;
-
-    // ============================================
-    // Function index functions (for funcref tables)
-    // ============================================
-
-    /**
-     * Get the function index by export name
-     * @param instance The Instance to query
-     * @param name The exported function name
-     * @returns Function index, or -1 if not found
-     */
-    export function getFuncIndex(instance: Instance, name: string): number;
-
-    /**
-     * Call a function by index (for funcref table entries)
-     * @param instance The Instance containing the function
-     * @param funcIndex The function index
-     * @param args Arguments to pass
-     * @returns Function result
-     * @throws RuntimeError if function index out of bounds
-     */
-    export function callFuncByIndex(instance: Instance, funcIndex: number, ...args: WasmFunctionArgument[]): WasmFunctionResult;
+    export function load(buffer: ArrayBuffer | ArrayBufferView): Module;
+    export function validate(buffer: ArrayBuffer | ArrayBufferView): boolean;
+    export function runtimeInfo(): RuntimeInfo;
 }

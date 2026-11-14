@@ -4,7 +4,7 @@ const engine = import.meta.use('engine');
 assert(wasm);
 
 test('wasm', () => {
-    const buffer = fs.exists('wasm.wasm') ? fs.readFile('wasm.wasm') : fs.readFile('tests/wasm.wasm');
+    const buffer = fs.exists('native/wasm.wasm') ? fs.readFile('native/wasm.wasm') : fs.readFile('tests/native/wasm.wasm');
     const { module, instance } = wasm.instantiate(buffer, {
         env: {
             console_log: (offset, len) => {
