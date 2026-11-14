@@ -6,6 +6,7 @@ const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const text = import.meta.use('text');
 const worker = import.meta.use('worker');
+const { setTimeout, clearTimeout } = import.meta.use('timers');
 const types = ffi.types;
 
 function fixturePath() {
@@ -18,6 +19,33 @@ function fixturePath() {
             : 'libffi_fixture.so';
     return directory + (os.platform === 'windows' ? '\\' : '/') + filename;
 }
+
+const isUncatchableExitProbe = worker.isWorker
+    && worker.workerData?.type === 'ffiUncatchableExitProbe';
+
+if (isUncatchableExitProbe) {
+    const state = new Int32Array(worker.workerData.state);
+    const library = ffi.open(fixturePath());
+    const call = library.bind([
+        types.i32,
+        'ffi_fixture_call_callback',
+        types.function,
+        types.i32,
+        types.i32,
+    ]);
+    const callback = ffi.callback(
+        [types.i32, types.i32, types.i32],
+        () => os.exit(37),
+    );
+
+    Atomics.store(state, 0, 1);
+    try {
+        call(callback.pointer, 1, 2);
+    } catch {
+        Atomics.store(state, 0, 2);
+    }
+    Atomics.store(state, 0, 3);
+} else {
 
 function assertArrayEquals(actual, expected, message) {
     assertEquals(actual.length, expected.length, message ?? 'array lengths differ');
@@ -654,6 +682,38 @@ await test('ffi callbacks receive and return direct JS values', () => {
     }
 });
 
+await test('ffi callback preserves worker os.exit as uncatchable', async () => {
+    const state = new Int32Array(new SharedArrayBuffer(4));
+    const child = new worker.Worker({
+        type: 'ffiUncatchableExitProbe',
+        state: state.buffer,
+    });
+    try {
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(
+                () => reject(new Error('FFI uncatchable worker probe timed out')),
+                3000,
+            );
+            child.messagePipe.onmessage = value => {
+                clearTimeout(timer);
+                reject(new Error(`worker continued after os.exit: ${JSON.stringify(value)}`));
+            };
+            child.messagePipe.onmessageerror = cause => {
+                clearTimeout(timer);
+                reject(cause);
+            };
+            child.messagePipe.onclose = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+        });
+        assertEquals(Atomics.load(state, 0), 1,
+            'worker must unwind at os.exit without catching or returning');
+    } finally {
+        await child.terminate();
+    }
+});
+
 await test('ffi callbacks support reentry and logical self-close', () => {
     const library = ffi.open(fixturePath());
     const call = library.bind([
@@ -1066,3 +1126,4 @@ await test('ffi library close invalidates bindings and derived pointers', () => 
     assertThrows(() => ffi.unsafe.address(symbol), 'closed');
     assertThrows(() => library.bind([types.i32, 'ffi_fixture_add_i32', types.i32, types.i32]), 'closed');
 });
+}
