@@ -695,7 +695,9 @@ static JSValue tjs_debug_start(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_debug_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.stop"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
     JS_SetDebugTraceHandler(ctx, NULL, NULL);
     JS_SetDebugThrowHook(ctx, NULL, NULL);
     JS_FreeValue(ctx, trt->debug.onBreak);

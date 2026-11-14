@@ -1887,7 +1887,7 @@ static JSValue js_console_time(JSContext* ctx, JSValueConst this_val, int argc, 
     return JS_UNDEFINED;
 }
 
-static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSValueConst* argv, bool remove_timer) {
+static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSValueConst* argv, bool remove_timer, FILE* stream) {
     TJSRuntime *runtime = TJS_GetRuntime(ctx);
     double ms = (double)(uv_hrtime() - timer->start) / 1000000.0;
     DynBuf buf;
@@ -1897,7 +1897,7 @@ static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSVa
     if (argc > 1) {
         DynBuf extra;
         dbuf_init2(&extra, JS_GetRuntime(ctx), console_realloc);
-        format_args_node(ctx, argc - 1, argv + 1, &extra, stdout);
+        format_args_node(ctx, argc - 1, argv + 1, &extra, stream);
         if (extra.size > 0) {
             dbuf_putc(&buf, ' ');
             dbuf_put(&buf, extra.buf, extra.size);
@@ -1908,7 +1908,7 @@ static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSVa
     JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
     dbuf_free(&buf);
     JSValueConst args[1] = { msg };
-    console_log_internal(ctx, 1, args, stdout, 2, false);
+    console_log_internal(ctx, 1, args, stream, 2, false);
     JS_FreeValue(ctx, msg);
 
     if (remove_timer) {
@@ -1935,6 +1935,9 @@ static JSValue js_console_time_log(JSContext* ctx, JSValueConst this_val, int ar
     ConsoleTimer* timer = find_timer(runtime, label);
     uint32_t stream = timer ? TJS_CONSOLE_STDOUT : TJS_CONSOLE_STDERR;
     TJS_CAPABILITY(tjs__capability_console(ctx, "console.timeLog", stream, argc, argv), js_free(ctx, label));
+    /* Write to the stream the hook was told about, even if hook JS started or
+     * stopped the timer under the gate. */
+    FILE* out = stream == TJS_CONSOLE_STDERR ? stderr : stdout;
     runtime = TJS_GetRuntime(ctx);
     timer = find_timer(runtime, label);
     if (!timer) {
@@ -1944,13 +1947,13 @@ static JSValue js_console_time_log(JSContext* ctx, JSValueConst this_val, int ar
         JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
         dbuf_free(&buf);
         JSValueConst args[1] = { msg };
-        console_log_internal(ctx, 1, args, stderr, 2, false);
+        console_log_internal(ctx, 1, args, out, 2, false);
         JS_FreeValue(ctx, msg);
         js_free(ctx, label);
         return JS_UNDEFINED;
     }
     js_free(ctx, label);
-    console_time_log(ctx, timer, argc, argv, false);
+    console_time_log(ctx, timer, argc, argv, false, out);
     return JS_UNDEFINED;
 }
 
@@ -1961,6 +1964,9 @@ static JSValue js_console_time_end(JSContext* ctx, JSValueConst this_val, int ar
     ConsoleTimer* timer = find_timer(runtime, label);
     uint32_t stream = timer ? TJS_CONSOLE_STDOUT : TJS_CONSOLE_STDERR;
     TJS_CAPABILITY(tjs__capability_console(ctx, "console.timeEnd", stream, argc, argv), js_free(ctx, label));
+    /* Write to the stream the hook was told about, even if hook JS started or
+     * stopped the timer under the gate. */
+    FILE* out = stream == TJS_CONSOLE_STDERR ? stderr : stdout;
     runtime = TJS_GetRuntime(ctx);
     timer = find_timer(runtime, label);
     if (!timer) {
@@ -1970,13 +1976,13 @@ static JSValue js_console_time_end(JSContext* ctx, JSValueConst this_val, int ar
         JSValue msg = JS_NewStringLen(ctx, (char*)buf.buf, buf.size);
         dbuf_free(&buf);
         JSValueConst args[1] = { msg };
-        console_log_internal(ctx, 1, args, stderr, 2, false);
+        console_log_internal(ctx, 1, args, out, 2, false);
         JS_FreeValue(ctx, msg);
         js_free(ctx, label);
         return JS_UNDEFINED;
     }
     js_free(ctx, label);
-    console_time_log(ctx, timer, argc, argv, true);
+    console_time_log(ctx, timer, argc, argv, true, out);
     return JS_UNDEFINED;
 }
 

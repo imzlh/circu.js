@@ -1368,9 +1368,9 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
         return JS_ThrowInternalError(ctx, "PSS setup failed");
     }
     
-    if (salt_len != 0) {
-        TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.rsaPssSign"), (EVP_MD_CTX_free(mdctx), EVP_PKEY_free(pkey)), do { data = JS_GetAnyBuffer(ctx, &data_len, argv[1]); if (!data) { EVP_MD_CTX_free(mdctx); EVP_PKEY_free(pkey); return JS_EXCEPTION; } } while (0));
-    }
+    /* Gate unconditionally: salt_len==0 is a valid PSS configuration, and the
+     * hook must observe every signing operation the same way. */
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.rsaPssSign"), (EVP_MD_CTX_free(mdctx), EVP_PKEY_free(pkey)), do { data = JS_GetAnyBuffer(ctx, &data_len, argv[1]); if (!data) { EVP_MD_CTX_free(mdctx); EVP_PKEY_free(pkey); return JS_EXCEPTION; } } while (0));
 
     size_t sig_len;
     if (EVP_DigestSign(mdctx, NULL, &sig_len, data, data_len) != 1) {
@@ -2360,7 +2360,8 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
     }
 
     int key_type = EVP_PKEY_base_id(pkey);
-    if (key_type == EVP_PKEY_EC || key_type == EVP_PKEY_DSA || key_type == EVP_PKEY_RSA_PSS) {
+    if (key_type == EVP_PKEY_EC || key_type == EVP_PKEY_DSA
+        || key_type == EVP_PKEY_RSA || key_type == EVP_PKEY_RSA_PSS) {
         TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.sign"), (EVP_MD_CTX_free(mdctx), EVP_PKEY_free(pkey)));
     }
 

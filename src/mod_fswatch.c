@@ -235,6 +235,11 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
     int recursive = 0;
     if (argc > 2) {
         recursive = JS_ToBool(ctx, argv[2]);
+        /* ToPrimitive can run user JS; -1 means it threw. */
+        if (recursive < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
     }
 
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "fswatch.watch", path), JS_FreeCString(ctx, path));
