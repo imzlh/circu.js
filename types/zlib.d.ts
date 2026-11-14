@@ -32,7 +32,7 @@
  * ```typescript
  * const zlib = import.meta.use('zlib')
  * 
- * const deflate = zlib.createDeflate(zlib.BEST_SPEED);
+ * const deflate = new zlib.Deflate(zlib.BEST_SPEED);
  * 
  * // Process data in chunks
  * const chunk1 = deflate.deflate(new Uint8Array([1, 2, 3]));
@@ -47,7 +47,7 @@
  * ```typescript
  * const zlib = import.meta.use('zlib')
  * 
- * const inflate = zlib.createInflate();
+ * const inflate = new zlib.Inflate();
  * 
  * // Process compressed data in chunks
  * const compressed = zlib.deflate(import.meta.use('engine').encodeString('test'));
@@ -88,7 +88,7 @@
  * ```typescript
  * const zlib = import.meta.use('zlib')
  * 
- * const deflate = zlib.createDeflate(zlib.DEFAULT_COMPRESSION);
+ * const deflate = new zlib.Deflate(zlib.DEFAULT_COMPRESSION);
  * 
  * // Compress some data
  * deflate.deflate(new Uint8Array(100));
@@ -122,7 +122,7 @@
  * ```typescript
  * const zlib = import.meta.use('zlib')
  * 
- * const gzip = zlib.createGzip(zlib.DEFAULT_COMPRESSION);
+ * const gzip = new zlib.Gzip(zlib.DEFAULT_COMPRESSION);
  * const output: Uint8Array[] = [];
  * 
  * // Simulate reading file in chunks
@@ -152,14 +152,14 @@
  * const zlib = import.meta.use('zlib')
  * 
  * // For text data, use default strategy
- * const textDeflate = zlib.createDeflate(
+ * const textDeflate = new zlib.Deflate(
  *   zlib.DEFAULT_COMPRESSION,
  *   zlib.DEFAULT_STRATEGY,
  *   8  // memory level
  * );
  * 
  * // For image data, RLE strategy might work better
- * const imageDeflate = zlib.createDeflate(
+ * const imageDeflate = new zlib.Deflate(
  *   zlib.DEFAULT_COMPRESSION,
  *   zlib.RLE,
  *   9  // higher memory for better compression
@@ -330,7 +330,15 @@ declare namespace CModuleZLib {
     /**
      * Deflate stream for incremental compression
      */
-    export interface Deflate {
+    export class Deflate {
+        /**
+         * Create a DEFLATE compression stream.
+         * @param level - Compression level (0-9, default: -1)
+         * @param strategy - Compression strategy (default: DEFAULT_STRATEGY)
+         * @param memLevel - Memory level 1-9 (default: 8)
+         */
+        constructor(level?: number, strategy?: number, memLevel?: number);
+
         /**
          * Process input data (incremental compression)
          * @param data - Input data chunk
@@ -380,44 +388,15 @@ declare namespace CModuleZLib {
         getTotalOut(): number;
     }
 
-    /**
-     * Create DEFLATE compression stream
-     * @param level - Compression level (0-9, default: -1)
-     * @param strategy - Compression strategy (default: DEFAULT_STRATEGY)
-     * @param memLevel - Memory level 1-9 (default: 8)
-     * @returns Deflate stream object
-     */
-    export function createDeflate(
-        level?: number,
-        strategy?: number,
-        memLevel?: number
-    ): Deflate;
+    /** GZIP compression stream. */
+    export class Gzip extends Deflate {
+        constructor(level?: number, strategy?: number, memLevel?: number);
+    }
 
-    /**
-     * Create GZIP compression stream
-     * @param level - Compression level (0-9, default: -1)
-     * @param strategy - Compression strategy (default: DEFAULT_STRATEGY)
-     * @param memLevel - Memory level 1-9 (default: 8)
-     * @returns Deflate stream object with gzip format
-     */
-    export function createGzip(
-        level?: number,
-        strategy?: number,
-        memLevel?: number
-    ): Deflate;
-
-    /**
-     * Create raw DEFLATE compression stream (no zlib header)
-     * @param level - Compression level (0-9, default: -1)
-     * @param strategy - Compression strategy (default: DEFAULT_STRATEGY)
-     * @param memLevel - Memory level 1-9 (default: 8)
-     * @returns Deflate stream object without headers
-     */
-    export function createDeflateRaw(
-        level?: number,
-        strategy?: number,
-        memLevel?: number
-    ): Deflate;
+    /** Raw DEFLATE compression stream without a zlib header. */
+    export class DeflateRaw extends Deflate {
+        constructor(level?: number, strategy?: number, memLevel?: number);
+    }
 
     // ============================================================================
     // Streaming Decompression
@@ -426,7 +405,10 @@ declare namespace CModuleZLib {
     /**
      * Inflate stream for incremental decompression
      */
-    export interface Inflate {
+    export class Inflate {
+        /** Create a DEFLATE decompression stream. */
+        constructor();
+
         /**
          * Process compressed input data (incremental decompression)
          * @param data - Compressed input chunk
@@ -475,26 +457,20 @@ declare namespace CModuleZLib {
         getTotalOut(): number;
     }
 
-    /**
-     * Create DEFLATE decompression stream
-     * @returns Inflate stream object
-     */
-    export function createInflate(): Inflate;
+    /** GZIP decompression stream. */
+    export class Gunzip extends Inflate {
+        constructor();
+    }
 
-    /**
-     * Create GZIP decompression stream
-     * @returns Inflate stream object for gzip format
-     */
-    export function createGunzip(): Inflate;
+    /** Raw DEFLATE decompression stream without a zlib header. */
+    export class InflateRaw extends Inflate {
+        constructor();
+    }
 
-    /**
-     * Create raw DEFLATE decompression stream (no zlib header)
-     * @returns Inflate stream object without headers
-     */
-    export function createInflateRaw(): Inflate;
-
-    /** Create a stream that auto-detects zlib or gzip wrappers. */
-    export function createUnzip(): Inflate;
+    /** Decompression stream that auto-detects zlib or gzip wrappers. */
+    export class Unzip extends Inflate {
+        constructor();
+    }
 
     // ============================================================================
     // Checksums

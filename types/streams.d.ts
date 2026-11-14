@@ -319,28 +319,25 @@ declare namespace CModuleStreams {
      * TCP constructor
      * @example const tcp = new TCP();
      */
-    export const TCP: {
-        new(af?: number): TCP;
-        readonly prototype: TCP;
-    };
+    export class TCP {
+        constructor(af?: number);
+    }
 
     /**
      * TTY constructor
      * @example const tty = new TTY(fd, true);
      */
-    export const TTY: {
-        new(fd: number, readable: boolean): TTY;
-        readonly prototype: TTY;
-    };
+    export class TTY {
+        constructor(fd: number, readable: boolean);
+    }
 
     /**
      * Pipe constructor
      * @example const pipe = new Pipe();
      */
-    export const Pipe: {
-        new(): Pipe;
-        readonly prototype: Pipe;
-    };
+    export class Pipe {
+        constructor();
+    }
 
     /**
      * Constants

@@ -24,9 +24,11 @@
  */
 
 #include "mem.h"
+#include "capability.h"
 #include "private.h"
 #include "utils.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #ifndef _WIN32
@@ -77,6 +79,10 @@ typedef struct {
     bool listening;                  /* listen() owns one GC pin while active */
     bool streaming_read;             /* startRead() owns one GC pin while active */
     bool streaming_read_started_foreground;
+    bool read_starting;              /* promise hook reentrancy reservation */
+    bool write_starting;             /* protects a partially-written request */
+    bool connect_starting;           /* promise hook reentrancy reservation */
+    bool shutdown_starting;          /* promise hook reentrancy reservation */
     bool close_pinned;               /* close() owns one GC pin until uv__close_cb */
     TJSReadReq *read_req;            /* non-NULL while a one-shot read(buf) is in flight */
     TJSPromise connect_promise;
@@ -106,6 +112,49 @@ struct TJSReadReq {
     int settled;        /* promise already resolved/rejected */
     int canceled;       /* close() requested while read was in flight */
 };
+
+static JSValue tjs_stream_capability(JSContext *ctx,
+                                     TJSStream *s,
+                                     TJSCapabilityMask operations,
+                                     uint32_t flags,
+                                     const char *api,
+                                     const char *detail) {
+    if (s->h.handle.type == UV_TCP) {
+        return tjs__capability_network(ctx,
+                                       TJS_CAP_NETWORK | operations,
+                                       flags,
+                                       api,
+                                       detail);
+    }
+    return tjs__capability_io(ctx,
+                              TJS_CAP_IO | operations,
+                              flags,
+                              api,
+                              detail);
+}
+
+static const char *tjs_stream_format_destination(const struct sockaddr_storage *ss,
+                                                 char *buf,
+                                                 size_t size) {
+    char ip[64];
+    int r;
+
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *addr = (const struct sockaddr_in *)ss;
+        r = uv_ip4_name(addr, ip, sizeof(ip));
+        if (r != 0) return NULL;
+        snprintf(buf, size, "%s:%u", ip, (unsigned)ntohs(addr->sin_port));
+        return buf;
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)ss;
+        r = uv_ip6_name(addr, ip, sizeof(ip));
+        if (r != 0) return NULL;
+        snprintf(buf, size, "[%s]:%u", ip, (unsigned)ntohs(addr->sin6_port));
+        return buf;
+    }
+    return NULL;
+}
 
 static void tjs_read_req_free(JSContext *ctx, TJSReadReq *rr) {
     if (!rr) return;
@@ -207,6 +256,84 @@ static inline int stream_get_fd(TJSStream *s) {
 #else
     return (int)fd;
 #endif
+}
+
+static inline bool stream_has_fd(TJSStream *s) {
+    uv_os_fd_t fd;
+    return uv_fileno(&s->h.handle, &fd) == 0;
+}
+
+static bool stream_revalidate_start_read(JSContext *ctx, TJSStream *s) {
+    if (!stream_check_open(ctx, s)) return false;
+    if (s->read_starting || s->read_req) {
+        JS_ThrowInternalError(ctx, "read already in progress");
+        return false;
+    }
+    if (s->streaming_read || s->read_buf) {
+        JS_ThrowInternalError(ctx, "startRead already in progress");
+        return false;
+    }
+    return true;
+}
+
+static bool stream_revalidate_write_buffer(JSContext *ctx,
+                                           TJSStream *s,
+                                           uint8_t **buf,
+                                           size_t *size,
+                                           JSValueConst value) {
+    if (!stream_check_open(ctx, s)) return false;
+    if (s->write_starting) {
+        JS_ThrowInternalError(ctx, "write already being started");
+        return false;
+    }
+    *buf = JS_GetAnyBuffer(ctx, size, value);
+    return *buf != NULL;
+}
+
+static bool stream_revalidate_read_buffer(JSContext *ctx,
+                                          TJSStream *s,
+                                          uint8_t **buf,
+                                          size_t *size,
+                                          JSValueConst value) {
+    if (!stream_check_open(ctx, s)) return false;
+    if (s->read_starting || s->read_req) {
+        JS_ThrowInternalError(ctx, "read already in progress");
+        return false;
+    }
+    if (s->streaming_read) {
+        JS_ThrowInternalError(ctx, "startRead already in progress");
+        return false;
+    }
+    *buf = JS_GetAnyBuffer(ctx, size, value);
+    if (!*buf) return false;
+    if (*size == 0) {
+        JS_ThrowTypeError(ctx, "read buffer must not be empty");
+        return false;
+    }
+    return true;
+}
+
+static bool stream_revalidate_read_sync_buffer(JSContext *ctx,
+                                               TJSStream *s,
+                                               uint8_t **buf,
+                                               size_t *size,
+                                               JSValueConst value) {
+    if (!stream_check_open(ctx, s)) return false;
+    if (s->read_starting) {
+        JS_ThrowInternalError(ctx, "read already in progress");
+        return false;
+    }
+    *buf = JS_GetAnyBuffer(ctx, size, value);
+    return *buf != NULL;
+}
+
+static bool stream_revalidate_shutdown(JSContext *ctx, TJSStream *s) {
+    if (!stream_check_open(ctx, s)) return false;
+    if (s->shutdown_starting || !JS_IsUndefined(s->shutdown_promise.p)) {
+        JS_ThrowInternalError(ctx, "shutdown already in progress");
+        return false;
+    }
+    return true;
 }
 
 static inline int stream_tty_foreground_state(TJSStream *s) {
@@ -430,13 +557,14 @@ static JSValue tjs_stream_start_read(JSContext *ctx, JSValue this_val, int argc,
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
-    if (s->read_req)
+    if (s->read_starting || s->read_req)
         return JS_ThrowInternalError(ctx, "read already in progress");
     if (s->streaming_read)
         return JS_ThrowInternalError(ctx, "startRead already in progress");
     if (s->read_buf)
         return JS_ThrowInternalError(ctx, "startRead already in progress");
 
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "stream.startRead", NULL), (void)0, if (!stream_revalidate_start_read(ctx, s)) return JS_EXCEPTION);
     bool started_foreground = s->h.handle.type == UV_TTY &&
                               stream_tty_foreground_state(s) == 1;
     int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
@@ -526,17 +654,26 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    if (s->write_starting)
+        return JS_ThrowInternalError(ctx, "write already being started");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
     if (!buf) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "stream.write", NULL), (void)0, if (!stream_revalidate_write_buffer(ctx, s, &buf, &sz, argv[0])) return JS_EXCEPTION);
+
+    /* uv_try_write may commit only a prefix. Keep recursive writes out until
+     * the remainder has a promise and is either queued or fully abandoned. */
+    s->write_starting = true;
 
     /* Fast path: everything written inline. */
     uv_buf_t b = uv_buf_init((char *)buf, sz);
     int r = uv_try_write(&s->h.stream, &b, 1);
     if (r == (int)sz) {
         JSValue arg = JS_NewInt32(ctx, (int32_t)sz);
-        return TJS_NewResolvedPromise(ctx, 1, &arg);
+        JSValue promise = TJS_NewResolvedPromise(ctx, 1, &arg);
+        s->write_starting = false;
+        return promise;
     }
 
     /* Partial or EAGAIN: async write for the remainder. */
@@ -545,7 +682,10 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     sz  -= sync;
 
     TJSWriteReq *wr = tjs__mallocz(sizeof(*wr));
-    if (!wr) return JS_EXCEPTION;
+    if (!wr) {
+        s->write_starting = false;
+        return JS_EXCEPTION;
+    }
     wr->req.data = wr;
     wr->buf = JS_UNDEFINED;
     TJS_ClearPromise(ctx, &wr->result);
@@ -555,6 +695,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!wr->data) {
         JS_FreeValue(ctx, wr->buf);
         tjs__free(wr);
+        s->write_starting = false;
         return JS_ThrowOutOfMemory(ctx);
     }
     memcpy(wr->data, buf, sz);
@@ -563,9 +704,16 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
      * capability before handing the request to libuv so an allocation failure
      * never leaves a queued write with an invalid promise record. */
     JSValue promise = TJS_InitPromise(ctx, &wr->result);
+    s->write_starting = false;
     if (JS_IsException(promise)) {
         tjs_write_req_free(ctx, wr);
         return promise;
+    }
+    if (!stream_check_open(ctx, s)) {
+        TJS_FreePromise(ctx, &wr->result);
+        JS_FreeValue(ctx, promise);
+        tjs_write_req_free(ctx, wr);
+        return JS_EXCEPTION;
     }
 
     /* Keep the stream wrapper alive until uv__write_cb releases this request. */
@@ -667,7 +815,7 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
-    if (s->read_req)
+    if (s->read_starting || s->read_req)
         return JS_ThrowInternalError(ctx, "read already in progress");
     if (s->streaming_read)
         return JS_ThrowInternalError(ctx, "startRead already in progress");
@@ -676,6 +824,7 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
     if (!buf) return JS_EXCEPTION;
     if (sz == 0) return JS_ThrowTypeError(ctx, "read buffer must not be empty");
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "stream.read", NULL), (void)0, if (!stream_revalidate_read_buffer(ctx, s, &buf, &sz, argv[0])) return JS_EXCEPTION);
 
     TJSReadReq *rr = js_malloc(ctx, sizeof(*rr));
     if (!rr) return JS_EXCEPTION;
@@ -691,12 +840,26 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
         js_free(ctx, rr);
         return JS_ThrowOutOfMemory(ctx);
     }
+    s->read_starting = true;
     JSValue promise = TJS_InitPromise(ctx, &rr->result);
+    s->read_starting = false;
     if (JS_IsException(promise)) {
         JS_FreeValue(ctx, rr->buf);
         js_free(ctx, rr->data);
         js_free(ctx, rr);
         return promise;
+    }
+    if (!stream_check_open(ctx, s)) {
+        TJS_FreePromise(ctx, &rr->result);
+        JS_FreeValue(ctx, promise);
+        tjs_read_req_free(ctx, rr);
+        return JS_EXCEPTION;
+    }
+    if (s->read_req || s->streaming_read) {
+        TJS_FreePromise(ctx, &rr->result);
+        JS_FreeValue(ctx, promise);
+        tjs_read_req_free(ctx, rr);
+        return JS_ThrowInternalError(ctx, "read already in progress");
     }
 
     s->read_req = rr;
@@ -746,17 +909,26 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
-    if (!JS_IsUndefined(s->shutdown_promise.p))
+    if (s->shutdown_starting || !JS_IsUndefined(s->shutdown_promise.p))
         return JS_ThrowInternalError(ctx, "shutdown already in progress");
 
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "stream.shutdown", NULL), (void)0, if (!stream_revalidate_shutdown(ctx, s)) return JS_EXCEPTION);
     uv_shutdown_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
     req->data = s;
 
+    s->shutdown_starting = true;
     JSValue promise = TJS_InitPromise(ctx, &s->shutdown_promise);
+    s->shutdown_starting = false;
     if (JS_IsException(promise)) {
         tjs__free(req);
         return promise;
+    }
+    if (!stream_check_open(ctx, s)) {
+        TJS_FreePromise(ctx, &s->shutdown_promise);
+        JS_FreeValue(ctx, promise);
+        tjs__free(req);
+        return JS_EXCEPTION;
     }
 
     stream_pin(ctx, s, this_val);
@@ -852,7 +1024,9 @@ static JSValue tjs_stream_listen(JSContext *ctx, JSValue this_val, int argc, JSV
     uint32_t backlog = 511;
     if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
         return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
 
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "stream.listen", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int r = uv_listen(&s->h.stream, (int)backlog, uv__connection_cb);
     if (r != 0) return tjs_throw_errno(ctx, r);
     if (!s->listening) {
@@ -868,8 +1042,10 @@ static JSValue tjs_stream_set_blocking(JSContext *ctx, JSValue this_val, int arg
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected blocking flag");
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     int blocking = JS_ToBool(ctx, argv[0]);
     if (blocking == -1) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "stream.setBlocking", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int r = uv_stream_set_blocking(&s->h.stream, blocking);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -878,6 +1054,8 @@ static JSValue tjs_stream_set_blocking(JSContext *ctx, JSValue this_val, int arg
 static JSValue tjs_stream_get_fileno(JSContext *ctx, JSValue this_val) {
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "stream.fileno", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     uv_os_fd_t fd;
     int r = uv_fileno(&s->h.handle, &fd);
     if (r != 0) return tjs_throw_errno(ctx, r);
@@ -915,12 +1093,15 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
-    int fd = stream_get_fd(s);
-    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
+    if (s->read_starting)
+        return JS_ThrowInternalError(ctx, "read already in progress");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
     if (!buf) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "stream.readSync", NULL), (void)0, if (!stream_revalidate_read_sync_buffer(ctx, s, &buf, &sz, argv[0])) return JS_EXCEPTION);
+    int fd = stream_get_fd(s);
+    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
 
     ssize_t n;
     n = read(fd, buf, sz);
@@ -941,12 +1122,15 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
     TJSStream *s = stream_get_any(ctx, this_val);
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
-    int fd = stream_get_fd(s);
-    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
+    if (s->write_starting)
+        return JS_ThrowInternalError(ctx, "write already being started");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
     if (!buf) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "stream.writeSync", NULL), (void)0, if (!stream_revalidate_write_buffer(ctx, s, &buf, &sz, argv[0])) return JS_EXCEPTION);
+    int fd = stream_get_fd(s);
+    if (fd < 0) return tjs_throw_errno(ctx, UV_EBADF);
 
     ssize_t n;
     n = write(fd, buf, sz);
@@ -1110,6 +1294,7 @@ static JSValue tjs_tcp_constructor(JSContext *ctx, JSValue new_target, int argc,
     int af = AF_UNSPEC;
     if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0]))
         return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tcp.create", NULL), (void)0);
     return tjs_new_tcp(ctx, af);
 }
 
@@ -1120,6 +1305,8 @@ static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj) {
 static JSValue tjs_tcp_get_sockpeername(JSContext *ctx, JSValue this_val, int magic) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "tcp.sockname" : "tcp.peername", NULL), (void)0, if (!stream_check_open(ctx, t)) return JS_EXCEPTION);
     struct sockaddr_storage addr;
     int namelen = sizeof(addr);
     int r = magic == 0
@@ -1135,19 +1322,31 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
-    if (!JS_IsUndefined(t->connect_promise.p))
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
         return JS_ThrowInternalError(ctx, "connect already in progress");
 
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    char destination[96];
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "tcp.connect", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); } while (0));
 
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
 
+    t->connect_starting = true;
     JSValue promise = TJS_InitPromise(ctx, &t->connect_promise);
+    t->connect_starting = false;
     if (JS_IsException(promise)) {
         tjs__free(req);
         return promise;
+    }
+    if (!stream_check_open(ctx, t)) {
+        TJS_FreePromise(ctx, &t->connect_promise);
+        JS_FreeValue(ctx, promise);
+        tjs__free(req);
+        return JS_EXCEPTION;
     }
 
     stream_pin(ctx, t, this_val);
@@ -1170,10 +1369,8 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
-
-    // uv_tcp_open requires the handle to not have a fd yet
-    if (stream_get_fd(t) >= 0)
-        return JS_ThrowInternalError(ctx, "socket already open");
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
 
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
@@ -1184,6 +1381,10 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
         if (JS_ToInt32(ctx, &timeout_ms, argv[1])) return JS_EXCEPTION;
         if (timeout_ms < 0) timeout_ms = 30000;
     }
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+
+    char destination[96];
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "tcp.connectSync", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_get_fd(t) >= 0) return JS_ThrowInternalError(ctx, "socket already open"); } while (0));
 
 #ifndef _WIN32
     int fd = socket(ss.ss_family, SOCK_STREAM, 0);
@@ -1317,10 +1518,14 @@ static JSValue tjs_tcp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
     int flags = 0;
     if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &flags, argv[1])) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    char destination[96];
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "tcp.bind", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, if (!stream_check_open(ctx, t)) return JS_EXCEPTION);
     int r = uv_tcp_bind(&t->h.tcp, (struct sockaddr *)&ss, flags);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1330,10 +1535,13 @@ static JSValue tjs_tcp_keepalive(JSContext *ctx, JSValue this_val, int argc, JSV
     if (argc < 2) return JS_ThrowTypeError(ctx, "expected enable and delay");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     int enable = JS_ToBool(ctx, argv[0]);
     if (enable == -1) return JS_EXCEPTION;
     int delay;
     if (JS_ToInt32(ctx, &delay, argv[1])) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tcp.setKeepAlive", NULL), (void)0, if (!stream_check_open(ctx, t)) return JS_EXCEPTION);
     int r = uv_tcp_keepalive(&t->h.tcp, enable, delay);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1343,8 +1551,11 @@ static JSValue tjs_tcp_nodelay(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected enable flag");
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     int enable = JS_ToBool(ctx, argv[0]);
     if (enable == -1) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tcp.setNoDelay", NULL), (void)0, if (!stream_check_open(ctx, t)) return JS_EXCEPTION);
     int r = uv_tcp_nodelay(&t->h.tcp, enable);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1370,6 +1581,7 @@ static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc,
     int fd, readable;
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
     if ((readable = JS_ToBool(ctx, argv[1])) == -1) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tty.create", NULL), (void)0);
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_tty_class_id);
     if (JS_IsException(obj)) return obj;
@@ -1464,8 +1676,16 @@ rollback: {
 static JSValue tjs_tty_set_mode(JSContext *ctx, JSValue this_val, JSValue value) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     int mode;
     if (JS_ToInt32(ctx, &mode, value)) return JS_EXCEPTION;
+    if (mode != UV_TTY_MODE_NORMAL &&
+        mode != UV_TTY_MODE_RAW &&
+        mode != UV_TTY_MODE_RAW_VT) {
+        return tjs_throw_errno(ctx, UV_EINVAL);
+    }
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tty.setMode", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int r = tjs_tty_apply_mode(s, mode, false);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1474,6 +1694,7 @@ static JSValue tjs_tty_set_mode(JSContext *ctx, JSValue this_val, JSValue value)
 static JSValue tjs_tty_set_raw(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
 
     int enabled = argc > 0 ? JS_ToBool(ctx, argv[0]) : 0;
     if (enabled == -1) return JS_EXCEPTION;
@@ -1481,6 +1702,7 @@ static JSValue tjs_tty_set_raw(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (cbreak == -1) return JS_EXCEPTION;
 
     int mode = enabled ? UV_TTY_MODE_RAW_VT : UV_TTY_MODE_NORMAL;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tty.setRaw", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int r = tjs_tty_apply_mode(s, mode, cbreak);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1495,6 +1717,8 @@ static JSValue tjs_tty_get_mode(JSContext *ctx, JSValue this_val) {
 static JSValue tjs_tty_is_foreground(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "tty.isForeground", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int state = stream_tty_foreground_state(s);
     if (state < 0) return tjs_throw_errno(ctx, state);
     return JS_NewBool(ctx, state);
@@ -1503,6 +1727,8 @@ static JSValue tjs_tty_is_foreground(JSContext *ctx, JSValue this_val, int argc,
 static JSValue tjs_tty_get_win_size(JSContext *ctx, JSValue this_val) {
     TJSStream *s = tjs_tty_get(ctx, this_val);
     if (!s) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "tty.size", NULL), (void)0, if (!stream_check_open(ctx, s)) return JS_EXCEPTION);
     int w, h;
     int r = uv_tty_get_winsize(&s->h.tty, &w, &h);
     if (r != 0) return tjs_throw_errno(ctx, r);
@@ -1548,6 +1774,7 @@ JSValue tjs_new_pipe(JSContext *ctx) {
 }
 
 static JSValue tjs_pipe_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "pipe.create", NULL), (void)0);
     return tjs_new_pipe(ctx);
 }
 
@@ -1573,6 +1800,8 @@ void tjs_pipe_set_pty_master(JSContext *ctx, JSValue obj) {
 static JSValue tjs_pipe_getsockpeername(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "pipe.getsockname" : "pipe.getpeername", NULL), (void)0, if (!stream_check_open(ctx, t)) return JS_EXCEPTION);
     char buf[1024];
     size_t len = sizeof(buf);
     int r = magic == 0
@@ -1586,22 +1815,42 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected pipe name");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
-    if (!JS_IsUndefined(t->connect_promise.p))
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
         return JS_ThrowInternalError(ctx, "connect already in progress");
+    if (stream_has_fd(t))
+        return JS_ThrowInternalError(ctx, "pipe already open");
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "pipe.connect", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "pipe already open"); } } while (0));
 
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
 
+    t->connect_starting = true;
     JSValue promise = TJS_InitPromise(ctx, &t->connect_promise);
+    t->connect_starting = false;
     if (JS_IsException(promise)) {
         JS_FreeCString(ctx, name);
         tjs__free(req);
         return promise;
+    }
+    if (!stream_check_open(ctx, t)) {
+        JS_FreeCString(ctx, name);
+        TJS_FreePromise(ctx, &t->connect_promise);
+        JS_FreeValue(ctx, promise);
+        tjs__free(req);
+        return JS_EXCEPTION;
+    }
+    if (stream_has_fd(t)) {
+        JS_FreeCString(ctx, name);
+        TJS_FreePromise(ctx, &t->connect_promise);
+        JS_FreeValue(ctx, promise);
+        tjs__free(req);
+        return JS_ThrowInternalError(ctx, "pipe already open");
     }
 
     stream_pin(ctx, t, this_val);
@@ -1628,6 +1877,10 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
+    if (stream_has_fd(t))
+        return JS_ThrowInternalError(ctx, "pipe already open");
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
@@ -1638,6 +1891,8 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
         JS_FreeCString(ctx, name);
         return JS_ThrowTypeError(ctx, "pipe name too long");
     }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "pipe.connectSync", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "pipe already open"); } } while (0));
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1661,10 +1916,12 @@ static JSValue tjs_pipe_bind(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected pipe name");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "pipe.bind", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } } while (0));
     int r = uv_pipe_bind2(&t->h.pipe, name, len, 0);
     JS_FreeCString(ctx, name);
     if (r != 0) return tjs_throw_errno(ctx, r);
@@ -1675,8 +1932,19 @@ static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected file descriptor");
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
+    if (stream_has_fd(t))
+        return JS_ThrowInternalError(ctx, "pipe already open");
     int fd;
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
+    if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
+        return JS_ThrowInternalError(ctx, "connect already in progress");
+    if (stream_has_fd(t))
+        return JS_ThrowInternalError(ctx, "pipe already open");
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "pipe.open", NULL), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_has_fd(t)) return JS_ThrowInternalError(ctx, "pipe already open"); } while (0));
     int r = uv_pipe_open(&t->h.pipe, fd);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;

@@ -391,8 +391,8 @@ static JSClassDef tjs_inflate_class = {
     .finalizer = tjs_inflate_finalizer,
 };
 
-/* Create deflate stream */
-static JSValue tjs_zlib_create_deflate(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+/* Construct a Deflate, Gzip, or DeflateRaw stream. */
+static JSValue tjs_zlib_deflate_constructor(JSContext* ctx, JSValueConst new_target, int argc, JSValueConst* argv, int magic) {
     int level = Z_DEFAULT_COMPRESSION;
     int strategy = Z_DEFAULT_STRATEGY;
     int mem_level = 8;
@@ -441,7 +441,15 @@ static JSValue tjs_zlib_create_deflate(JSContext* ctx, JSValueConst this_val, in
     d->initialized = 1;
     d->finished = 0;
     
-    JSValue obj = JS_NewObjectClass(ctx, tjs_deflate_class_id);
+    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
+    if (JS_IsException(proto)) {
+        deflateEnd(&d->strm);
+        js_free(ctx, d);
+        return proto;
+    }
+
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, tjs_deflate_class_id);
+    JS_FreeValue(ctx, proto);
     if (JS_IsException(obj)) {
         deflateEnd(&d->strm);
         js_free(ctx, d);
@@ -452,8 +460,8 @@ static JSValue tjs_zlib_create_deflate(JSContext* ctx, JSValueConst this_val, in
     return obj;
 }
 
-/* Create inflate stream */
-static JSValue tjs_zlib_create_inflate(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
+/* Construct an Inflate, Gunzip, InflateRaw, or Unzip stream. */
+static JSValue tjs_zlib_inflate_constructor(JSContext* ctx, JSValueConst new_target, int argc, JSValueConst* argv, int magic) {
     int method = magic & 0xFF;
     int window_bits = get_window_bits(method);
     
@@ -471,7 +479,15 @@ static JSValue tjs_zlib_create_inflate(JSContext* ctx, JSValueConst this_val, in
     i->initialized = 1;
     i->finished = 0;
     
-    JSValue obj = JS_NewObjectClass(ctx, tjs_inflate_class_id);
+    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
+    if (JS_IsException(proto)) {
+        inflateEnd(&i->strm);
+        js_free(ctx, i);
+        return proto;
+    }
+
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, tjs_inflate_class_id);
+    JS_FreeValue(ctx, proto);
     if (JS_IsException(obj)) {
         inflateEnd(&i->strm);
         js_free(ctx, i);
@@ -504,16 +520,20 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     size_t data_len = 0;
     const uint8_t* data = NULL;
 
-    int flush = magic;  /* Flush mode from magic */
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32(ctx, &flush, argv[1]) < 0) {
+    /* flush(mode) has no data argument; deflate(data, mode) and finish(data)
+     * do. Keep scalar conversion ahead of acquiring a buffer pointer because
+     * it may run user code capable of detaching the input buffer. */
+    bool is_flush_method = magic == Z_SYNC_FLUSH;
+    int flush = magic;
+    int flush_arg = is_flush_method ? 0 : 1;
+    if (argc > flush_arg && !JS_IsUndefined(argv[flush_arg])) {
+        if (JS_ToInt32(ctx, &flush, argv[flush_arg]) < 0) {
             return JS_EXCEPTION;
         }
     }
 
-    /* Data argument is optional for finish/flush. Convert scalar args first:
-     * JS_ToInt32 may run user code capable of detaching argv[0]. */
-    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+    /* The data argument is optional for finish(). */
+    if (!is_flush_method && argc >= 1 && !JS_IsUndefined(argv[0])) {
         data = JS_GetAnyBuffer(ctx, &data_len, argv[0]);
         if (!data) {
             return JS_EXCEPTION;
@@ -710,7 +730,7 @@ static JSValue tjs_deflate_total_out(JSContext* ctx, JSValueConst this_val, int 
 
 static const JSCFunctionListEntry tjs_deflate_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("deflate", 2, tjs_deflate_process, Z_NO_FLUSH),
-    JS_CFUNC_MAGIC_DEF("flush", 0, tjs_deflate_process, Z_SYNC_FLUSH),
+    JS_CFUNC_MAGIC_DEF("flush", 1, tjs_deflate_process, Z_SYNC_FLUSH),
     JS_CFUNC_MAGIC_DEF("finish", 0, tjs_deflate_process, Z_FINISH),
     JS_CFUNC_DEF("reset", 0, tjs_deflate_reset),
     JS_CFUNC_DEF("params", 2, tjs_deflate_params),
@@ -903,17 +923,6 @@ static const JSCFunctionListEntry tjs_zlib_funcs[] = {
     JS_CFUNC_MAGIC_DEF("inflateRaw", 1, tjs_zlib_decompress, METHOD_RAW_DEFLATE),
     JS_CFUNC_MAGIC_DEF("unzip", 1, tjs_zlib_decompress, METHOD_UNZIP),
 
-    /* Streaming compression */
-    JS_CFUNC_MAGIC_DEF("createDeflate", 3, tjs_zlib_create_deflate, METHOD_DEFLATE),
-    JS_CFUNC_MAGIC_DEF("createGzip", 3, tjs_zlib_create_deflate, METHOD_GZIP),
-    JS_CFUNC_MAGIC_DEF("createDeflateRaw", 3, tjs_zlib_create_deflate, METHOD_RAW_DEFLATE),
-    
-    /* Streaming decompression */
-    JS_CFUNC_MAGIC_DEF("createInflate", 0, tjs_zlib_create_inflate, METHOD_DEFLATE),
-    JS_CFUNC_MAGIC_DEF("createGunzip", 0, tjs_zlib_create_inflate, METHOD_GZIP),
-    JS_CFUNC_MAGIC_DEF("createInflateRaw", 0, tjs_zlib_create_inflate, METHOD_RAW_DEFLATE),
-    JS_CFUNC_MAGIC_DEF("createUnzip", 0, tjs_zlib_create_inflate, METHOD_UNZIP),
-    
     /* Checksums */
     JS_CFUNC_DEF("crc32", 2, tjs_zlib_crc32),
     JS_CFUNC_DEF("adler32", 2, tjs_zlib_adler32),
@@ -938,20 +947,93 @@ static const JSCFunctionListEntry tjs_zlib_funcs[] = {
     JS_PROP_INT32_DEF("BLOCK", Z_BLOCK, JS_PROP_CONFIGURABLE),
 };
 
+static JSValue tjs_zlib_new_constructor(JSContext* ctx, const char* name, int length,
+                                        JSCFunctionMagic* constructor, int magic,
+                                        JSValueConst proto, JSValueConst parent) {
+    JSValue ctor = JS_NewCFunctionMagic(ctx, constructor, name, length,
+                                        JS_CFUNC_constructor_magic, magic);
+    if (JS_IsException(ctor)) {
+        return ctor;
+    }
+    if (JS_SetConstructor(ctx, ctor, proto) < 0 ||
+        (!JS_IsUndefined(parent) && JS_SetPrototype(ctx, ctor, parent) < 0)) {
+        JS_FreeValue(ctx, ctor);
+        return JS_EXCEPTION;
+    }
+    return ctor;
+}
+
+static int tjs_zlib_export_subclass(JSContext* ctx, JSValueConst ns,
+                                    const char* name, int length,
+                                    JSCFunctionMagic* constructor, int magic,
+                                    JSValueConst parent_proto, JSValueConst parent_ctor) {
+    JSValue proto = JS_NewObjectProto(ctx, parent_proto);
+    if (JS_IsException(proto)) {
+        return -1;
+    }
+    JSValue ctor = tjs_zlib_new_constructor(ctx, name, length, constructor, magic,
+                                            proto, parent_ctor);
+    JS_FreeValue(ctx, proto);
+    if (JS_IsException(ctor)) {
+        return -1;
+    }
+    return JS_DefinePropertyValueStr(ctx, ns, name, ctor, JS_PROP_C_W_E);
+}
+
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns) {
     /* Initialize Deflate class */
     JS_NewClassID(JS_GetRuntime(ctx), &tjs_deflate_class_id);
     JS_NewClass(JS_GetRuntime(ctx), tjs_deflate_class_id, &tjs_deflate_class);
     JSValue deflate_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, deflate_proto, tjs_deflate_proto_funcs, countof(tjs_deflate_proto_funcs));
-    JS_SetClassProto(ctx, tjs_deflate_class_id, deflate_proto);
+    JS_SetClassProto(ctx, tjs_deflate_class_id, JS_DupValue(ctx, deflate_proto));
+
+    JSValue deflate_ctor = tjs_zlib_new_constructor(
+        ctx, "Deflate", 3, tjs_zlib_deflate_constructor, METHOD_DEFLATE,
+        deflate_proto, JS_UNDEFINED);
+    if (JS_IsException(deflate_ctor)) {
+        JS_FreeValue(ctx, deflate_proto);
+        return;
+    }
+    if (JS_DefinePropertyValueStr(ctx, ns, "Deflate", JS_DupValue(ctx, deflate_ctor), JS_PROP_C_W_E) < 0 ||
+        tjs_zlib_export_subclass(ctx, ns, "Gzip", 3, tjs_zlib_deflate_constructor,
+                                 METHOD_GZIP, deflate_proto, deflate_ctor) < 0 ||
+        tjs_zlib_export_subclass(ctx, ns, "DeflateRaw", 3, tjs_zlib_deflate_constructor,
+                                 METHOD_RAW_DEFLATE, deflate_proto, deflate_ctor) < 0) {
+        JS_FreeValue(ctx, deflate_ctor);
+        JS_FreeValue(ctx, deflate_proto);
+        return;
+    }
+    JS_FreeValue(ctx, deflate_ctor);
+    JS_FreeValue(ctx, deflate_proto);
     
     /* Initialize Inflate class */
     JS_NewClassID(JS_GetRuntime(ctx), &tjs_inflate_class_id);
     JS_NewClass(JS_GetRuntime(ctx), tjs_inflate_class_id, &tjs_inflate_class);
     JSValue inflate_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, inflate_proto, tjs_inflate_proto_funcs, countof(tjs_inflate_proto_funcs));
-    JS_SetClassProto(ctx, tjs_inflate_class_id, inflate_proto);
+    JS_SetClassProto(ctx, tjs_inflate_class_id, JS_DupValue(ctx, inflate_proto));
+
+    JSValue inflate_ctor = tjs_zlib_new_constructor(
+        ctx, "Inflate", 0, tjs_zlib_inflate_constructor, METHOD_DEFLATE,
+        inflate_proto, JS_UNDEFINED);
+    if (JS_IsException(inflate_ctor)) {
+        JS_FreeValue(ctx, inflate_proto);
+        return;
+    }
+    if (JS_DefinePropertyValueStr(ctx, ns, "Inflate", JS_DupValue(ctx, inflate_ctor), JS_PROP_C_W_E) < 0 ||
+        tjs_zlib_export_subclass(ctx, ns, "Gunzip", 0, tjs_zlib_inflate_constructor,
+                                 METHOD_GZIP, inflate_proto, inflate_ctor) < 0 ||
+        tjs_zlib_export_subclass(ctx, ns, "InflateRaw", 0, tjs_zlib_inflate_constructor,
+                                 METHOD_RAW_DEFLATE, inflate_proto, inflate_ctor) < 0 ||
+        tjs_zlib_export_subclass(ctx, ns, "Unzip", 0, tjs_zlib_inflate_constructor,
+                                 METHOD_UNZIP, inflate_proto, inflate_ctor) < 0) {
+        JS_FreeValue(ctx, inflate_ctor);
+        JS_FreeValue(ctx, inflate_proto);
+        return;
+    }
+    JS_FreeValue(ctx, inflate_ctor);
+    JS_FreeValue(ctx, inflate_proto);
     
     /* Set zlib functions and constants */
     JS_SetPropertyFunctionList(ctx, ns, tjs_zlib_funcs, countof(tjs_zlib_funcs));

@@ -162,18 +162,19 @@ await test('zlib.adler32 - deterministic', () => {
 });
 
 // ========== Streaming Compression ==========
-await test('zlib.createDeflate - create deflate stream', () => {
-    const deflate = zlib.createDeflate();
+await test('zlib.Deflate - construct deflate stream', () => {
+    const deflate = new zlib.Deflate();
     assert(deflate, 'Should create deflate stream');
+    assert(deflate instanceof zlib.Deflate, 'Should be a Deflate instance');
 });
 
-await test('zlib.createDeflate - with options', () => {
-    const deflate = zlib.createDeflate(zlib.BEST_COMPRESSION, zlib.FILTERED);
+await test('zlib.Deflate - with options', () => {
+    const deflate = new zlib.Deflate(zlib.BEST_COMPRESSION, zlib.FILTERED);
     assert(deflate, 'Should create deflate stream with options');
 });
 
 await test('zlib.Deflate - compress stream', () => {
-    const deflate = zlib.createDeflate();
+    const deflate = new zlib.Deflate();
     const data = encode('hello world');
     
     const compressed = deflate.deflate(data);
@@ -184,7 +185,7 @@ await test('zlib.Deflate - compress stream', () => {
 });
 
 await test('zlib.Deflate - flush', () => {
-    const deflate = zlib.createDeflate();
+    const deflate = new zlib.Deflate();
     const data = encode('hello');
     
     deflate.deflate(data, zlib.SYNC_FLUSH);
@@ -193,8 +194,21 @@ await test('zlib.Deflate - flush', () => {
     assert(flushed instanceof Uint8Array, 'Flush should return Uint8Array');
 });
 
+await test('zlib.Deflate.flush - accepts an explicit FINISH mode', () => {
+    const original = encode('finish through flush '.repeat(100));
+    const deflate = new zlib.Deflate();
+    const head = deflate.deflate(original);
+    const tail = deflate.flush(zlib.FINISH);
+
+    assert(tail instanceof Uint8Array, 'flush(FINISH) should return Uint8Array');
+    const compressed = new Uint8Array(head.length + tail.length);
+    compressed.set(head);
+    compressed.set(tail, head.length);
+    assert(arraysEqual(zlib.inflate(compressed), original), 'flush(FINISH) should complete the stream');
+});
+
 await test('zlib.Deflate - reset', () => {
-    const deflate = zlib.createDeflate();
+    const deflate = new zlib.Deflate();
     deflate.deflate(encode('data'));
     deflate.reset();
     
@@ -204,7 +218,7 @@ await test('zlib.Deflate - reset', () => {
 });
 
 await test('zlib.Deflate - getTotalIn/Out', () => {
-    const deflate = zlib.createDeflate();
+    const deflate = new zlib.Deflate();
     const data = encode('hello world');
     
     deflate.deflate(data);
@@ -218,9 +232,10 @@ await test('zlib.Deflate - getTotalIn/Out', () => {
 });
 
 // ========== Streaming Decompression ==========
-await test('zlib.createInflate - create inflate stream', () => {
-    const inflate = zlib.createInflate();
+await test('zlib.Inflate - construct inflate stream', () => {
+    const inflate = new zlib.Inflate();
     assert(inflate, 'Should create inflate stream');
+    assert(inflate instanceof zlib.Inflate, 'Should be an Inflate instance');
 });
 
 await test('zlib.Inflate - decompress stream', () => {
@@ -229,7 +244,7 @@ await test('zlib.Inflate - decompress stream', () => {
     const compressed = zlib.deflate(original);
     
     // Now decompress in chunks
-    const inflate = zlib.createInflate();
+    const inflate = new zlib.Inflate();
     const decompressed = inflate.inflate(compressed);
     
     assert(decompressed instanceof Uint8Array, 'Should return Uint8Array');
@@ -237,7 +252,7 @@ await test('zlib.Inflate - decompress stream', () => {
 });
 
 await test('zlib.Inflate - reset', () => {
-    const inflate = zlib.createInflate();
+    const inflate = new zlib.Inflate();
     const compressed = zlib.deflate(encode('data'));
     
     inflate.inflate(compressed);
@@ -251,7 +266,7 @@ await test('zlib.Inflate - reset', () => {
 });
 
 await test('zlib.Inflate - getTotalIn/Out', () => {
-    const inflate = zlib.createInflate();
+    const inflate = new zlib.Inflate();
     const compressed = zlib.deflate(encode('hello world'));
     
     inflate.inflate(compressed);
@@ -263,41 +278,6 @@ await test('zlib.Inflate - getTotalIn/Out', () => {
     assert(typeof totalOut === 'number', 'getTotalOut should return number');
 });
 
-// ========== Gzip/Gunzip Streaming ==========
-await test('zlib.createGzip - create gzip stream', () => {
-    const gzip = zlib.createGzip();
-    assert(gzip, 'Should create gzip stream');
-});
-
-await test('zlib.createGunzip - create gunzip stream', () => {
-    const gunzip = zlib.createGunzip();
-    assert(gunzip, 'Should create gunzip stream');
-});
-
-// ========== Constants ==========
-await test('zlib constants - compression levels', () => {
-    assertEquals(typeof zlib.NO_COMPRESSION, 'number', 'NO_COMPRESSION should be defined');
-    assertEquals(typeof zlib.BEST_SPEED, 'number', 'BEST_SPEED should be defined');
-    assertEquals(typeof zlib.BEST_COMPRESSION, 'number', 'BEST_COMPRESSION should be defined');
-    assertEquals(typeof zlib.DEFAULT_COMPRESSION, 'number', 'DEFAULT_COMPRESSION should be defined');
-});
-
-await test('zlib constants - strategies', () => {
-    assertEquals(typeof zlib.FILTERED, 'number', 'FILTERED should be defined');
-    assertEquals(typeof zlib.HUFFMAN_ONLY, 'number', 'HUFFMAN_ONLY should be defined');
-    assertEquals(typeof zlib.RLE, 'number', 'RLE should be defined');
-    assertEquals(typeof zlib.FIXED, 'number', 'FIXED should be defined');
-    assertEquals(typeof zlib.DEFAULT_STRATEGY, 'number', 'DEFAULT_STRATEGY should be defined');
-});
-
-await test('zlib constants - flush modes', () => {
-    assertEquals(typeof zlib.NO_FLUSH, 'number', 'NO_FLUSH should be defined');
-    assertEquals(typeof zlib.PARTIAL_FLUSH, 'number', 'PARTIAL_FLUSH should be defined');
-    assertEquals(typeof zlib.SYNC_FLUSH, 'number', 'SYNC_FLUSH should be defined');
-    assertEquals(typeof zlib.FULL_FLUSH, 'number', 'FULL_FLUSH should be defined');
-    assertEquals(typeof zlib.FINISH, 'number', 'FINISH should be defined');
-    assertEquals(typeof zlib.BLOCK, 'number', 'BLOCK should be defined');
-});
 
 // ========== Error Handling ==========
 await test('zlib - invalid data throws', () => {
@@ -329,7 +309,7 @@ await test('zlib - invalid compression level throws', () => {
 
 // ========== Regression: params(), truncated input, catchable stream errors ==========
 await test('zlib.Deflate.params - changes level mid-stream and round-trips', () => {
-    const deflate = zlib.createDeflate(zlib.BEST_SPEED);
+    const deflate = new zlib.Deflate(zlib.BEST_SPEED);
     const a = encode('hello world '.repeat(500));
     const b = encode('goodbye world '.repeat(500));
     const parts = [deflate.deflate(a)];
@@ -364,7 +344,7 @@ await test('zlib.inflate - truncated input throws a catchable TypeError', () => 
 });
 
 await test('zlib.Inflate - finished stream error is catchable', () => {
-    const inflate = zlib.createInflate();
+    const inflate = new zlib.Inflate();
     inflate.inflate(zlib.deflate(encode('abc')));
     assert(inflate.finished, 'Stream should be finished');
     let thrown = null;

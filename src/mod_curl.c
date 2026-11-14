@@ -26,6 +26,7 @@
 #include "tjs.h"
 #include "utils.h"
 #include "mem.h"
+#include "capability.h"
 
 #include <curl/curl.h>
 #include <stdio.h>
@@ -120,6 +121,9 @@ typedef struct {
 
     /* Status / scratch */
     long response_code;
+    char *request_url;
+    long follow_redirects;
+    uint64_t request_generation;
     char *effective_url;
     char error_buffer[CURL_ERROR_SIZE];
     bool completed;
@@ -937,6 +941,7 @@ static void tjs_curl_finalizer(JSRuntime *rt, JSValue val) {
     JS_FreeValueRT(rt, curl->pool_obj);
     JS_FreeValueRT(rt, curl->share_obj);
 
+    if (curl->request_url) js_free_rt(rt, curl->request_url);
     if (curl->effective_url) js_free_rt(rt, curl->effective_url);
 
     js_free_rt(rt, curl);
@@ -1235,6 +1240,17 @@ static void curl_apply_default_opts(TJSCURL *curl) {
 #endif
     curl_easy_setopt(curl->handle, CURLOPT_ERRORBUFFER, curl->error_buffer);
     curl_easy_setopt(curl->handle, CURLOPT_FOLLOWLOCATION, 1L);
+    /* A network authorization must never silently turn into local file I/O on
+     * a redirect. Generic setOpt cannot override this binding invariant. */
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl->handle, CURLOPT_REDIR_PROTOCOLS_STR,
+                     "http,https,ftp,ftps");
+#else
+    curl_easy_setopt(curl->handle, CURLOPT_REDIR_PROTOCOLS,
+                     (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS |
+                            CURLPROTO_FTP | CURLPROTO_FTPS));
+#endif
+    curl->follow_redirects = 1L;
 }
 
 static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
@@ -1298,12 +1314,91 @@ static JSValue tjs_curl_constructor(JSContext *ctx, JSValueConst new_target,
     TJSCURL *curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); \
     if (!curl) return JS_EXCEPTION
 
+static TJSCapabilityMask curl_file_option_mask(CURLoption option) {
+    switch (option) {
+        case CURLOPT_COOKIEJAR:
+            return TJS_CAP_IO | TJS_CAP_IO_WRITE;
+        case CURLOPT_CAINFO:
+        case CURLOPT_SSLCERT:
+        case CURLOPT_SSLKEY:
+        case CURLOPT_COOKIEFILE:
+            return TJS_CAP_IO | TJS_CAP_IO_READ;
+        default:
+            return 0;
+    }
+}
+
+static bool curl_is_file_url(const char *url) {
+    return url && strlen(url) >= 5 &&
+           (url[0] == 'f' || url[0] == 'F') &&
+           (url[1] == 'i' || url[1] == 'I') &&
+           (url[2] == 'l' || url[2] == 'L') &&
+           (url[3] == 'e' || url[3] == 'E') &&
+           url[4] == ':';
+}
+
+static JSValue curl_transfer_capability(JSContext *ctx,
+                                        TJSCURL *curl,
+                                        uint32_t flags,
+                                        const char *api) {
+    const char *url = curl->request_url;
+    char *destination = url ? js_strdup(ctx, url) : NULL;
+    if (url && !destination) return JS_EXCEPTION;
+
+    JSValue result;
+    if (curl_is_file_url(destination)) {
+        /* libcurl can select upload semantics through generic options too, so
+         * the binding cannot infer a reliable direction from its own body
+         * fields. Conservatively expose both possible file effects. A file URL
+         * is not a native path until it has been decoded and its authority has
+         * been resolved, so do not expose a misleading substring as `path`. */
+        result = tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, flags, api, NULL);
+    } else {
+        /* Following redirects authorizes a response-selected destination. A
+         * concrete initial URL would incorrectly imply a single-target check. */
+        result = tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, flags, api, curl->follow_redirects ? NULL : destination);
+    }
+    js_free(ctx, destination);
+    return result;
+}
+
+static CURLcode curl_set_request_url(JSContext *ctx,
+                                     TJSCURL *curl,
+                                     const char *url) {
+    char *request_url = url ? js_strdup(ctx, url) : NULL;
+    if (url && !request_url) return CURLE_OUT_OF_MEMORY;
+
+    CURLcode rc = curl_easy_setopt(curl->handle, CURLOPT_URL, url);
+    if (rc != CURLE_OK) {
+        js_free(ctx, request_url);
+        return rc;
+    }
+
+    js_free(ctx, curl->request_url);
+    curl->request_url = request_url;
+    curl->request_generation++;
+    return CURLE_OK;
+}
+
+static CURLcode curl_set_follow_redirects(TJSCURL *curl, long follow) {
+    CURLcode rc = curl_easy_setopt(curl->handle, CURLOPT_FOLLOWLOCATION, follow);
+    if (rc == CURLE_OK && curl->follow_redirects != follow) {
+        curl->follow_redirects = follow;
+        curl->request_generation++;
+    }
+    return rc;
+}
+
 static JSValue tjs_curl_set_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
     const char *url = JS_ToCString(ctx, argv[0]);
     if (!url) return JS_EXCEPTION;
-    curl_easy_setopt(curl->handle, CURLOPT_URL, url);
+    CURLcode rc = curl_set_request_url(ctx, curl, url);
     JS_FreeCString(ctx, url);
+    if (rc != CURLE_OK) {
+        if (JS_HasException(ctx)) return JS_EXCEPTION;
+        return JS_ThrowPlainError(ctx, "setUrl failed: %s", curl_easy_strerror(rc));
+    }
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1494,7 +1589,8 @@ static JSValue tjs_curl_set_timeout(JSContext *ctx, JSValueConst this_val, int a
 
 static JSValue tjs_curl_set_follow_redirects(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CURL_THIS(ctx, this_val);
-    curl_easy_setopt(curl->handle, CURLOPT_FOLLOWLOCATION, JS_ToBool(ctx, argv[0]) ? 1L : 0L);
+    CURLcode rc = curl_set_follow_redirects(curl, JS_ToBool(ctx, argv[0]) ? 1L : 0L);
+    if (rc != CURLE_OK) return JS_ThrowPlainError(ctx, "setFollowRedirects failed: %s", curl_easy_strerror(rc));
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1568,6 +1664,9 @@ static int js_to_curl_long(JSContext *ctx, JSValueConst v, long *out) {
 }
 
 static bool curl_option_is_reserved(CURLoption id) {
+    /* The numeric option remains accepted by libcurl after deprecation. Check
+     * it without naming the deprecated enum so -Werror builds stay clean. */
+    if ((long)id == CURLOPTTYPE_LONG + 182) return true;
     switch (id) {
         case CURLOPT_PRIVATE:
         case CURLOPT_ERRORBUFFER:
@@ -1581,6 +1680,9 @@ static bool curl_option_is_reserved(CURLoption id) {
         case CURLOPT_DEBUGDATA:
         case CURLOPT_READFUNCTION:
         case CURLOPT_READDATA:
+#if LIBCURL_VERSION_NUM >= 0x075500
+        case CURLOPT_REDIR_PROTOCOLS_STR:
+#endif
             return true;
         default:
             return false;
@@ -1730,7 +1832,15 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
         case T_LONG: {
             long n;
             if (js_to_curl_long(ctx, value, &n) < 0) return JS_EXCEPTION;
-            rc = curl_easy_setopt(curl->handle, id, n);
+            if (id == CURLOPT_NETRC && n != CURL_NETRC_IGNORED) {
+                curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
+                if (!curl) return JS_EXCEPTION;
+                if (curl->in_flight) return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress");
+                TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "curl.setOpt", NULL), (void)0, do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) return (JS_EXCEPTION); if (curl->in_flight) return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress"); } while (0));
+            }
+            rc = id == CURLOPT_FOLLOWLOCATION
+                ? curl_set_follow_redirects(curl, n)
+                : curl_easy_setopt(curl->handle, id, n);
             break;
         }
         case T_OFFT: {
@@ -1745,7 +1855,9 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
             switch (curl_object_option_kind(id)) {
                 case CURL_OBJECT_OPTION_COPIED_STRING: {
                     if (JS_IsNull(value) || JS_IsUndefined(value)) {
-                        rc = curl_easy_setopt(curl->handle, id, NULL);
+                        rc = id == CURLOPT_URL
+                            ? curl_set_request_url(ctx, curl, NULL)
+                            : curl_easy_setopt(curl->handle, id, NULL);
                         break;
                     }
                     if (!JS_IsString(value)) {
@@ -1753,7 +1865,22 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
                     }
                     const char *s = JS_ToCString(ctx, value);
                     if (!s) return JS_EXCEPTION;
-                    rc = curl_easy_setopt(curl->handle, id, s);
+                    TJSCapabilityMask file_mask = curl_file_option_mask(id);
+                    if (file_mask) {
+                        curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
+                        if (!curl) {
+                            JS_FreeCString(ctx, s);
+                            return JS_EXCEPTION;
+                        }
+                        if (curl->in_flight) {
+                            JS_FreeCString(ctx, s);
+                            return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress");
+                        }
+                        TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, file_mask, TJS_CAP_FLAG_REPLACEABLE, "curl.setOpt", s), JS_FreeCString(ctx, s), do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) { JS_FreeCString(ctx, s); return (JS_EXCEPTION); } if (curl->in_flight) { JS_FreeCString(ctx, s); return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress"); } } while (0));
+                    }
+                    rc = id == CURLOPT_URL
+                        ? curl_set_request_url(ctx, curl, s)
+                        : curl_easy_setopt(curl->handle, id, s);
                     JS_FreeCString(ctx, s);
                     break;
                 }
@@ -1806,6 +1933,7 @@ static JSValue tjs_curl_set_opt(JSContext *ctx, JSValueConst this_val, int argc,
     }
 
     if (rc != CURLE_OK) {
+        if (JS_HasException(ctx)) return JS_EXCEPTION;
         return JS_ThrowPlainError(ctx, "setOpt(%d) failed: %s", id32, curl_easy_strerror(rc));
     }
     return JS_DupValue(ctx, this_val);
@@ -1907,40 +2035,53 @@ static JSValue tjs_curl_set_ssl_verify(JSContext *ctx, JSValueConst this_val, in
     return JS_DupValue(ctx, this_val);
 }
 
-static JSValue curl_set_string_opt(JSContext *ctx, JSValueConst this_val, JSValueConst v, CURLoption opt) {
+static JSValue curl_set_string_opt(JSContext *ctx, JSValueConst this_val, JSValueConst v, CURLoption opt, const char *api) {
     CURL_THIS(ctx, this_val);
     const char *s = JS_ToCString(ctx, v);
     if (!s) return JS_EXCEPTION;
+    TJSCapabilityMask mask = curl_file_option_mask(opt);
+    if (mask) {
+        curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
+        if (!curl) {
+            JS_FreeCString(ctx, s);
+            return JS_EXCEPTION;
+        }
+        if (curl->in_flight) {
+            JS_FreeCString(ctx, s);
+            return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress");
+        }
+        TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, api, s), JS_FreeCString(ctx, s), do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) { JS_FreeCString(ctx, s); return (JS_EXCEPTION); } if (curl->in_flight) { JS_FreeCString(ctx, s); return JS_ThrowTypeError(ctx, "Cannot change a file option while a request is in progress"); } } while (0));
+    }
     curl_easy_setopt(curl->handle, opt, s);
     JS_FreeCString(ctx, s);
     return JS_DupValue(ctx, this_val);
 }
 
 static JSValue tjs_curl_set_ca_bundle(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_CAINFO);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_CAINFO, "curl.setCABundle");
 }
 static JSValue tjs_curl_set_user_agent(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_USERAGENT);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_USERAGENT, "curl.setUserAgent");
 }
 static JSValue tjs_curl_set_cookie(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIE);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIE, "curl.setCookie");
 }
 static JSValue tjs_curl_set_cookie_file(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIEFILE);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIEFILE, "curl.setCookieFile");
 }
 static JSValue tjs_curl_set_cookie_jar(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIEJAR);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_COOKIEJAR, "curl.setCookieJar");
 }
 static JSValue tjs_curl_set_referer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_REFERER);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_REFERER, "curl.setReferer");
 }
 #if LIBCURL_VERSION_NUM >= 0x071800
 static JSValue tjs_curl_set_dns_servers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_DNS_SERVERS);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_DNS_SERVERS, "curl.setDNSServers");
 }
 #endif
 static JSValue tjs_curl_set_interface(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_INTERFACE);
+    return curl_set_string_opt(ctx, this_val, argv[0], CURLOPT_INTERFACE, "curl.setInterface");
 }
 
 static JSValue tjs_curl_set_accept_encoding(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2133,6 +2274,17 @@ static JSValue tjs_curl_set_upload_file(JSContext *ctx, JSValueConst this_val, i
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
+    if (!curl) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+    if (curl->in_flight) {
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
+    }
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "curl.setUploadFile", path), JS_FreeCString(ctx, path), do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) { JS_FreeCString(ctx, path); return (JS_EXCEPTION); } if (curl->in_flight) { JS_FreeCString(ctx, path); return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress"); } } while (0));
+
     FILE *fp = fopen(path, "rb");
     if (!fp) {
         JS_FreeCString(ctx, path);
@@ -2165,6 +2317,8 @@ static JSValue tjs_curl_set_mime_post(JSContext *ctx, JSValueConst this_val, int
     /* Property reads can run JS, so the existing body is replaced only after
      * the new mime tree is fully built. */
     uint32_t len = 0;
+    char *file_path = NULL;
+    size_t file_count = 0;
     JSValue lenv = JS_GetPropertyStr(ctx, argv[0], "length");
     if (JS_IsException(lenv)) return JS_EXCEPTION;
     if (JS_ToUint32(ctx, &len, lenv) < 0) {
@@ -2206,7 +2360,18 @@ static JSValue tjs_curl_set_mime_post(JSContext *ctx, JSValueConst this_val, int
         }
         if (ok && JS_IsString(jfile)) {
             const char *f = JS_ToCString(ctx, jfile);
-            if (f) { curl_mime_filedata(mp, f); JS_FreeCString(ctx, f); }
+            if (f) {
+                file_count++;
+                if (file_count == 1) {
+                    file_path = js_strdup(ctx, f);
+                    if (!file_path) ok = false;
+                } else if (file_count == 2) {
+                    js_free(ctx, file_path);
+                    file_path = NULL;
+                }
+                if (curl_mime_filedata(mp, f) != CURLE_OK) ok = false;
+                JS_FreeCString(ctx, f);
+            }
             else ok = false;
         } else if (ok && !JS_IsUndefined(jdata)) {
             size_t dlen = 0;
@@ -2243,9 +2408,16 @@ static JSValue tjs_curl_set_mime_post(JSContext *ctx, JSValueConst this_val, int
         if (!ok) goto fail;
     }
 
+    curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id);
+    if (!curl) goto fail;
     if (curl->in_flight) { /* a getter started a transfer */
         JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress");
         goto fail;
+    }
+    if (file_count != 0) {
+        TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "curl.setMimePost", file_count == 1 ? file_path : NULL), (js_free(ctx, file_path), curl_mime_free(mime)), do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) { js_free(ctx, file_path); curl_mime_free(mime); return (JS_EXCEPTION); } if (curl->in_flight) { js_free(ctx, file_path); curl_mime_free(mime); return JS_ThrowTypeError(ctx, "Cannot change the request body while a request is in progress"); } } while (0));
+        js_free(ctx, file_path);
+        file_path = NULL;
     }
     curl_clear_body_resources(JS_GetRuntime(ctx), curl);
     curl->mime = mime;
@@ -2253,6 +2425,7 @@ static JSValue tjs_curl_set_mime_post(JSContext *ctx, JSValueConst this_val, int
     return JS_DupValue(ctx, this_val);
 
 fail:
+    js_free(ctx, file_path);
     curl_mime_free(mime);
     return JS_EXCEPTION;
 }
@@ -2283,6 +2456,9 @@ static JSValue tjs_curl_perform(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     if (curl->in_flight || TJS_IsPromisePending(ctx, &curl->promise))
         return JS_ThrowTypeError(ctx, "Request already in progress");
+
+    uint64_t request_generation = curl->request_generation;
+    TJS_CAPABILITY_REVALIDATE(curl_transfer_capability(ctx, curl, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "curl.perform"), (void)0, do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) return (JS_EXCEPTION); pool = curl->pool; if (!pool || connpool_require_open(ctx, pool) < 0) return (JS_EXCEPTION); if (curl->request_generation != request_generation) return JS_ThrowTypeError(ctx, "request authorization scope changed during capability check"); if (curl->in_flight || TJS_IsPromisePending(ctx, &curl->promise)) return JS_ThrowTypeError(ctx, "Request already in progress"); } while (0));
 
     curl_reset_buffers(curl);
 
@@ -2394,6 +2570,9 @@ static JSValue tjs_curl_perform_sync(JSContext *ctx, JSValueConst this_val, int 
     if (curl->in_flight)
         return JS_ThrowTypeError(ctx, "Request already in progress");
 
+    uint64_t request_generation = curl->request_generation;
+    TJS_CAPABILITY_REVALIDATE(curl_transfer_capability(ctx, curl, TJS_CAP_FLAG_REPLACEABLE, "curl.performSync"), (void)0, do { curl = JS_GetOpaque2(ctx, this_val, tjs_curl_class_id); if (!curl) return (JS_EXCEPTION); if (curl->request_generation != request_generation) return JS_ThrowTypeError(ctx, "request authorization scope changed during capability check"); if (curl->in_flight) return JS_ThrowTypeError(ctx, "Request already in progress"); } while (0));
+
     curl_reset_buffers(curl);
 
     /* curl_easy_perform on the handle directly; never touches the multi pool. */
@@ -2434,6 +2613,9 @@ static JSValue tjs_curl_reset(JSContext *ctx, JSValueConst this_val, int argc, J
     curl_easy_reset(curl->handle);
     curl_apply_default_opts(curl);
     curl_clear_request_resources(JS_GetRuntime(ctx), curl);
+    js_free(ctx, curl->request_url);
+    curl->request_url = NULL;
+    curl->request_generation++;
 
     dbuf_free(&curl->response_body);
     dbuf_free(&curl->response_headers);
