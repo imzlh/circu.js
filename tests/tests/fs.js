@@ -1,6 +1,8 @@
 // tests/tests/fs.js - Filesystem module tests (syncfs)
 
 const fs = import.meta.use('fs');
+const asyncfs = import.meta.use('asyncfs');
+const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const text = import.meta.use('text');
 
@@ -26,6 +28,46 @@ await test('fs.open - open file for writing', () => {
     assert(typeof fd === 'number', 'Should return file descriptor');
     assert(fd >= 0, 'File descriptor should be non-negative');
     fs.close(fd);
+});
+
+await test('asyncfs.createFrom accepts an omitted path', async () => {
+    const fd = fs.open(TEST_FILE, 'r');
+    const file = asyncfs.createFrom(fd);
+    assertEquals(file.path, undefined);
+    assertEquals(file.fileno(), fd);
+    await file.close();
+});
+
+await test('asyncfs.createFrom retains fd ownership when construction fails', async () => {
+    const fd = fs.open(TEST_FILE, 'r');
+    const previousMemoryLimit = os.memoryUsage().limit;
+    let unexpectedFile;
+    let failed = false;
+
+    try {
+        // With no path conversion before tjs_new_file(), this forces its first
+        // object allocation to fail and reaches createFrom's ownership edge.
+        engine.setMemoryLimit(1);
+        try {
+            unexpectedFile = asyncfs.createFrom(fd);
+        } catch {
+            failed = true;
+        }
+    } finally {
+        engine.setMemoryLimit(previousMemoryLimit);
+    }
+
+    if (unexpectedFile) {
+        await unexpectedFile.close();
+        assert(false, 'createFrom should fail under the injected memory limit');
+    }
+
+    assert(failed, 'createFrom should report the injected allocation failure');
+    try {
+        fs.fstat(fd); // The caller must still own a usable fd after failure.
+    } finally {
+        try { fs.close(fd); } catch {}
+    }
 });
 
 await test('fs.write - write to file', () => {

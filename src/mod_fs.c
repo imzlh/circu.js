@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "utils.h"
+#include "capability.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -410,6 +411,28 @@ static int parse_open_flags(JSContext* ctx, JSValueConst flags_obj) {
     return flags;
 }
 
+static TJSCapabilityMask tjs_syncfs_open_capability_mask(int flags) {
+    TJSCapabilityMask mask = TJS_CAP_IO;
+
+    switch (flags & (O_RDONLY | O_WRONLY | O_RDWR)) {
+        case O_WRONLY:
+            mask |= TJS_CAP_IO_WRITE;
+            break;
+        case O_RDWR:
+            mask |= TJS_CAP_IO_READ | TJS_CAP_IO_WRITE;
+            break;
+        default:
+            mask |= TJS_CAP_IO_READ;
+            break;
+    }
+
+    if (flags & (O_CREAT | O_TRUNC)) {
+        mask |= TJS_CAP_IO_WRITE;
+    }
+
+    return mask;
+}
+
 #ifdef _WIN32
 static int crt2uv(int crt_err) {
     switch (crt_err) {
@@ -581,6 +604,190 @@ static inline int fs_errno2uv(int crt_err) {
     return uv_translate_sys_error(crt_err);
 #endif
 }
+
+typedef struct TJSSyncFsFdPin {
+    int fd;
+    int error;
+    bool owned;
+} TJSSyncFsFdPin;
+
+/* A capability hook may close an fd and reuse its numeric slot before it
+ * returns. Pin the open resource only when a hook will actually run, then use
+ * the duplicate for the operation. dup/F_DUPFD_CLOEXEC preserves the shared
+ * open-file state (offset, status flags and locks) without retaining a raw JS
+ * wrapper or relying on the original descriptor number after re-entry. */
+static TJSSyncFsFdPin tjs_syncfs_pin_fd(int fd) {
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    int pinned_fd;
+#ifdef _WIN32
+    if (uv_get_osfhandle(fd) == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        pinned_fd = -1;
+    } else {
+        pinned_fd = _dup(fd);
+    }
+    if (pinned_fd >= 0) {
+        HANDLE handle = uv_get_osfhandle(pinned_fd);
+        if (handle == INVALID_HANDLE_VALUE ||
+            !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
+            int saved_errno = handle == INVALID_HANDLE_VALUE ? EBADF : EINVAL;
+            _close(pinned_fd);
+            errno = saved_errno;
+            pinned_fd = -1;
+        }
+    }
+#elif defined(F_DUPFD_CLOEXEC)
+    do {
+        pinned_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    } while (pinned_fd < 0 && errno == EINTR);
+#else
+    do {
+        pinned_fd = dup(fd);
+    } while (pinned_fd < 0 && errno == EINTR);
+    if (pinned_fd >= 0) {
+        int fd_flags;
+        do {
+            fd_flags = fcntl(pinned_fd, F_GETFD);
+        } while (fd_flags < 0 && errno == EINTR);
+        if (fd_flags < 0 || fcntl(pinned_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            int saved_errno = errno;
+            close(pinned_fd);
+            errno = saved_errno;
+            pinned_fd = -1;
+        }
+    }
+#endif
+
+    if (pinned_fd < 0) {
+        pin.fd = -1;
+        pin.error = errno ? errno : EBADF;
+        return pin;
+    }
+    pin.fd = pinned_fd;
+    pin.owned = true;
+    return pin;
+}
+
+static TJSSyncFsFdPin tjs_syncfs_pin_posix_fd(int fd) {
+#ifdef _WIN32
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    return pin;
+#else
+    return tjs_syncfs_pin_fd(fd);
+#endif
+}
+
+static void tjs_syncfs_unpin_fd(TJSSyncFsFdPin* pin) {
+    if (!pin || !pin->owned) return;
+
+    int saved_errno = errno;
+#ifdef _WIN32
+    DWORD saved_error = GetLastError();
+    _close(pin->fd);
+    SetLastError(saved_error);
+#else
+    close(pin->fd);
+#endif
+    errno = saved_errno;
+    pin->fd = -1;
+    pin->owned = false;
+}
+
+#ifdef _WIN32
+static bool tjs_syncfs_pin_matches_fd(const TJSSyncFsFdPin* pin, int fd) {
+    if (!pin->owned) return pin->fd == fd;
+
+    HANDLE raw_handle = uv_get_osfhandle(fd);
+    HANDLE pinned_handle = uv_get_osfhandle(pin->fd);
+    if (raw_handle == INVALID_HANDLE_VALUE ||
+        pinned_handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    return CompareObjectHandles(raw_handle, pinned_handle) != FALSE;
+}
+#endif
+
+static bool tjs_syncfs_pin_failed(const TJSSyncFsFdPin* pin) {
+    return pin->error != 0;
+}
+
+static JSValue tjs_syncfs_throw_pin_error(JSContext* ctx, const TJSSyncFsFdPin* pin) {
+    return tjs_throw_errno(ctx, fs_errno2uv(pin->error));
+}
+
+/* Complete the hook-only fd transition in one macro argument. No-hook calls
+ * retain the caller's descriptor and never duplicate or rewrite it. */
+#define TJS_SYNCFS_REVALIDATE_PIN(pin_, fd_)                              \
+    do {                                                                 \
+        if (tjs_syncfs_pin_failed(&(pin_)))                              \
+            return tjs_syncfs_throw_pin_error(ctx, &(pin_));             \
+        (fd_) = (pin_).fd;                                               \
+    } while (0)
+
+#define TJS_SYNCFS_REVALIDATE_PIN_ONLY(pin_)                              \
+    do {                                                                 \
+        if (tjs_syncfs_pin_failed(&(pin_)))                              \
+            return tjs_syncfs_throw_pin_error(ctx, &(pin_));             \
+    } while (0)
+
+#define TJS_SYNCFS_REVALIDATE_PIN_BUFFER(pin_, fd_, buffer_, size_, value_) \
+    do {                                                                   \
+        TJS_SYNCFS_REVALIDATE_PIN(pin_, fd_);                              \
+        (buffer_) = JS_GetAnyBuffer(ctx, &(size_), (value_));              \
+        if (!(buffer_)) {                                                  \
+            tjs_syncfs_unpin_fd(&(pin_));                                  \
+            return (JS_EXCEPTION);                                        \
+        }                                                                  \
+    } while (0)
+
+#define TJS_SYNCFS_REVALIDATE_BUFFER(buffer_, size_, value_, cleanup_)     \
+    do {                                                                 \
+        (buffer_) = JS_GetAnyBuffer(ctx, &(size_), (value_));             \
+        if (!(buffer_)) {                                                \
+            cleanup_;                                                    \
+            return (JS_EXCEPTION);                                      \
+        }                                                                \
+    } while (0)
+
+static JSValue tjs_syncfs_throw_pinned_errno(JSContext* ctx, TJSSyncFsFdPin* pin) {
+    int saved_errno = errno;
+    tjs_syncfs_unpin_fd(pin);
+    return tjs_throw_errno(ctx, fs_errno2uv(saved_errno));
+}
+
+static JSValue tjs_syncfs_throw_pinned_positional_io(JSContext* ctx, TJSSyncFsFdPin* pin) {
+#ifdef _WIN32
+    DWORD saved_error = GetLastError();
+    tjs_syncfs_unpin_fd(pin);
+    return tjs_throw_errno(ctx, uv_translate_sys_error(saved_error));
+#else
+    return tjs_syncfs_throw_pinned_errno(ctx, pin);
+#endif
+}
+
+static JSValue tjs_syncfs_throw_pinned_uv(JSContext* ctx, TJSSyncFsFdPin* pin, int uv_error) {
+    tjs_syncfs_unpin_fd(pin);
+    return tjs_throw_errno(ctx, uv_error);
+}
+
+#ifdef _WIN32
+#define TJS_SYNCFS_REVALIDATE_FLOCK(pin_, fd_)                           \
+    do {                                                                 \
+        TJS_SYNCFS_REVALIDATE_PIN_ONLY(pin_);                            \
+        if (!tjs_syncfs_pin_matches_fd(&(pin_), (fd_)))                  \
+            return tjs_syncfs_throw_pinned_uv(ctx, &(pin_), UV_EBADF);   \
+    } while (0)
+#else
+#define TJS_SYNCFS_REVALIDATE_FLOCK(pin_, fd_) \
+    TJS_SYNCFS_REVALIDATE_PIN(pin_, fd_)
+#endif
+
+#ifdef _WIN32
+static JSValue tjs_syncfs_throw_pinned_win32(JSContext* ctx, TJSSyncFsFdPin* pin, DWORD error) {
+    tjs_syncfs_unpin_fd(pin);
+    return tjs_throw_errno(ctx, uv_translate_sys_error(error));
+}
+#endif
 
 #define THROW_PATH() return JS_ThrowTypeError(ctx, "path is not a string");
 #define THROW_FD() return JS_ThrowTypeError(ctx, "fd is not a number");
@@ -869,6 +1076,8 @@ static JSValue tjs_syncfs_stat(JSContext* ctx, JSValueConst this_val, int argc, 
     path = JS_ToCString(ctx, argv[0]);
     if (!path)  THROW_PATH();
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.stat", path), JS_FreeCString(ctx, path));
+
 #ifdef _WIN32
     uv_fs_t req;
     tjs_win_stat_times_t wtimes;
@@ -913,6 +1122,9 @@ static JSValue tjs_syncfs_fstat(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "stat() requires 1 number argument: fd");
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.fstat", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     uv_fs_t req;
     tjs_win_stat_times_t wtimes;
@@ -928,6 +1140,7 @@ static JSValue tjs_syncfs_fstat(JSContext* ctx, JSValueConst this_val, int argc,
 #else
         JSValue err = tjs_throw_errno(ctx, fs_errno2uv(errno));
 #endif
+        tjs_syncfs_unpin_fd(&pin);
         return err;
     }
 
@@ -935,9 +1148,12 @@ static JSValue tjs_syncfs_fstat(JSContext* ctx, JSValueConst this_val, int argc,
     tjs_win_stat_times_from_fd(fd, &wtimes);
     JSValue result = build_uv_stat_obj(ctx, &req.statbuf, &wtimes);
     uv_fs_req_cleanup(&req);
+    tjs_syncfs_unpin_fd(&pin);
     return result;
 #else
-    return build_stat_obj(ctx, &st);
+    JSValue result = build_stat_obj(ctx, &st);
+    tjs_syncfs_unpin_fd(&pin);
+    return result;
 #endif
 }
 
@@ -951,6 +1167,8 @@ static JSValue tjs_syncfs_lstat(JSContext* ctx, JSValueConst this_val, int argc,
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.lstat", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     /* MSVC has no lstat; libuv also preserves sub-second timestamps. */
@@ -996,6 +1214,8 @@ static JSValue tjs_syncfs_statfs(JSContext* ctx, JSValueConst this_val, int argc
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.statFs", path), JS_FreeCString(ctx, path));
+
     int ret = uv_fs_statfs(NULL, &req, path, NULL);
     if (ret < 0) {
         JSValue err = tjs_throw_errno_path(ctx, ret, path);
@@ -1021,6 +1241,8 @@ static JSValue tjs_syncfs_exists(JSContext* ctx, JSValueConst this_val, int argc
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path)  THROW_PATH();
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.exists", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -1061,6 +1283,8 @@ static JSValue tjs_syncfs_open(JSContext* ctx, JSValueConst this_val, int argc, 
             THROW_MODE();
         }
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, tjs_syncfs_open_capability_mask(flags), TJS_CAP_FLAG_REPLACEABLE, "fs.open", path), JS_FreeCString(ctx, path));
 
     int fd;
 #ifdef _WIN32
@@ -1116,6 +1340,9 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
         return JS_EXCEPTION;
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.read", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN_BUFFER(pin, fd, buffer, buf_size, argv[1]));
+
     // Simple blocking read with EAGAIN/EINTR handling
     ssize_t bytes_read;
     while (1) {
@@ -1131,19 +1358,21 @@ static JSValue tjs_syncfs_read(JSContext* ctx, JSValueConst this_val, int argc, 
                 int ret = poll(&pfd, 1, -1);
                 if (ret < 0) {
                     if (errno == EINTR) continue;
-                    THROW("poll");
+                    return tjs_syncfs_throw_pinned_errno(ctx, &pin);
                 }
                 continue;
 #else
-                THROW("read");
+                return tjs_syncfs_throw_pinned_errno(ctx, &pin);
 #endif
             }
-            THROW("read");
+            return tjs_syncfs_throw_pinned_errno(ctx, &pin);
         }
         break;
     }
 
-    return JS_NewInt32(ctx, bytes_read);
+    JSValue result = JS_NewInt32(ctx, bytes_read);
+    tjs_syncfs_unpin_fd(&pin);
+    return result;
 }
 
 /* write() - write to file descriptor */
@@ -1163,6 +1392,9 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.write", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN_BUFFER(pin, fd, buffer, buf_size, argv[1]));
+
     // Write all data, handling EINTR and EAGAIN
     ssize_t total_written = 0;
     while (total_written < (ssize_t) buf_size) {
@@ -1177,19 +1409,21 @@ static JSValue tjs_syncfs_write(JSContext* ctx, JSValueConst this_val, int argc,
                 int ret = poll(&pfd, 1, -1);
                 if (ret < 0) {
                     if (errno == EINTR) continue;
-                    THROW("poll");
+                    return tjs_syncfs_throw_pinned_errno(ctx, &pin);
                 }
                 continue;
 #else
-                THROW("write");
+                return tjs_syncfs_throw_pinned_errno(ctx, &pin);
 #endif
             }
-            THROW("write");
+            return tjs_syncfs_throw_pinned_errno(ctx, &pin);
         }
         total_written += n;
     }
 
-    return JS_NewInt32(ctx, total_written);
+    JSValue result = JS_NewInt32(ctx, total_written);
+    tjs_syncfs_unpin_fd(&pin);
+    return result;
 }
 
 /* pread() - positional read */
@@ -1215,13 +1449,18 @@ static JSValue tjs_syncfs_pread(JSContext* ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.pread", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN_BUFFER(pin, fd, buffer, buf_size, argv[1]));
+
     ssize_t bytes_read = fs_pread(fd, buffer, buf_size, offset);
 
     if (bytes_read < 0) {
-        THROW("pread");
+        return tjs_syncfs_throw_pinned_positional_io(ctx, &pin);
     }
 
-    return JS_NewInt32(ctx, bytes_read);
+    JSValue result = JS_NewInt32(ctx, bytes_read);
+    tjs_syncfs_unpin_fd(&pin);
+    return result;
 }
 
 /* pwrite() - positional write */
@@ -1247,13 +1486,18 @@ static JSValue tjs_syncfs_pwrite(JSContext* ctx, JSValueConst this_val, int argc
         return JS_EXCEPTION;
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.pwrite", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN_BUFFER(pin, fd, buffer, buf_size, argv[1]));
+
     ssize_t bytes_written = fs_pwrite(fd, buffer, buf_size, offset);
 
     if (bytes_written < 0) {
-        THROW("pwrite");
+        return tjs_syncfs_throw_pinned_positional_io(ctx, &pin);
     }
 
-    return JS_NewInt32(ctx, bytes_written);
+    JSValue result = JS_NewInt32(ctx, bytes_written);
+    tjs_syncfs_unpin_fd(&pin);
+    return result;
 }
 
 /* setBlocking() - set fd to blocking/non-blocking mode */
@@ -1269,10 +1513,13 @@ static JSValue tjs_syncfs_set_blocking(JSContext* ctx, JSValueConst this_val, in
 
     blocking = JS_ToBool(ctx, argv[1]);
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_posix_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "fs.setBlocking", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifndef _WIN32
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
-        THROW("fcntl");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 
     if (blocking) {
@@ -1283,8 +1530,9 @@ static JSValue tjs_syncfs_set_blocking(JSContext* ctx, JSValueConst this_val, in
     }
 
     if (fcntl(fd, F_SETFL, flags) == -1) {
-        THROW("fcntl");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
+    tjs_syncfs_unpin_fd(&pin);
 #endif
 
     return JS_UNDEFINED;
@@ -1301,6 +1549,8 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.readFile", path), JS_FreeCString(ctx, path));
 
     int fd;
 #ifdef _WIN32
@@ -1449,6 +1699,8 @@ static JSValue tjs_syncfs_write_file(JSContext* ctx, JSValueConst this_val, int 
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.writeFile", path), JS_FreeCString(ctx, path), TJS_SYNCFS_REVALIDATE_BUFFER(data, data_len, argv[1], JS_FreeCString(ctx, path)));
+
     int fd;
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -1503,6 +1755,8 @@ static JSValue tjs_syncfs_mkdir(JSContext* ctx, JSValueConst this_val, int argc,
         }
     }
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.mkdir", path), JS_FreeCString(ctx, path));
+
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
     if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
@@ -1532,6 +1786,8 @@ static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc,
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.rmdir", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     /*
@@ -1575,6 +1831,8 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.unlink", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     /*
@@ -1648,6 +1906,8 @@ static JSValue tjs_syncfs_link(JSContext* ctx, JSValueConst this_val,
         return JS_ThrowRangeError(ctx, "Paths cannot be empty");
     }
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.link", existing_path), (JS_FreeCString(ctx, existing_path), JS_FreeCString(ctx, new_path)));
+
     // Platform-specific link creation
 #ifdef _WIN32
     // Windows implementation using CreateHardLink
@@ -1714,31 +1974,39 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
     DWORD flags = 0;
     bool is_directory = false;
 
-    // Check if we should treat as directory (third argument or auto-detect)
+    // Check if an explicit link type was supplied.
     if (argc >= 3) {
         JSValue type_val = argv[2];
         if (JS_IsString(type_val)) {
             const char* type_str = JS_ToCString(ctx, type_val);
-            if (type_str) {
-                if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
-                    flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-                    is_directory = true;
-                }
-                else if (strcmp(type_str, "file") == 0) {
-                    flags = 0;
-                    is_directory = false;
-                }
-                else {
-                    JS_FreeCString(ctx, target);
-                    JS_FreeCString(ctx, path);
-                    JS_FreeCString(ctx, type_str);
-                    return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
-                }
-                JS_FreeCString(ctx, type_str);
+            if (!type_str) {
+                JS_FreeCString(ctx, target);
+                JS_FreeCString(ctx, path);
+                return JS_EXCEPTION;
             }
+            if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
+                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+                is_directory = true;
+            }
+            else if (strcmp(type_str, "file") == 0) {
+                flags = 0;
+                is_directory = false;
+            }
+            else {
+                JS_FreeCString(ctx, target);
+                JS_FreeCString(ctx, path);
+                JS_FreeCString(ctx, type_str);
+                return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
+            }
+            JS_FreeCString(ctx, type_str);
         }
     }
-    else {
+#endif
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.symlink", path), (JS_FreeCString(ctx, target), JS_FreeCString(ctx, path)));
+
+#ifdef _WIN32
+    if (argc < 3) {
         // Auto-detect: try to determine if target is a directory
         WCHAR *wtarget = utf8_to_wcs(target);
         DWORD attribs = INVALID_FILE_ATTRIBUTES;
@@ -1875,6 +2143,8 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
         return JS_ThrowRangeError(ctx, "Path cannot be empty");
     }
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.readlink", path), JS_FreeCString(ctx, path));
+
 #ifdef _WIN32
     /*
      * Delegate to libuv, which is what Node itself uses.
@@ -1985,6 +2255,8 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
         JS_FreeCString(ctx, dest_path);
         return JS_ThrowRangeError(ctx, "Paths cannot be empty");
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.copy", src_path), (JS_FreeCString(ctx, src_path), JS_FreeCString(ctx, dest_path)));
 
 #ifdef _WIN32
     // Check if source is a regular file (not a directory)
@@ -2203,6 +2475,8 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
         JS_FreeCString(ctx, oldpath); THROW_PATH();
     }
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.rename", oldpath), (JS_FreeCString(ctx, oldpath), JS_FreeCString(ctx, newpath)));
+
 #ifdef _WIN32
     /*
      * Delegate to libuv rather than calling _wrename.
@@ -2270,6 +2544,8 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
         }
         with_types = types_flag != 0;
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.readdir", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     if (path[0] == '\0') {
@@ -2392,6 +2668,8 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
     path = JS_ToCString(ctx, argv[0]);
     if (!path) THROW_PATH();
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.realpath", path), JS_FreeCString(ctx, path));
+
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
     if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
@@ -2487,10 +2765,17 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
     if (JS_ToInt32(ctx, &operation, argv[1]) < 0)
         return JS_ThrowTypeError(ctx, "invaild operation: expect a number");
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "fs.flock", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_FLOCK(pin, fd));
+
 #ifdef _WIN32
+    /* Byte-range locks belong to the handle passed to LockFileEx and are
+     * released when that handle closes. The duplicate only pins identity while
+     * the hook runs; lock the caller's still-current handle so the lock lives
+     * until that fd is closed or explicitly unlocked. */
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("flock")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 
     OVERLAPPED overlapped = { 0 };
@@ -2499,7 +2784,7 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
     // LOCK_SH = 1, LOCK_EX = 2, LOCK_UN = 8, LOCK_NB = 4
     if (operation & 8) { // LOCK_UN
         if (!UnlockFileEx(hFile, 0, MAXDWORD, MAXDWORD, &overlapped)) {
-            THROW2("unlock")
+            return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
         }
     }
     else {
@@ -2514,16 +2799,17 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
             /* LockFileEx sets a Win32 error, not CRT errno; translate that. */
             DWORD werr = GetLastError();
             if (werr == ERROR_LOCK_VIOLATION && (operation & 4))
-                return tjs_throw_errno(ctx, UV_EAGAIN);
-            return tjs_throw_errno(ctx, uv_translate_sys_error(werr));
+                return tjs_syncfs_throw_pinned_uv(ctx, &pin, UV_EAGAIN);
+            return tjs_syncfs_throw_pinned_win32(ctx, &pin, werr);
         }
     }
 #else
     if (flock(fd, operation) < 0) {
-        THROW("flock");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #endif
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -2537,21 +2823,25 @@ static JSValue tjs_syncfs_fsync(JSContext* ctx, JSValueConst this_val, int argc,
 
     if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fsync", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("fsync")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 
     if (!FlushFileBuffers(hFile)) {
-        THROW2("fsync")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 #else
     if (fsync(fd) < 0) {
-        THROW("fsync");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #endif
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -2565,29 +2855,33 @@ static JSValue tjs_syncfs_fdatasync(JSContext* ctx, JSValueConst this_val, int a
 
     if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fdatasync", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     // Windows doesn't distinguish between fsync and fdatasync
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("fdatasync")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 
     if (!FlushFileBuffers(hFile)) {
-        THROW2("fdatasync")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 #else
 #ifdef __APPLE__
     // macOS doesn't have fdatasync, use fcntl F_FULLFSYNC
     if (fcntl(fd, F_FULLFSYNC) < 0) {
-        THROW("fdatasync");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #else
     if (fdatasync(fd) < 0) {
-        THROW("fdatasync");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #endif
 #endif
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -2607,6 +2901,8 @@ static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int ar
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, "length should be a number");
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.truncate", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -2677,10 +2973,13 @@ static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int a
     if (JS_ToInt64(ctx, &length, argv[1]) < 0)
         return JS_ThrowTypeError(ctx, "length should be a number");
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.ftruncate", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        THROW2("ftruncate")
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 
     LARGE_INTEGER li, orig = { 0 }, zero = { 0 };
@@ -2692,14 +2991,15 @@ static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int a
     DWORD trunc_err = trunc_ok ? 0 : GetLastError();
     if (have_pos) SetFilePointerEx(hFile, orig, NULL, FILE_BEGIN);
     if (!trunc_ok) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(trunc_err));
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, trunc_err);
     }
 #else
     if (ftruncate(fd, length) < 0) {
-        THROW("ftruncate");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #endif
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -2719,6 +3019,8 @@ static JSValue tjs_syncfs_chmod(JSContext* ctx, JSValueConst this_val, int argc,
         JS_FreeCString(ctx, path);
         THROW_MODE();
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.chmod", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     /*
@@ -2768,6 +3070,9 @@ static JSValue tjs_syncfs_fchmod(JSContext* ctx, JSValueConst this_val, int argc
     if (JS_ToInt32(ctx, &fd, argv[0]) < 0) THROW_FD();
     if (JS_ToInt32(ctx, &mode, argv[1]) < 0) THROW_MODE();
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fchmod", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     /*
      * Delegate to libuv rather than refusing.
@@ -2808,9 +3113,10 @@ static JSValue tjs_syncfs_fchmod(JSContext* ctx, JSValueConst this_val, int argc
 #endif
 
     if (ret < 0) {
-        return tjs_throw_errno(ctx, uv_err);
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, uv_err);
     }
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -2830,6 +3136,8 @@ static JSValue tjs_syncfs_chown(JSContext* ctx, JSValueConst this_val, int argc,
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, "uid and gid should be positive numbers");
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.chown", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     JS_FreeCString(ctx, path);
@@ -2862,12 +3170,15 @@ static JSValue tjs_syncfs_fchown(JSContext* ctx, JSValueConst this_val, int argc
         return JS_ThrowTypeError(ctx, "uid and gid should be positive numbers");
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_posix_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fchown", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 #ifdef _WIN32
     return JS_ThrowInternalError(ctx, "fchown not supported on Windows");
 #else
     if (fchown(fd, uid, gid) < 0) {
-        THROW("fchown");
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
+    tjs_syncfs_unpin_fd(&pin);
 #endif
 
     return JS_UNDEFINED;
@@ -2889,6 +3200,8 @@ static JSValue tjs_syncfs_utimes(JSContext* ctx, JSValueConst this_val, int argc
         JS_FreeCString(ctx, path);
         return JS_ThrowTypeError(ctx, "atime and mtime should be positive numbers");
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.utimes", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     WCHAR *wpath = utf8_to_wcs(path);
@@ -2961,9 +3274,13 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
         return JS_ThrowTypeError(ctx, "atime and mtime should be positive numbers");
     }
 
+    TJSSyncFsFdPin pin = { fd, 0, false };
+    TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.futimes", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
+
 #ifdef _WIN32
     HANDLE hFile = (HANDLE)_get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
+        tjs_syncfs_unpin_fd(&pin);
         return JS_ThrowTypeError(ctx, "futimes: invalid file descriptor");
     }
 
@@ -2979,7 +3296,7 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
     ft_mtime.dwHighDateTime = ul.HighPart;
 
     if (!SetFileTime(hFile, NULL, &ft_atime, &ft_mtime)) {
-        return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
+        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
     }
 #else
     struct timeval times[2];
@@ -2989,10 +3306,11 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
     times[1].tv_usec = (suseconds_t) ((mtime - times[1].tv_sec) * 1000000);
 
     if (futimes(fd, times) < 0) {
-        return tjs_throw_errno(ctx, fs_errno2uv(errno));
+        return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
 #endif
 
+    tjs_syncfs_unpin_fd(&pin);
     return JS_UNDEFINED;
 }
 
@@ -3014,6 +3332,8 @@ static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc
             THROW_MODE();
         }
     }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.access", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
     /*

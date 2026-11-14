@@ -82,11 +82,8 @@ declare namespace CModuleAsyncFS {
         /** Truncate file to specified size */
         truncate(offset?: number): Promise<void>;
 
-        /** Sync file data to disk (including metadata) */
-        sync(): Promise<void>;
-
-        /** Sync file data to disk (excluding metadata) */
-        datasync(): Promise<void>;
+        /** Sync file data to disk (including metadata by default) */
+        sync(excludeMetadata?: boolean): Promise<void>;
 
         /** Change file permissions (e.g., 0o644) */
         chmod(mode: number): Promise<void>;
@@ -97,8 +94,8 @@ declare namespace CModuleAsyncFS {
         /** Change file access and modification times in milliseconds since epoch */
         utime(atime: number, mtime: number): Promise<void>;
 
-        /** File path (passed during creation) */
-        readonly path: string;
+        /** File path when one was passed during creation. */
+        readonly path: string | undefined;
 
         readonly [Symbol.toStringTag]: 'FileHandle';
     }
@@ -227,9 +224,6 @@ declare namespace CModuleAsyncFS {
     /** Create directory (async) */
     export function mkdir(path: string, mode?: number): Promise<void>;
 
-    /** Create directory (sync) */
-    export function mkdirSync(path: string, mode?: number): void;
-
     /** Remove empty directory (async) */
     export function rmdir(path: string): Promise<void>;
 
@@ -284,13 +278,10 @@ declare namespace CModuleAsyncFS {
 
     /**
      * Create FileHandle from opened file descriptor (internal use)
+     * Ownership transfers to the FileHandle only after this function returns
+     * successfully. If construction throws, the caller still owns the fd.
      * @internal
+     * @param path - (Only used for FileHandle.path) mark up fd path
      */
-    export function newStdioFile(path: string, fd: number): FileHandle;
-
-    /**
-     * Get file metadata (sync)
-     * @internal Only for special scenarios, avoid blocking event loop
-     */
-    export function statSync(path: string): StatResult;
+    export function createFrom(fd: number, path?: string): FileHandle;
 }
