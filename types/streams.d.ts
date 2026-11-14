@@ -128,6 +128,7 @@ declare namespace CModuleStreams {
         /**
          * Get underlying file descriptor
          * @returns File descriptor number
+         * @throws {Error} ECONNRESET when the handle is closing
          */
         get fileno(): number;
 

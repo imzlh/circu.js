@@ -29,7 +29,8 @@ declare namespace CModuleSignals {
      *
      * The object is populated from the platform signal map at startup. Common
      * POSIX names are listed here, and less common/platform-specific names may
-     * also be present.
+     * also be present. Linux realtime signals (SIGRTMIN..SIGRTMAX) are NOT in
+     * the map and are rejected by `kill()`/`signal()`.
      */
     export const signals: {
         readonly SIGHUP: Signal;

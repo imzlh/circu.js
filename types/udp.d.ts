@@ -21,7 +21,8 @@ declare namespace CModuleUDP {
      */
     export interface UDP {
         /**
-         * Close UDP connection (synchronous)
+         * Close UDP connection (synchronous, idempotent — unlike
+         * `Socket.close()`, a second call is a no-op)
          */
         close(): void;
 

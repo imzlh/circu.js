@@ -93,6 +93,10 @@ declare namespace CModuleProcess {
      */
     export interface ExitInfo {
         exit_status: number;
+        /** Terminating signal number. Usually a value from
+         * `signals.signals`, but the OS may report an out-of-table number
+         * (e.g. a Linux realtime signal via WTERMSIG) — handle unknown
+         * numbers defensively. */
         term_signal: CModuleSignals.Signal | null;
     }
 

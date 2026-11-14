@@ -366,7 +366,9 @@ declare namespace CModuleFFI {
         /** Address of the current runtime thread's libuv event loop. */
         currentEventLoop(): Pointer;
 
-        /** Attach an already-bound `void (void *)` disposer to a pointer. */
+        /** Attach an already-bound `void (void *)` disposer to a pointer.
+         * Borrowed buffer and callback pointers are rejected, and so are
+         * `OwnedPointer` values — release those instead of re-adopting. */
         adopt(pointer: Pointer, disposer: PointerDisposer): OwnedPointer;
     }
 

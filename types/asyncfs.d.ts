@@ -56,10 +56,9 @@ declare namespace CModuleAsyncFS {
          * Read data from file (async)
          * @param buffer Buffer to write data into (will be modified)
          * @param position File read position; omit it to use the current offset
-         * @returns Actual bytes read, 0 indicates EOF
-         * @throws {RangeError} position < 0
+         * @returns Actual bytes read, or `null` on EOF
          */
-        read(buffer: Uint8Array, position?: number): Promise<number>;
+        read(buffer: Uint8Array, position?: number): Promise<number | null>;
 
         /**
          * Write data to file (async)

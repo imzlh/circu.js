@@ -54,7 +54,9 @@ declare namespace CModuleSSL {
         /** Cipher list string */
         ciphers?: string;
 
-        /** Enable peer certificate verification */
+        /** Enable peer certificate verification. circu.js does not load system
+         * trust anchors implicitly: pass `ca` PEM data, otherwise every
+         * verified handshake fails. */
         verify?: boolean;
 
         /** Check the peer certificate name against the pipe servername */

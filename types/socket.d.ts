@@ -85,7 +85,8 @@ declare namespace CModuleSocket {
         /** Shut down reading, writing, or both (`0`, `1`, or `2`). */
         shutdown(how: 0 | 1 | 2): void;
 
-        /** Close the socket. */
+        /** Close the socket. A second call throws — unlike `UDP.close()`,
+         * which is idempotent. */
         close(): void;
 
         /** Receive up to `count` bytes; returns `null` on an orderly peer close. */

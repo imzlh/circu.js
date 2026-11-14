@@ -61,6 +61,10 @@ declare namespace CModuleWASM {
         provider?: Instance;
         /** Function index in provider. */
         sourceIndex?: number;
+        /* Function imports cannot alias an earlier import via
+         * `sourceImportIndex` (unlike global/table/memory): WAMR only links
+         * function aliases through a live provider instance, so resolution
+         * rejects the combination with a LinkError. */
         /** Original high-level wasm function wrapper, retained for re-exports. */
         owner?: unknown;
     }

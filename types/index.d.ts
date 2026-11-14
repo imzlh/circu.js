@@ -54,7 +54,7 @@ interface UseFN {
      * Load an optional or context-limited built-in module by name.
      * Returns `null` when the current build or platform does not provide it.
      * Also returns `null` in workers for modules marked not worker-safe by the
-     * native module table, such as `nodeapi` and `wasm`.
+     * native module table, such as `nodeapi`.
      * @param name The name of the module to load (e.g. "wasm" or "nodeapi")
      * @returns The corresponding module object or null if module not found
      */
