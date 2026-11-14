@@ -75,7 +75,7 @@ declare namespace CModuleSSL {
         /** Server name for SNI (client mode) */
         servername?: string;
 
-        /** Path to DH parameters file */
+        /** DH parameters in PEM format */
         dhparam?: string;
 
         /** ECDH curve name */

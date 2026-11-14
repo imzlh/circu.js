@@ -31,28 +31,12 @@ declare namespace CModuleSourceMap {
     export function has(file_path: string): boolean;
 
     /**
-     * Load SourceMap from JavaScript object
+     * Load SourceMap from an object, JSON string, or UTF-8 JSON bytes.
      * @param file_path File path
-     * @param sourcemap_obj SourceMap object
+     * @param sourcemap SourceMap object or serialized JSON
      * @returns Operation result code
      */
-    export function load(file_path: string, sourcemap_obj: unknown): number;
-
-    /**
-     * Load SourceMap from JSON string
-     * @param file_path File path
-     * @param json_str SourceMap JSON string
-     * @returns Operation result code
-     */
-    export function loadJSON(file_path: string, json_str: string): number;
-
-    /**
-     * Load SourceMap from UTF-8 JSON bytes.
-     * @param file_path File path
-     * @param json_bytes SourceMap JSON bytes
-     * @returns Operation result code
-     */
-    export function loadJSONBytes(file_path: string, json_bytes: Uint8Array | ArrayBufferLike): number;
+    export function load(file_path: string, sourcemap: object | string | ArrayBuffer | ArrayBufferView): number;
 
     /**
      * Get source mapping info

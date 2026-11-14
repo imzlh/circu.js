@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 
+#include "capability.h"
 #include "private.h"
 #include "utils.h"
 
@@ -65,10 +66,11 @@ static void tjs_close_received_fds(struct msghdr *msg) {
 static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     int status;
     if (JS_ToInt32(ctx, &status, argv[0])) {
-        status = -1;
+        return JS_EXCEPTION;
     }
 
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+    TJS_CAPABILITY(tjs__capability(ctx, ((trt && trt->is_worker) ? TJS_CAP_WORKER : TJS_CAP_PROCESS) | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.exit"), (void)0);
 
     if (trt && trt->is_worker) {
         // In a worker: stop only this worker and unwind JS without user catch.
@@ -110,15 +112,18 @@ static JSValue tjs_set_exit_code(JSContext *ctx, JSValue this_val, int argc, JSV
 
     /* undefined clears the request: node treats `process.exitCode = undefined`
      * as "no code asked for", not as 0-the-value. */
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+    bool clear = argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]);
+    int status = 0;
+    if (!clear && JS_ToInt32(ctx, &status, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY(tjs__capability(ctx, (trt->is_worker ? TJS_CAP_WORKER : TJS_CAP_PROCESS) | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.setExitCode"), (void)0);
+
+    if (clear) {
         trt->js_exit_code_set = false;
         trt->js_exit_code = 0;
         return JS_UNDEFINED;
-    }
-
-    int status;
-    if (JS_ToInt32(ctx, &status, argv[0])) {
-        return JS_EXCEPTION;
     }
 
     trt->js_exit_code = status;
@@ -131,6 +136,7 @@ static JSValue tjs_uname(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     int r;
     uv_utsname_t utsname;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.uname"), (void)0);
     r = uv_os_uname(&utsname);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -147,6 +153,7 @@ static JSValue tjs_uname(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 
 static JSValue tjs_uptime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     double upt;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.uptime"), (void)0);
     uv_uptime(&upt);
     return JS_NewFloat64(ctx, upt);
 }
@@ -157,6 +164,7 @@ static JSValue tjs_guess_handle(JSContext *ctx, JSValue this_val, int argc, JSVa
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.guessHandle"), (void)0);
     switch (uv_guess_handle(fd)) {
         case UV_TTY:
             return JS_NewString(ctx, "tty");
@@ -177,6 +185,7 @@ static JSValue tjs_environ(JSContext *ctx, JSValue this_val, int argc, JSValue *
     uv_env_item_t *env;
     int envcount, r;
 
+    TJS_CAPABILITY(tjs__capability_env(ctx, TJS_CAP_ENV | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "os.environ", NULL), (void)0);
     r = uv_os_environ(&env, &envcount);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -197,6 +206,7 @@ static JSValue tjs_envKeys(JSContext *ctx, JSValue this_val, int argc, JSValue *
     uv_env_item_t *env;
     int envcount, r;
 
+    TJS_CAPABILITY(tjs__capability_env(ctx, TJS_CAP_ENV | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.envKeys", NULL), (void)0);
     r = uv_os_environ(&env, &envcount);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -228,6 +238,7 @@ static JSValue tjs_getenv(JSContext *ctx, JSValue this_val, int argc, JSValue *a
     char *dbuf = buf;
     int r;
 
+    TJS_CAPABILITY(tjs__capability_env(ctx, TJS_CAP_ENV | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "os.getenv", name), JS_FreeCString(ctx, name));
     r = uv_os_getenv(name, dbuf, &size);
     if (r != 0) {
         if (r != UV_ENOBUFS) {
@@ -276,6 +287,7 @@ static JSValue tjs_setenv(JSContext *ctx, JSValue this_val, int argc, JSValue *a
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY(tjs__capability_env(ctx, TJS_CAP_ENV | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "os.setenv", name), (JS_FreeCString(ctx, value), JS_FreeCString(ctx, name)));
     int r = uv_os_setenv(name, value);
     JS_FreeCString(ctx, name);
     JS_FreeCString(ctx, value);
@@ -296,6 +308,7 @@ static JSValue tjs_unsetenv(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY(tjs__capability_env(ctx, TJS_CAP_ENV | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "os.unsetenv", name), JS_FreeCString(ctx, name));
     int r = uv_os_unsetenv(name);
     JS_FreeCString(ctx, name);
     if (r != 0) {
@@ -315,6 +328,7 @@ static JSValue tjs_chdir(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.chdir"), JS_FreeCString(ctx, dir));
     int r = uv_chdir(dir);
     JS_FreeCString(ctx, dir);
     if (r != 0) {
@@ -330,6 +344,7 @@ static JSValue tjs_cwd(JSContext *ctx, JSValue this_val) {
     char *dbuf = buf;
     int r;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.cwd"), (void)0);
     r = uv_cwd(dbuf, &size);
     if (r != 0) {
         if (r != UV_ENOBUFS) {
@@ -361,6 +376,7 @@ static JSValue tjs_homedir(JSContext *ctx, JSValue this_val) {
     char *dbuf = buf;
     int r;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.homeDir"), (void)0);
     r = uv_os_homedir(dbuf, &size);
     if (r != 0) {
         if (r != UV_ENOBUFS) {
@@ -392,6 +408,7 @@ static JSValue tjs_tmpdir(JSContext *ctx, JSValue this_val) {
     char *dbuf = buf;
     int r;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.tmpDir"), (void)0);
     r = uv_os_tmpdir(dbuf, &size);
     if (r != 0) {
         if (r != UV_ENOBUFS) {
@@ -418,6 +435,7 @@ static JSValue tjs_tmpdir(JSContext *ctx, JSValue this_val) {
 }
 
 static JSValue tjs_memory(JSContext *ctx, JSValue this_val, int argc, JSValue *argv){
+	TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.memoryUsage"), (void)0);
 	uint64_t available = uv_get_available_memory(),
 		total = uv_get_total_memory(),
 		constrained = uv_get_constrained_memory();
@@ -452,6 +470,19 @@ static JSValue tjs_memory(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 	return ret;
 }
 
+static int tjs_random_revalidate_buffer(JSContext *ctx, JSValueConst value,
+                                        uint64_t off, uint64_t len,
+                                        uint8_t **buf_out, size_t *size_out) {
+    uint8_t *buf = JS_GetArrayBuffer(ctx, size_out, value);
+    if (!buf) return -1;
+    if (off > *size_out || len > *size_out - off) {
+        JS_ThrowRangeError(ctx, "array buffer overflow");
+        return -1;
+    }
+    *buf_out = buf;
+    return 0;
+}
+
 static JSValue tjs_random(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     // Convert all scalar parameters BEFORE getting buffer pointer
     uint64_t off = 0;
@@ -480,6 +511,8 @@ static JSValue tjs_random(JSContext *ctx, JSValue this_val, int argc, JSValue *a
         return JS_ThrowRangeError(ctx, "array buffer overflow");
     }
 
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "os.random"), (void)0, if (tjs_random_revalidate_buffer(ctx, argv[0], off, len, &buf, &size) < 0) return JS_EXCEPTION);
+
     int r = uv_random(NULL, NULL, buf + off, len, 0, NULL);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -491,6 +524,7 @@ static JSValue tjs_random(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 static JSValue tjs_cpu_info(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     uv_cpu_info_t *infos;
     int count;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.cpuInfo"), (void)0);
     int r = uv_cpu_info(&infos, &count);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -525,6 +559,7 @@ static JSValue tjs_cpu_info(JSContext *ctx, JSValue this_val, int argc, JSValue 
 static JSValue tjs_loadavg(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     double avg[3] = { -1, -1, -1 };
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.loadavg"), (void)0);
     uv_loadavg(avg);
 
     JSValue val = JS_NewArray(ctx);
@@ -539,6 +574,7 @@ static JSValue tjs_loadavg(JSContext *ctx, JSValue this_val, int argc, JSValue *
 static JSValue tjs_network_interfaces(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     uv_interface_address_t *interfaces;
     int count;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.networkInterfaces"), (void)0);
     int r = uv_interface_addresses(&interfaces, &count);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -601,6 +637,7 @@ static JSValue tjs_gethostname(JSContext *ctx, JSValue this_val) {
     char buf[UV_MAXHOSTNAMESIZE];
     size_t size = sizeof(buf);
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.hostName"), (void)0);
     int r = uv_os_gethostname(buf, &size);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -610,16 +647,19 @@ static JSValue tjs_gethostname(JSContext *ctx, JSValue this_val) {
 }
 
 static JSValue tjs_getpid(JSContext *ctx, JSValue this_val) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.pid"), (void)0);
     return JS_NewInt32(ctx, uv_os_getpid());
 }
 
 static JSValue tjs_getppid(JSContext *ctx, JSValue this_val) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.ppid"), (void)0);
     return JS_NewInt32(ctx, uv_os_getppid());
 }
 
 static JSValue tjs_userInfo(JSContext *ctx, JSValue this_val) {
     uv_passwd_t p;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.userInfo"), (void)0);
     int r = uv_os_get_passwd(&p);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -638,6 +678,7 @@ static JSValue tjs_userInfo(JSContext *ctx, JSValue this_val) {
 }
 
 static JSValue tjs_availableParallelism(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.availableParallelism"), (void)0);
     return JS_NewUint32(ctx, uv_available_parallelism());
 }
 
@@ -649,6 +690,7 @@ static JSValue tjs_exepath(JSContext *ctx, JSValue this_val) {
     char *dbuf = buf;
     int r;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "os.exePath"), (void)0);
     r = uv_exepath(dbuf, &size);
     if (r != 0) {
         if (r != UV_ENOBUFS) {
@@ -682,7 +724,8 @@ static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
     if (time < 0 || time > UINT_MAX) {
         return JS_ThrowRangeError(ctx, "sleep duration out of range");
     }
-    
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.sleep"), (void)0);
     uv_sleep((unsigned int) time);
     return JS_UNDEFINED;
 }
@@ -715,6 +758,7 @@ static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue 
     int fds[2];
     int r;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "os.ipcPipe"), (void)0);
 #ifdef _WIN32
     r = _pipe(fds, 65536, _O_BINARY);
 #else
@@ -753,6 +797,7 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
     if (JS_ToInt32(ctx, &fd_to_send, argv[1])) return JS_EXCEPTION;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_WRITE | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.sendfd"), (void)0);
     // Prepare control message buffer
     struct msghdr msg = {0};
     struct iovec iov;
@@ -800,6 +845,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     int sock_fd;
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_READ | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.recvfd"), (void)0);
     struct msghdr msg = {0};
     struct iovec iov;
     char dummy;

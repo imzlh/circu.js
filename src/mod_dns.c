@@ -23,6 +23,7 @@
  * THE SOFTWARE.
  */
 
+#include "capability.h"
 #include "private.h"
 #include "utils.h"
 
@@ -242,6 +243,12 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 	JS_FreeValue(ctx, js_hints);
 
+	TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "dns.resolve", node), JS_FreeCString(ctx, node));
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	if (!trt || trt->freeing) {
+		JS_FreeCString(ctx, node);
+		return JS_ThrowInternalError(ctx, "runtime is closing");
+	}
 	TJSGetAddrInfoReq* gr = js_malloc(ctx, sizeof(*gr));
 	if (!gr) {
 		JS_FreeCString(ctx, node);
@@ -249,7 +256,7 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	}
 
 	gr->ctx = ctx;
-	gr->trt = TJS_GetRuntime(ctx);
+	gr->trt = trt;
 	init_list_head(&gr->link);
 	gr->linked = false;
 	gr->tearing_down = false;
@@ -326,6 +333,7 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 	hints.ai_family = family;
 	hints.ai_flags = dns_ai_flags(hint_bits);
 
+	TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "dns.resolveSync", node), JS_FreeCString(ctx, node));
 	// Direct system call instead of using libuv
 	struct addrinfo* res = NULL;
 	int r = getaddrinfo(node, NULL, &hints, &res);
@@ -395,6 +403,26 @@ static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 		return JS_ThrowRangeError(ctx, "The \"port\" argument is out of range");
 	}
 
+	struct sockaddr_storage addr = {0};
+	struct sockaddr_in addr4;
+	struct sockaddr_in6 addr6;
+	int r = uv_ip4_addr(address, port, &addr4);
+	if (r == 0) {
+		memcpy(&addr, &addr4, sizeof(addr4));
+	} else {
+		r = uv_ip6_addr(address, port, &addr6);
+		if (r == 0) memcpy(&addr, &addr6, sizeof(addr6));
+	}
+	if (r != 0) {
+		JS_FreeCString(ctx, address);
+		return JS_ThrowTypeError(ctx, "Invalid IP address");
+	}
+	TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "dns.lookupService", address), JS_FreeCString(ctx, address));
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	if (!trt || trt->freeing) {
+		JS_FreeCString(ctx, address);
+		return JS_ThrowInternalError(ctx, "runtime is closing");
+	}
 	TJSGetNameInfoReq* gr = js_malloc(ctx, sizeof(*gr));
 	if (!gr) {
 		JS_FreeCString(ctx, address);
@@ -402,25 +430,13 @@ static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 	}
 	memset(gr, 0, sizeof(*gr));
 	gr->ctx = ctx;
-	gr->trt = TJS_GetRuntime(ctx);
+	gr->trt = trt;
 	init_list_head(&gr->link);
 	gr->linked = false;
 	gr->tearing_down = false;
 	gr->req.data = gr;
-	struct sockaddr_in addr4;
-	struct sockaddr_in6 addr6;
-	int r = uv_ip4_addr(address, port, &addr4);
-	if (r == 0) {
-		memcpy(&gr->addr, &addr4, sizeof(addr4));
-	} else {
-		r = uv_ip6_addr(address, port, &addr6);
-		if (r == 0) memcpy(&gr->addr, &addr6, sizeof(addr6));
-	}
+	memcpy(&gr->addr, &addr, sizeof(addr));
 	JS_FreeCString(ctx, address);
-	if (r != 0) {
-		js_free(ctx, gr);
-		return JS_ThrowTypeError(ctx, "Invalid IP address");
-	}
 
 	JSValue promise = TJS_InitPromise(ctx, &gr->result);
 	if (JS_IsException(promise)) {
@@ -1371,7 +1387,6 @@ static JSValue tjs_dns_query_abort(JSContext* ctx, JSValueConst this_val,
 // Performs raw UDP DNS query
 static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv) {
-	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	if (argc < 1) return JS_ThrowTypeError(ctx, "expected hostname");
 	const char* hostname = JS_ToCString(ctx, argv[0]);
 	if (!hostname) return JS_ThrowTypeError(ctx, "Invalid hostname");
@@ -1405,6 +1420,35 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		return JS_ThrowRangeError(ctx, "Invalid port");
 	}
 
+	uint8_t validated_query_buf[512];
+	int query_len = build_dns_query(hostname, 0, qtype, validated_query_buf, sizeof(validated_query_buf));
+	if (query_len < 0) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
+		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
+	}
+	struct sockaddr_storage server_addr = {0};
+	struct sockaddr_in server_addr4;
+	struct sockaddr_in6 server_addr6;
+	int r = uv_ip4_addr(server, port, &server_addr4);
+	if (r == 0) {
+		memcpy(&server_addr, &server_addr4, sizeof(server_addr4));
+	} else {
+		r = uv_ip6_addr(server, port, &server_addr6);
+		if (r == 0) memcpy(&server_addr, &server_addr6, sizeof(server_addr6));
+	}
+	if (r < 0) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
+		return JS_ThrowTypeError(ctx, "Invalid server address");
+	}
+	TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT | TJS_CAP_IO_WRITE | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "dns.query", server), (JS_FreeCString(ctx, hostname), server_is_js ? JS_FreeCString(ctx, server) : (void)0));
+	TJSRuntime* trt = TJS_GetRuntime(ctx);
+	if (!trt || trt->freeing) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
+		return JS_ThrowInternalError(ctx, "runtime is closing");
+	}
 	dns_udp_ctx_t* req_ctx = malloc(sizeof(dns_udp_ctx_t));
 	if (!req_ctx) {
 		JS_FreeCString(ctx, hostname);
@@ -1422,6 +1466,17 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		return JS_ThrowOutOfMemory(ctx);
 	}
 	req_ctx->query_id = dns_random_query_id();
+	query_len = build_dns_query(hostname, req_ctx->query_id, qtype,
+		req_ctx->query_buf, sizeof(req_ctx->query_buf));
+	if (query_len < 0) {
+		JS_FreeCString(ctx, hostname);
+		if (server_is_js) JS_FreeCString(ctx, server);
+		free(req_ctx->hostname);
+		free(req_ctx);
+		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
+	}
+	req_ctx->query_len = (unsigned int) query_len;
+	memcpy(&req_ctx->server_addr, &server_addr, sizeof(server_addr));
 	req_ctx->udp.data = req_ctx;
 	req_ctx->send_req.data = req_ctx;
 	req_ctx->resolve_func = JS_UNDEFINED;
@@ -1469,44 +1524,10 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	}
 	JS_DefinePropertyValueStr(ctx, promise, "abort", abort_func, JS_PROP_CONFIGURABLE);
 
-	// Build DNS query packet
-	int query_len = build_dns_query(hostname, req_ctx->query_id, qtype,
-		req_ctx->query_buf, sizeof(req_ctx->query_buf));
-	req_ctx->query_len = query_len > 0 ? (unsigned int) query_len : 0;
-
 	JS_FreeCString(ctx, hostname);
-
-	if (query_len < 0) {
-		if (server_is_js) JS_FreeCString(ctx, server);
-		dns_udp_detach_controller(req_ctx);
-		dns_udp_free_callbacks(req_ctx);
-		JS_FreeValue(ctx, promise);
-		free(req_ctx->hostname);
-		free(req_ctx);
-		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
-	}
-
-	// Setup IPv4 or IPv6 server address.
-	struct sockaddr_in server_addr4;
-	struct sockaddr_in6 server_addr6;
-	int r = uv_ip4_addr(server, port, &server_addr4);
-	if (r == 0) {
-		memcpy(&req_ctx->server_addr, &server_addr4, sizeof(server_addr4));
-	} else {
-		r = uv_ip6_addr(server, port, &server_addr6);
-		if (r == 0) memcpy(&req_ctx->server_addr, &server_addr6, sizeof(server_addr6));
-	}
 	if (server_is_js) {
 		JS_FreeCString(ctx, server);
 		server_is_js = false;
-	}
-	if (r < 0) {
-		dns_udp_detach_controller(req_ctx);
-		dns_udp_free_callbacks(req_ctx);
-		JS_FreeValue(ctx, promise);
-		free(req_ctx->hostname);
-		free(req_ctx);
-		return JS_ThrowTypeError(ctx, "Invalid server address");
 	}
 
 	// Initialize UDP socket

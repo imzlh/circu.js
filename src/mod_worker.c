@@ -24,6 +24,7 @@
  */
 
 #include "mem.h"
+#include "capability.h"
 #include "private.h"
 #include "tjs.h"
 
@@ -860,6 +861,29 @@ static void uv__write_cb(uv_write_t *req, int status) {
     tjs__free(wr);
 }
 
+static int msgpipe_postmessage_revalidate(JSContext *ctx, JSValueConst this_val,
+                                          TJSMessagePipe **pipe_out) {
+    TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
+    if (!p) return -1;
+    if (p->peer_eof || uv_is_closing(&p->h.handle)) {
+        tjs_throw_errno(ctx, UV_EPIPE);
+        return -1;
+    }
+    *pipe_out = p;
+    return 0;
+}
+
+static void msgpipe_postmessage_discard(JSContext *ctx,
+                                        TJSMessagePipeWriteReq *wr,
+                                        JSSABTab *sab_tab,
+                                        TJSMessagePipeTransferOwner *owner) {
+    tjs__free(wr->data);
+    js_free(ctx, sab_tab->tab);
+    msgpipe_free_transfer_values(ctx, owner);
+    msgpipe_transfer_owner_release_unsent(owner);
+    tjs__free(wr);
+}
+
 static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
     if (!p) {
@@ -894,6 +918,14 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
         tjs__free(wr);
         return JS_EXCEPTION;
     }
+    if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) {
+        js_free(ctx, buf);
+        js_free(ctx, sab_tab.tab);
+        msgpipe_free_transfer_values(ctx, owner);
+        msgpipe_transfer_owner_release_unsent(owner);
+        tjs__free(wr);
+        return JS_EXCEPTION;
+    }
 
     wr->req.data = wr;
     wr->transfer_owner = owner;
@@ -917,6 +949,8 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     }
     if (len) memcpy(wr->data, buf, len);
     js_free(ctx, buf);
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "worker.postMessage"), msgpipe_postmessage_discard(ctx, wr, &sab_tab, owner), do { if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) { msgpipe_postmessage_discard(ctx, wr, &sab_tab, owner); return (JS_EXCEPTION); } } while (0));
 
     /* Keep SABs alive until the peer deserializes the message. The read side
      * consumes these transferred references after cloning the objects. */
@@ -1103,6 +1137,9 @@ typedef struct {
 	uint8_t* udata;
 	size_t udata_size;
     TJSMessagePipeTransferOwner *transfer_owner;
+    TJSCapabilityHook capability_hook;
+    void *capability_userdata;
+    uint32_t capability_hook_flags;
 } worker_data_t;
 
 static void worker_release_self(JSContext *ctx, TJSWorker *w) {
@@ -1241,6 +1278,8 @@ static void worker_entry(void *arg) {
 
     TJSRuntime *wrt = TJS_NewRuntimeWorker();
     CHECK_NOT_NULL(wrt);
+    TJS_SetCapabilityHook(wrt, wd->capability_hook, wd->capability_userdata,
+                          wd->capability_hook_flags);
     JSContext *ctx = wrt->main_ctx;
 
     /* Bootstrap the worker scope. */
@@ -1433,6 +1472,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 		js_free(ctx, udata);
 		udata = neutral_udata;
 	}
+	TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "worker.create"), (tjs__free(udata), msgpipe_free_transfer_values(ctx, transfer_owner), msgpipe_transfer_owner_release_unsent(transfer_owner)));
 
     uv_os_sock_t fds[2];
     int r = uv_socketpair(SOCK_STREAM, 0, fds, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE);
@@ -1489,6 +1529,9 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     worker_data->udata = udata;
     worker_data->udata_size = udata_size;
     worker_data->transfer_owner = transfer_owner;
+    worker_data->capability_hook = qrt->capability_hook;
+    worker_data->capability_userdata = qrt->capability_userdata;
+    worker_data->capability_hook_flags = qrt->capability_hook_flags;
     atomic_init(&worker_data->commit_error, 1);
 
     tjs_worker_count_add();

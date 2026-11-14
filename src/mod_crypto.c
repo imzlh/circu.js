@@ -25,6 +25,7 @@
 
 #include "private.h"
 #include "utils.h"
+#include "capability.h"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -514,6 +515,8 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     if (!group) {
         return JS_ThrowInternalError(ctx, "Invalid ECC curve");
     }
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.generateEcKey"), EC_GROUP_free(group));
     
     EC_KEY* eckey = EC_KEY_new();
     if (!eckey) {
@@ -758,7 +761,9 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
         EC_KEY_free(eckey);
         return JS_ThrowInternalError(ctx, "Hash computation failed");
     }
-    
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.ecdsaSign"), (BN_free(priv_bn), EC_KEY_free(eckey)));
+
     // Compute signature
     ECDSA_SIG* sig = ECDSA_do_sign(hash, hash_len, eckey);
     if (!sig) {
@@ -1161,6 +1166,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     
     if (argc >= 3 && !JS_IsUndefined(argv[2])) {
         label = JS_GetAnyBuffer(ctx, &label_len, argv[2]);
+        if (!label) return JS_EXCEPTION;
     }
     
     EVP_PKEY* pkey = tjs_crypto_load_public_key(key_data, key_len);
@@ -1178,9 +1184,13 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     
     // Set OAEP padding and hash
     const EVP_MD* md = get_md_from_magic(magic);
-    EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_OAEP_PADDING);
-    EVP_PKEY_CTX_set_rsa_oaep_md(pctx, md);
-    EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md);
+    if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_OAEP_PADDING) != 1 ||
+        EVP_PKEY_CTX_set_rsa_oaep_md(pctx, md) != 1 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) != 1) {
+        EVP_PKEY_CTX_free(pctx);
+        EVP_PKEY_free(pkey);
+        return JS_ThrowInternalError(ctx, "Failed to configure RSA-OAEP");
+    }
     
     if (label) {
         /* EVP_PKEY_CTX_set0_rsa_oaep_label takes ownership and will free with
@@ -1192,9 +1202,15 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
             return JS_ThrowOutOfMemory(ctx);
         }
         memcpy(label_copy, label, label_len);
-        EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, label_copy, label_len);
+        if (EVP_PKEY_CTX_set0_rsa_oaep_label(pctx, label_copy, label_len) != 1) {
+            OPENSSL_free(label_copy);
+            EVP_PKEY_CTX_free(pctx);
+            EVP_PKEY_free(pkey);
+            return JS_ThrowInternalError(ctx, "Failed to configure RSA-OAEP label");
+        }
     }
     
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.rsaOaepEncrypt"), (EVP_PKEY_CTX_free(pctx), EVP_PKEY_free(pkey)), do { data = JS_GetAnyBuffer(ctx, &data_len, argv[1]); if (!data) { EVP_PKEY_CTX_free(pctx); EVP_PKEY_free(pkey); return JS_EXCEPTION; } } while (0));
     /* Reinitializing here would reset the OAEP padding, hash and label. */
     size_t out_len;
     if (EVP_PKEY_encrypt(pctx, NULL, &out_len, data, data_len) != 1) {
@@ -1202,7 +1218,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
         EVP_PKEY_free(pkey);
         return JS_ThrowTypeError(ctx, "RSA-OAEP encryption failed");
     }
-    
+
     uint8_t* out = js_malloc(ctx, out_len);
     if (!out) {
         EVP_PKEY_CTX_free(pctx);
@@ -1338,6 +1354,10 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        EVP_PKEY_free(pkey);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     EVP_PKEY_CTX* pctx = NULL;
     
     if (EVP_DigestSignInit(mdctx, &pctx, md, NULL, pkey) != 1 ||
@@ -1348,13 +1368,17 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
         return JS_ThrowInternalError(ctx, "PSS setup failed");
     }
     
+    if (salt_len != 0) {
+        TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.rsaPssSign"), (EVP_MD_CTX_free(mdctx), EVP_PKEY_free(pkey)), do { data = JS_GetAnyBuffer(ctx, &data_len, argv[1]); if (!data) { EVP_MD_CTX_free(mdctx); EVP_PKEY_free(pkey); return JS_EXCEPTION; } } while (0));
+    }
+
     size_t sig_len;
     if (EVP_DigestSign(mdctx, NULL, &sig_len, data, data_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
         return JS_ThrowInternalError(ctx, "Sign failed");
     }
-    
+
     uint8_t* sig = js_malloc(ctx, sig_len);
     if (!sig) {
         EVP_MD_CTX_free(mdctx);
@@ -1733,13 +1757,15 @@ static JSValue tjs_crypto_random_bytes(JSContext* ctx, JSValueConst this_val, in
     if (length < 0 || length > 65536) {
         return JS_ThrowRangeError(ctx, "Length must be between 0 and 65536");
     }
+
+    if (length != 0) { TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.randomBytes"), (void)0); }
     
-    uint8_t* buf = js_malloc(ctx, length);
+    uint8_t* buf = js_malloc(ctx, length ? (size_t)length : 1);
     if (!buf) {
         return JS_EXCEPTION;
     }
     
-    if (RAND_bytes(buf, length) != 1) {
+    if (length != 0 && RAND_bytes(buf, length) != 1) {
         js_free(ctx, buf);
         return JS_ThrowInternalError(ctx, "Failed to generate random bytes");
     }
@@ -1780,6 +1806,8 @@ static JSValue tjs_crypto_random_fill(JSContext* ctx, JSValueConst this_val, int
     if (size > data_len - offset) {
         return JS_ThrowRangeError(ctx, "offset + size exceeds buffer length");
     }
+
+    if (size != 0) { TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.randomFill"), (void)0, do { data = JS_GetAnyBuffer(ctx, &data_len, argv[0]); if (!data) return JS_EXCEPTION; if (offset > data_len) return JS_ThrowRangeError(ctx, "offset + size exceeds buffer length"); size = has_size ? (size_t)size64 : data_len - offset; if (size > data_len - offset) return JS_ThrowRangeError(ctx, "offset + size exceeds buffer length"); } while (0)); }
 
     uint8_t* out = data + offset;
     while (size > 0) {
@@ -2245,6 +2273,8 @@ static JSValue tjs_crypto_generate_rsa_key(JSContext* ctx, JSValueConst this_val
     if (bits < 512 || bits > 8192) {
         return JS_ThrowRangeError(ctx, "Key size must be between 512 and 8192");
     }
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.generateRsaKey"), (void)0);
     
     /* EVP_PKEY_keygen allocates a fresh key into *pkey; do NOT pre-allocate
      * with EVP_PKEY_new() or the original allocation leaks. */
@@ -2318,16 +2348,29 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
-    size_t sig_len;
-    
+    if (!mdctx) {
+        EVP_PKEY_free(pkey);
+        return JS_ThrowOutOfMemory(ctx);
+    }
     if (EVP_DigestSignInit(mdctx, NULL, md, NULL, pkey) != 1 ||
-        EVP_DigestSignUpdate(mdctx, data, data_len) != 1 ||
-        EVP_DigestSignFinal(mdctx, NULL, &sig_len) != 1) {
+        EVP_DigestSignUpdate(mdctx, data, data_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
         return JS_ThrowInternalError(ctx, "Signature failed");
     }
-    
+
+    int key_type = EVP_PKEY_base_id(pkey);
+    if (key_type == EVP_PKEY_EC || key_type == EVP_PKEY_DSA || key_type == EVP_PKEY_RSA_PSS) {
+        TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.sign"), (EVP_MD_CTX_free(mdctx), EVP_PKEY_free(pkey)));
+    }
+
+    size_t sig_len;
+    if (EVP_DigestSignFinal(mdctx, NULL, &sig_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        EVP_PKEY_free(pkey);
+        return JS_ThrowInternalError(ctx, "Signature failed");
+    }
+
     uint8_t* sig = js_malloc(ctx, sig_len);
     if (!sig) {
         EVP_MD_CTX_free(mdctx);
@@ -3251,6 +3294,7 @@ static JSValue tjs_randomUUID(JSContext *ctx, JSValue this_val, int argc, JSValu
     char v[37];
     unsigned char u[16];
 
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.randomUUID"), (void)0);
     int r = uv_random(NULL, NULL, u, sizeof(u), 0, NULL);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);

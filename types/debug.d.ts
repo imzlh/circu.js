@@ -62,6 +62,8 @@ declare namespace CModuleDebug {
 		thrown?: unknown,
 	) => number | void;
 
+	type DebugChannelPointer = ArrayBuffer;
+
 	export function start(onBreak: BreakCallback): void;
 	export function stop(): void;
 
@@ -101,7 +103,7 @@ declare namespace CModuleDebug {
 
 	/** Return type of createDebugChannel(). */
 	export interface DebugChannelPair {
-		handle: ArrayBuffer;
+		handle: DebugChannelPointer;
 		dc: DebugChannelMain;
 	}
 
@@ -160,5 +162,5 @@ declare namespace CModuleDebug {
 	export function createDebugChannel(): DebugChannelPair;
 
 	/** Rebuild the worker-side handle from a transferred handle ArrayBuffer. */
-	export function getDebugChannel(handle: ArrayBuffer): DebugChannelWorker;
+	export function getDebugChannel(handle: DebugChannelPointer): DebugChannelWorker;
 }

@@ -1,11 +1,8 @@
 /**
  * txiki.js crypto module type definitions
  * OpenSSL-based cryptographic operations
- */
-
-
-/**
- * Example: Hash data
+ *
+ * @example Hash data
  * ```typescript
  * const crypto = import.meta.use('crypto')
  * const { Encoder, Decoder } = import.meta.use('text');

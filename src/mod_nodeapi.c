@@ -20,6 +20,7 @@
 #define NAPI_VERSION 9
 
 #include "private.h"
+#include "capability.h"
 #include "tjs.h"
 #include "mem.h"
 
@@ -2356,7 +2357,13 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, arraybuffer);
     if (!JS_IsArrayBuffer(v(arraybuffer))) return NAPI_RET(env, napi_arraybuffer_expected);
-    JS_DetachArrayBuffer(env->ctx, v(arraybuffer));
+    if (JS_DetachArrayBuffer(env->ctx, v(arraybuffer)) < 0) {
+        /* N-API reports non-detachable buffers as a status, not as a pending
+         * JavaScript exception. Consume QuickJS's internal diagnostic. */
+        JSValue exception = JS_GetException(env->ctx);
+        JS_FreeValue(env->ctx, exception);
+        return NAPI_RET(env, napi_detachable_arraybuffer_expected);
+    }
     return NAPI_OK(env);
 }
 
@@ -3006,6 +3013,7 @@ static JSValue tjs__napi_dlopen(JSContext *ctx, JSValueConst this_val,
     if (argc < 1) return JS_ThrowTypeError(ctx, "dlopen(path) requires a path");
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability_resource(ctx, TJS_CAP_DYNLIB | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "nodeapi.dlopen", path), JS_FreeCString(ctx, path));
 
     TJSDynLib *node = calloc(1, sizeof(*node));
     if (!node) {

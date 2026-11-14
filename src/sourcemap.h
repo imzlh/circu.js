@@ -26,7 +26,6 @@ void js_destroy_mapping_context(MappingContext *ctx);
 /* Source map operations */
 bool js_has_sourcemap(MappingContext *ctx, const char *file_path);
 int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx, const char *file_path, JSValue sourcemap_obj);
-int js_load_sourcemap_cjson(MappingContext *ctx, JSContext *js_ctx, const char *file_path, const char *json_str);
 MappingResult js_get_source_mapping(MappingContext *ctx, const char *file_path, int line, int col);
 bool js_remove_sourcemap(MappingContext *ctx, const char *file_path);
 

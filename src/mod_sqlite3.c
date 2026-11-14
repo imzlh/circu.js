@@ -24,6 +24,7 @@
  */
 
 #include "private.h"
+#include "capability.h"
 
 #include <sqlite3.h>
 #include <inttypes.h>
@@ -218,6 +219,20 @@ static JSValue tjs_sqlite3_open(JSContext *ctx, JSValue this_val, int argc, JSVa
         return JS_EXCEPTION;
     }
 
+    int access_flags = flags & (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE |
+                                SQLITE_OPEN_CREATE);
+    if (access_flags != SQLITE_OPEN_READONLY &&
+        access_flags != SQLITE_OPEN_READWRITE &&
+        access_flags != (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) {
+        JS_FreeCString(ctx, db_name);
+        return JS_ThrowTypeError(ctx, "invalid sqlite open access flags");
+    }
+
+    TJSCapabilityMask mask = TJS_CAP_IO;
+    if (flags & (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE)) mask |= TJS_CAP_IO_READ;
+    if (flags & (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) mask |= TJS_CAP_IO_WRITE;
+    TJS_CAPABILITY(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.open", db_name), JS_FreeCString(ctx, db_name));
+
     sqlite3 *handle = NULL;
     int r = sqlite3_open_v2(db_name, &handle, flags, NULL);
 
@@ -291,6 +306,15 @@ static JSValue tjs_sqlite3_load_extension(JSContext *ctx, JSValue this_val, int 
 
     // zProc can be 0, it means "sqlite, do your best to quess it"
 
+    h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h) {
+        JS_FreeCString(ctx, zFile);
+        if (zProc) JS_FreeCString(ctx, zProc);
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_resource(ctx, TJS_CAP_DYNLIB | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.loadExtension", zFile), (zProc ? JS_FreeCString(ctx, zProc) : (void)0, JS_FreeCString(ctx, zFile)), do { h = tjs_sqlite3_get_open(ctx, this_val); if (!h) { JS_FreeCString(ctx, zFile); if (zProc) JS_FreeCString(ctx, zProc); return JS_EXCEPTION; } } while (0));
+
     int r = sqlite3_db_config(h->handle, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
     if (r != SQLITE_OK) {
         JS_FreeCString(ctx, zFile);
@@ -332,6 +356,14 @@ static JSValue tjs_sqlite3_exec(JSContext *ctx, JSValue this_val, int argc, JSVa
         return JS_EXCEPTION;
     }
 
+    h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h) {
+        JS_FreeCString(ctx, sql);
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.exec", NULL), JS_FreeCString(ctx, sql), do { h = tjs_sqlite3_get_open(ctx, this_val); if (!h) { JS_FreeCString(ctx, sql); return JS_EXCEPTION; } } while (0));
+
     int r = sqlite3_exec(h->handle, sql, NULL, NULL, NULL);
 
     JS_FreeCString(ctx, sql);
@@ -358,6 +390,14 @@ static JSValue tjs_sqlite3_prepare(JSContext *ctx, JSValue this_val, int argc, J
     if (!sql) {
         return JS_EXCEPTION;
     }
+
+    h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h) {
+        JS_FreeCString(ctx, sql);
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.prepare", NULL), JS_FreeCString(ctx, sql), do { h = tjs_sqlite3_get_open(ctx, this_val); if (!h) { JS_FreeCString(ctx, sql); return JS_EXCEPTION; } } while (0));
 
     sqlite3_stmt *stmt = NULL;
     int r = sqlite3_prepare_v2(h->handle, sql, -1, &stmt, NULL);
@@ -1132,6 +1172,16 @@ static JSValue tjs_sqlite3_backup_to(JSContext *ctx, JSValue this_val, int argc,
         dst_name = dst_owned;
     }
 
+    h = tjs_sqlite3_get_open(ctx, this_val);
+    if (!h) {
+        JS_FreeCString(ctx, dest_path);
+        if (src_owned) JS_FreeCString(ctx, src_owned);
+        if (dst_owned) JS_FreeCString(ctx, dst_owned);
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.backupTo", dest_path), (dst_owned ? JS_FreeCString(ctx, dst_owned) : (void)0, src_owned ? JS_FreeCString(ctx, src_owned) : (void)0, JS_FreeCString(ctx, dest_path)), do { h = tjs_sqlite3_get_open(ctx, this_val); if (!h) { JS_FreeCString(ctx, dest_path); if (src_owned) JS_FreeCString(ctx, src_owned); if (dst_owned) JS_FreeCString(ctx, dst_owned); return JS_EXCEPTION; } } while (0));
+
     sqlite3 *dest = NULL;
     int r = sqlite3_open_v2(dest_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if (r != SQLITE_OK) {
@@ -1774,6 +1824,10 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
         return JS_ThrowInternalError(ctx, "Statement has been finalized");
     }
 
+    TJSCapabilityMask mask = TJS_CAP_IO | TJS_CAP_IO_READ;
+    if (!sqlite3_stmt_readonly(h->stmt)) mask |= TJS_CAP_IO_WRITE;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.all", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized"); } while (0));
+
     int r = sqlite3_reset(h->stmt);
     if (r != SQLITE_OK) {
         return tjs_throw_sqlite3_errno(ctx, r);
@@ -1786,6 +1840,10 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
             return JS_EXCEPTION;
         }
     }
+
+    h = tjs_sqlite3_stmt_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized");
 
     JSValue result = JS_NewArray(ctx);
     if (JS_IsException(result)) {
@@ -1825,6 +1883,10 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
         return JS_ThrowInternalError(ctx, "Statement has been finalized");
     }
 
+    TJSCapabilityMask mask = TJS_CAP_IO | TJS_CAP_IO_READ;
+    if (!sqlite3_stmt_readonly(h->stmt)) mask |= TJS_CAP_IO_WRITE;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.run", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized"); } while (0));
+
     int r = sqlite3_reset(h->stmt);
     if (r != SQLITE_OK) {
         return tjs_throw_sqlite3_errno(ctx, r);
@@ -1837,6 +1899,10 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
             return JS_EXCEPTION;
         }
     }
+
+    h = tjs_sqlite3_stmt_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized");
 
     r = sqlite3_step(h->stmt);
     if (r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) {

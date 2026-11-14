@@ -1,10 +1,6 @@
 /**
  * txiki.js Text Module - TypeScript Definitions
  * Based on libiconv for character encoding conversion
- */
-
-/**
- * Examples focus on the native text module, not global TextEncoder/TextDecoder.
  *
  * @example UTF-8 encode/decode
  * ```ts

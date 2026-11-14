@@ -23,6 +23,7 @@
  */
 
 #include "private.h"
+#include "capability.h"
 #include "mem.h"
 
 #include <windows.h>
@@ -77,15 +78,10 @@ static inline HKEY to_hkey(JSContext *ctx, JSValue v) {
     return (HKEY)(intptr_t)value;
 }
 
-/* Open a registry key; sets JS exception and returns NULL on failure */
-static HKEY open_key(JSContext *ctx, JSValue hive_v, JSValue key_v, REGSAM access) {
-    HKEY hive = to_hkey(ctx, hive_v);
-    if (!hive) return NULL;
-    WCHAR *key = to_wcs(ctx, key_v);
-    if (!key) return NULL;
+/* Open an already validated registry key; sets JS exception on failure. */
+static HKEY open_key(JSContext *ctx, HKEY hive, const WCHAR *key, REGSAM access) {
     HKEY hk;
     LONG r = RegOpenKeyExW(hive, key, 0, access, &hk);
-    js_free(ctx, key);
     if (r != ERROR_SUCCESS) { throw_win32_error(ctx, r); return NULL; }
     return hk;
 }
@@ -140,11 +136,17 @@ static JSValue reg_to_js(JSContext *ctx, DWORD type, const BYTE *data, DWORD sz)
 
 static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and value name");
-    HKEY hk = open_key(ctx, argv[0], argv[1], KEY_READ);
-    if (!hk) return JS_EXCEPTION;
-
+    HKEY hive = to_hkey(ctx, argv[0]);
+    if (!hive) return JS_EXCEPTION;
+    WCHAR *key = to_wcs(ctx, argv[1]);
+    if (!key) return JS_EXCEPTION;
     WCHAR *name = to_wcs(ctx, argv[2]);
-    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
+    if (!name) { js_free(ctx, key); return JS_EXCEPTION; }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WIN32 | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "win32.readRegistry"), (js_free(ctx, name), js_free(ctx, key)));
+    HKEY hk = open_key(ctx, hive, key, KEY_READ);
+    js_free(ctx, key);
+    if (!hk) { js_free(ctx, name); return JS_EXCEPTION; }
+
     DWORD type, size;
     LONG r = RegQueryValueExW(hk, name, NULL, &type, NULL, &size);
     if (r != ERROR_SUCCESS) { js_free(ctx, name); RegCloseKey(hk); return throw_win32_error(ctx, r); }
@@ -166,36 +168,42 @@ static JSValue tjs_reg_read(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
 static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 4) return JS_ThrowTypeError(ctx, "expected hive, key, value name and value");
-    HKEY hk = open_key(ctx, argv[0], argv[1], KEY_WRITE);
-    if (!hk) return JS_EXCEPTION;
-
+    HKEY hive = to_hkey(ctx, argv[0]);
+    if (!hive) return JS_EXCEPTION;
+    WCHAR *key = to_wcs(ctx, argv[1]);
+    if (!key) return JS_EXCEPTION;
     WCHAR *name = to_wcs(ctx, argv[2]);
-    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
+    if (!name) { js_free(ctx, key); return JS_EXCEPTION; }
     JSValue val = argv[3];
     DWORD type, size;
     WCHAR *wbuf = NULL;
     DWORD dword_val;
     const BYTE *data;
-    bool is_extbuf = false;
+    bool is_binary = false;
 
     if (JS_IsString(val)) {
         wbuf = to_wcs(ctx, val);
-        if (!wbuf) { js_free(ctx, name); RegCloseKey(hk); return JS_EXCEPTION; }
+        if (!wbuf) { js_free(ctx, name); js_free(ctx, key); return JS_EXCEPTION; }
         type = REG_SZ; size = (wcslen(wbuf) + 1) * sizeof(WCHAR);
         data = (const BYTE *)wbuf;
     } else if (JS_IsNumber(val)) {
         uint32_t dword_val32;
-        JS_ToUint32(ctx, &dword_val32, val);
+        if (JS_ToUint32(ctx, &dword_val32, val)) { js_free(ctx, name); js_free(ctx, key); return JS_EXCEPTION; }
         dword_val = (DWORD)dword_val32;
         type = REG_DWORD; size = sizeof(DWORD);
         data = (const BYTE *)&dword_val;
     } else {
         size_t sz;
         uint8_t *buf = JS_GetUint8Array(ctx, &sz, val);
-        if (!buf) { js_free(ctx, name); RegCloseKey(hk); return JS_EXCEPTION; }
-        type = REG_BINARY; size = sz; data = buf; is_extbuf = true;
+        if (!buf) { js_free(ctx, name); js_free(ctx, key); return JS_EXCEPTION; }
+        if (sz > UINT32_MAX) { js_free(ctx, name); js_free(ctx, key); return JS_ThrowRangeError(ctx, "registry value is too large"); }
+        type = REG_BINARY; size = (DWORD)sz; data = buf; is_binary = true;
     }
 
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_WIN32 | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "win32.writeRegistry"), (js_free(ctx, wbuf), js_free(ctx, name), js_free(ctx, key)), do { if (is_binary) { size_t sz; uint8_t *buf = JS_GetUint8Array(ctx, &sz, val); if (!buf) { js_free(ctx, name); js_free(ctx, key); return JS_EXCEPTION; } if (sz > UINT32_MAX) { js_free(ctx, name); js_free(ctx, key); return JS_ThrowRangeError(ctx, "registry value is too large"); } size = (DWORD)sz; data = buf; } } while (0));
+    HKEY hk = open_key(ctx, hive, key, KEY_WRITE);
+    js_free(ctx, key);
+    if (!hk) { js_free(ctx, name); js_free(ctx, wbuf); return JS_EXCEPTION; }
     LONG r = RegSetValueExW(hk, name, 0, type, data, size);
     js_free(ctx, name); RegCloseKey(hk);
     if (wbuf) js_free(ctx, wbuf);
@@ -206,10 +214,16 @@ static JSValue tjs_reg_write(JSContext *ctx, JSValue this_val, int argc, JSValue
 
 static JSValue tjs_reg_delete(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and value name");
-    HKEY hk = open_key(ctx, argv[0], argv[1], KEY_WRITE);
-    if (!hk) return JS_EXCEPTION;
+    HKEY hive = to_hkey(ctx, argv[0]);
+    if (!hive) return JS_EXCEPTION;
+    WCHAR *key = to_wcs(ctx, argv[1]);
+    if (!key) return JS_EXCEPTION;
     WCHAR *name = to_wcs(ctx, argv[2]);
-    if (!name) { RegCloseKey(hk); return JS_EXCEPTION; }
+    if (!name) { js_free(ctx, key); return JS_EXCEPTION; }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WIN32 | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "win32.delRegistry"), (js_free(ctx, name), js_free(ctx, key)));
+    HKEY hk = open_key(ctx, hive, key, KEY_WRITE);
+    js_free(ctx, key);
+    if (!hk) { js_free(ctx, name); return JS_EXCEPTION; }
     LONG r = RegDeleteValueW(hk, name);
     js_free(ctx, name); RegCloseKey(hk);
     return r == ERROR_SUCCESS ? JS_UNDEFINED : throw_win32_error(ctx, r);
@@ -327,7 +341,13 @@ static const JSCFunctionListEntry tjs_regwatch_proto_funcs[] = {
 static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 3) return JS_ThrowTypeError(ctx, "expected hive, key and callback");
     TJS_CHECK_ARG_RET(ctx, JS_IsFunction(ctx, argv[2]), 2, "function");
-    HKEY hk = open_key(ctx, argv[0], argv[1], KEY_NOTIFY);
+    HKEY hive = to_hkey(ctx, argv[0]);
+    if (!hive) return JS_EXCEPTION;
+    WCHAR *key = to_wcs(ctx, argv[1]);
+    if (!key) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WIN32 | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "win32.watchRegistry"), js_free(ctx, key));
+    HKEY hk = open_key(ctx, hive, key, KEY_NOTIFY);
+    js_free(ctx, key);
     if (!hk) return JS_EXCEPTION;
 
     HANDLE event = CreateEventW(NULL, false, false, NULL);
@@ -389,8 +409,11 @@ static JSValue tjs_reg_watch(JSContext *ctx, JSValue this_val, int argc, JSValue
 static JSValue tjs_get_certs(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     const char *store_name = "ROOT";
     const char *store_cstr = NULL;
-    if (argc > 0 && JS_IsString(argv[0]))
+    if (argc > 0 && JS_IsString(argv[0])) {
         store_name = store_cstr = JS_ToCString(ctx, argv[0]);
+        if (!store_cstr) return JS_EXCEPTION;
+    }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WIN32 | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "win32.exportCerts"), JS_FreeCString(ctx, store_cstr));
 
     HCERTSTORE store = CertOpenSystemStoreA(0, store_name);
     DWORD error = store ? ERROR_SUCCESS : GetLastError();

@@ -23,6 +23,7 @@
  */
 #include "private.h"
 #include "tjs.h"
+#include "capability.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -400,9 +401,6 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     if (JS_ToBool(ctx, verify_val)) {
         ssl_ctx->verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
         SSL_CTX_set_verify(ssl_ctx->ssl_ctx, ssl_ctx->verify_mode, NULL);
-        if (SSL_CTX_set_default_verify_paths(ssl_ctx->ssl_ctx) != 1) {
-            ERR_clear_error();
-        }
     }
     JS_FreeValue(ctx, verify_val);
 
@@ -493,7 +491,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     JSValue dhparam_val = JS_GetPropertyStr(ctx, options, "dhparam");
     const char *dhparam = cstr(ctx, dhparam_val);
     if (dhparam) {
-        BIO *bio = BIO_new_file(dhparam, "r");
+        BIO *bio = BIO_new_mem_buf(dhparam, -1);
         if (bio) {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
             EVP_PKEY *dh = PEM_read_bio_Parameters(bio, NULL);
@@ -557,6 +555,8 @@ typedef struct {
     TJSSSLContext *ssl_context;
 	JSValue ssl_obj;	// hold reference to SSL object
     TJSSSLHandshakeState handshake_state;
+    bool handshake_capability_checked;
+    bool handshake_capability_checking;
     bool is_server;
     char *hostname;
 } TJSSSLPipe;
@@ -683,6 +683,38 @@ static JSValue tjs_ssl_pipe_feed(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+static JSValue tjs_ssl_pipe_handshake_capability(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  TJSSSLPipe **pipe_ptr,
+                                                  const char *api) {
+    TJSSSLPipe *pipe = *pipe_ptr;
+    if (pipe->handshake_capability_checked) return TJS_CAPABILITY_PASS;
+    if (pipe->handshake_capability_checking) {
+        return JS_ThrowTypeError(ctx, "reentrant SSL handshake capability check");
+    }
+
+    /* The enclosing TJS_CAPABILITY gate calls this helper only for an active,
+     * non-reentrant hook. A temporary nested-hook bypass therefore never marks
+     * this pipe as checked for later untrusted calls. */
+    pipe->handshake_capability_checking = true;
+    JSValue result = tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ,
+                                     TJS_CAP_FLAG_REPLACEABLE, api);
+    pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
+    if (!pipe) {
+        if (!JS_IsUninitialized(result) && !JS_IsException(result)) {
+            JS_FreeValue(ctx, result);
+        }
+        return JS_EXCEPTION;
+    }
+
+    pipe->handshake_capability_checking = false;
+    *pipe_ptr = pipe;
+    if (JS_IsUninitialized(result)) {
+        pipe->handshake_capability_checked = true;
+    }
+    return result;
+}
+
 /* pipe.read(size) - Read decrypted data */
 static JSValue tjs_ssl_pipe_read(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
@@ -699,6 +731,8 @@ static JSValue tjs_ssl_pipe_read(JSContext *ctx, JSValueConst this_val,
             return JS_ThrowRangeError(ctx, "size must be between 1 and 1048576");
         }
     }
+
+    TJS_CAPABILITY(tjs_ssl_pipe_handshake_capability(ctx, this_val, &pipe, "ssl.read"), (void)0);
 
     uint8_t *buf = js_malloc(ctx, size);
     if (!buf) return JS_EXCEPTION;
@@ -728,6 +762,8 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
     if (!buf) return JS_EXCEPTION;
+
+    TJS_CAPABILITY_REVALIDATE(tjs_ssl_pipe_handshake_capability(ctx, this_val, &pipe, "ssl.write"), (void)0, do { buf = JS_GetAnyBuffer(ctx, &size, argv[0]); if (!buf) return JS_EXCEPTION; } while (0));
 
     /* Clamp to INT_MAX to prevent truncation */
     if (size > INT_MAX) size = INT_MAX;
@@ -775,6 +811,8 @@ static JSValue tjs_ssl_pipe_do_handshake(JSContext *ctx, JSValueConst this_val,
     if (pipe->handshake_state == TJS_SSL_HANDSHAKE_DONE) {
         return JS_NewBool(ctx, true);
     }
+
+    TJS_CAPABILITY(tjs_ssl_pipe_handshake_capability(ctx, this_val, &pipe, "ssl.handshake"), (void)0);
     
     pipe->handshake_state = TJS_SSL_HANDSHAKE_IN_PROGRESS;
     
@@ -1128,13 +1166,33 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
      * must be freed regardless of argc. cn_owned tracks whether cn came from
      * JS_ToCString (and so requires JS_FreeCString) vs a static fallback. */
     JSValue cn_val = JS_IsObject(options) ? JS_GetPropertyStr(ctx, options, "commonName") : JS_UNDEFINED;
-    const char *cn = cstr(ctx, cn_val);
-    bool cn_owned = (cn != NULL);
-    if (!cn) cn = "localhost";
+    if (JS_IsException(cn_val)) return JS_EXCEPTION;
+    const char *cn = "localhost";
+    bool cn_owned = false;
+    if (JS_IsString(cn_val)) {
+        cn = JS_ToCString(ctx, cn_val);
+        if (!cn) {
+            JS_FreeValue(ctx, cn_val);
+            return JS_EXCEPTION;
+        }
+        cn_owned = true;
+    }
 
     JSValue days_val = JS_IsObject(options) ? JS_GetPropertyStr(ctx, options, "days") : JS_UNDEFINED;
+    if (JS_IsException(days_val)) {
+        if (cn_owned) JS_FreeCString(ctx, cn);
+        JS_FreeValue(ctx, cn_val);
+        return JS_EXCEPTION;
+    }
     int32_t days = 365;
-    if (!JS_IsUndefined(days_val)) JS_ToInt32(ctx, &days, days_val);
+    if (!JS_IsUndefined(days_val) && JS_ToInt32(ctx, &days, days_val) < 0) {
+        if (cn_owned) JS_FreeCString(ctx, cn);
+        JS_FreeValue(ctx, cn_val);
+        JS_FreeValue(ctx, days_val);
+        return JS_EXCEPTION;
+    }
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "ssl.createSelfSignedCert"), (cn_owned ? JS_FreeCString(ctx, cn) : (void)0, JS_FreeValue(ctx, cn_val), JS_FreeValue(ctx, days_val)));
     
     /* Generate RSA key. Keep pkey NULL so EVP_PKEY_generate allocates it (passing
      * a pre-allocated EVP_PKEY leaks the original). */

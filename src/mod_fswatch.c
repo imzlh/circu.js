@@ -25,6 +25,7 @@
 #include "mem.h"
 #include "private.h"
 #include "utils.h"
+#include "capability.h"
 
 typedef struct {
     JSContext *ctx;
@@ -133,9 +134,11 @@ static JSValue tjs_fswatch_close(JSContext *ctx, JSValue this_val, int argc, JSV
 
 static JSValue tjs_fswatch_path_get(JSContext *ctx, JSValue this_val) {
     TJSFsWatch *fw = tjs_fswatch_get(this_val);
-    if (!fw) {
+    if (!fw || fw->closed || fw->finalized || uv_is_closing((uv_handle_t *) &fw->handle)) {
         return JS_UNDEFINED;
     }
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fswatch.path", NULL), (void)0, do { fw = tjs_fswatch_get(this_val); if (!fw || fw->closed || fw->finalized || uv_is_closing((uv_handle_t *) &fw->handle)) return (JS_UNDEFINED); } while (0));
 
     char buf[1024];
     size_t size = sizeof(buf);
@@ -229,6 +232,13 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_ThrowTypeError(ctx, "no callback function provided");
     }
 
+    int recursive = 0;
+    if (argc > 2) {
+        recursive = JS_ToBool(ctx, argv[2]);
+    }
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "fswatch.watch", path), JS_FreeCString(ctx, path));
+
     JSValue obj = JS_NewObjectClass(ctx, tjs_fswatch_class_id);
     if (JS_IsException(obj)) {
         JS_FreeCString(ctx, path);
@@ -255,11 +265,6 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     fw->ctx = ctx;
     fw->handle.data = fw;
-
-    int recursive = 0;
-    if (argc > 2) {
-        recursive = JS_ToBool(ctx, argv[2]);
-    }
 
     r = uv_fs_event_start(&fw->handle, uv__fs_event_cb, path, recursive ? UV_FS_EVENT_RECURSIVE : 0);
     if (r != 0) {

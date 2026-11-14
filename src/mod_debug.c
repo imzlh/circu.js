@@ -23,6 +23,7 @@
  */
 
 #include "private.h"
+#include "capability.h"
 #include "tjs.h"
 #include "utils.h"
 #include "mem.h"
@@ -682,7 +683,9 @@ static int tjs__debug_throw_cb(JSContext *ctx, JSValueConst exception, int throw
 static JSValue tjs_debug_start(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc == 0 || !JS_IsFunction(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "startDebug requires a callback function");
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.start"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
     JS_FreeValue(ctx, trt->debug.onBreak);
     trt->debug.onBreak = JS_DupValue(ctx, argv[0]);
     trt->debug.active  = true;
@@ -719,16 +722,19 @@ static JSValue tjs_debug_stop(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue tjs_debug_add_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 2 || !JS_IsString(argv[0]))
         return JS_ThrowTypeError(ctx, "addBreakpoint requires (filename: string, line: number)");
-    TJSRuntime *trt = TJS_GetRuntime(ctx);
     const char *filename = JS_ToCString(ctx, argv[0]);
     if (!filename) return JS_EXCEPTION;
-    JSAtom filename_atom = JS_NewAtom(ctx, filename);
-    JS_FreeCString(ctx, filename);
     int32_t line;
-    if (JS_ToInt32(ctx, &line, argv[1])) { JS_FreeAtom(ctx, filename_atom); return JS_EXCEPTION; }
+    if (JS_ToInt32(ctx, &line, argv[1])) { JS_FreeCString(ctx, filename); return JS_EXCEPTION; }
     int32_t col = -1;
     if (argc >= 3 && JS_IsNumber(argv[2]))
-        if (JS_ToInt32(ctx, &col, argv[2])) { JS_FreeAtom(ctx, filename_atom); return JS_EXCEPTION; }
+        if (JS_ToInt32(ctx, &col, argv[2])) { JS_FreeCString(ctx, filename); return JS_EXCEPTION; }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.addBreakpoint"), JS_FreeCString(ctx, filename));
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return JS_ThrowInternalError(ctx, "runtime is shutting down"); }
+    JSAtom filename_atom = JS_NewAtom(ctx, filename);
+    JS_FreeCString(ctx, filename);
+    if (filename_atom == JS_ATOM_NULL) return JS_EXCEPTION;
     TJSBreakpoint key = { .filename = filename_atom, .line = line };
     TJSBreakpoint *existing = NULL;
     HASH_FIND(hh, trt->debug.breakpoints, &key, sizeof(JSAtom)+sizeof(int), existing);
@@ -762,13 +768,16 @@ static JSValue tjs_debug_add_breakpoint(JSContext *ctx, JSValue this_val, int ar
 static JSValue tjs_debug_remove_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 2 || !JS_IsString(argv[0]))
         return JS_ThrowTypeError(ctx, "removeBreakpoint requires (filename: string, line: number)");
-    TJSRuntime *trt = TJS_GetRuntime(ctx);
     const char *filename = JS_ToCString(ctx, argv[0]);
     if (!filename) return JS_EXCEPTION;
+    int32_t line;
+    if (JS_ToInt32(ctx, &line, argv[1])) { JS_FreeCString(ctx, filename); return JS_EXCEPTION; }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.removeBreakpoint"), JS_FreeCString(ctx, filename));
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return JS_ThrowInternalError(ctx, "runtime is shutting down"); }
     JSAtom filename_atom = JS_NewAtom(ctx, filename);
     JS_FreeCString(ctx, filename);
-    int32_t line;
-    if (JS_ToInt32(ctx, &line, argv[1])) { JS_FreeAtom(ctx, filename_atom); return JS_EXCEPTION; }
+    if (filename_atom == JS_ATOM_NULL) return JS_EXCEPTION;
     TJSBreakpoint key = { .filename = filename_atom, .line = line };
     TJSBreakpoint *found = NULL;
     HASH_FIND(hh, trt->debug.breakpoints, &key, sizeof(JSAtom)+sizeof(int), found);
@@ -778,7 +787,9 @@ static JSValue tjs_debug_remove_breakpoint(JSContext *ctx, JSValue this_val, int
 }
 
 static JSValue tjs_debug_clear_breakpoints(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.clearBreakpoints"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
     TJSBreakpoint *bp, *tmp;
     HASH_ITER(hh, trt->debug.breakpoints, bp, tmp) {
         HASH_DEL(trt->debug.breakpoints, bp);
@@ -789,6 +800,7 @@ static JSValue tjs_debug_clear_breakpoints(JSContext *ctx, JSValue this_val, int
 }
 
 static JSValue tjs_debug_get_stack_depth(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "debug.getStackDepth"), (void)0);
     return JS_NewInt32(ctx, JS_GetStackDepth(ctx));
 }
 
@@ -796,6 +808,7 @@ static JSValue tjs_debug_get_frame_info(JSContext *ctx, JSValue this_val, int ar
     int level;
     if (argc == 0 || -1 == JS_ToInt32(ctx, &level, argv[0]))
         return JS_ThrowTypeError(ctx, "getFrameInfo requires (level: number)");
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "debug.getFrameInfo"), (void)0);
     JSFrameInfo frame = JS_GetStackFrame(ctx, level);
     if (frame.line_num == -1) {
         JS_FreeValue(ctx, frame.func);
@@ -813,6 +826,7 @@ static JSValue tjs_debug_get_local_variables(JSContext *ctx, JSValue this_val, i
     if (argc == 0) return JS_ThrowTypeError(ctx, "getLocalVariables requires (level: number)");
     int32_t level;
     if (JS_ToInt32(ctx, &level, argv[0])) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "debug.getLocalVariables"), (void)0);
     JSDebugLocalVar *vars = NULL;
     int count = 0;
     int rc = JS_GetLocalVariablesAtLevel(ctx, level, &vars, &count);
@@ -846,6 +860,7 @@ static JSValue tjs_debug_set_variable(JSContext *ctx, JSValue this_val, int argc
             return JS_EXCEPTION;
         }
     }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.setVariable"), JS_FreeCString(ctx, name));
     if (scopeNumber == 2) {
         /* CDP global scope — set property on the global object. */
         JSValue global = JS_GetGlobalObject(ctx);
@@ -872,6 +887,7 @@ static JSValue tjs_debug_eval_in_frame(JSContext *ctx, JSValue this_val, int arg
     size_t len;
     const char *expr = JS_ToCStringLen(ctx, &len, argv[1]);
     if (!expr) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.evalInFrame"), JS_FreeCString(ctx, expr));
     JSValue ret = JS_EvalInStackFrame(ctx, level, expr, len, "<eval>");
     JS_FreeCString(ctx, expr);
     return ret;
@@ -879,19 +895,23 @@ static JSValue tjs_debug_eval_in_frame(JSContext *ctx, JSValue this_val, int arg
 
 static JSValue tjs_debug_set_exception_breakpoint(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc == 0) return JS_ThrowTypeError(ctx, "setExceptionBreakpoint requires (mode: number | boolean)");
-    TJSRuntime *trt = TJS_GetRuntime(ctx);
     uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
     if (tjs__debug_exception_mode_from_arg(ctx, argv[0], &mode))
         return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.setExceptionBreakpoint"), (void)0);
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
     trt->debug.exception_break_mode = (int)mode;
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_debug_set_step_mode(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc == 0) return JS_ThrowTypeError(ctx, "step requires (mode: number)");
-    TJSRuntime *trt = TJS_GetRuntime(ctx);
     int32_t mode;
     if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.step"), (void)0);
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
     trt->debug.step_mode  = (int)mode;
     trt->debug.step_depth = tjs__debug_current_pause_depth(trt, ctx);
     return JS_UNDEFINED;
@@ -961,6 +981,10 @@ static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JS
     size_t len;
     uint8_t *buf = dc_write(ctx, argv[1], &len);
     if (!buf) return JS_EXCEPTION;
+    if (len > UINT32_MAX) { js_free(ctx, buf); return JS_ThrowRangeError(ctx, "debug channel payload is too large"); }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.notify"), js_free(ctx, buf));
+    h = tjs_dc_main_get(ctx, this_val);
+    if (!h) { js_free(ctx, buf); return JS_EXCEPTION; }
     bool ok = ring_push(&h->cb->to_worker, (uint32_t)ev_type, 0, buf, (uint32_t)len);
     js_free(ctx, buf);
     if (ok) tjs_sem_post(&h->cb->worker_sem);
@@ -974,6 +998,7 @@ static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JS
 static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCMain *h = tjs_dc_main_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.waitRequest"), (void)0, do { h = tjs_dc_main_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     TJSRuntime *trt = TJS_GetRuntime(ctx);
     DebugControlBlock *cb = h->cb;
     for (;;) {
@@ -1048,6 +1073,10 @@ static JSValue tjs_dc_main_reply(JSContext *ctx, JSValue this_val, int argc, JSV
     size_t len;
     uint8_t *buf = dc_write(ctx, argv[1], &len);
     if (!buf) return JS_EXCEPTION;
+    if (len > UINT32_MAX) { js_free(ctx, buf); return JS_ThrowRangeError(ctx, "debug channel payload is too large"); }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.reply"), js_free(ctx, buf));
+    h = tjs_dc_main_get(ctx, this_val);
+    if (!h) { js_free(ctx, buf); return JS_EXCEPTION; }
     bool ok = ring_push(&h->cb->to_worker, MSG_REPLY, (uint32_t)id, buf, (uint32_t)len);
     js_free(ctx, buf);
     if (ok) tjs_sem_post(&h->cb->worker_sem);
@@ -1081,7 +1110,9 @@ static const JSCFunctionListEntry tjs_dc_main_proto_funcs[] = {
 /* ---- createDebugChannel() ------------------------------------------------ */
 // Note: We should never bind the memory in ctx, which should be transferred and not stay in current ctx.
 static JSValue tjs_debug_create_channel(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.createDebugChannel"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
 
     /* Old channel (if any) stays owned by its existing handles; just drop the
      * weak pointer so the trace hook starts using the new one. */
@@ -1168,6 +1199,7 @@ static TJSDCWorker *tjs_dc_worker_get(JSContext *ctx, JSValueConst this_val) {
 static JSValue tjs_dc_worker_interrupt(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.interrupt"), (void)0, do { h = tjs_dc_worker_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     atomic_store(&h->cb->interrupt, 1u);
     return JS_UNDEFINED;
 }
@@ -1175,6 +1207,7 @@ static JSValue tjs_dc_worker_interrupt(JSContext *ctx, JSValue this_val, int arg
 static JSValue tjs_dc_worker_state(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.state"), (void)0, do { h = tjs_dc_worker_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     return JS_NewInt32(ctx, (int)atomic_load(&h->cb->state));
 }
 
@@ -1185,9 +1218,13 @@ static JSValue tjs_dc_worker_add_breakpoint(JSContext *ctx, JSValue this_val, in
     const char *file = JS_ToCString(ctx, argv[0]);
     if (!file) return JS_EXCEPTION;
     uint32_t line = 0, col = (uint32_t)-1;
-    JS_ToUint32(ctx, &line, argv[1]);
-    if (argc >= 3 && JS_IsNumber(argv[2])) JS_ToUint32(ctx, &col, argv[2]);
+    if (JS_ToUint32(ctx, &line, argv[1])) { JS_FreeCString(ctx, file); return JS_EXCEPTION; }
+    if (argc >= 3 && JS_IsNumber(argv[2]) && JS_ToUint32(ctx, &col, argv[2])) { JS_FreeCString(ctx, file); return JS_EXCEPTION; }
     size_t flen = strlen(file) + 1;
+    if (flen > UINT32_MAX - 8) { JS_FreeCString(ctx, file); return JS_ThrowRangeError(ctx, "debug channel payload is too large"); }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.addBreakpoint"), JS_FreeCString(ctx, file));
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) { JS_FreeCString(ctx, file); return JS_EXCEPTION; }
     uint32_t plen = (uint32_t)(flen + 8);
     uint8_t *buf = malloc(plen);
     if (!buf) { JS_FreeCString(ctx, file); return JS_ThrowOutOfMemory(ctx); }
@@ -1208,8 +1245,12 @@ static JSValue tjs_dc_worker_remove_breakpoint(JSContext *ctx, JSValue this_val,
     const char *file = JS_ToCString(ctx, argv[0]);
     if (!file) return JS_EXCEPTION;
     uint32_t line = 0;
-    JS_ToUint32(ctx, &line, argv[1]);
+    if (JS_ToUint32(ctx, &line, argv[1])) { JS_FreeCString(ctx, file); return JS_EXCEPTION; }
     size_t flen = strlen(file) + 1;
+    if (flen > UINT32_MAX - 4) { JS_FreeCString(ctx, file); return JS_ThrowRangeError(ctx, "debug channel payload is too large"); }
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.removeBreakpoint"), JS_FreeCString(ctx, file));
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) { JS_FreeCString(ctx, file); return JS_EXCEPTION; }
     uint32_t plen = (uint32_t)(flen + 4);
     uint8_t *buf = malloc(plen);
     if (!buf) { JS_FreeCString(ctx, file); return JS_ThrowOutOfMemory(ctx); }
@@ -1225,6 +1266,7 @@ static JSValue tjs_dc_worker_remove_breakpoint(JSContext *ctx, JSValue this_val,
 static JSValue tjs_dc_worker_clear_breakpoints(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.clearBreakpoints"), (void)0, do { h = tjs_dc_worker_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     if (!dc_push_control(h->cb, MSG_CLEAR_BP, 0, NULL, 0))
         return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
@@ -1237,6 +1279,9 @@ static JSValue tjs_dc_worker_set_exception_bp(JSContext *ctx, JSValue this_val, 
     uint32_t mode = TJS_DEBUG_EXCEPTION_NONE;
     if (tjs__debug_exception_mode_from_arg(ctx, argv[0], &mode))
         return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.setExceptionBreakpoint"), (void)0);
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     if (!dc_push_control(h->cb, MSG_SET_EXC_BP, 0, (const uint8_t *)&mode, 4))
         return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
@@ -1247,7 +1292,10 @@ static JSValue tjs_dc_worker_set_step(JSContext *ctx, JSValue this_val, int argc
     if (!h) return JS_EXCEPTION;
     if (argc == 0) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t mode = 0;
-    JS_ToUint32(ctx, &mode, argv[0]);
+    if (JS_ToUint32(ctx, &mode, argv[0])) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.setStep"), (void)0);
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     if (!dc_push_control(h->cb, MSG_SET_STEP, 0, (const uint8_t *)&mode, 4))
         return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
@@ -1257,7 +1305,12 @@ static JSValue tjs_dc_worker_set_breakpoints_active(JSContext *ctx, JSValue this
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
     if (argc == 0) return JS_ThrowTypeError(ctx, "missing arguments");
-    uint32_t active = JS_ToBool(ctx, argv[0]) ? 1 : 0;
+    int active_value = JS_ToBool(ctx, argv[0]);
+    if (active_value < 0) return JS_EXCEPTION;
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
+    uint32_t active = active_value ? 1 : 0;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.setBreakpointsActive"), (void)0, do { h = tjs_dc_worker_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     if (!dc_push_control(h->cb, MSG_SET_BP_ACTIVE, 0, (const uint8_t *)&active, 4))
         return JS_ThrowTypeError(ctx, "debug channel full");
     return JS_UNDEFINED;
@@ -1269,7 +1322,7 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
     if (!h) return JS_EXCEPTION;
     if (argc < 3) return JS_ThrowTypeError(ctx, "missing arguments");
     uint32_t id = 0;
-    JS_ToUint32(ctx, &id, argv[0]);
+    if (JS_ToUint32(ctx, &id, argv[0])) return JS_EXCEPTION;
     const char *method = JS_ToCString(ctx, argv[1]);
     if (!method) return JS_EXCEPTION;
     size_t params_len;
@@ -1277,6 +1330,7 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
     if (!params) { JS_FreeCString(ctx, method); return JS_EXCEPTION; }
     /* carrier: method '\0' + JS_WriteObject(params) bytes (binary, may hold NULs) */
     size_t mlen = strlen(method) + 1;
+    if (mlen > UINT32_MAX || params_len > UINT32_MAX - mlen) { JS_FreeCString(ctx, method); js_free(ctx, params); return JS_ThrowRangeError(ctx, "debug channel payload is too large"); }
     uint32_t plen = (uint32_t)(mlen + params_len);
     uint8_t *buf = malloc(plen);
     if (!buf) { JS_FreeCString(ctx, method); js_free(ctx, params); return JS_ThrowOutOfMemory(ctx); }
@@ -1284,6 +1338,9 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
     memcpy(buf + mlen, params, params_len);
     JS_FreeCString(ctx, method);
     js_free(ctx, params);
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.send"), free(buf));
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) { free(buf); return JS_EXCEPTION; }
     bool ok = ring_push(&h->cb->to_main, MSG_INSPECT, id, buf, plen);
     free(buf);
     if (ok) tjs_sem_post(&h->cb->main_sem);
@@ -1294,6 +1351,7 @@ static JSValue tjs_dc_worker_send(JSContext *ctx, JSValue this_val, int argc, JS
 static JSValue tjs_dc_worker_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.recv"), (void)0, do { h = tjs_dc_worker_get(ctx, this_val); if (!h) return JS_EXCEPTION; } while (0));
     RingMsg m;
     if (!ring_pop(&h->cb->to_worker, &m)) return JS_NULL;
     tjs_sem_trywait(&h->cb->worker_sem);   /* keep sem ~ queue length */
@@ -1314,7 +1372,10 @@ static JSValue tjs_dc_worker_wait_recv(JSContext *ctx, JSValue this_val, int arg
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
     uint32_t ms = 1;
-    if (argc > 0) JS_ToUint32(ctx, &ms, argv[0]);
+    if (argc > 0 && JS_ToUint32(ctx, &ms, argv[0])) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.waitRecv"), (void)0);
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     int ret = tjs_sem_timedwait(&h->cb->worker_sem, ms);
     return JS_NewBool(ctx, ret == 0);
 }
@@ -1324,7 +1385,10 @@ static JSValue tjs_dc_worker_resume(JSContext *ctx, JSValue this_val, int argc, 
     TJSDCWorker *h = tjs_dc_worker_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
     uint32_t step = 0;
-    if (argc > 0) JS_ToUint32(ctx, &step, argv[0]);
+    if (argc > 0 && JS_ToUint32(ctx, &step, argv[0])) return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.channel.resume"), (void)0);
+    h = tjs_dc_worker_get(ctx, this_val);
+    if (!h) return JS_EXCEPTION;
     bool ok = ring_push(&h->cb->to_main, MSG_RESUME, 0, (uint8_t *)&step, 4);
     if (ok) tjs_sem_post(&h->cb->main_sem);
     return JS_NewBool(ctx, ok);
@@ -1367,6 +1431,7 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
     memcpy(&cb, data, sizeof cb);   /* read the shared control-block pointer */
     if (!cb)
         return JS_ThrowTypeError(ctx, "null debug channel pointer");
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.getDebugChannel"), (void)0, do { data = (uint8_t *)JS_GetArrayBuffer(ctx, &byte_len, argv[0]); if (!data || byte_len != sizeof(void *)) return JS_ThrowTypeError(ctx, "invalid handle ArrayBuffer (expected an 8-byte channel pointer)"); memcpy(&cb, data, sizeof cb); if (!cb) return JS_ThrowTypeError(ctx, "null debug channel pointer"); } while (0));
 
     /* Worker claims the second baked-in ref (refcount started at 2) →do NOT
      * increment here. The handle bytes are cleared once the claim succeeds
