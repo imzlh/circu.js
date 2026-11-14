@@ -46,7 +46,16 @@ typedef struct TJSApp App;
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-/* External native module ABI. */
+/* External native module ABI.
+ *
+ * A loadable `.so`/`.dll` must export a single function:
+ *
+ *     TJS_EXPORT const TJSModuleInfo *tjs_module_info(void);
+ *
+ * Use the DEF_MODULE() macro below to declare it.  The loader validates
+ * `abi_version` against TJS_ABI_VERSION before reading any other field,
+ * so adding fields in future versions does not break old `.so`s.
+ */
 #define TJS_ABI_VERSION 1u
 
 /* Runtime capability hook ABI.

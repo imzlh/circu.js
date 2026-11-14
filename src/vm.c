@@ -608,6 +608,9 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
 }
 
 void TJS_FreeRuntime(TJSRuntime* qrt) {
+    /* Must precede `freeing = true`: TJS_SetCapabilityHook refuses to run and
+     * clear the global hook count once `freeing` is set, which would leave the
+     * process-wide count elevated and force every runtime onto the slow path. */
     TJS_SetCapabilityHook(qrt, NULL, NULL, 0);
     qrt->freeing = true;
 

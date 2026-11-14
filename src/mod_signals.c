@@ -88,7 +88,8 @@ static void uv__signal_cb(uv_signal_t *handle, int sig_num) {
 }
 
 static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (TJS_GetRuntime(ctx)->is_worker) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->is_worker) {
         return JS_ThrowTypeError(ctx, "signal() is unavailable inside a worker");
     }
     if (argc < 2) {

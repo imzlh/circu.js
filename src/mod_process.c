@@ -2197,6 +2197,11 @@ pty_fail:
                 JS_FreeValue(ctx, js_ipc);
                 goto fail;
             }
+            /* UV_NONBLOCK_PIPE is part of the IPC contract, not an
+             * optimization: the parent writes this pipe from the event loop,
+             * and a blocking pipe can stall the loop when the child stops
+             * draining. libuv documents that a child not designed for a
+             * non-blocking pipe may lose data, so child.send() relies on it. */
             options.stdio[ipc_fd].flags = UV_CREATE_PIPE | UV_READABLE_PIPE |
                                            UV_WRITABLE_PIPE | UV_NONBLOCK_PIPE;
             options.stdio[ipc_fd].data.stream = NULL;
@@ -2246,10 +2251,8 @@ pty_fail:
         if (ipc_fd >= 3 && !JS_IsUndefined(p->stdio_extra) &&
             JS_SetPropertyUint32(ctx, p->stdio_extra, ipc_fd, JS_NULL) < 0)
             goto fail;
-        if (ipc_fd < 3) {
-            JS_FreeValue(ctx, p->stdio[ipc_fd]);
-            p->stdio[ipc_fd] = JS_UNDEFINED;
-        }
+        /* materialize_spawn_stdio skips fd == ipc_fd when use_ipc, so
+         * p->stdio[ipc_fd] is always JS_UNDEFINED here — nothing to free. */
     }
 
     options.exit_cb = uv__exit_cb;
