@@ -55,10 +55,20 @@ struct AssertionInfo {
 #ifdef __GNUC__
 #define TJS__LIKELY(expr)    __builtin_expect(!!(expr), 1)
 #define TJS__UNLIKELY(expr)  __builtin_expect(!!(expr), 0)
+#define TJS__ALWAYS_INLINE   inline __attribute__((always_inline))
+#define TJS__HIDDEN          __attribute__((visibility("hidden")))
 #define PRETTY_FUNCTION_NAME __PRETTY_FUNCTION__
+#elif defined(_MSC_VER)
+#define TJS__LIKELY(expr)    expr
+#define TJS__UNLIKELY(expr)  expr
+#define TJS__ALWAYS_INLINE   __forceinline
+#define TJS__HIDDEN
+#define PRETTY_FUNCTION_NAME __FUNCSIG__
 #else
 #define TJS__LIKELY(expr)    expr
 #define TJS__UNLIKELY(expr)  expr
+#define TJS__ALWAYS_INLINE   inline
+#define TJS__HIDDEN
 #define PRETTY_FUNCTION_NAME ""
 #endif
 

@@ -23,6 +23,7 @@
  */
 
 #include "mem.h"
+#include "capability.h"
 #include "private.h"
 #include "tjs.h"
 #include "binary.h"
@@ -79,24 +80,18 @@ static void* console_realloc(void* opaque, void* ptr, size_t size) {
 /* STDOUT lock */
 static uv_mutex_t stdout_mutex;
 static uv_once_t stdout_mutex_once = UV_ONCE_INIT;
-static thread_local int console_group_indent = 0;
 
-typedef struct ConsoleCounter {
+struct ConsoleCounter {
     char* label;
     int count;
     struct ConsoleCounter* next;
-} ConsoleCounter;
+};
 
-typedef struct ConsoleTimer {
+struct ConsoleTimer {
     char* label;
     uint64_t start;
     struct ConsoleTimer* next;
-} ConsoleTimer;
-
-/* Per-thread: each worker runtime has its own console state; sharing these
- * across threads without locks would race. */
-static thread_local ConsoleCounter* console_counters = NULL;
-static thread_local ConsoleTimer* console_timers = NULL;
+};
 
 #define __mutex(op) do { uv_mutex_lock(&stdout_mutex); op; uv_mutex_unlock(&stdout_mutex); } while(0)
 #define fwrite2(...) __mutex(fwrite(__VA_ARGS__))
@@ -252,8 +247,10 @@ static inline void put_reset(DynBuf* buf, const InspectOptions* opts) {
     if (opts->colors) dbuf_putstr(buf, ANSI_RESET);
 }
 
-static inline void put_group_indent(DynBuf* buf) {
-    for (int i = 0; i < console_group_indent; i++) dbuf_putc(buf, ' ');
+static inline void put_group_indent(JSContext *ctx, DynBuf* buf) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
+    int indent = runtime ? runtime->console.group_indent : 0;
+    for (int i = 0; i < indent; i++) dbuf_putc(buf, ' ');
 }
 
 static void format_value_with_depth(JSContext* ctx, JSValueConst val, DynBuf* buf, int depth,
@@ -438,7 +435,7 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
 static void console_write_args(JSContext* ctx, int argc, JSValueConst* argv, FILE* stream) {
     DynBuf buf;
     dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
-    put_group_indent(&buf);
+    put_group_indent(ctx, &buf);
     format_args_node(ctx, argc, argv, &buf, stream);
     dbuf_putc(&buf, '\n');
     fwrite2(buf.buf, 1, buf.size, stream);
@@ -449,19 +446,20 @@ static void console_write_args(JSContext* ctx, int argc, JSValueConst* argv, FIL
 static char* console_label(JSContext* ctx, JSValueConst val, const char* fallback) {
     if (JS_IsUndefined(val)) return js_strdup(ctx, fallback);
     const char* str = JS_ToCString(ctx, val);
-    char* label = js_strdup(ctx, str ? str : fallback);
-    if (str) JS_FreeCString(ctx, str);
+    if (!str) return NULL;
+    char* label = js_strdup(ctx, str);
+    JS_FreeCString(ctx, str);
     return label;
 }
 
-static ConsoleCounter* find_counter(const char* label) {
-    for (ConsoleCounter* c = console_counters; c; c = c->next)
+static ConsoleCounter* find_counter(TJSRuntime *runtime, const char* label) {
+    for (ConsoleCounter* c = runtime->console.counters; c; c = c->next)
         if (strcmp(c->label, label) == 0) return c;
     return NULL;
 }
 
-static ConsoleTimer* find_timer(const char* label) {
-    for (ConsoleTimer* t = console_timers; t; t = t->next)
+static ConsoleTimer* find_timer(TJSRuntime *runtime, const char* label) {
+    for (ConsoleTimer* t = runtime->console.timers; t; t = t->next)
         if (strcmp(t->label, label) == 0) return t;
     return NULL;
 }
@@ -1683,31 +1681,37 @@ static inline void console_log_internal(JSContext* ctx, int argc, JSValueConst* 
 }
 
 static JSValue js_console_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.log", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     console_log_internal(ctx, argc, argv, stdout, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_error(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.error", TJS_CONSOLE_STDERR, argc, argv), (void)0);
     console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_warn(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+	TJS_CAPABILITY(tjs__capability_console(ctx, "console.warn", TJS_CONSOLE_STDERR, argc, argv), (void)0);
 	console_log_internal(ctx, argc, argv, stderr, 2, false);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_info(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+	TJS_CAPABILITY(tjs__capability_console(ctx, "console.info", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
 	console_log_internal(ctx, argc, argv, stdout, 2, false);
 	return JS_UNDEFINED;
 }
 
 static JSValue js_console_debug(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.debug", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     console_log_internal(ctx, argc, argv, stdout, 2, false);
 	return JS_UNDEFINED;
 }
 
 static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.dir", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     if (argc == 0) return JS_UNDEFINED;
 
     JSValue opts_val = argc > 1 ? argv[1] : JS_UNDEFINED;
@@ -1751,12 +1755,14 @@ static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, J
 }
 
 static JSValue js_console_clear(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.clear", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     printf("\033[2J\033[H");
     fflush(stdout);
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.trace", TJS_CONSOLE_STDERR, argc, argv), (void)0);
     if (argc > 0) console_log_internal(ctx, argc, argv, stderr, 2, false);
     else console_log_internal(ctx, 0, argv, stderr, 2, false);
     
@@ -1776,6 +1782,7 @@ static JSValue js_console_trace(JSContext* ctx, JSValueConst this_val, int argc,
 
 static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (argc == 0 || !JS_ToBool(ctx, argv[0])) {
+        TJS_CAPABILITY(tjs__capability_console(ctx, "console.assert", TJS_CONSOLE_STDERR, argc, argv), (void)0);
         DynBuf buf;
         dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
         dbuf_putstr(&buf, "Assertion failed");
@@ -1798,8 +1805,11 @@ static JSValue js_console_assert(JSContext* ctx, JSValueConst this_val, int argc
 }
 
 static JSValue js_console_count(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.count", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
-    ConsoleCounter* counter = find_counter(label);
+    if (!label) return JS_EXCEPTION;
+    ConsoleCounter* counter = find_counter(runtime, label);
     if (!counter) {
         counter = js_mallocz(ctx, sizeof(*counter));
         if (!counter) {
@@ -1807,8 +1817,8 @@ static JSValue js_console_count(JSContext* ctx, JSValueConst this_val, int argc,
             return JS_EXCEPTION;
         }
         counter->label = label;
-        counter->next = console_counters;
-        console_counters = counter;
+        counter->next = runtime->console.counters;
+        runtime->console.counters = counter;
     } else {
         js_free(ctx, label);
     }
@@ -1826,13 +1836,15 @@ static JSValue js_console_count(JSContext* ctx, JSValueConst this_val, int argc,
 }
 
 static JSValue js_console_count_reset(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
+    if (!label) return JS_EXCEPTION;
     ConsoleCounter* prev = NULL;
-    ConsoleCounter* cur = console_counters;
+    ConsoleCounter* cur = runtime->console.counters;
     while (cur) {
         if (strcmp(cur->label, label) == 0) {
             if (prev) prev->next = cur->next;
-            else console_counters = cur->next;
+            else runtime->console.counters = cur->next;
             js_free(ctx, cur->label);
             js_free(ctx, cur);
             js_free(ctx, label);
@@ -1841,6 +1853,7 @@ static JSValue js_console_count_reset(JSContext* ctx, JSValueConst this_val, int
         prev = cur;
         cur = cur->next;
     }
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.countReset", TJS_CONSOLE_STDERR, argc, argv), js_free(ctx, label));
     DynBuf buf;
     dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
     dbuf_printf(&buf, "Count for '%s' does not exist", label);
@@ -1854,8 +1867,10 @@ static JSValue js_console_count_reset(JSContext* ctx, JSValueConst this_val, int
 }
 
 static JSValue js_console_time(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
-    ConsoleTimer* timer = find_timer(label);
+    if (!label) return JS_EXCEPTION;
+    ConsoleTimer* timer = find_timer(runtime, label);
     if (!timer) {
         timer = js_mallocz(ctx, sizeof(*timer));
         if (!timer) {
@@ -1863,8 +1878,8 @@ static JSValue js_console_time(JSContext* ctx, JSValueConst this_val, int argc, 
             return JS_EXCEPTION;
         }
         timer->label = label;
-        timer->next = console_timers;
-        console_timers = timer;
+        timer->next = runtime->console.timers;
+        runtime->console.timers = timer;
     } else {
         js_free(ctx, label);
     }
@@ -1873,6 +1888,7 @@ static JSValue js_console_time(JSContext* ctx, JSValueConst this_val, int argc, 
 }
 
 static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSValueConst* argv, bool remove_timer) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     double ms = (double)(uv_hrtime() - timer->start) / 1000000.0;
     DynBuf buf;
     dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
@@ -1897,11 +1913,11 @@ static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSVa
 
     if (remove_timer) {
         ConsoleTimer* prev = NULL;
-        ConsoleTimer* cur = console_timers;
+        ConsoleTimer* cur = runtime->console.timers;
         while (cur) {
             if (cur == timer) {
                 if (prev) prev->next = cur->next;
-                else console_timers = cur->next;
+                else runtime->console.timers = cur->next;
                 js_free(ctx, cur->label);
                 js_free(ctx, cur);
                 break;
@@ -1913,8 +1929,14 @@ static void console_time_log(JSContext* ctx, ConsoleTimer* timer, int argc, JSVa
 }
 
 static JSValue js_console_time_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
-    ConsoleTimer* timer = find_timer(label);
+    if (!label) return JS_EXCEPTION;
+    ConsoleTimer* timer = find_timer(runtime, label);
+    uint32_t stream = timer ? TJS_CONSOLE_STDOUT : TJS_CONSOLE_STDERR;
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.timeLog", stream, argc, argv), js_free(ctx, label));
+    runtime = TJS_GetRuntime(ctx);
+    timer = find_timer(runtime, label);
     if (!timer) {
         DynBuf buf;
         dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
@@ -1933,8 +1955,14 @@ static JSValue js_console_time_log(JSContext* ctx, JSValueConst this_val, int ar
 }
 
 static JSValue js_console_time_end(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
     char* label = console_label(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, "default");
-    ConsoleTimer* timer = find_timer(label);
+    if (!label) return JS_EXCEPTION;
+    ConsoleTimer* timer = find_timer(runtime, label);
+    uint32_t stream = timer ? TJS_CONSOLE_STDOUT : TJS_CONSOLE_STDERR;
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.timeEnd", stream, argc, argv), js_free(ctx, label));
+    runtime = TJS_GetRuntime(ctx);
+    timer = find_timer(runtime, label);
     if (!timer) {
         DynBuf buf;
         dbuf_init2(&buf, JS_GetRuntime(ctx), console_realloc);
@@ -1961,26 +1989,31 @@ static JSValue js_console_time_stamp(JSContext* ctx, JSValueConst this_val, int 
 }
 
 static JSValue js_console_group(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.group", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     if (argc > 0) console_log_internal(ctx, argc, argv, stdout, 2, false);
-    console_group_indent += 2;
+    TJS_GetRuntime(ctx)->console.group_indent += 2;
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_group_end(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    (void)ctx;
     (void)this_val;
     (void)argc;
     (void)argv;
-    if (console_group_indent >= 2) console_group_indent -= 2;
+    TJSRuntime *runtime = TJS_GetRuntime(ctx);
+    if (runtime->console.group_indent >= 2) runtime->console.group_indent -= 2;
     return JS_UNDEFINED;
 }
 
 static JSValue js_console_dirxml(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    return js_console_log(ctx, this_val, argc, argv);
+    (void)this_val;
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.dirxml", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
+    console_log_internal(ctx, argc, argv, stdout, 2, false);
+    return JS_UNDEFINED;
 }
 
 static JSValue js_console_table(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     (void)this_val;
+    TJS_CAPABILITY(tjs__capability_console(ctx, "console.table", TJS_CONSOLE_STDOUT, argc, argv), (void)0);
     if (argc == 0 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
         console_log_internal(ctx, argc, argv, stdout, 2, false);
         return JS_UNDEFINED;
@@ -2089,6 +2122,27 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
     uv_once(&stdout_mutex_once, console_init_once);
 
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
+}
+
+void tjs__console_cleanup_runtime(TJSRuntime *runtime) {
+    ConsoleCounter *counter = runtime->console.counters;
+    while (counter) {
+        ConsoleCounter *next = counter->next;
+        js_free_rt(runtime->rt, counter->label);
+        js_free_rt(runtime->rt, counter);
+        counter = next;
+    }
+    runtime->console.counters = NULL;
+
+    ConsoleTimer *timer = runtime->console.timers;
+    while (timer) {
+        ConsoleTimer *next = timer->next;
+        js_free_rt(runtime->rt, timer->label);
+        js_free_rt(runtime->rt, timer);
+        timer = next;
+    }
+    runtime->console.timers = NULL;
+    runtime->console.group_indent = 0;
 }
 
 // # C apis

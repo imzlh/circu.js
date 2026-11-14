@@ -122,6 +122,7 @@ static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
 
 static JSValue tjs_gc_run(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     JS_RunGC(JS_GetRuntime(ctx));
+    tjs__mod_ffi_drain_runtime(TJS_GetRuntime(ctx));
     return JS_UNDEFINED;
 }
 
@@ -1219,7 +1220,10 @@ TJS_ENGINE_PREDICATE(isWeakSet, JS_IsWeakSet)
 static JSValue tjs_detachArrayBuffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if(argc == 0 || !JS_IsArrayBuffer(argv[0]))
         return JS_ThrowTypeError(ctx, "first argument is not an ArrayBuffer");
-    JS_DetachArrayBuffer(ctx, argv[0]);
+    if (JS_IsImmutableArrayBuffer(argv[0]) > 0)
+        return JS_ThrowTypeError(ctx, "ArrayBuffer is immutable");
+    if (JS_DetachArrayBuffer(ctx, argv[0]) < 0)
+        return JS_EXCEPTION;
 
     return JS_UNDEFINED;
 }

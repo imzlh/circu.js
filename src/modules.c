@@ -23,6 +23,7 @@
  */
 
 #include "private.h"
+#include "capability.h"
 #include "tjs.h"
 #include "utils.h"
 
@@ -70,7 +71,7 @@ static const struct TJSModule tjs_modules[] = {
 	{ "os", tjs__mod_os_init, true },
 	{ "process", tjs__mod_process_init, true },
 	/* pty merged into process module */
-	{ "signals", tjs__mod_signals_init, false }, // worker is not allowed to control process behavior
+	{ "signals", tjs__mod_signals_init, true }, // workers can read the enum; signal() rejects there
 	{ "sourcemap", tjs__mod_sourcemap_init, true },
 	{ "sqlite3", tjs__mod_sqlite3_init, true },
 	{ "ssl", tjs__mod_ssl_init, true },
@@ -217,6 +218,7 @@ JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 			JS_FreeCString(ctx, name);
 			return JS_EXCEPTION;
 		}
+		TJS_CAPABILITY(tjs__capability_resource(ctx, TJS_CAP_DYNLIB | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "module.use", path), (JS_FreeCString(ctx, path), JS_FreeCString(ctx, name)));
 		JSValue result = tjs__dynmod_load(ctx, name, path);
 		JS_FreeCString(ctx, path);
 		if (JS_IsObject(result)) {
@@ -347,6 +349,8 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
 			return NULL;
 		}
 	}
+
+    if (!tjs__capability_require_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS | TJS_CAP_IO_READ, "module.load", module_name)) return NULL;
 
     tjs_dbuf_init(ctx, &dbuf);
 

@@ -222,6 +222,21 @@ test("console.countReset", () => {
     console.count("reset_test"); // should reset to 1
 });
 
+test("console labels propagate conversion errors without changing state", () => {
+    console.count("default");
+    for (const method of ["count", "countReset", "time", "timeLog", "timeEnd"]) {
+        let threw = false;
+        try {
+            console[method](Symbol(method));
+        } catch (error) {
+            threw = error instanceof TypeError;
+        }
+        assert(threw, `console.${method}(Symbol()) should throw TypeError`);
+    }
+    /* countReset(Symbol()) must not fall back to "default" and delete it. */
+    console.count("default"); // should continue rather than reset to 1
+});
+
 test("console.time/timeEnd/timeLog", () => {
     console.log("=== console.time test ===");
 
@@ -311,6 +326,3 @@ test("mixed output test", () => {
     };
     console.log("mixed object:", mixed);
 });
-
-// run all tests
-console.log("\n🧪 Starting console full feature test...\n");

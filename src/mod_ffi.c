@@ -1,7 +1,3 @@
-#if defined(__linux__) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE
-#endif
-
 /*
  * circu.js
  *
@@ -27,1597 +23,803 @@
  * THE SOFTWARE.
  */
 
-#include "private.h"
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 
+#include "private.h"
+#include "mem.h"
+#include "capability.h"
+#include <errno.h>
 #include <ffi.h>
+#include <limits.h>
+#include <math.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #if defined(__linux__)
 #include <dlfcn.h>
 #endif
-#include <stdint.h>
 
-#define TJS_CONST_STRING_DEF(x) JS_PROP_STRING_DEF(#x, x, JS_PROP_ENUMERABLE)
+typedef struct FfiType FfiType;
+typedef struct FfiLibrary FfiLibrary;
+typedef struct FfiLibraryState FfiLibraryState;
+typedef struct FfiCallback FfiCallback;
+typedef struct FfiBound FfiBound;
+typedef struct FfiBindCache FfiBindCache;
+typedef struct FfiCleanupNode FfiCleanupNode;
 
-#define JS_PTR_TYPE       t_bigint
-#define JS_IS_PTR(ctx, x) JS_IsBigInt(x)
+static thread_local JSClassID type_class, pointer_class, owned_class, library_class, bound_class, callback_class;
+static thread_local int last_errno;
 
-#if UINTPTR_MAX == UINT32_MAX
-#define JS_TO_UINTPTR_T(ctx, pres, val)                                                                                \
-    {                                                                                                                  \
-        uint32_t v;                                                                                                    \
-        JS_ToUint32(ctx, &v, val);                                                                                   	\
-        memcpy(pres, &v, sizeof(v));                                                                    				\
-    }
-#define JS_NEW_UINTPTR_T(ctx, val) JS_NewUint32(ctx, (uint32_t) (val))
-#define ffi_type_ptr               ffi_type_uint32
-#elif UINTPTR_MAX == UINT64_MAX
-#define JS_TO_UINTPTR_T(ctx, pres, val) JS_ToBigInt64(ctx, (int64_t *) (pres), val)
-#define JS_NEW_UINTPTR_T(ctx, val)      JS_NewBigUint64(ctx, (int64_t) (val))
-#define ffi_type_ptr                    ffi_type_uint64
-#else
-#error "'uintptr_t' neither 32bit nor 64 bit, I don't know how to handle it."
-#endif
+typedef enum { CLEANUP_STATE_UNREF, CLEANUP_STATE_CLOSE_UNREF, CLEANUP_DISPOSE } CleanupKind;
 
-/* Convert a JS pointer value without silently continuing after a conversion
- * exception.  Several FFI entry points dereference the result immediately;
- * leaving the destination unchanged on an exception can turn a bad argument
- * into an arbitrary native read/write. */
-static int js_to_uintptr(JSContext *ctx, void *pres, JSValueConst val) {
-    uintptr_t value;
-#if UINTPTR_MAX == UINT32_MAX
-    uint32_t v;
-    if (JS_ToUint32(ctx, &v, val) < 0) return -1;
-    value = (uintptr_t)v;
-#elif UINTPTR_MAX == UINT64_MAX
-    int64_t v;
-    if (JS_ToBigInt64(ctx, &v, val) < 0) return -1;
-    value = (uintptr_t)v;
-#endif
-    memcpy(pres, &value, sizeof(value));
-    return 0;
-}
+struct FfiCleanupNode {
+    FfiCleanupNode *next;
+    CleanupKind kind;
+};
 
-#if SIZE_MAX == UINT32_MAX
-#define JS_TO_SIZE_T(ctx, pres, val)  JS_ToInt32(ctx, (int32_t *) (pres), val)
-#define JS_NEW_SIZE_T(ctx, val)       JS_NewInt32(ctx, (int32_t) (val))
-#define JS_PROP_SIZE_T_DEF(name, val) JS_PROP_INT32_DEF(name, (int32_t) (val), JS_PROP_CONFIGURABLE)
-#define C_SIZEOF_DEF(x)               JS_PROP_INT32_DEF(STRINGIFY(sizeof_##x), (int32_t) (sizeof(x)), JS_PROP_CONFIGURABLE)
-#define ffi_type_size_t               ffi_type_uint32
-#elif SIZE_MAX == UINT64_MAX
-#define JS_TO_SIZE_T(ctx, pres, val)  JS_ToInt64(ctx, (int64_t *) (pres), val)
-#define JS_NEW_SIZE_T(ctx, val)       JS_NewInt64(ctx, (int64_t) (val))
-#define JS_PROP_SIZE_T_DEF(name, val) JS_PROP_INT64_DEF(name, (int64_t) (val), JS_PROP_CONFIGURABLE)
-#define C_SIZEOF_DEF(x)               JS_PROP_INT64_DEF(STRINGIFY(sizeof_##x), (int64_t) (sizeof(x)), JS_PROP_CONFIGURABLE)
-#define C_OFFSETOF_DEF(t, d)                                                                                           \
-    JS_PROP_INT64_DEF(STRINGIFY(offsetof_##t##_##d), (int64_t) (offsetof(t, d)), JS_PROP_CONFIGURABLE)
-#define ffi_type_size_t ffi_type_sint32
-#else
-#error "'size_t' neither 32bit nor 64 bit, I don't know how to handle it."
-#endif
+typedef enum {
+    K_VOID, K_BOOL, K_I8, K_U8, K_I16, K_U16, K_I32, K_U32, K_I64, K_U64,
+    K_F32, K_F64, K_LONG_DOUBLE, K_POINTER, K_BUFFER, K_FUNCTION, K_AGGREGATE,
+} TypeKind;
 
-#if INT_MAX == INT32_MAX
-#define C_MACRO_INT_DEF(x)        JS_PROP_INT32_DEF(#x, (int32_t) (x), JS_PROP_CONFIGURABLE)
-#define C_ENUM_DEF(x)             JS_PROP_INT32_DEF(#x, (int32_t) (x), JS_PROP_CONFIGURABLE)
-#define JS_TO_INT(ctx, pres, val) JS_ToInt32(ctx, (int32_t *) (pres), val)
-#define JS_NEW_INT(ctx, val)      JS_NewInt32(ctx, (int32_t) (val))
-#elif INT_MAX == INT64_MAX
-#define C_MACRO_INT_DEF(x)        JS_PROP_INT64_DEF(#x, (int64_t) (x), JS_PROP_CONFIGURABLE)
-#define C_ENUM_DEF(x)             JS_PROP_INT64_DEF(#x, (int64_t) (x), JS_PROP_CONFIGURABLE)
-#define JS_TO_INT(ctx, pres, val) JS_ToInt64(ctx, (int64_t *) (pres), val)
-#define JS_NEW_INT(ctx, val)      JS_NewInt64(ctx, (int64_t) (val))
-#else
-#error "'int' neither 32bit nor 64 bit, I don't know how to handle it."
-#endif
+struct FfiType {
+    ffi_type *ffi;
+    TypeKind kind;
+    bool dynamic, array;
+    size_t count, *offsets;
+    JSValue *deps;
+};
 
-#define FFI_ALIGN(v, a) (((((size_t) (v)) - 1) | ((a) - 1)) + 1)
+typedef struct {
+    void *addr;
+    JSValue owner;
+    /* Non-owning identity for a backing store pinned by pointerOf(). The
+     * owner keeps the BufferSource (and therefore its backing store) alive. */
+    JSValue pinned_backing;
+    FfiLibraryState *state;
+    FfiCallback *callback;
+    bool valid;
+} FfiPointer;
 
-#pragma region "FFI Helpers"
+struct FfiLibraryState {
+    FfiCleanupNode cleanup;
+    uv_lib_t handle;
+    int *(*errno_location)(void);
+    size_t refs, pending_unrefs;
+    size_t owned_holds;
+    size_t active_calls;
+    bool handle_open, closed, cleanup_queued;
+};
 
-static void *js__free_rt(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
-    if (size == 0) { js_free_rt(rt, ptr); return NULL; }
-    return js_realloc_rt(rt, ptr, size);
-}
+struct FfiLibrary {
+    FfiLibraryState *state;
+    FfiBindCache *cache;
+    bool closed;
+};
 
+typedef struct {
+    ffi_cif cif;
+    ffi_type **arg_types;
+    FfiType **types;
+    JSValue *type_values;
+    size_t *offsets, frame_offset, frame_size;
+    unsigned nargs;
+    int fixed;
+} FfiSignature;
 
-static const char *ffi_strerror(ffi_status status) {
+struct FfiBound {
+    FfiSignature sig;
+    void *addr;
+    void *call_storage;
+    uint8_t *result_storage;
+    size_t call_storage_size, result_storage_size, pin_values_offset;
+    size_t callback_values_offset, callback_counts_offset;
+    JSValue owner;
+    FfiLibraryState *state;
+    FfiCallback *callback;
+    bool in_call;
+};
+
+struct FfiBindCache {
+    FfiBindCache *next;
+    char *symbol;
+    JSValue bound;
+};
+
+struct FfiCallback {
+    FfiSignature sig;
+    ffi_closure *closure;
+    void *code;
+    JSValue function;
+    JSContext *ctx;
+    uv_thread_t thread;
+    atomic_uint_fast64_t foreign_calls;
+    atomic_bool foreign_reported;
+    bool closed;
+};
+
+typedef struct {
+    FfiCleanupNode cleanup;
+    void *resource_addr, *disposer_addr;
+    ffi_cif cif;
+    ffi_type *arg_types[1];
+    FfiLibraryState *state, *resource_state;
+} FfiDisposeJob;
+
+typedef struct {
+    FfiPointer pointer;
+    FfiDisposeJob *job;
+    bool armed;
+} OwnedPointer;
+
+typedef struct CallFrame {
+    struct CallFrame *previous;
+    JSValue exception;
+} CallFrame;
+static thread_local CallFrame *active_call;
+
+static const char *status_name(ffi_status status) {
     switch (status) {
-        case FFI_OK:
-            return "FFI_OK";
-        case FFI_BAD_TYPEDEF:
-            return "FFI_BAD_TYPEDEF";
-        case FFI_BAD_ABI:
-            return "FFI_BAD_ABI";
-        case FFI_BAD_ARGTYPE:
-            return "FFI_BAD_ARGTYPE";
-        default:
-            return "Unknown FFI error";
+        case FFI_OK: return "FFI_OK";
+        case FFI_BAD_TYPEDEF: return "FFI_BAD_TYPEDEF";
+        case FFI_BAD_ABI: return "FFI_BAD_ABI";
+        case FFI_BAD_ARGTYPE: return "FFI_BAD_ARGTYPE";
+        default: return "unknown libffi error";
     }
 }
-
-#pragma endregion "FFI Helpers"
-
-#pragma region "FfiType class definition"
-typedef struct {
-    size_t elemCount;
-    JSValue *deps;
-    bool dynamic;
-    ffi_type *ffi_type;
-    size_t *offsets;  // Pre-calculated field offsets for structs (NULL for non-structs)
-} js_ffi_type;
-
-size_t ffi_type_get_sz(ffi_type *type) {
-    /* Use libffi's calculated size directly, don't recompute.
-     * ffi_prep_cif already fills type->size with correct alignment/padding.
-     * Self-computed size can be smaller with nested structs, causing heap overflow.
-     */
-    return type->type == FFI_TYPE_VOID ? 0 : type->size;
+static size_t type_size(FfiType *t) { return t->kind == K_VOID ? 0 : t->ffi->size; }
+static bool pointer_kind(FfiType *t) { return t->kind == K_POINTER || t->kind == K_BUFFER || t->kind == K_FUNCTION; }
+static bool narrow_kind(FfiType *t) {
+    return t->ffi->size < sizeof(ffi_arg) && t->kind >= K_BOOL && t->kind <= K_U32;
 }
-
-static bool ffi_type_is_narrow_integer(const ffi_type *type) {
-    if (type->size >= sizeof(ffi_arg)) return false;
-    switch (type->type) {
-        case FFI_TYPE_INT:
-        case FFI_TYPE_UINT8:
-        case FFI_TYPE_SINT8:
-        case FFI_TYPE_UINT16:
-        case FFI_TYPE_SINT16:
-        case FFI_TYPE_UINT32:
-        case FFI_TYPE_SINT32:
-            return true;
-        default:
-            return false;
-    }
+static bool size_add(size_t *v, size_t n) { if (*v > SIZE_MAX - n) return false; *v += n; return true; }
+static bool size_align(size_t *v, size_t a) { size_t r = a > 1 ? *v % a : 0; return !r || size_add(v, a-r); }
+static void capture_errno(FfiLibraryState *state) {
+    last_errno = state && state->errno_location ? *state->errno_location() : errno;
 }
-
-static void ffi_copy_call_result(uint8_t *dest, const void *source, const ffi_type *type) {
-    if (!ffi_type_is_narrow_integer(type)) {
-        memcpy(dest, source, type->size);
-        return;
-    }
-
-    ffi_arg word = 0;
-    memcpy(&word, source, sizeof(word));
-    switch (type->type) {
-        case FFI_TYPE_UINT8: {
-            uint8_t value = (uint8_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        case FFI_TYPE_SINT8: {
-            int8_t value = (int8_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        case FFI_TYPE_UINT16: {
-            uint16_t value = (uint16_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        case FFI_TYPE_SINT16: {
-            int16_t value = (int16_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        case FFI_TYPE_UINT32: {
-            uint32_t value = (uint32_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        case FFI_TYPE_SINT32:
-        case FFI_TYPE_INT: {
-            int32_t value = (int32_t)word;
-            memcpy(dest, &value, sizeof(value));
-            break;
-        }
-        default:
-            break;
-    }
-}
-
-static thread_local JSClassID js_ffi_type_classid;
-static JSValue js_ffi_type_create_struct(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "expected at least one FfiType argument");
-    }
-
-    JSValue *types = argv;
-    size_t typeCnt = argc;
-    int arrSz = 0;
-    if (JS_IsNumber(argv[0])) {
-        typeCnt--;
-        types++;
-        if (JS_ToInt32(ctx, &arrSz, argv[0])) {
-            JS_ThrowTypeError(ctx, "expected argument 1 to be FfiType or positive integer");
-            return JS_EXCEPTION;
-        }
-        if (argc != 2 || arrSz <= 0) {
-            JS_ThrowTypeError(ctx, "expected arguments: number, FfiType");
-            return JS_EXCEPTION;
-        }
-
-        /* The element pointer array and the reported ffi size are both
-         * attacker-controlled. Reject values that would wrap either size
-         * calculation before allocating or multiplying. */
-        if ((size_t) arrSz > SIZE_MAX / sizeof(ffi_type *) - 1) {
-            return JS_ThrowRangeError(ctx, "array size is too large");
-        }
-    }
-    for (unsigned i = 0; i < typeCnt; i++) {
-        if (JS_GetOpaque(types[i], js_ffi_type_classid) == NULL) {
-            JS_ThrowTypeError(ctx, "argument %lld is not a FfiType", (long long int)((types - argv) + i + 1));
-            return JS_EXCEPTION;
-        }
-    }
-
-    JSValue obj = JS_NewObjectClass(ctx, js_ffi_type_classid);
-    if (JS_IsException(obj)) return obj;
-
-    if (typeCnt > (SIZE_MAX / sizeof(JSValue))) {
-        JS_FreeValue(ctx, obj);
-        return JS_ThrowRangeError(ctx, "too many struct fields");
-    }
-    size_t element_count = arrSz > 0 ? (size_t) arrSz + 1 : typeCnt + 1;
-    ffi_type **elements = js_malloc(ctx, sizeof(ffi_type *) * element_count);
-    if (!elements) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    if (arrSz > 0) {
-        js_ffi_type *jst = JS_GetOpaque(types[0], js_ffi_type_classid);
-        for (int i = 0; i < arrSz; i++) {
-            elements[i] = jst->ffi_type;
-        }
-        elements[arrSz] = NULL;
-    } else {
-        for (size_t i = 0; i < typeCnt; i++) {
-            js_ffi_type *jst = JS_GetOpaque(types[i], js_ffi_type_classid);
-            elements[i] = jst->ffi_type;
-        }
-        elements[typeCnt] = NULL;
-    }
-
-    js_ffi_type *structType = js_malloc(ctx, sizeof(js_ffi_type));
-    if (!structType) {
-        js_free(ctx, elements);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    structType->elemCount = typeCnt;
-    structType->dynamic = true;
-    structType->deps = NULL;
-    structType->ffi_type = js_malloc(ctx, sizeof(ffi_type));
-    if (!structType->ffi_type) {
-        js_free(ctx, elements);
-        js_free(ctx, structType);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-
-    structType->ffi_type->type = FFI_TYPE_STRUCT;
-    structType->ffi_type->size = 0;
-    structType->ffi_type->alignment = 0;
-    structType->ffi_type->elements = elements;
-
-    // Array type: calculate size and alignment directly
-    if (arrSz > 0) {
-        size_t elem_size = ffi_type_get_sz(elements[0]);
-        if (elem_size != 0 && (size_t) arrSz > SIZE_MAX / elem_size) {
-            js_free(ctx, elements);
-            js_free(ctx, structType->ffi_type);
-            js_free(ctx, structType);
-            JS_FreeValue(ctx, obj);
-            return JS_ThrowRangeError(ctx, "array size is too large");
-        }
-        structType->ffi_type->size = arrSz * ffi_type_get_sz(elements[0]);
-        structType->ffi_type->alignment = elements[0]->alignment;
-        structType->offsets = NULL;
-    } else {
-        if (typeCnt > SIZE_MAX / sizeof(size_t)) {
-            JS_FreeValue(ctx, obj);
-            return JS_ThrowRangeError(ctx, "too many struct fields");
-        }
-        size_t *offsets = js_malloc(ctx, sizeof(size_t) * typeCnt);
-        if (!offsets) {
-            js_free(ctx, elements);
-            js_free(ctx, structType->ffi_type);
-            js_free(ctx, structType);
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-
-        ffi_status st = ffi_get_struct_offsets(FFI_DEFAULT_ABI, structType->ffi_type, offsets);
-        if (st != FFI_OK) {
-            js_free(ctx, elements);
-            js_free(ctx, structType->ffi_type);
-            js_free(ctx, structType);
-            js_free(ctx, offsets);
-            JS_ThrowTypeError(ctx, "ffi_get_struct_offsets failed: %s", ffi_strerror(st));
-            return JS_EXCEPTION;
-        }
-
-        // Store offsets in the js_ffi_type for use during packing
-        structType->offsets = offsets;
-
-        JSValue arr = JS_NewArray(ctx);
-        if (JS_IsException(arr)) {
-            js_free(ctx, elements);
-            js_free(ctx, structType->ffi_type);
-            js_free(ctx, structType->offsets);
-            js_free(ctx, structType);
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-        for (unsigned i = 0; i < typeCnt; i++) {
-            if (JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, offsets[i])) < 0) {
-                JS_FreeValue(ctx, arr);
-                js_free(ctx, elements);
-                js_free(ctx, structType->ffi_type);
-                js_free(ctx, structType->offsets);
-                js_free(ctx, structType);
-                JS_FreeValue(ctx, obj);
-                return JS_EXCEPTION;
-            }
-        }
-        if (JS_SetPropertyStr(ctx, obj, "offsets", arr) < 0) {
-            /* JS_SetPropertyStr consumes arr even on failure. */
-            js_free(ctx, elements);
-            js_free(ctx, structType->ffi_type);
-            js_free(ctx, structType->offsets);
-            js_free(ctx, structType);
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-        // Don't free offsets - they're now owned by structType
-    }
-
-    if (typeCnt > SIZE_MAX / sizeof(JSValue)) {
-        js_free(ctx, elements);
-        js_free(ctx, structType->ffi_type);
-        js_free(ctx, structType->offsets);
-        js_free(ctx, structType);
-        JS_FreeValue(ctx, obj);
-        return JS_ThrowRangeError(ctx, "too many struct fields");
-    }
-    structType->deps = js_malloc(ctx, sizeof(JSValue) * typeCnt);
-    if (!structType->deps) {
-        js_free(ctx, elements);
-        js_free(ctx, structType->offsets);
-        js_free(ctx, structType->ffi_type);
-        js_free(ctx, structType);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    for (unsigned i = 0; i < typeCnt; i++) {
-        structType->deps[i] = JS_DupValue(ctx, types[i]);
-    }
-
-    JS_SetOpaque(obj, structType);
-    return obj;
-}
-
-static JSValue ffi_type_create_existing(JSContext *ctx, ffi_type *exist, const char *name) {
-    JSValue obj = JS_NewObjectClass(ctx, js_ffi_type_classid);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    js_ffi_type *structType = js_malloc(ctx, sizeof(js_ffi_type));
-    if (!structType) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    structType->elemCount = 0;
-    structType->dynamic = false;
-    structType->deps = NULL;
-    structType->ffi_type = exist;
-
-    JS_SetOpaque(obj, structType);
-    JS_SetPropertyStr(ctx, obj, "_name", JS_NewString(ctx, name));
-
-    return obj;
-}
-
-static void js_ffi_type_finalizer(JSRuntime *rt, JSValue val) {
-    js_ffi_type *u = JS_GetOpaque(val, js_ffi_type_classid);
-    if (u) {
-        if (u->dynamic) {
-            for (unsigned i = 0; i < u->elemCount; i++) {
-                JS_FreeValueRT(rt, u->deps[i]);
-            }
-            if (u->deps != NULL) {
-                js_free_rt(rt, u->deps);
-            }
-            if (u->ffi_type != NULL) {
-                if (u->ffi_type->elements != NULL) {
-                    js_free_rt(rt, u->ffi_type->elements);
-                }
-                js_free_rt(rt, u->ffi_type);
-            }
-            if (u->offsets != NULL) {
-                js_free_rt(rt, u->offsets);
-            }
-        }
-        js_free_rt(rt, u);
-    }
-}
-static void js_ffi_type_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    js_ffi_type *u = JS_GetOpaque(val, js_ffi_type_classid);
-    if (u) {
-        for (unsigned i = 0; i < u->elemCount; i++) {
-            JS_MarkValue(rt, u->deps[i], mark_func);
-        }
-    }
-}
-JSClassDef js_ffi_type_class = { "FfiType", .finalizer = js_ffi_type_finalizer, .gc_mark = js_ffi_type_mark };
-
-static JSValue js_ffi_type_get_sz(JSContext *ctx, JSValue this_val) {
-    js_ffi_type *type = JS_GetOpaque(this_val, js_ffi_type_classid);
-    if (type == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be FfiType");
-        return JS_EXCEPTION;
-    }
-    return JS_NEW_SIZE_T(ctx, ffi_type_get_sz(type->ffi_type));
-}
-
-int ffi_type_to_buffer(JSContext *ctx, JSValue val, ffi_type *type, uint8_t *buf) {
-    if (type->type == FFI_TYPE_STRUCT) {
-        if (!JS_IsArray(val)) {
-            JS_ThrowTypeError(ctx, "expected argument 1 to be array");
-            return -1;
-        }
-        if (type->size > INT_MAX) {
-            JS_ThrowRangeError(ctx, "struct value is too large");
-            return -1;
-        }
-        size_t count = 0;
-        while (type->elements[count] != NULL) count++;
-        size_t arrlen;
-        JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
-        if (JS_TO_SIZE_T(ctx, &arrlen, len_val) < 0) {
-            JS_FreeValue(ctx, len_val);
-            return -1;
-        }
-        JS_FreeValue(ctx, len_val);
-        if (count > arrlen) {
-            JS_ThrowRangeError(ctx, "array is too short");
-            return -1;
-        }
-        if (count < arrlen) {
-            JS_ThrowRangeError(ctx, "array is too long");
-            return -1;
-        }
-        /* Fields must be written at their ABI offsets (with padding), the same
-         * layout libffi uses, not packed back to back. */
-        size_t *offsets = NULL;
-        if (count > 0) {
-            if (count > SIZE_MAX / sizeof(size_t)) {
-                JS_ThrowRangeError(ctx, "too many struct fields");
-                return -1;
-            }
-            offsets = js_malloc(ctx, sizeof(size_t) * count);
-            if (!offsets) return -1;
-            ffi_status st = ffi_get_struct_offsets(FFI_DEFAULT_ABI, type, offsets);
-            if (st != FFI_OK) {
-                js_free(ctx, offsets);
-                JS_ThrowTypeError(ctx, "ffi_get_struct_offsets failed: %s", ffi_strerror(st));
-                return -1;
-            }
-        }
-        for (size_t i = 0; i < count; i++) {
-            JSValue elem = JS_GetPropertyUint32(ctx, val, i);
-            if (JS_IsException(elem)) {
-                js_free(ctx, offsets);
-                return -1;
-            }
-            int ret = ffi_type_to_buffer(ctx, elem, type->elements[i], buf + offsets[i]);
-            JS_FreeValue(ctx, elem);
-            if (ret < 0) {
-                js_free(ctx, offsets);
-                return -1;
-            }
-        }
-        js_free(ctx, offsets);
-        return (int) type->size;
-    } else {
-        switch (type->type) {
-            case FFI_TYPE_VOID:
-                JS_ThrowTypeError(ctx, "cannot convert js val to void");
-                return -1;
-                break;
-            case FFI_TYPE_INT:
-                if (JS_TO_INT(ctx, (int *) buf, val) < 0) return -1;
-                return sizeof(int);
-            case FFI_TYPE_FLOAT: {
-                double v;
-                if (JS_ToFloat64(ctx, &v, val) < 0) return -1;
-                *(float *) buf = v;
-                return sizeof(float);
-            }
-            case FFI_TYPE_DOUBLE:
-                if (JS_ToFloat64(ctx, (double *) buf, val) < 0) return -1;
-                return sizeof(double);
-#if FFI_TYPE_LONGDOUBLE != FFI_TYPE_DOUBLE
-            case FFI_TYPE_LONGDOUBLE: {
-                double v;
-                if (JS_ToFloat64(ctx, &v, val) < 0) return -1;
-                *(long double *) buf = v;
-                return sizeof(long double);
-            }
-#endif
-            case FFI_TYPE_UINT8: {
-                uint32_t v;
-                if (JS_ToUint32(ctx, &v, val) < 0) return -1;
-                *(uint8_t *) buf = v;
-                return sizeof(uint8_t);
-            }
-            case FFI_TYPE_SINT8: {
-                int32_t v;
-                if (JS_ToInt32(ctx, &v, val) < 0) return -1;
-                *(int8_t *) buf = v;
-                return sizeof(int8_t);
-            }
-            case FFI_TYPE_UINT16: {
-                uint32_t v;
-                if (JS_ToUint32(ctx, &v, val) < 0) return -1;
-                *(uint16_t *) buf = v;
-                return sizeof(uint16_t);
-            }
-            case FFI_TYPE_SINT16: {
-                int32_t v;
-                if (JS_ToInt32(ctx, &v, val) < 0) return -1;
-                *(int16_t *) buf = v;
-                return sizeof(int16_t);
-            }
-            case FFI_TYPE_UINT32:
-                if (JS_ToUint32(ctx, (uint32_t *) buf, val) < 0) return -1;
-                return sizeof(uint32_t);
-            case FFI_TYPE_SINT32:
-                if (JS_ToInt32(ctx, (int32_t *) buf, val) < 0) return -1;
-                return sizeof(int32_t);
-            case FFI_TYPE_STRUCT:
-                fprintf(stderr, "js_ffi_type_val_to_buffer switch FFI_TYPE_STRUCT, should not happen!");
-                abort();
-                break;
-            case FFI_TYPE_UINT64:
-                if (JS_ToIndex(ctx, (uint64_t *) buf, val) < 0) return -1;
-                return sizeof(uint64_t);
-            case FFI_TYPE_SINT64:
-                if (JS_ToInt64(ctx, (int64_t *) buf, val) < 0) return -1;
-                return sizeof(int64_t);
-                break;
-            case FFI_TYPE_POINTER:
-                if (JS_IsNull(val)) {
-                    *(void **)buf = NULL;
-                    return sizeof(void *);
-                }
-                if (js_to_uintptr(ctx, (void **)buf, val) < 0)
-                    return -1;
-                return sizeof(void *);
-            case FFI_TYPE_COMPLEX:
-                JS_ThrowTypeError(ctx, "FFI_TYPE_COMPLEX is not yet supported!");
-                return -1;
-                break;
-            default:
-                JS_ThrowInternalError(ctx, "FFI Unknown type %d", type->type);
-                return -1;
-        }
-    }
-}
-
-static JSValue js_ffi_type_to_buffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    js_ffi_type *type = JS_GetOpaque(this_val, js_ffi_type_classid);
-    if (type == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be FfiType");
-        return JS_EXCEPTION;
-    }
-    if (argc < 1) {
-        JS_ThrowTypeError(ctx, "expected 1 argument");
-        return JS_EXCEPTION;
-    }
-    size_t sz = ffi_type_get_sz(type->ffi_type);
-    uint8_t *buf = js_mallocz(ctx, sz);
-    if (!buf) {
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    int ret = ffi_type_to_buffer(ctx, argv[0], type->ffi_type, buf);
-    if (ret < 0) {
-        js_free(ctx, buf);
-        return JS_EXCEPTION;
-    }
-    return TJS_NewUint8Array(ctx, buf, sz);
-}
-
-static int ffi_type_from_buffer(JSContext *ctx, ffi_type *type, uint8_t *buf, JSValue *val) {
-    if (type->type == FFI_TYPE_STRUCT) {
-        JS_ThrowInternalError(ctx, "converting buffer to js is not yet implemented for structs");
-        return -1;
-    } else {
-        switch (type->type) {
-            case FFI_TYPE_VOID:
-                *val = JS_UNDEFINED;
-                return 0;
-                break;
-            case FFI_TYPE_INT:
-                *val = JS_NewInt32(ctx, *(int *) buf);
-                return sizeof(int);
-            case FFI_TYPE_FLOAT:
-                *val = JS_NewFloat64(ctx, (double) *(float *) buf);
-                return sizeof(float);
-            case FFI_TYPE_DOUBLE:
-                *val = JS_NewFloat64(ctx, *(double *) buf);
-                return sizeof(double);
-#if FFI_TYPE_LONGDOUBLE != FFI_TYPE_DOUBLE
-            case FFI_TYPE_LONGDOUBLE: {
-                *val = JS_NewFloat64(ctx, *(long double *) buf);
-                return sizeof(long double);
-            }
-#endif
-            case FFI_TYPE_UINT8:
-                *val = JS_NewInt32(ctx, *(uint8_t *) buf);
-                return sizeof(uint8_t);
-            case FFI_TYPE_SINT8:
-                *val = JS_NewInt32(ctx, *(int8_t *) buf);
-                return sizeof(int8_t);
-            case FFI_TYPE_UINT16:
-                *val = JS_NewInt32(ctx, *(uint16_t *) buf);
-                return sizeof(uint16_t);
-            case FFI_TYPE_SINT16:
-                *val = JS_NewInt32(ctx, *(int16_t *) buf);
-                return sizeof(int16_t);
-            case FFI_TYPE_UINT32:
-                *val = JS_NewInt64(ctx, *(uint32_t *) buf);
-                return sizeof(uint32_t);
-            case FFI_TYPE_SINT32:
-                *val = JS_NewInt32(ctx, *(int32_t *) buf);
-                return sizeof(int32_t);
-            case FFI_TYPE_STRUCT:
-                fprintf(stderr, "ffi_type_from_buffer switch FFI_TYPE_STRUCT, should not happen!");
-                abort();
-                break;
-            case FFI_TYPE_UINT64:
-                *val = JS_NewInt64(ctx, *(uint64_t *) buf);
-                return sizeof(uint64_t);
-            case FFI_TYPE_SINT64:
-                *val = JS_NewInt64(ctx, *(int64_t *) buf);
-                return sizeof(int64_t);
-                break;
-            case FFI_TYPE_POINTER:
-                *val = JS_NEW_UINTPTR_T(ctx, *(void **) buf);
-                return sizeof(void *);
-                break;
-            case FFI_TYPE_COMPLEX:
-                JS_ThrowTypeError(ctx, "FFI_TYPE_COMPLEX is not yet supported!");
-                return -1;
-                break;
-            default:
-                JS_ThrowInternalError(ctx, "FFI Unknown type %d", type->type);
-                return -1;
-        }
-    }
-}
-
-static JSValue js_ffi_type_from_buffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    js_ffi_type *type = JS_GetOpaque(this_val, js_ffi_type_classid);
-    if (type == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be FfiType");
-        return JS_EXCEPTION;
-    }
-    if (argc < 1) {
-        JS_ThrowTypeError(ctx, "expected 1 argument");
-        return JS_EXCEPTION;
-    }
-    size_t bufsz;
-    uint8_t *buf = JS_GetUint8Array(ctx, &bufsz, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-    size_t typesz = ffi_type_get_sz(type->ffi_type);
-    if (bufsz != typesz) {
-        JS_ThrowRangeError(ctx, "expected buffer to be of size %zu", typesz);
-        return JS_EXCEPTION;
-    }
-    JSValue val = JS_UNDEFINED;
-    int ret = ffi_type_from_buffer(ctx, type->ffi_type, buf, &val);
-    if (ret < 0) {
-        return JS_EXCEPTION;
-    }
-    return val;
-}
-
-static JSValue js_ffi_type_name(JSContext *ctx, JSValue this_val) {
-    js_ffi_type *type = JS_GetOpaque(this_val, js_ffi_type_classid);
-    if (type == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be FfiType");
-        return JS_EXCEPTION;
-    }
-    return JS_GetPropertyStr(ctx, this_val, "_name");
-}
-
-static const JSCFunctionListEntry js_ffi_type_proto_funcs[] = {
-    TJS_CFUNC_DEF("toBuffer", 1, js_ffi_type_to_buffer),
-    TJS_CFUNC_DEF("fromBuffer", 1, js_ffi_type_from_buffer),
-    TJS_CGETSET_DEF("name", js_ffi_type_name, NULL),
-    TJS_CGETSET_DEF("size", js_ffi_type_get_sz, NULL),
-};
-#pragma endregion "FfiType class definition"
-
-#pragma region "UvDlSym class definition"
-
-static thread_local JSClassID js_uv_dlsym_classid;
-
-JSClassDef js_uv_dlsym_class = {
-    "UvDlSym",
-};
-
-static JSValue js_uv_dlsym_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    JS_ThrowReferenceError(ctx, "no constructor for UvDlSym available");
-    return JS_EXCEPTION;
-}
-
-static JSValue js_uv_dlsym_get_addr(JSContext *ctx, JSValue this_val) {
-    void *ptr = JS_GetOpaque(this_val, js_uv_dlsym_classid);
-    if (ptr == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be UvDlSym");
-        return JS_EXCEPTION;
-    }
-    return JS_NEW_UINTPTR_T(ctx, ptr);
-}
-static const JSCFunctionListEntry js_uv_dlsym_proto_funcs[] = {
-    TJS_CGETSET_DEF("addr", js_uv_dlsym_get_addr, NULL),
-};
-
-#pragma endregion "UvDlSym class definition"
-
-#pragma region "FfiCif class definition"
-
-static thread_local JSClassID js_ffi_cif_classid;
-typedef struct {
-    ffi_cif ffi_cif;
-    ffi_type **args;
-    size_t depsCount;
-    JSValue *deps;
-} js_ffi_cif;
-
-static JSValue js_ffi_cif_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "expected at least 1 argument: return FfiType");
-    }
-    ssize_t nfixedargs = -1;
-    /* signed math prevents the (size_t)argc - 1 underflow if argc was tiny */
-    size_t ntotalargs = (size_t)(argc - 1);
-    if (JS_IsNumber(argv[argc - 1])) {
-        if (JS_TO_SIZE_T(ctx, &nfixedargs, argv[argc - 1]) < 0) {
-            return JS_ThrowTypeError(ctx, "argument %d has to be positive integer", argc);
-        }
-        if (nfixedargs < 0) {
-            return JS_ThrowRangeError(ctx, "argument %d has to be non-negative", argc);
-        }
-        ntotalargs = (argc >= 2) ? (size_t)(argc - 2) : 0;
-    } else if (JS_IsUndefined(argv[argc - 1])) {
-        ntotalargs = (argc >= 2) ? (size_t)(argc - 2) : 0;
-    }
-    for (unsigned i = 0; i < ntotalargs + 1; i++) {
-        ffi_type *t = JS_GetOpaque(argv[i], js_ffi_type_classid);
-        if (t == NULL) {
-            return JS_ThrowTypeError(ctx, "argument %d is not a FfiType", i + 1);
-        }
-    }
-
-    JSValue obj = JS_NewObjectClass(ctx, js_ffi_cif_classid);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    JS_SetPropertyStr(ctx, obj, "vla", JS_NewInt32(ctx, 0));
-
-    js_ffi_cif *js_cif = js_malloc(ctx, sizeof(js_ffi_cif));
-    if (!js_cif) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    js_cif->args = NULL;
-    js_cif->deps = NULL;
-    js_cif->depsCount = 0;
-    if (ntotalargs > 0) {
-        if (ntotalargs > SIZE_MAX / sizeof(ffi_type *)) {
-            js_free(ctx, js_cif);
-            JS_FreeValue(ctx, obj);
-            return JS_ThrowRangeError(ctx, "too many FFI arguments");
-        }
-        js_cif->args = js_malloc(ctx, sizeof(ffi_type *) * ntotalargs);
-        if (!js_cif->args) {
-            js_free(ctx, js_cif);
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-    }
-    if (ntotalargs == SIZE_MAX || ntotalargs + 1 > SIZE_MAX / sizeof(JSValue)) {
-        if (js_cif->args) js_free(ctx, js_cif->args);
-        js_free(ctx, js_cif);
-        JS_FreeValue(ctx, obj);
-        return JS_ThrowRangeError(ctx, "too many FFI arguments");
-    }
-    js_cif->deps = js_malloc(ctx, sizeof(JSValue) * (ntotalargs + 1));
-    if (!js_cif->deps) {
-        if (js_cif->args) js_free(ctx, js_cif->args);
-        js_free(ctx, js_cif);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    js_cif->depsCount = ntotalargs + 1;
-    ffi_type *retType;
-
-    {
-        js_ffi_type *jst = JS_GetOpaque(argv[0], js_ffi_type_classid);
-        retType = jst->ffi_type;
-    }
-
-    for (unsigned i = 0; i < js_cif->depsCount; i++) {
-        js_cif->deps[i] = JS_DupValue(ctx, argv[i]);
-    }
-
-    for (unsigned i = 1; i < ntotalargs + 1; i++) {
-        js_ffi_type *jst = JS_GetOpaque(argv[i], js_ffi_type_classid);
-        js_cif->args[i - 1] = jst->ffi_type;
-    }
-
-    ffi_status ret;
-    if (nfixedargs > -1) {
-        ret = ffi_prep_cif_var(&js_cif->ffi_cif, FFI_DEFAULT_ABI, nfixedargs, ntotalargs, retType, js_cif->args);
-    } else {
-        ret = ffi_prep_cif(&js_cif->ffi_cif, FFI_DEFAULT_ABI, ntotalargs, retType, js_cif->args);
-    }
-    if (ret != FFI_OK) {
-        /* dup'd deps must be released */
-        for (size_t i = 0; i < js_cif->depsCount; i++) {
-            JS_FreeValue(ctx, js_cif->deps[i]);
-        }
-        js_free(ctx, js_cif->deps);
-        if (js_cif->args) js_free(ctx, js_cif->args);
-        js_free(ctx, js_cif);
-        JS_FreeValue(ctx, obj);
-        JS_ThrowInternalError(ctx, "internal error creating cif: %s", ffi_strerror(ret));
-        return JS_EXCEPTION;
-    }
-    JS_SetOpaque(obj, js_cif);
-    return obj;
-}
-
-static void js_ffi_cif_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    js_ffi_cif *u = JS_GetOpaque(val, js_ffi_cif_classid);
-    if (u) {
-        for (unsigned i = 0; i < u->depsCount; i++) {
-            JS_MarkValue(rt, u->deps[i], mark_func);
-        }
-    }
-}
-
-static void js_ffi_cif_finalizer(JSRuntime *rt, JSValue val) {
-    js_ffi_cif *u = JS_GetOpaque(val, js_ffi_cif_classid);
-    if (u) {
-        for (unsigned i = 0; i < u->depsCount; i++) {
-            JS_FreeValueRT(rt, u->deps[i]);
-        }
-        js_free_rt(rt, u->deps);
-        if (u->args) {
-            js_free_rt(rt, u->args);
-        }
-        js_free_rt(rt, u);
-    }
-}
-
-JSClassDef js_ffi_cif_class = { "FfiCif", .finalizer = js_ffi_cif_finalizer, .gc_mark = js_ffi_cif_mark };
-
-static JSValue js_ffi_cif_call(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    js_ffi_cif *cif = JS_GetOpaque(this_val, js_ffi_cif_classid);
-    if (!cif) {
-        JS_ThrowTypeError(ctx, "this must be FfiCif");
-        return JS_EXCEPTION;
-    }
-    void *func;
-    if (argc <= 0 || (func = JS_GetOpaque(argv[0], js_uv_dlsym_classid)) == NULL) {
-        JS_ThrowTypeError(ctx, "argument 1 must be UvDlSym object");
-        return JS_EXCEPTION;
-    }
-
-    unsigned ffi_arg_cnt = argc - 1;
-    JSValue *func_argv = &argv[1];
-    if (ffi_arg_cnt != cif->ffi_cif.nargs) {
-        JS_ThrowRangeError(ctx, "expected %d arguments but got %d", cif->ffi_cif.nargs, ffi_arg_cnt);
-        return JS_EXCEPTION;
-    }
-
-    void **aval = NULL;
-    if (ffi_arg_cnt > 0) {
-        if ((size_t)ffi_arg_cnt > SIZE_MAX / (2 * sizeof(void *))) {
-            return JS_ThrowRangeError(ctx, "too many FFI arguments");
-        }
-        aval = js_malloc(ctx, ffi_arg_cnt * sizeof(void *) * 2);
-        if (!aval) return JS_EXCEPTION;
-    }
-    for (unsigned i = 0; i < ffi_arg_cnt; i++) {
-        void *ptr;
-        if (JS_IS_PTR(ctx, func_argv[i])) {
-            /* The pointer is stored in an 8-byte slot; libffi would read past
-             * it for a larger declared parameter type. */
-            if (ffi_type_get_sz(cif->ffi_cif.arg_types[i]) > sizeof(void *)) {
-                js_free(ctx, aval);
-                return JS_ThrowRangeError(ctx, "argument %d is larger than a pointer; pass a buffer", i + 1);
-            }
-            ptr = &aval[ffi_arg_cnt + i];
-            if (js_to_uintptr(ctx, ptr, func_argv[i]) < 0) {
-                js_free(ctx, aval);
-                return JS_EXCEPTION;
-            }
-        } else {
-            size_t sz;
-            ptr = JS_GetUint8Array(ctx, &sz, func_argv[i]);
-            if (ptr == NULL) {
-                js_free(ctx, aval);
-                JS_ThrowTypeError(ctx, "argument %d expected to be ptr or buffer", i + 1);
-                return JS_EXCEPTION;
-            }
-            /* Validate buffer size matches parameter type */
-            size_t expected_sz = ffi_type_get_sz(cif->ffi_cif.arg_types[i]);
-            if (sz < expected_sz) {
-                js_free(ctx, aval);
-                JS_ThrowRangeError(ctx, "argument %d buffer too small (expected %zu bytes, got %zu)", i + 1, expected_sz, sz);
-                return JS_EXCEPTION;
-            }
-        }
-        aval[i] = ptr;
-    }
-
-    ffi_type *rtype = cif->ffi_cif.rtype;
-    size_t retsz = ffi_type_get_sz(rtype);
-    if (retsz == 0) {
-        ffi_call(&cif->ffi_cif, func, NULL, aval);
-        js_free(ctx, aval);
-        return JS_NewUint8Array(ctx, NULL, 0, NULL, NULL, false);
-    }
-
-    /* libffi widens only narrow integral returns to ffi_arg. Floating-point
-     * returns and structs use their declared size. */
-    size_t storage_sz = ffi_type_is_narrow_integer(rtype) ? sizeof(ffi_arg) : retsz;
-    void *storage = js_mallocz(ctx, storage_sz);
-    if (!storage) {
-        js_free(ctx, aval);
-        return JS_EXCEPTION;
-    }
-    ffi_call(&cif->ffi_cif, func, storage, aval);
-    js_free(ctx, aval);
-
-    uint8_t *result = js_malloc(ctx, retsz);
-    if (!result) {
-        js_free(ctx, storage);
-        return JS_EXCEPTION;
-    }
-    ffi_copy_call_result(result, storage, rtype);
-    js_free(ctx, storage);
-    return TJS_NewUint8Array(ctx, result, retsz);
-}
-static const JSCFunctionListEntry js_ffi_cif_proto_funcs[] = {
-    TJS_CFUNC_DEF("call", 1, js_ffi_cif_call),
-};
-
-#pragma endregion "FfiCif class definition"
-
-#pragma region "UvLib class definition"
-
-static thread_local JSClassID js_uv_lib_classid;
-
-#if defined(__linux__) && defined(__GLIBC__)
-/* dlmopen/Lmid_t are glibc extensions; musl has neither. */
-static uv_once_t js_ffi_loader_once = UV_ONCE_INIT;
-static uv_mutex_t js_ffi_loader_mutex;
-static bool js_ffi_loader_has_lmid;
-static Lmid_t js_ffi_loader_lmid;
-static size_t js_ffi_loader_ref_count;
-
-static void js_ffi_loader_init_once(void) {
-    uv_mutex_init(&js_ffi_loader_mutex);
-}
-
-static int js_ffi_dlopen_locked(const char *filename, uv_lib_t *lib, const char **errmsg) {
-    dlerror();
-    lib->errmsg = NULL;
-    Lmid_t lmid = js_ffi_loader_has_lmid ? js_ffi_loader_lmid : LM_ID_NEWLM;
-    lib->handle = dlmopen(lmid, filename, RTLD_LAZY | RTLD_LOCAL);
-    if (!lib->handle) {
-        *errmsg = dlerror();
-        return -1;
-    }
-    if (js_ffi_loader_has_lmid) {
-        js_ffi_loader_ref_count++;
-        return 0;
-    }
-    if (dlinfo(lib->handle, RTLD_DI_LMID, &js_ffi_loader_lmid) != 0) {
-        *errmsg = dlerror();
-        dlclose(lib->handle);
-        lib->handle = NULL;
-        return -1;
-    }
-    js_ffi_loader_has_lmid = true;
-    js_ffi_loader_ref_count = 1;
+static int strict_integer(JSContext *ctx, JSValueConst value, int64_t *result, const char *name) {
+    double number;
+    if (!JS_IsNumber(value) || JS_ToFloat64(ctx, &number, value) < 0)
+        return JS_ThrowTypeError(ctx, "%s must be an integer", name), -1;
+    if (!isfinite(number) || trunc(number) != number || number < -9007199254740991.0 || number > 9007199254740991.0)
+        return JS_ThrowRangeError(ctx, "%s must be a safe integer", name), -1;
+    *result = (int64_t) number;
     return 0;
 }
 
-static int js_ffi_dlopen(const char *filename, uv_lib_t *lib, const char **errmsg) {
-    uv_once(&js_ffi_loader_once, js_ffi_loader_init_once);
-    uv_mutex_lock(&js_ffi_loader_mutex);
-    int ret = js_ffi_dlopen_locked(filename, lib, errmsg);
-    uv_mutex_unlock(&js_ffi_loader_mutex);
-    return ret;
+/* Preserve the original glibc dlmopen namespace, with ordinary libuv loading
+ * on musl, macOS and Windows. */
+#if defined(__linux__) && defined(__GLIBC__)
+static uv_once_t loader_once = UV_ONCE_INIT;
+static uv_mutex_t loader_mutex;
+static bool loader_has_lmid;
+static Lmid_t loader_lmid;
+static size_t loader_refs;
+static void loader_init(void) { uv_mutex_init(&loader_mutex); }
+static int ffi_dlopen(const char *name, uv_lib_t *lib, const char **error) {
+    uv_once(&loader_once, loader_init); uv_mutex_lock(&loader_mutex);
+    dlerror(); lib->errmsg = NULL;
+    Lmid_t lmid = loader_has_lmid ? loader_lmid : LM_ID_NEWLM;
+    lib->handle = dlmopen(lmid, name, RTLD_LAZY | RTLD_LOCAL);
+    if (!lib->handle) { *error = dlerror(); uv_mutex_unlock(&loader_mutex); return -1; }
+    if (loader_has_lmid) loader_refs++;
+    else if (dlinfo(lib->handle, RTLD_DI_LMID, &loader_lmid) != 0) {
+        *error = dlerror(); dlclose(lib->handle); lib->handle = NULL;
+        uv_mutex_unlock(&loader_mutex); return -1;
+    } else { loader_has_lmid = true; loader_refs = 1; }
+    uv_mutex_unlock(&loader_mutex); return 0;
 }
-
-static void js_ffi_dlclose(uv_lib_t *lib) {
-    uv_once(&js_ffi_loader_once, js_ffi_loader_init_once);
-    uv_mutex_lock(&js_ffi_loader_mutex);
-    uv_dlclose(lib);
-    if (js_ffi_loader_ref_count > 0) js_ffi_loader_ref_count--;
-    if (js_ffi_loader_ref_count == 0) {
-        js_ffi_loader_has_lmid = false;
-        js_ffi_loader_lmid = LM_ID_BASE;
-    }
-    uv_mutex_unlock(&js_ffi_loader_mutex);
+static void ffi_dlclose(uv_lib_t *lib) {
+    uv_once(&loader_once, loader_init); uv_mutex_lock(&loader_mutex);
+    uv_dlclose(lib); if (loader_refs) loader_refs--;
+    if (!loader_refs) { loader_has_lmid = false; loader_lmid = LM_ID_BASE; }
+    uv_mutex_unlock(&loader_mutex);
 }
 #else
-static int js_ffi_dlopen(const char *filename, uv_lib_t *lib, const char **errmsg) {
-    int ret = uv_dlopen(filename, lib);
-    *errmsg = ret == 0 ? NULL : uv_dlerror(lib);
-    return ret;
+static int ffi_dlopen(const char *name, uv_lib_t *lib, const char **error) {
+    int r = uv_dlopen(name, lib); *error = r ? uv_dlerror(lib) : NULL; return r;
 }
-
-static void js_ffi_dlclose(uv_lib_t *lib) {
-    uv_dlclose(lib);
-}
+static void ffi_dlclose(uv_lib_t *lib) { uv_dlclose(lib); }
 #endif
 
-static JSValue js_uv_lib_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "library name is required");
+static void state_maybe_unload(FfiLibraryState *state) {
+    if (state && state->handle_open && state->closed && state->owned_holds == 0 && state->active_calls == 0) {
+        ffi_dlclose(&state->handle);
+        state->handle_open = false;
     }
-    TJS_CHECK_ARG_RET(ctx, JS_IsString(argv[0]), 0, "string");
-    JSValue obj = JS_NewObjectClass(ctx, js_uv_lib_classid);
-    if (JS_IsException(obj)) {
-        return obj;
+}
+static void state_ref(FfiLibraryState *state) { if (state) state->refs++; }
+static void state_unref(FfiLibraryState *state) {
+    if (!state) return;
+    assert(state->refs > 0);
+    state->refs--;
+    if (!state->refs) state->closed = true;
+    state_maybe_unload(state);
+    if (!state->refs) { assert(!state->handle_open); tjs__free(state); }
+}
+static void state_owned_ref(FfiLibraryState *state) {
+    if (!state) return;
+    state_ref(state);
+    state->owned_holds++;
+}
+static void state_owned_unref(FfiLibraryState *state) {
+    if (!state) return;
+    assert(state->owned_holds > 0);
+    state->owned_holds--;
+    state_unref(state);
+}
+static void cleanup_enqueue(TJSRuntime *trt, FfiCleanupNode *node) {
+    node->next = trt->ffi_cleanup;
+    trt->ffi_cleanup = node;
+}
+static void state_defer_unref(JSRuntime *rt, FfiLibraryState *state, bool close) {
+    if (!state) return;
+    state->pending_unrefs++;
+    if (close) state->cleanup.kind = CLEANUP_STATE_CLOSE_UNREF;
+    if (!state->cleanup_queued) {
+        state->cleanup_queued = true;
+        cleanup_enqueue(JS_GetRuntimeOpaque(rt), &state->cleanup);
     }
-    const char *dlname = JS_ToCString(ctx, argv[0]);
-    if (!dlname) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+}
+static void dispose_job_run(FfiDisposeJob *job, bool capture) {
+    void *resource = job->resource_addr;
+    void *args[] = { &resource };
+    if (job->state) job->state->active_calls++;
+    ffi_call(&job->cif, FFI_FN(job->disposer_addr), NULL, args);
+    if (capture) capture_errno(job->state);
+    if (job->state) {
+        assert(job->state->active_calls > 0);
+        job->state->active_calls--;
     }
-    uv_lib_t *lib = js_malloc(ctx, sizeof(uv_lib_t));
-    if (!lib) {
-        JS_FreeCString(ctx, dlname);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+    state_owned_unref(job->resource_state);
+    state_owned_unref(job->state);
+    tjs__free(job);
+}
+static thread_local bool cleanup_draining;
+void tjs__mod_ffi_drain_runtime(TJSRuntime *trt) {
+    if (!trt || cleanup_draining) return;
+    cleanup_draining = true;
+    FfiCleanupNode *node;
+    while ((node = trt->ffi_cleanup) != NULL) {
+        trt->ffi_cleanup = node->next;
+        if (node->kind == CLEANUP_DISPOSE) {
+            dispose_job_run((FfiDisposeJob *)node, false);
+        } else {
+            FfiLibraryState *state = (FfiLibraryState *)node;
+            state->cleanup_queued = false;
+            if (node->kind == CLEANUP_STATE_CLOSE_UNREF) state->closed = true;
+            size_t count = state->pending_unrefs;
+            state->pending_unrefs = 0;
+            while (count--) state_unref(state);
+        }
     }
-    const char *errmsg = NULL;
-    int ret = js_ffi_dlopen(dlname, lib, &errmsg);
-    JS_FreeCString(ctx, dlname);
-    if (ret != 0) {
-        JS_ThrowInternalError(ctx, "Deno.dlopen failed: %s", errmsg ? errmsg : uv_dlerror(lib));
-        /* Releases lib->errmsg (and a handle, if any); no loader refcount was taken on failure. */
-        uv_dlclose(lib);
-        js_free(ctx, lib);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    JS_SetOpaque(obj, lib);
-    return obj;
+    cleanup_draining = false;
 }
 
-static void js_uv_lib_finalizer(JSRuntime *rt, JSValue val) {
-    uv_lib_t *u = JS_GetOpaque(val, js_uv_lib_classid);
-    if (!u) return;
-    JS_SetOpaque(val, NULL);
-    js_ffi_dlclose(u);
-    js_free_rt(rt, u);
+/* Pointer objects */
+static FfiPointer *get_pointer(JSValueConst value);
+static int pointer_check(JSContext *ctx, FfiPointer *p) {
+    if (!p || !p->valid) return JS_ThrowTypeError(ctx, "pointer is closed or released"), -1;
+    if (p->state && p->state->closed) return JS_ThrowTypeError(ctx, "pointer belongs to a closed library"), -1;
+    if (p->callback && p->callback->closed) return JS_ThrowTypeError(ctx, "pointer belongs to a closed callback"), -1;
+    /* Native-derived pointers keep their source Pointer as owner. Follow that
+     * chain so close/release invalidation propagates to every later offset or
+     * dereference instead of leaving a usable address into freed storage. */
+    if (!JS_IsUndefined(p->owner)) {
+        FfiPointer *owner = get_pointer(p->owner);
+        if (owner && pointer_check(ctx, owner) < 0) return -1;
+    }
+    return 0;
+}
+static FfiPointer *get_pointer(JSValueConst value) {
+    FfiPointer *p = JS_GetOpaque(value, pointer_class);
+    if (p) return p;
+    OwnedPointer *owned = JS_GetOpaque(value, owned_class);
+    return owned ? &owned->pointer : NULL;
+}
+static FfiPointer *require_pointer(JSContext *ctx, JSValueConst value) {
+    FfiPointer *p = get_pointer(value);
+    if (!p) return JS_ThrowTypeError(ctx, "expected an FFI Pointer"), NULL;
+    return pointer_check(ctx, p) < 0 ? NULL : p;
+}
+static JSValue new_pointer(JSContext *ctx, void *addr, JSValueConst owner, FfiLibraryState *state, FfiCallback *callback) {
+    if (!addr) return JS_NULL;
+    JSValue obj = JS_NewObjectClass(ctx, pointer_class);
+    if (JS_IsException(obj)) return obj;
+    FfiPointer *p = js_mallocz(ctx, sizeof(*p));
+    if (!p) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
+    p->addr = addr; p->owner = JS_IsUndefined(owner) ? JS_UNDEFINED : JS_DupValue(ctx, owner);
+    p->pinned_backing = JS_UNDEFINED; p->state = state; state_ref(state);
+    p->callback = callback; p->valid = true; JS_SetOpaque(obj, p); return obj;
+}
+static void pointer_mark(JSRuntime *rt, JSValueConst value, JS_MarkFunc *mark) {
+    FfiPointer *p = JS_GetOpaque(value, pointer_class);
+    if (p && !JS_IsUndefined(p->owner)) JS_MarkValue(rt, p->owner, mark);
+}
+static void pointer_finalizer(JSRuntime *rt, JSValueConst value) {
+    FfiPointer *p = JS_GetOpaque(value, pointer_class); if (!p) return;
+    if (JS_IsLiveObject(rt, p->pinned_backing)) JS_UnpinArrayBuffer(p->pinned_backing);
+    state_defer_unref(rt, p->state, false);
+    JS_FreeValueRT(rt, p->owner); js_free_rt(rt, p);
+}
+static JSClassDef pointer_def = { "Pointer", .finalizer = pointer_finalizer, .gc_mark = pointer_mark };
+
+/* Scalar and aggregate conversion */
+static int pointer_native(JSContext *ctx, JSValueConst value, void **out) {
+    if (JS_IsNull(value)) { *out = NULL; return 0; }
+    FfiPointer *p = require_pointer(ctx, value); if (!p) return -1; *out = p->addr; return 0;
+}
+static int exact_number(JSContext *ctx, JSValueConst value, double minimum, double maximum, double *out) {
+    double v;
+    if (!JS_IsNumber(value) || JS_ToFloat64(ctx, &v, value) < 0)
+        return JS_ThrowTypeError(ctx, "expected number"), -1;
+    if (!isfinite(v) || trunc(v) != v || v < minimum || v > maximum)
+        return JS_ThrowRangeError(ctx, "integer is outside the C type range"), -1;
+    *out = v;
+    return 0;
+}
+static int exact_bigint(JSContext *ctx, JSValueConst value, bool is_signed, unsigned bits, uint64_t *out) {
+    if (!JS_IsBigInt(value)) return JS_ThrowTypeError(ctx, "expected bigint"), -1;
+    int negative = 0;
+    size_t count = 2;
+    uint64_t words[2] = { 0, 0 };
+    if (JS_GetBigIntWords(ctx, value, &negative, &count, words) < 0) return -1;
+    if (count > 2 || (count == 2 && words[1] != 0))
+        return JS_ThrowRangeError(ctx, "bigint is outside the C type range"), -1;
+    uint64_t word = words[0];
+    uint64_t limit = bits == 64 ? UINT64_MAX : ((UINT64_C(1) << bits) - 1);
+    if (!is_signed && negative)
+        return JS_ThrowRangeError(ctx, "bigint is outside the C type range"), -1;
+    if (is_signed) {
+        uint64_t positive_max = bits == 64 ? INT64_MAX : ((UINT64_C(1) << (bits - 1)) - 1);
+        uint64_t negative_max = UINT64_C(1) << (bits - 1);
+        if ((!negative && word > positive_max) || (negative && word > negative_max))
+            return JS_ThrowRangeError(ctx, "bigint is outside the C type range"), -1;
+        *out = negative ? (uint64_t)(0 - word) : word;
+    } else {
+        if (word > limit) return JS_ThrowRangeError(ctx, "bigint is outside the C type range"), -1;
+        *out = word;
+    }
+    return 0;
+}
+static int pack_value(JSContext *ctx, FfiType *t, JSValueConst value, uint8_t *out) {
+    switch (t->kind) {
+        case K_VOID: return JS_ThrowTypeError(ctx, "void is not a value"), -1;
+        case K_BOOL: { if (!JS_IsBool(value)) return JS_ThrowTypeError(ctx, "expected boolean"), -1;
+            uint8_t v=(uint8_t)JS_ToBool(ctx,value); memcpy(out,&v,sizeof(v)); return 0; }
+        case K_I8: { double n;if(exact_number(ctx,value,INT8_MIN,INT8_MAX,&n)<0)return -1;int8_t v=(int8_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_U8: { double n;if(exact_number(ctx,value,0,UINT8_MAX,&n)<0)return -1;uint8_t v=(uint8_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_I16:{ double n;if(exact_number(ctx,value,INT16_MIN,INT16_MAX,&n)<0)return -1;int16_t v=(int16_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_U16:{ double n;if(exact_number(ctx,value,0,UINT16_MAX,&n)<0)return -1;uint16_t v=(uint16_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_I32:{ double n;if(exact_number(ctx,value,INT32_MIN,INT32_MAX,&n)<0)return -1;int32_t v=(int32_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_U32:{ double n;if(exact_number(ctx,value,0,UINT32_MAX,&n)<0)return -1;uint32_t v=(uint32_t)n;memcpy(out,&v,sizeof(v));return 0; }
+        case K_I64:{ uint64_t raw;if(exact_bigint(ctx,value,true,(unsigned)(t->ffi->size*CHAR_BIT),&raw)<0)return -1;if(t->ffi->size==4){uint32_t v=(uint32_t)raw;memcpy(out,&v,4);}else memcpy(out,&raw,8);return 0; }
+        case K_U64:{ uint64_t raw;if(exact_bigint(ctx,value,false,(unsigned)(t->ffi->size*CHAR_BIT),&raw)<0)return -1;if(t->ffi->size==4){uint32_t v=(uint32_t)raw;memcpy(out,&v,4);}else memcpy(out,&raw,8);return 0; }
+        case K_F32:{ double v;if(!JS_IsNumber(value))goto number;if(JS_ToFloat64(ctx,&v,value)<0)return -1;float n=(float)v;memcpy(out,&n,sizeof(n));return 0; }
+        case K_F64:{ double v; if(!JS_IsNumber(value))goto number; if(JS_ToFloat64(ctx,&v,value)<0)return -1; memcpy(out,&v,8);return 0; }
+        case K_LONG_DOUBLE:{ double v;if(!JS_IsNumber(value))goto number;if(JS_ToFloat64(ctx,&v,value)<0)return -1;long double n=(long double)v;memcpy(out,&n,sizeof(n));return 0; }
+        case K_POINTER: case K_FUNCTION:{ void *p; if(pointer_native(ctx,value,&p)<0)return -1;memcpy(out,&p,sizeof(p));return 0; }
+        case K_BUFFER: return JS_ThrowTypeError(ctx,"buffer is only valid as a function argument"),-1;
+        case K_AGGREGATE: {
+            if(!JS_IsArray(value))return JS_ThrowTypeError(ctx,"expected an array with %zu values",t->count),-1;
+            JSValue lv=JS_GetPropertyStr(ctx,value,"length"); uint64_t len;
+            if (JS_IsException(lv)) return -1;
+            int r = JS_ToIndex(ctx, &len, lv);
+            JS_FreeValue(ctx, lv);
+            if (r < 0) return -1;
+            if(len!=t->count)return JS_ThrowRangeError(ctx,"expected exactly %zu aggregate values",t->count),-1;
+            memset(out,0,type_size(t));
+            for(size_t i=0;i<t->count;i++){JSValue item=JS_GetPropertyUint32(ctx,value,(uint32_t)i);if(JS_IsException(item))return -1;
+                r=pack_value(ctx,JS_GetOpaque(t->deps[i],type_class),item,out+t->offsets[i]);JS_FreeValue(ctx,item);if(r<0)return -1;}
+            return 0;
+        }
+    }
+number:return JS_ThrowTypeError(ctx,"expected number"),-1;
+}
+static JSValue read_value(JSContext *ctx,FfiType*t,const uint8_t*src,JSValueConst owner,FfiLibraryState*state,FfiCallback*cb,bool structured){
+    switch(t->kind){
+        case K_VOID:return JS_UNDEFINED;
+        case K_BOOL:{uint8_t v;memcpy(&v,src,1);return JS_NewBool(ctx,v!=0);}
+        case K_I8:{int8_t v;memcpy(&v,src,1);return JS_NewInt32(ctx,v);}case K_U8:{uint8_t v;memcpy(&v,src,1);return JS_NewInt32(ctx,v);}
+        case K_I16:{int16_t v;memcpy(&v,src,2);return JS_NewInt32(ctx,v);}case K_U16:{uint16_t v;memcpy(&v,src,2);return JS_NewInt32(ctx,v);}
+        case K_I32:{int32_t v;memcpy(&v,src,4);return JS_NewInt32(ctx,v);}case K_U32:{uint32_t v;memcpy(&v,src,4);return JS_NewUint32(ctx,v);}
+        case K_I64:{int64_t v=0;if(t->ffi->size==4){int32_t n;memcpy(&n,src,4);v=n;}else memcpy(&v,src,8);return JS_NewBigInt64(ctx,v);}
+        case K_U64:{uint64_t v=0;if(t->ffi->size==4){uint32_t n;memcpy(&n,src,4);v=n;}else memcpy(&v,src,8);return JS_NewBigUint64(ctx,v);}
+        case K_F32:{float v;memcpy(&v,src,sizeof(v));return JS_NewFloat64(ctx,v);}case K_F64:{double v;memcpy(&v,src,sizeof(v));return JS_NewFloat64(ctx,v);}
+        case K_LONG_DOUBLE:{long double v;memcpy(&v,src,sizeof(v));return JS_NewFloat64(ctx,(double)v);}
+        case K_POINTER:case K_BUFFER:case K_FUNCTION:{void*p;memcpy(&p,src,sizeof(p));return new_pointer(ctx,p,owner,state,cb);}
+        case K_AGGREGATE:{
+            if(!structured)return JS_NewUint8ArrayCopy(ctx,src,type_size(t));
+            JSValue a=JS_NewArray(ctx);if(JS_IsException(a))return a;
+            for(size_t i=0;i<t->count;i++){FfiType*e=JS_GetOpaque(t->deps[i],type_class);
+                JSValue v=read_value(ctx,e,src+t->offsets[i],JS_UNDEFINED,NULL,NULL,true);
+                if(JS_IsException(v)||JS_SetPropertyUint32(ctx,a,(uint32_t)i,v)<0){JS_FreeValue(ctx,a);return JS_EXCEPTION;}}
+            return a;
+        }
+    } return JS_ThrowInternalError(ctx,"unknown FFI type");
 }
 
-static JSValue js_uv_lib_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    uv_lib_t *u = JS_GetOpaque(this_val, js_uv_lib_classid);
-    if (!u) return JS_UNDEFINED;
-    JS_SetOpaque(this_val, NULL);
-    js_ffi_dlclose(u);
-    js_free(ctx, u);
-    return JS_UNDEFINED;
+static JSValue type_pack(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){
+    FfiType*t=JS_GetOpaque2(ctx,self,type_class);if(!t)return JS_EXCEPTION;
+    if(t->kind!=K_AGGREGATE||argc!=1)return JS_ThrowTypeError(ctx,"pack expects one aggregate value");
+    size_t n=type_size(t);uint8_t*b=js_mallocz(ctx,n);if(!b&&n)return JS_EXCEPTION;
+    if(pack_value(ctx,t,argv[0],b)<0){js_free(ctx,b);return JS_EXCEPTION;}return TJS_NewUint8Array(ctx,b,n);
+}
+static JSValue type_unpack(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){
+    FfiType*t=JS_GetOpaque2(ctx,self,type_class);if(!t)return JS_EXCEPTION;
+    if(t->kind!=K_AGGREGATE||argc!=1)return JS_ThrowTypeError(ctx,"unpack expects one Uint8Array");
+    size_t n;uint8_t*b=JS_GetUint8Array(ctx,&n,argv[0]);if(!b)return JS_ThrowTypeError(ctx,"unpack expects a Uint8Array");
+    if(n!=type_size(t))return JS_ThrowRangeError(ctx,"buffer size must be exactly %zu bytes",type_size(t));
+    return read_value(ctx,t,b,JS_UNDEFINED,NULL,NULL,true);
+}
+static void type_mark(JSRuntime*rt,JSValueConst value,JS_MarkFunc*mark){FfiType*t=JS_GetOpaque(value,type_class);if(t&&t->dynamic)for(size_t i=0;i<t->count;i++)JS_MarkValue(rt,t->deps[i],mark);}
+static void type_finalizer(JSRuntime*rt,JSValueConst value){FfiType*t=JS_GetOpaque(value,type_class);if(!t)return;if(t->dynamic){for(size_t i=0;i<t->count;i++)JS_FreeValueRT(rt,t->deps[i]);js_free_rt(rt,t->deps);js_free_rt(rt,t->offsets);js_free_rt(rt,t->ffi->elements);js_free_rt(rt,t->ffi);}js_free_rt(rt,t);}
+static JSClassDef type_def={"FfiTypeToken",.finalizer=type_finalizer,.gc_mark=type_mark};
+static int const_prop(JSContext*ctx,JSValueConst obj,const char*name,JSValue value){return JS_DefinePropertyValueStr(ctx,obj,name,value,JS_PROP_ENUMERABLE);}
+static JSValue new_type(JSContext*ctx,ffi_type*native,TypeKind kind,const char*name){
+    JSValue obj=JS_NewObjectClass(ctx,type_class);if(JS_IsException(obj))return obj;FfiType*t=js_mallocz(ctx,sizeof(*t));
+    if(!t){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}t->ffi=native;t->kind=kind;JS_SetOpaque(obj,t);
+    if(const_prop(ctx,obj,"name",JS_NewString(ctx,name))<0||const_prop(ctx,obj,"size",JS_NewInt64(ctx,kind==K_VOID?0:(int64_t)native->size))<0||
+       const_prop(ctx,obj,"alignment",JS_NewInt32(ctx,native->alignment))<0||JS_FreezeObject(ctx,obj)<0){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}return obj;
+}
+static JSValue new_aggregate(JSContext*ctx,JSValueConst fields,bool array,size_t count){
+    JSValue repeated=JS_UNDEFINED;if(array)repeated=JS_DupValue(ctx,fields);else{
+        if (!JS_IsArray(fields)) return JS_ThrowTypeError(ctx, "types.struct expects an array");
+        JSValue lv = JS_GetPropertyStr(ctx, fields, "length");
+        uint64_t n;
+        if (JS_IsException(lv)) return JS_EXCEPTION;
+        int r = JS_ToIndex(ctx, &n, lv);
+        JS_FreeValue(ctx, lv);
+        if (r < 0) return JS_EXCEPTION;
+        if (!n || n > UINT32_MAX) return JS_ThrowRangeError(ctx, "struct requires at least one field");
+        count = (size_t) n;
+    }
+    if(count>(SIZE_MAX/sizeof(ffi_type*))-1||count>SIZE_MAX/sizeof(JSValue)||count>SIZE_MAX/sizeof(size_t)){JS_FreeValue(ctx,repeated);return JS_ThrowRangeError(ctx,"aggregate is too large");}
+    JSValue obj=JS_NewObjectClass(ctx,type_class);if(JS_IsException(obj)){JS_FreeValue(ctx,repeated);return obj;}
+    FfiType*t=js_mallocz(ctx,sizeof(*t));ffi_type*f=js_mallocz(ctx,sizeof(*f));ffi_type**elements=js_mallocz(ctx,sizeof(*elements)*(count+1));
+    JSValue*deps=js_mallocz(ctx,sizeof(*deps)*count);size_t*offsets=js_mallocz(ctx,sizeof(*offsets)*count);
+    if(!t||!f||!elements||!deps||!offsets)goto fail;
+    for(size_t i=0;i<count;i++){JSValue token=array?JS_DupValue(ctx,repeated):JS_GetPropertyUint32(ctx,fields,(uint32_t)i);if(JS_IsException(token))goto fail;
+        FfiType*e=JS_GetOpaque(token,type_class);if(!e||e->kind==K_VOID||e->kind==K_BUFFER){JS_FreeValue(ctx,token);JS_ThrowTypeError(ctx,"invalid aggregate field %zu",i+1);goto fail;}deps[i]=token;elements[i]=e->ffi;}
+    JS_FreeValue(ctx,repeated);repeated=JS_UNDEFINED;f->type=FFI_TYPE_STRUCT;f->elements=elements;ffi_status st=ffi_get_struct_offsets(FFI_DEFAULT_ABI,f,offsets);
+    if(st!=FFI_OK){JS_ThrowTypeError(ctx,"cannot create aggregate: %s",status_name(st));goto fail;}
+    t->ffi=f;t->kind=K_AGGREGATE;t->dynamic=true;t->array=array;t->count=count;t->deps=deps;t->offsets=offsets;JS_SetOpaque(obj,t);
+    if(const_prop(ctx,obj,"name",JS_NewString(ctx,array?"array":"struct"))<0||const_prop(ctx,obj,"size",JS_NewInt64(ctx,(int64_t)f->size))<0||
+       const_prop(ctx,obj,"alignment",JS_NewInt32(ctx,f->alignment))<0||const_prop(ctx,obj,"pack",JS_NewCFunction(ctx,type_pack,"pack",1))<0||
+       const_prop(ctx,obj,"unpack",JS_NewCFunction(ctx,type_unpack,"unpack",1))<0){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}
+    {JSValue a=JS_NewArray(ctx);if(JS_IsException(a)){JS_FreeValue(ctx,obj);return a;}for(size_t i=0;i<count;i++)if(JS_SetPropertyUint32(ctx,a,(uint32_t)i,JS_NewInt64(ctx,(int64_t)offsets[i]))<0){JS_FreeValue(ctx,a);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}
+        if(JS_FreezeObject(ctx,a)<0||const_prop(ctx,obj,"offsets",a)<0){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}}
+    if(JS_FreezeObject(ctx,obj)<0){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}return obj;
+fail:JS_FreeValue(ctx,repeated);if(deps)for(size_t i=0;i<count;i++)JS_FreeValue(ctx,deps[i]);js_free(ctx,deps);js_free(ctx,offsets);js_free(ctx,elements);js_free(ctx,f);js_free(ctx,t);JS_FreeValue(ctx,obj);return JS_EXCEPTION;
+}
+static JSValue types_struct(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=1)return JS_ThrowTypeError(ctx,"types.struct expects one argument");return new_aggregate(ctx,argv[0],false,0);}
+static JSValue types_array(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2)return JS_ThrowTypeError(ctx,"types.array expects type and count");FfiType*t=JS_GetOpaque(argv[0],type_class);
+    if (!t || t->kind == K_VOID || t->kind == K_BUFFER) return JS_ThrowTypeError(ctx, "invalid array element type");
+    int64_t n;
+    if (strict_integer(ctx, argv[1], &n, "array count") < 0) return JS_EXCEPTION;
+    if (n <= 0 || n > UINT32_MAX) return JS_ThrowRangeError(ctx, "array count must be positive");
+    return new_aggregate(ctx, argv[0], true, (size_t) n);
 }
 
-static JSValue js_uv_lib_dlsym(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "symbol name is required");
-    }
-    TJS_CHECK_ARG_RET(ctx, JS_IsString(argv[0]), 0, "string");
+/* Prepared signatures and bound calls */
+static void signature_clear(JSRuntime*rt,FfiSignature*s){if(s->type_values)for(unsigned i=0;i<=s->nargs;i++)JS_FreeValueRT(rt,s->type_values[i]);js_free_rt(rt,s->type_values);js_free_rt(rt,s->types);js_free_rt(rt,s->arg_types);js_free_rt(rt,s->offsets);memset(s,0,sizeof(*s));}
+static void signature_mark(JSRuntime*rt,FfiSignature*s,JS_MarkFunc*mark){for(unsigned i=0;i<=s->nargs;i++)JS_MarkValue(rt,s->type_values[i],mark);}
+static int parse_fixed(JSContext*ctx,JSValueConst options,unsigned nargs,int*out){*out=-1;if(JS_IsUndefined(options))return 0;if(!JS_IsObject(options))return JS_ThrowTypeError(ctx,"options must be an object"),-1;
+    JSValue v=JS_GetPropertyStr(ctx,options,"fixed");if(JS_IsException(v))return -1;if(JS_IsUndefined(v)){JS_FreeValue(ctx,v);return 0;}int64_t n;
+    if(strict_integer(ctx,v,&n,"fixed")<0){JS_FreeValue(ctx,v);return -1;}JS_FreeValue(ctx,v);
+    if(n<=0||(uint64_t)n>=nargs)return JS_ThrowRangeError(ctx,"fixed must be greater than zero and less than parameter count"),-1;
+    *out=(int)n;return 0;}
+static int signature_prepare(JSContext*ctx,JSValueConst array,unsigned skip,JSValueConst options,FfiSignature*s){
+    memset(s,0,sizeof(*s));if(!JS_IsArray(array))return JS_ThrowTypeError(ctx,"signature must be an array"),-1;JSValue lv=JS_GetPropertyStr(ctx,array,"length");uint64_t len;
+    if (JS_IsException(lv)) return -1;
+    int r = JS_ToIndex(ctx, &len, lv);
+    JS_FreeValue(ctx, lv);
+    if (r < 0) return -1;
+    if(len<=skip||len-skip-1>UINT_MAX)return JS_ThrowTypeError(ctx,"signature requires a result type"),-1;
+    s->nargs=(unsigned)(len-skip-1);if(parse_fixed(ctx,options,s->nargs,&s->fixed)<0)return -1;size_t count=(size_t)s->nargs+1;
+    if(count>SIZE_MAX/sizeof(JSValue)||count>SIZE_MAX/sizeof(FfiType*)||s->nargs>SIZE_MAX/sizeof(ffi_type*)||s->nargs>SIZE_MAX/sizeof(size_t))return JS_ThrowRangeError(ctx,"signature is too large"),-1;
+    s->type_values=js_mallocz(ctx,sizeof(JSValue)*count);s->types=js_mallocz(ctx,sizeof(FfiType*)*count);if(s->nargs)s->arg_types=js_mallocz(ctx,sizeof(ffi_type*)*s->nargs);
+    if(!s->type_values||!s->types||(s->nargs&&!s->arg_types))goto fail;
+    for(unsigned i=0;i<=s->nargs;i++){uint32_t at=i?skip+i:0;JSValue token=JS_GetPropertyUint32(ctx,array,at);if(JS_IsException(token))goto fail;FfiType*t=JS_GetOpaque(token,type_class);
+        if(!t){JS_FreeValue(ctx,token);JS_ThrowTypeError(ctx,"signature item %u is not a type token",at+1);goto fail;}
+        if(t->array){JS_FreeValue(ctx,token);JS_ThrowTypeError(ctx,"array types cannot be used in callable signatures");goto fail;}
+        if((!i&&t->kind==K_BUFFER)||(i&&t->kind==K_VOID)){JS_FreeValue(ctx,token);JS_ThrowTypeError(ctx,"invalid type in callable signature");goto fail;}
+        s->type_values[i]=token;s->types[i]=t;if(i)s->arg_types[i-1]=t->ffi;}
+    if(s->fixed>=0)for(unsigned i=(unsigned)s->fixed;i<s->nargs;i++){TypeKind kind=s->types[i+1]->kind;if(kind==K_BOOL||kind==K_I8||kind==K_U8||kind==K_I16||kind==K_U16||kind==K_F32){JS_ThrowTypeError(ctx,"variadic argument %u requires an explicitly promoted C type",i+1);goto fail;}}
+    ffi_status st=s->fixed>=0?ffi_prep_cif_var(&s->cif,FFI_DEFAULT_ABI,(unsigned)s->fixed,s->nargs,s->types[0]->ffi,s->arg_types):ffi_prep_cif(&s->cif,FFI_DEFAULT_ABI,s->nargs,s->types[0]->ffi,s->arg_types);
+    if(st!=FFI_OK){JS_ThrowTypeError(ctx,"cannot prepare signature: %s",status_name(st));goto fail;}if(s->nargs)s->offsets=js_mallocz(ctx,sizeof(size_t)*s->nargs);if(s->nargs&&!s->offsets)goto fail;
+    size_t frame=0,max_alignment=1;for(unsigned i=0;i<s->nargs;i++){FfiType*t=s->types[i+1];size_t a=pointer_kind(t)?_Alignof(void*):t->ffi->alignment,n=pointer_kind(t)?sizeof(void*):type_size(t);if(a>max_alignment)max_alignment=a;if(!size_align(&frame,a?a:1)){JS_ThrowRangeError(ctx,"call frame too large");goto fail;}s->offsets[i]=frame;if(!size_add(&frame,n)){JS_ThrowRangeError(ctx,"call frame too large");goto fail;}}size_t table;if(s->nargs>SIZE_MAX/sizeof(void*)){JS_ThrowRangeError(ctx,"call frame too large");goto fail;}table=sizeof(void*)*s->nargs;s->frame_offset=table;if(!size_align(&s->frame_offset,max_alignment)){JS_ThrowRangeError(ctx,"call frame too large");goto fail;}s->frame_size=frame;return 0;
+fail:signature_clear(JS_GetRuntime(ctx),s);return -1;}
+static int validate_buffer(JSContext*ctx,JSValueConst v){if(JS_IsNull(v)||JS_IsDataView(v)||JS_GetTypedArrayType(v)>=0)return 0;if(JS_PinArrayBuffer(ctx,v)<0)return -1;JS_UnpinArrayBuffer(v);return 0;}
 
-    uv_lib_t *lib = JS_GetOpaque(this_val, js_uv_lib_classid);
-    if (lib == NULL) {
-        JS_ThrowTypeError(ctx, "this needs to be instance of UvLib");
-        return JS_EXCEPTION;
+static int acquire_buffer(JSContext *ctx, JSValueConst value, void **pointer, JSValue *backing) {
+    size_t offset = 0, length = 0, element_size = 0, backing_size = 0;
+    JSValue buffer;
+    bool pinned = false, direct = false;
+    if (JS_IsDataView(value)) {
+        buffer = JS_GetDataViewBuffer(ctx, value, &offset, &length);
+        if (JS_IsException(buffer)) return -1;
+    } else if (JS_GetTypedArrayType(value) >= 0) {
+        buffer = JS_GetTypedArrayBuffer(ctx, value, &offset, &length, &element_size);
+        if (JS_IsException(buffer)) return -1;
+    } else {
+        buffer = JS_DupValue(ctx, value);
+        direct = true;
+        if (JS_PinArrayBuffer(ctx, buffer) < 0) {
+            JS_FreeValue(ctx, buffer);
+            return -1;
+        }
+        pinned = true;
     }
-
-    JSValue obj = JS_NewObjectClass(ctx, js_uv_dlsym_classid);
-    if (JS_IsException(obj)) {
-        return obj;
+    if (!pinned && JS_PinArrayBuffer(ctx, buffer) < 0) {
+        JS_FreeValue(ctx, buffer);
+        return -1;
     }
-
-    const char *sym = JS_ToCString(ctx, argv[0]);
-    if (!sym) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+    uint8_t *base = JS_GetArrayBuffer(ctx, &backing_size, buffer);
+    if (!base && JS_HasException(ctx)) {
+        JS_UnpinArrayBuffer(buffer);
+        JS_FreeValue(ctx, buffer);
+        return -1;
     }
-    void *ptr;
-    int ret = uv_dlsym(lib, sym, &ptr);
-    JS_FreeCString(ctx, sym);
-    if (ret != 0) {
-        JS_ThrowInternalError(ctx, "uv_dlsym failed: %s", uv_dlerror(lib));
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+    if (direct) length = backing_size;
+    if (offset > backing_size || length > backing_size - offset) {
+        JS_UnpinArrayBuffer(buffer);
+        JS_FreeValue(ctx, buffer);
+        return JS_ThrowRangeError(ctx, "BufferSource is outside its backing store"), -1;
     }
-
-    /* The symbol address is only valid while the library stays loaded. Keep
-     * the UvLib alive from the symbol so GC cannot dlclose it underneath. */
-    if (JS_DefinePropertyValueStr(ctx, obj, "_lib", JS_DupValue(ctx, this_val), 0) < 0) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    JS_SetOpaque(obj, ptr);
-    return obj;
+    static uint8_t empty_buffer_sentinel;
+    *pointer = base ? base + offset : &empty_buffer_sentinel;
+    *backing = buffer;
+    return 0;
 }
 
-JSClassDef js_uv_lib_class = {
-    "UvLib",
-    .finalizer = js_uv_lib_finalizer,
-};
-static const JSCFunctionListEntry js_uv_lib_proto_funcs[] = {
-    TJS_CFUNC_DEF("symbol", 1, js_uv_lib_dlsym),
-    TJS_CFUNC_DEF("close", 0, js_uv_lib_close),
-};
-#pragma endregion "UvLib class definition"
-
-#pragma region "Libc helpers"
-
-static JSValue js_libc_errno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc != 0) {
-        JS_ThrowTypeError(ctx, "expected 0 arguments");
-        return JS_EXCEPTION;
+static void release_pins(JSContext *ctx, FfiSignature *signature, JSValue *values) {
+    for (unsigned i = signature->nargs; i-- > 0;) {
+        if (!JS_IsUndefined(values[i])) {
+            JS_UnpinArrayBuffer(values[i]);
+            JS_FreeValue(ctx, values[i]);
+            values[i] = JS_UNDEFINED;
+        }
     }
-    return JS_NEW_INT(ctx, errno);
 }
 
+static int prepare_call_values(JSContext *ctx,
+                               FfiSignature *signature,
+                               JSValueConst *argv,
+                               void **args,
+                               uint8_t *frame,
+                               FfiCallback **callbacks,
+                               uint_fast64_t *callback_counts) {
+    for (unsigned i = 0; i < signature->nargs; i++) {
+        FfiType *type = signature->types[i + 1];
+        uint8_t *slot = frame + signature->offsets[i];
+        args[i] = slot;
+        callbacks[i] = NULL;
+        callback_counts[i] = 0;
+        if (type->kind == K_BUFFER) {
+            if (validate_buffer(ctx, argv[i]) < 0) return -1;
+        } else if (type->kind == K_AGGREGATE) {
+            if (JS_GetTypedArrayType(argv[i]) != JS_TYPED_ARRAY_UINT8) {
+                JS_ThrowTypeError(ctx, "argument %u must be a Uint8Array", i + 1);
+                return -1;
+            }
+        } else if (pack_value(ctx, type, argv[i], slot) < 0) {
+            return -1;
+        }
+        if ((type->kind == K_POINTER || type->kind == K_FUNCTION) &&
+            !JS_IsNull(argv[i])) {
+            FfiPointer *pointer = get_pointer(argv[i]);
+            callbacks[i] = pointer ? pointer->callback : NULL;
+            if (callbacks[i]) {
+                callback_counts[i] = atomic_load_explicit(
+                    &callbacks[i]->foreign_calls, memory_order_acquire);
+            }
+        }
+    }
+    return 0;
+}
+
+static void cancel_bound_call(JSContext *ctx,
+                              FfiBound *bound,
+                              bool temporary,
+                              void *allocation,
+                              uint8_t *result) {
+    bound->in_call = temporary;
+    if (temporary) {
+        js_free(ctx, result);
+        js_free(ctx, allocation);
+    }
+}
+
+static JSValue call_bound(JSContext*ctx,JSValueConst func,FfiBound*b,int argc,JSValueConst*argv,bool ignore_closed){
+    FfiSignature*s=&b->sig;if(!ignore_closed&&((b->state&&b->state->closed)||(b->callback&&b->callback->closed)))return JS_ThrowTypeError(ctx,"FFI owner is closed");
+    if((unsigned)argc!=s->nargs)return JS_ThrowTypeError(ctx,"expected %u FFI arguments but received %d",s->nargs,argc);
+    bool temporary=b->in_call;void*allocation=b->call_storage;uint8_t*result=b->result_storage;
+    if(temporary){allocation=js_mallocz(ctx,b->call_storage_size?b->call_storage_size:1);if(!allocation)return JS_EXCEPTION;result=js_mallocz(ctx,b->result_storage_size?b->result_storage_size:1);if(!result){js_free(ctx,allocation);return JS_EXCEPTION;}}
+    b->in_call=true;memset(allocation,0,b->call_storage_size);memset(result,0,b->result_storage_size);
+    void**args=allocation;uint8_t*frame=(uint8_t*)allocation+s->frame_offset;
+    JSValue *pin_values=(JSValue*)((uint8_t*)allocation+b->pin_values_offset);
+    FfiCallback **callbacks=(FfiCallback**)((uint8_t*)allocation+b->callback_values_offset);uint_fast64_t *callback_counts=(uint_fast64_t*)((uint8_t*)allocation+b->callback_counts_offset);
+    for(unsigned i=0;i<s->nargs;i++)pin_values[i]=JS_UNDEFINED;
+    /* Aggregate packing can execute getters. Recheck the owner afterwards even
+     * without a capability hook; a getter can synchronously close it. */
+    if(prepare_call_values(ctx,s,argv,args,frame,callbacks,callback_counts)<0)goto fail;
+    if(!ignore_closed&&((b->state&&b->state->closed)||(b->callback&&b->callback->closed))){JS_ThrowTypeError(ctx,"FFI owner is closed");goto fail;}
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DYNLIB | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "ffi.call"), cancel_bound_call(ctx, b, temporary, allocation, result), do { if(!ignore_closed&&((b->state&&b->state->closed)||(b->callback&&b->callback->closed))){JS_ThrowTypeError(ctx,"FFI owner is closed");goto fail;} if(prepare_call_values(ctx,s,argv,args,frame,callbacks,callback_counts)<0)goto fail; } while (0));
+    /* Phase 2 acquires all raw buffer/aggregate addresses only after validation completed. */
+    for(unsigned i=0;i<s->nargs;i++){FfiType*t=s->types[i+1];if(t->kind==K_BUFFER){void*p=NULL;if(!JS_IsNull(argv[i])&&acquire_buffer(ctx,argv[i],&p,&pin_values[i])<0)goto fail;memcpy(frame+s->offsets[i],&p,sizeof(p));}
+        else if(t->kind==K_AGGREGATE){size_t bytes;uint8_t*p=JS_GetUint8Array(ctx,&bytes,argv[i]);if(!p&&JS_HasException(ctx))goto fail;if(bytes!=type_size(t)){JS_ThrowRangeError(ctx,"argument %u must contain exactly %zu bytes",i+1,type_size(t));goto fail;}memcpy(frame+s->offsets[i],p,bytes);}}
+    FfiType*rt=s->types[0];size_t n=type_size(rt);CallFrame cf={.previous=active_call,.exception=JS_UNDEFINED};active_call=&cf;if(b->state)b->state->active_calls++;
+    ffi_call(&s->cif,FFI_FN(b->addr),n?result:NULL,args);capture_errno(b->state);if(b->state){assert(b->state->active_calls>0);b->state->active_calls--;state_maybe_unload(b->state);}bool bad_thread=false;for(unsigned i=0;i<s->nargs;i++)if(callbacks[i]&&callback_counts[i]!=atomic_load_explicit(&callbacks[i]->foreign_calls,memory_order_acquire)){bad_thread=true;break;}active_call=cf.previous;b->in_call=temporary;release_pins(ctx,s,pin_values);
+    if(temporary)js_free(ctx,allocation);
+    if(!JS_IsUndefined(cf.exception)){if(temporary)js_free(ctx,result);return JS_Throw(ctx,cf.exception);}if(bad_thread){if(temporary)js_free(ctx,result);return JS_ThrowTypeError(ctx,"FFI callback invoked from an unsupported native thread");}
+    JSValue out;if(rt->kind==K_AGGREGATE)out=JS_NewUint8ArrayCopy(ctx,result,n);else if(narrow_kind(rt)){ffi_arg word=0;memcpy(&word,result,sizeof(word));uint8_t small[sizeof(ffi_arg)]={0};
+        switch(rt->kind){case K_BOOL:case K_U8:{uint8_t v=(uint8_t)word;memcpy(small,&v,1);break;}case K_I8:{int8_t v=(int8_t)word;memcpy(small,&v,1);break;}case K_U16:{uint16_t v=(uint16_t)word;memcpy(small,&v,2);break;}case K_I16:{int16_t v=(int16_t)word;memcpy(small,&v,2);break;}case K_U32:{uint32_t v=(uint32_t)word;memcpy(small,&v,4);break;}case K_I32:{int32_t v=(int32_t)word;memcpy(small,&v,4);break;}default:break;}out=read_value(ctx,rt,small,func,b->state,b->callback,false);
+    }else out=read_value(ctx,rt,result,func,b->state,b->callback,false);if(temporary)js_free(ctx,result);return out;
+fail:release_pins(ctx,s,pin_values);b->in_call=temporary;if(temporary){js_free(ctx,result);js_free(ctx,allocation);}return JS_EXCEPTION;}
+static JSValue bound_call(JSContext*ctx,JSValueConst func,JSValueConst self,int argc,JSValueConst*argv,int flags){(void)self;if(flags&JS_CALL_FLAG_CONSTRUCTOR)return JS_ThrowTypeError(ctx,"FFI functions are not constructors");FfiBound*b=JS_GetOpaque2(ctx,func,bound_class);return b?call_bound(ctx,func,b,argc,argv,false):JS_EXCEPTION;}
+static JSValue bound_pointer(JSContext*ctx,JSValueConst self){FfiBound*b=JS_GetOpaque2(ctx,self,bound_class);if(!b)return JS_EXCEPTION;if((b->state&&b->state->closed)||(b->callback&&b->callback->closed))return JS_ThrowTypeError(ctx,"FFI owner is closed");return new_pointer(ctx,b->addr,self,b->state,b->callback);}
+static void bound_mark(JSRuntime*rt,JSValueConst value,JS_MarkFunc*mark){FfiBound*b=JS_GetOpaque(value,bound_class);if(b){signature_mark(rt,&b->sig,mark);JS_MarkValue(rt,b->owner,mark);}}
+static void bound_finalizer(JSRuntime*rt,JSValueConst value){FfiBound*b=JS_GetOpaque(value,bound_class);if(!b)return;state_defer_unref(rt,b->state,false);signature_clear(rt,&b->sig);JS_FreeValueRT(rt,b->owner);js_free_rt(rt,b->call_storage);js_free_rt(rt,b->result_storage);js_free_rt(rt,b);}
+static JSClassDef bound_def={"BoundFfiFunction",.finalizer=bound_finalizer,.gc_mark=bound_mark,.call=bound_call};
+static JSValue new_bound(JSContext*ctx,void*addr,JSValueConst owner,FfiLibraryState*state,FfiCallback*cb,JSValueConst sig,unsigned skip,JSValueConst options){JSValue obj=JS_NewObjectClass(ctx,bound_class);if(JS_IsException(obj))return obj;FfiBound*b=js_mallocz(ctx,sizeof(*b));if(!b){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}b->owner=JS_DupValue(ctx,owner);b->addr=addr;b->state=state;b->callback=cb;if(signature_prepare(ctx,sig,skip,options,&b->sig)<0)goto fail;size_t total=b->sig.frame_offset;if(!size_add(&total,b->sig.frame_size)||!size_align(&total,_Alignof(JSValue)))goto too_large;b->pin_values_offset=total;if(b->sig.nargs>SIZE_MAX/sizeof(JSValue)||!size_add(&total,sizeof(JSValue)*b->sig.nargs)||!size_align(&total,_Alignof(FfiCallback*)))goto too_large;b->callback_values_offset=total;if(b->sig.nargs>SIZE_MAX/sizeof(FfiCallback*)||!size_add(&total,sizeof(FfiCallback*)*b->sig.nargs)||!size_align(&total,_Alignof(uint_fast64_t)))goto too_large;b->callback_counts_offset=total;if(b->sig.nargs>SIZE_MAX/sizeof(uint_fast64_t)||!size_add(&total,sizeof(uint_fast64_t)*b->sig.nargs))goto too_large;b->call_storage_size=total;b->result_storage_size=narrow_kind(b->sig.types[0])?sizeof(ffi_arg):type_size(b->sig.types[0]);b->call_storage=js_mallocz(ctx,total?total:1);b->result_storage=js_mallocz(ctx,b->result_storage_size?b->result_storage_size:1);if(!b->call_storage||!b->result_storage)goto fail;state_ref(state);JS_SetOpaque(obj,b);return obj;
+too_large:JS_ThrowRangeError(ctx,"call frame too large");
+fail:signature_clear(JS_GetRuntime(ctx),&b->sig);JS_FreeValue(ctx,b->owner);js_free(ctx,b->call_storage);js_free(ctx,b->result_storage);js_free(ctx,b);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}
+
+/* Libraries */
+static FfiLibrary*require_library(JSContext*ctx,JSValueConst value,bool closed_ok){FfiLibrary*l=JS_GetOpaque2(ctx,value,library_class);if(!l)return NULL;if(!closed_ok&&l->closed){JS_ThrowTypeError(ctx,"FFI library is closed");return NULL;}return l;}
+static int resolve(JSContext*ctx,FfiLibrary*l,JSValueConst value,void**addr){if(!JS_IsString(value))return JS_ThrowTypeError(ctx,"symbol name must be a string"),-1;const char*name=JS_ToCString(ctx,value);if(!name)return -1;int r=uv_dlsym(&l->state->handle,name,addr);if(r)JS_ThrowReferenceError(ctx,"cannot resolve FFI symbol '%s': %s",name,uv_dlerror(&l->state->handle));JS_FreeCString(ctx,name);return r?-1:0;}
+static JSValue ffi_open_js(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){
+    (void)self;
+    if(argc!=1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"ffi.open expects a path string");
+    const char*path=JS_ToCString(ctx,argv[0]);
+    if(!path)return JS_EXCEPTION;
+    TJS_CAPABILITY(tjs__capability_resource(ctx, TJS_CAP_DYNLIB | TJS_CAP_IO_ACCESS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "ffi.open", path), JS_FreeCString(ctx, path));
+    JSValue obj=JS_NewObjectClass(ctx,library_class);
+    if(JS_IsException(obj)){JS_FreeCString(ctx,path);return obj;}
+    FfiLibrary*l=js_mallocz(ctx,sizeof(*l));
+    FfiLibraryState*state=tjs__mallocz(sizeof(*state));
+    if(!l||!state){JS_FreeCString(ctx,path);js_free(ctx,l);tjs__free(state);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}
+    const char*error=NULL;
+    int r=ffi_dlopen(path,&state->handle,&error);
+    if(r){JSValue e=JS_ThrowReferenceError(ctx,"cannot open FFI library '%s': %s",path,error?error:"loader error");JS_FreeCString(ctx,path);if(state->handle.handle)uv_dlclose(&state->handle);tjs__free(state);js_free(ctx,l);JS_FreeValue(ctx,obj);return e;}
+    JS_FreeCString(ctx,path);
+    state->handle_open=true;state->refs=1;l->state=state;
+#if defined(_WIN32)
+    void *errno_symbol = NULL;
+    if (uv_dlsym(&state->handle, "_errno", &errno_symbol) == 0) state->errno_location = (int *(*)(void)) errno_symbol;
+#elif defined(__APPLE__)
+    void *errno_symbol = NULL;
+    if (uv_dlsym(&state->handle, "__error", &errno_symbol) == 0) state->errno_location = (int *(*)(void)) errno_symbol;
+#else
+    void *errno_symbol = NULL;
+    if (uv_dlsym(&state->handle, "__errno_location", &errno_symbol) == 0) state->errno_location = (int *(*)(void)) errno_symbol;
+#endif
+    JS_SetOpaque(obj,l);return obj;}
+static JSValue library_symbol(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){FfiLibrary*l=require_library(ctx,self,false);if(!l)return JS_EXCEPTION;if(argc!=1)return JS_ThrowTypeError(ctx,"symbol expects one name");void*addr;if(resolve(ctx,l,argv[0],&addr)<0)return JS_EXCEPTION;return new_pointer(ctx,addr,self,l->state,NULL);}
+static JSValue library_bind(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){
+    FfiLibrary*l=require_library(ctx,self,false);if(!l)return JS_EXCEPTION;if(argc<1||argc>2||!JS_IsArray(argv[0]))return JS_ThrowTypeError(ctx,"bind expects a signature");
+    JSValue length_value=JS_GetPropertyStr(ctx,argv[0],"length");uint64_t length;if(JS_IsException(length_value))return JS_EXCEPTION;int converted=JS_ToIndex(ctx,&length,length_value);JS_FreeValue(ctx,length_value);if(converted<0)return JS_EXCEPTION;if(length<2||length-2>UINT_MAX)return JS_ThrowTypeError(ctx,"library signature requires result type and symbol");
+    int fixed;if(parse_fixed(ctx,argc==2?argv[1]:JS_UNDEFINED,(unsigned)(length-2),&fixed)<0)return JS_EXCEPTION;
+    JSValue name=JS_GetPropertyUint32(ctx,argv[0],1);if(JS_IsException(name))return JS_EXCEPTION;if(!JS_IsString(name)){JS_FreeValue(ctx,name);return JS_ThrowTypeError(ctx,"symbol name must be a string");}const char*symbol=JS_ToCString(ctx,name);if(!symbol){JS_FreeValue(ctx,name);return JS_EXCEPTION;}
+    for(FfiBindCache*entry=l->cache;entry;entry=entry->next){if(strcmp(entry->symbol,symbol)!=0)continue;FfiBound*cached=JS_GetOpaque(entry->bound,bound_class);if(!cached||cached->sig.nargs!=(unsigned)(length-2)||cached->sig.fixed!=fixed)continue;bool match=true;for(unsigned i=0;i<=cached->sig.nargs;i++){uint32_t at=i?i+1:0;JSValue token=JS_GetPropertyUint32(ctx,argv[0],at);if(JS_IsException(token)){JS_FreeCString(ctx,symbol);JS_FreeValue(ctx,name);return JS_EXCEPTION;}int equal=JS_IsStrictEqual(ctx,token,cached->sig.type_values[i]);JS_FreeValue(ctx,token);if(equal<0){JS_FreeCString(ctx,symbol);JS_FreeValue(ctx,name);return JS_EXCEPTION;}match=equal!=0;if(!match)break;}if(match){JSValue result=JS_DupValue(ctx,entry->bound);JS_FreeCString(ctx,symbol);JS_FreeValue(ctx,name);return result;}}
+    void*addr;int r=resolve(ctx,l,name,&addr);JS_FreeValue(ctx,name);if(r<0){JS_FreeCString(ctx,symbol);return JS_EXCEPTION;}JSValue result=new_bound(ctx,addr,JS_UNDEFINED,l->state,NULL,argv[0],1,argc==2?argv[1]:JS_UNDEFINED);if(JS_IsException(result)){JS_FreeCString(ctx,symbol);return result;}
+    FfiBindCache*entry=js_mallocz(ctx,sizeof(*entry));char*symbol_copy=entry?js_strdup(ctx,symbol):NULL;JS_FreeCString(ctx,symbol);if(!entry||!symbol_copy){js_free(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;}entry->symbol=symbol_copy;entry->bound=JS_DupValue(ctx,result);entry->next=l->cache;l->cache=entry;return result;
+}
+static JSValue library_read(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){FfiLibrary*l=require_library(ctx,self,false);if(!l)return JS_EXCEPTION;if(argc!=1||!JS_IsArray(argv[0]))return JS_ThrowTypeError(ctx,"read expects [type, symbol]");JSValue tv=JS_GetPropertyUint32(ctx,argv[0],0);if(JS_IsException(tv))return JS_EXCEPTION;FfiType*t=JS_GetOpaque(tv,type_class);if(!t||t->kind==K_VOID||t->kind==K_BUFFER){JS_FreeValue(ctx,tv);return JS_ThrowTypeError(ctx,"read requires a readable type");}JSValue name=JS_GetPropertyUint32(ctx,argv[0],1);void*addr;if(JS_IsException(name)){JS_FreeValue(ctx,tv);return JS_EXCEPTION;}int r=resolve(ctx,l,name,&addr);JS_FreeValue(ctx,name);if(r<0){JS_FreeValue(ctx,tv);return JS_EXCEPTION;}JSValue out=read_value(ctx,t,addr,self,l->state,NULL,false);JS_FreeValue(ctx,tv);return out;}
+static JSValue library_close(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)argc;(void)argv;FfiLibrary*l=require_library(ctx,self,true);if(!l)return JS_EXCEPTION;if(!l->closed){l->closed=true;l->state->closed=true;state_maybe_unload(l->state);}return JS_UNDEFINED;}
+static void library_mark(JSRuntime*rt,JSValueConst value,JS_MarkFunc*mark){FfiLibrary*l=JS_GetOpaque(value,library_class);if(l)for(FfiBindCache*entry=l->cache;entry;entry=entry->next)JS_MarkValue(rt,entry->bound,mark);}
+static void library_finalizer(JSRuntime*rt,JSValueConst value){FfiLibrary*l=JS_GetOpaque(value,library_class);if(l){FfiBindCache*entry=l->cache;while(entry){FfiBindCache*next=entry->next;JS_FreeValueRT(rt,entry->bound);js_free_rt(rt,entry->symbol);js_free_rt(rt,entry);entry=next;}state_defer_unref(rt,l->state,false);js_free_rt(rt,l);}}
+static JSClassDef library_def={"FfiLibrary",.finalizer=library_finalizer,.gc_mark=library_mark};
+
+/* Callbacks */
+static void callback_zero(FfiCallback*cb,void*result){size_t n=type_size(cb->sig.types[0]);if(result&&n)memset(result,0,n);}
+static int callback_result(JSContext*ctx,FfiType*t,JSValueConst value,void*out){if(t->kind==K_VOID)return 0;if(t->kind==K_AGGREGATE){size_t n;uint8_t*p=JS_GetUint8Array(ctx,&n,value);if(!p)return JS_ThrowTypeError(ctx,"callback must return Uint8Array"),-1;if(n!=type_size(t))return JS_ThrowRangeError(ctx,"callback result size must be %zu",type_size(t)),-1;memcpy(out,p,n);return 0;}return pack_value(ctx,t,value,out);}
+static void latch_exception(FfiCallback*cb){JSContext*ctx=cb->ctx;JSValue e=JS_GetException(ctx);if(active_call){if(JS_IsUndefined(active_call->exception))active_call->exception=e;else JS_FreeValue(ctx,e);return;}if(JS_IsUncatchableError(e)){tjs__stop_uncatchable_error(ctx,e);JS_FreeValue(ctx,e);return;}JSValue handled=tjs__dispatch_event(ctx,EV_JOB_EXCEPTION,e);if(JS_IsException(handled))TJS_DumpException(ctx);if(JS_IsException(handled)||(JS_IsBool(handled)&&!JS_VALUE_GET_BOOL(handled)))TJS_Stop(TJS_GetRuntime(ctx));JS_FreeValue(ctx,e);JS_FreeValue(ctx,handled);}
+static void callback_invoke(ffi_cif*cif,void*result,void**args,void*opaque){(void)cif;FfiCallback*cb=opaque;uv_thread_t current=uv_thread_self();if(!uv_thread_equal(&current,&cb->thread)){callback_zero(cb,result);atomic_fetch_add_explicit(&cb->foreign_calls,1,memory_order_release);if(!atomic_exchange_explicit(&cb->foreign_reported,true,memory_order_relaxed)){fputs("circu.js FFI: callback invoked from an unsupported native thread; returned ABI zero without entering JavaScript\n",stderr);fflush(stderr);}return;}if(cb->closed){callback_zero(cb,result);return;}JSContext*ctx=cb->ctx;unsigned n=cb->sig.nargs;JSValue*values=n?js_malloc(ctx,sizeof(JSValue)*n):NULL;if(n&&!values){callback_zero(cb,result);latch_exception(cb);return;}unsigned made=0;for(;made<n;made++){FfiType*t=cb->sig.types[made+1];values[made]=read_value(ctx,t,args[made],JS_UNDEFINED,NULL,NULL,false);if(JS_IsException(values[made]))break;}JSValue ret=JS_EXCEPTION;if(made==n)ret=JS_Call(ctx,cb->function,JS_UNDEFINED,n,values);for(unsigned i=0;i<made;i++)JS_FreeValue(ctx,values[i]);js_free(ctx,values);if(JS_IsException(ret)){callback_zero(cb,result);latch_exception(cb);}else{if(callback_result(ctx,cb->sig.types[0],ret,result)<0){callback_zero(cb,result);latch_exception(cb);}JS_FreeValue(ctx,ret);}}
+static JSValue callback_create(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2||!JS_IsArray(argv[0])||!JS_IsFunction(ctx,argv[1]))return JS_ThrowTypeError(ctx,"callback expects signature and function");JSValue obj=JS_NewObjectClass(ctx,callback_class);if(JS_IsException(obj))return obj;FfiCallback*cb=js_mallocz(ctx,sizeof(*cb));if(!cb){JS_FreeValue(ctx,obj);return JS_EXCEPTION;}atomic_init(&cb->foreign_calls,0);atomic_init(&cb->foreign_reported,false);if(signature_prepare(ctx,argv[0],0,JS_UNDEFINED,&cb->sig)<0){js_free(ctx,cb);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}cb->closure=ffi_closure_alloc(sizeof(ffi_closure),&cb->code);if(!cb->closure){signature_clear(JS_GetRuntime(ctx),&cb->sig);js_free(ctx,cb);JS_FreeValue(ctx,obj);return JS_ThrowOutOfMemory(ctx);}ffi_status st=ffi_prep_closure_loc(cb->closure,&cb->sig.cif,callback_invoke,cb,cb->code);if(st!=FFI_OK){ffi_closure_free(cb->closure);signature_clear(JS_GetRuntime(ctx),&cb->sig);js_free(ctx,cb);JS_FreeValue(ctx,obj);return JS_ThrowTypeError(ctx,"cannot prepare callback: %s",status_name(st));}cb->function=JS_DupValue(ctx,argv[1]);cb->ctx=ctx;cb->thread=uv_thread_self();JS_SetOpaque(obj,cb);return obj;}
+static JSValue callback_pointer(JSContext*ctx,JSValueConst self){FfiCallback*cb=JS_GetOpaque2(ctx,self,callback_class);if(!cb)return JS_EXCEPTION;if(cb->closed)return JS_ThrowTypeError(ctx,"FFI callback is closed");return new_pointer(ctx,cb->code,self,NULL,cb);}
+static JSValue callback_close(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)argc;(void)argv;FfiCallback*cb=JS_GetOpaque2(ctx,self,callback_class);if(!cb)return JS_EXCEPTION;cb->closed=true;return JS_UNDEFINED;}
+static void callback_mark(JSRuntime*rt,JSValueConst value,JS_MarkFunc*mark){FfiCallback*cb=JS_GetOpaque(value,callback_class);if(cb){signature_mark(rt,&cb->sig,mark);JS_MarkValue(rt,cb->function,mark);}}
+static void callback_finalizer(JSRuntime*rt,JSValueConst value){FfiCallback*cb=JS_GetOpaque(value,callback_class);if(!cb)return;if(cb->closure)ffi_closure_free(cb->closure);signature_clear(rt,&cb->sig);JS_FreeValueRT(rt,cb->function);js_free_rt(rt,cb);}
+static JSClassDef callback_def={"FfiCallback",.finalizer=callback_finalizer,.gc_mark=callback_mark};
+
+/* Owned pointers copy the disposer address/CIF and pin the relevant library
+ * states until disposal completes outside the GC finalizer. */
+static void owned_dispose(OwnedPointer*o){if(!o->armed||!o->pointer.valid)return;o->armed=false;o->pointer.addr=NULL;o->pointer.valid=false;FfiDisposeJob*job=o->job;o->job=NULL;dispose_job_run(job,true);}
+static JSValue owned_close(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)argc;(void)argv;OwnedPointer*o=JS_GetOpaque2(ctx,self,owned_class);if(!o)return JS_EXCEPTION;owned_dispose(o);return JS_UNDEFINED;}
+static JSValue owned_release(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)argc;(void)argv;OwnedPointer*o=JS_GetOpaque2(ctx,self,owned_class);if(!o)return JS_EXCEPTION;if(!o->armed||!o->pointer.valid)return JS_ThrowTypeError(ctx,"owned pointer is closed or released");JSValue p=new_pointer(ctx,o->pointer.addr,o->pointer.owner,o->pointer.state,o->pointer.callback);if(JS_IsException(p))return p;o->armed=false;o->pointer.valid=false;o->pointer.addr=NULL;FfiDisposeJob*job=o->job;o->job=NULL;state_owned_unref(job->resource_state);state_owned_unref(job->state);tjs__free(job);return p;}
+static void owned_mark(JSRuntime*rt,JSValueConst value,JS_MarkFunc*mark){OwnedPointer*o=JS_GetOpaque(value,owned_class);if(o&&!JS_IsUndefined(o->pointer.owner))JS_MarkValue(rt,o->pointer.owner,mark);}
+static void owned_finalizer(JSRuntime*rt,JSValueConst value){OwnedPointer*o=JS_GetOpaque(value,owned_class);if(!o)return;if(o->job){FfiDisposeJob*job=o->job;o->job=NULL;if(o->armed&&o->pointer.valid){job->cleanup.kind=CLEANUP_DISPOSE;cleanup_enqueue(JS_GetRuntimeOpaque(rt),&job->cleanup);}else{state_owned_unref(job->resource_state);state_owned_unref(job->state);tjs__free(job);}}JS_FreeValueRT(rt,o->pointer.owner);js_free_rt(rt,o);}
+static JSClassDef owned_def={"OwnedPointer",.finalizer=owned_finalizer,.gc_mark=owned_mark};
+
+/* Public function() and unsafe namespace */
+static JSValue ffi_function_js(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc<2||argc>3)return JS_ThrowTypeError(ctx,"function expects pointer and signature");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;return new_bound(ctx,p->addr,argv[0],p->state,p->callback,argv[1],0,argc==3?argv[2]:JS_UNDEFINED);}
+static JSValue unsafe_address(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=1)return JS_ThrowTypeError(ctx,"address expects Pointer");FfiPointer*p=require_pointer(ctx,argv[0]);return p?JS_NewBigUint64(ctx,(uint64_t)(uintptr_t)p->addr):JS_EXCEPTION;}
+static JSValue unsafe_from_address(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=1||!JS_IsBigInt(argv[0]))return JS_ThrowTypeError(ctx,"fromAddress expects bigint");uint64_t a;if(exact_bigint(ctx,argv[0],false,(unsigned)(sizeof(uintptr_t)*CHAR_BIT),&a)<0)return JS_EXCEPTION;
+    return new_pointer(ctx,(void*)(uintptr_t)a,JS_UNDEFINED,NULL,NULL);}
+static JSValue unsafe_pointer_of(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=1)return JS_ThrowTypeError(ctx,"pointerOf expects BufferSource");if(validate_buffer(ctx,argv[0])<0)return JS_EXCEPTION;if(JS_IsNull(argv[0]))return JS_NULL;void*p=NULL;JSValue backing=JS_UNDEFINED;if(acquire_buffer(ctx,argv[0],&p,&backing)<0)return JS_EXCEPTION;JSValue result=new_pointer(ctx,p,argv[0],NULL,NULL);if(JS_IsException(result)){JS_UnpinArrayBuffer(backing);JS_FreeValue(ctx,backing);return result;}FfiPointer*pointer=JS_GetOpaque(result,pointer_class);assert(pointer);pointer->pinned_backing=backing;JS_FreeValue(ctx,backing);return result;}
+static JSValue unsafe_offset(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2)return JS_ThrowTypeError(ctx,"offset expects Pointer and number");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;int64_t off;if(strict_integer(ctx,argv[1],&off,"offset")<0)return JS_EXCEPTION;uintptr_t a=(uintptr_t)p->addr;if((off>0&&a>UINTPTR_MAX-(uintptr_t)off)||(off<0&&a<(uintptr_t)(-(off+1))+1))return JS_ThrowRangeError(ctx,"pointer offset overflow");a=off>=0?a+(uintptr_t)off:a-((uintptr_t)(-(off+1))+1);return new_pointer(ctx,(void*)a,argv[0],p->state,p->callback);}
+static JSValue unsafe_deref(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc<1||argc>2)return JS_ThrowTypeError(ctx,"deref expects Pointer");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;int64_t count=1;if(argc==2&&strict_integer(ctx,argv[1],&count,"count")<0)return JS_EXCEPTION;if(count<0)return JS_ThrowRangeError(ctx,"count must be non-negative");void*a=p->addr;for(int64_t i=0;i<count&&a;i++)memcpy(&a,a,sizeof(a));return new_pointer(ctx,a,argv[0],p->state,p->callback);}
+static JSValue unsafe_view(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2)return JS_ThrowTypeError(ctx,"view expects Pointer and length");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;int64_t n;if(strict_integer(ctx,argv[1],&n,"length")<0)return JS_EXCEPTION;if(n<0||(uint64_t)n>SIZE_MAX)return JS_ThrowRangeError(ctx,"invalid view length");JSValue view=JS_NewUint8Array(ctx,p->addr,(size_t)n,NULL,NULL,false);if(JS_IsException(view))return view;if(JS_DefinePropertyValueStr(ctx,view,"_ffiOwner",JS_DupValue(ctx,argv[0]),0)<0){JS_FreeValue(ctx,view);return JS_EXCEPTION;}return view;}
+static JSValue unsafe_cstring(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc<1||argc>2)return JS_ThrowTypeError(ctx,"readCString expects Pointer");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;if(argc==1)return JS_NewString(ctx,p->addr);int64_t n;if(strict_integer(ctx,argv[1],&n,"maximum length")<0)return JS_EXCEPTION;if(n<0||(uint64_t)n>SIZE_MAX)return JS_ThrowRangeError(ctx,"invalid maximum length");return JS_NewStringLen(ctx,p->addr,strnlen(p->addr,(size_t)n));}
+static JSValue unsafe_loop(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;(void)argc;(void)argv;return new_pointer(ctx,tjs_get_loop(ctx),JS_UNDEFINED,NULL,NULL);}
+static JSValue unsafe_adopt(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2)return JS_ThrowTypeError(ctx,"adopt expects pointer and disposer");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;
+    /* GC fallback runs from a native cleanup queue after the JS owner may have
+     * been finalized. Borrowed buffer and callback addresses therefore cannot
+     * safely become owned resources; adopt is for independent native storage. */
+    if(p->callback||(!p->state&&!JS_IsUndefined(p->owner)))return JS_ThrowTypeError(ctx,"cannot adopt a borrowed buffer or callback pointer");
+    FfiBound*b=JS_GetOpaque(argv[1],bound_class);if(!b||b->sig.fixed>=0||b->sig.nargs!=1||b->sig.types[0]->kind!=K_VOID||b->sig.types[1]->kind!=K_POINTER||b->callback)return JS_ThrowTypeError(ctx,"disposer must be a native bound void(pointer) function");if(b->state&&b->state->closed)return JS_ThrowTypeError(ctx,"disposer belongs to a closed FFI owner");JSValue obj=JS_NewObjectClass(ctx,owned_class);if(JS_IsException(obj))return obj;OwnedPointer*o=js_mallocz(ctx,sizeof(*o));FfiDisposeJob*job=tjs__mallocz(sizeof(*job));if(!o||!job){js_free(ctx,o);tjs__free(job);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}job->resource_addr=p->addr;job->disposer_addr=b->addr;job->arg_types[0]=&ffi_type_pointer;job->state=b->state;job->resource_state=p->state!=b->state?p->state:NULL;ffi_status st=ffi_prep_cif(&job->cif,b->sig.cif.abi,1,&ffi_type_void,job->arg_types);if(st!=FFI_OK){js_free(ctx,o);tjs__free(job);JS_FreeValue(ctx,obj);return JS_ThrowTypeError(ctx,"cannot prepare disposer: %s",status_name(st));}state_owned_ref(job->state);state_owned_ref(job->resource_state);o->pointer.addr=p->addr;o->pointer.owner=JS_DupValue(ctx,argv[0]);o->pointer.state=p->state;o->pointer.callback=p->callback;o->pointer.valid=true;o->job=job;o->armed=true;JS_SetOpaque(obj,o);return obj;}
+
+static JSValue ffi_errno_js(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;(void)argv;if(argc)return JS_ThrowTypeError(ctx,"errno expects no arguments");return JS_NewInt32(ctx,last_errno);}
 #ifndef _WIN32
-/* GNU strerror_r: returns the message, which may not use buf. */
-static const char *js_ffi_strerror_gnu(char *rv, char *buf, size_t n, int err) {
-    (void) buf;
-    (void) n;
-    (void) err;
-    return rv ? rv : "Unknown error";
-}
-
-/* XSI strerror_r: returns 0 on success and fills buf. */
-static const char *js_ffi_strerror_xsi(int rv, char *buf, size_t n, int err) {
-    if (rv != 0) snprintf(buf, n, "Unknown error %d", err);
-    return buf;
-}
-
-#define JS_FFI_STRERROR_RESULT(call, buf, n, err)                                                                      \
-    _Generic((call), char *: js_ffi_strerror_gnu, default: js_ffi_strerror_xsi)((call), (buf), (n), (err))
+static const char*strerror_gnu(char*r,char*b,size_t n,int e){(void)b;(void)n;(void)e;return r?r:"Unknown error";}static const char*strerror_xsi(int r,char*b,size_t n,int e){if(r)snprintf(b,n,"Unknown error %d",e);return b;}
+#define STRERROR_RESULT(call,b,n,e) _Generic((call),char*:strerror_gnu,default:strerror_xsi)((call),(b),(n),(e))
 #endif
-
-static JSValue js_libc_strerror(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "error number is required");
-    }
-    TJS_CHECK_ARG_RET(ctx, JS_IsNumber(argv[0]), 0, "number");
-    int err;
-    JS_TO_INT(ctx, &err, argv[0]);
-    // Use thread-safe strerror_r instead of strerror (worker threads safety)
-    char buf[256];
-    buf[0] = '\0';
+static JSValue ffi_strerror_js(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=1||!JS_IsNumber(argv[0]))return JS_ThrowTypeError(ctx,"strerror expects number");int32_t e;if(JS_ToInt32(ctx,&e,argv[0])<0)return JS_EXCEPTION;char b[256]={0};
 #ifdef _WIN32
-    if (strerror_s(buf, sizeof(buf), err) != 0) {
-        snprintf(buf, sizeof(buf), "Unknown error %d", err);
-    }
-    return JS_NewString(ctx, buf);
+    if(strerror_s(b,sizeof(b),e))snprintf(b,sizeof(b),"Unknown error %d",e);return JS_NewString(ctx,b);
 #else
-    /* strerror_r is GNU (returns char *) or XSI (returns int) depending on
-     * the libc. It must not be called inside assert(): NDEBUG drops the call. */
-    const char *msg = JS_FFI_STRERROR_RESULT(strerror_r(err, buf, sizeof(buf)), buf, sizeof(buf), err);
-    return JS_NewString(ctx, msg);
+    return JS_NewString(ctx,STRERROR_RESULT(strerror_r(e,b,sizeof(b)),b,sizeof(b),e));
 #endif
-}
-#pragma endregion "Libc helpers"
-
-#pragma region "other helpers"
-
-static JSValue js_array_buffer_get_ptr(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc <= 0) {
-        JS_ThrowTypeError(ctx, "expected argument 1 to be ArrayBuffer");
-        return JS_EXCEPTION;
-    }
-    size_t size;
-    uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
-    return JS_NEW_UINTPTR_T(ctx, buf);
-}
-
-static JSValue js_get_cstring(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc == 0 || argc > 2) {
-        JS_ThrowTypeError(ctx, "expected pointer and optional maximum length");
-        return JS_EXCEPTION;
-    }
-    if (argc >= 1) {
-        TJS_CHECK_ARG_RET(ctx, JS_IS_PTR(ctx, argv[0]), 0, "pointer");
-    }
-    if (argc >= 2) {
-        TJS_CHECK_ARG_RET(ctx, JS_IsNumber(argv[1]), 1, "number");
-    }
-    size_t max = 0;
-    if (argc == 2 && JS_IsNumber(argv[1])) {
-        int64_t max_value;
-        if (JS_ToInt64(ctx, &max_value, argv[1]) || max_value < 0 ||
-            (uint64_t)max_value > SIZE_MAX) {
-            JS_ThrowRangeError(ctx, "expected argument 2 to be a non-negative integer");
-            return JS_EXCEPTION;
-        }
-        max = (size_t)max_value;
-    }
-    char *ptr;
-    if (js_to_uintptr(ctx, &ptr, argv[0]) < 0) return JS_EXCEPTION;
-    if (max == 0) {
-        return JS_NewString(ctx, ptr);
-    }
-    size_t len = strnlen(ptr, max);
-    return JS_NewStringLen(ctx, ptr, len);
-}
-
-
-static JSValue TJS_NewUint8ArrayExternal(JSContext *ctx, uint8_t *data, size_t size) {
-    return JS_NewUint8Array(ctx, data, size, NULL, NULL, false);
-}
-
-static JSValue js_ptr_to_buffer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "expected pointer and size");
-    }
-    TJS_CHECK_ARG_RET(ctx, JS_IS_PTR(ctx, argv[0]), 0, "pointer");
-    TJS_CHECK_ARG_RET(ctx, JS_IsNumber(argv[1]), 1, "number");
-    uint8_t *ptr;
-    if (js_to_uintptr(ctx, &ptr, argv[0]) < 0) return JS_EXCEPTION;
-    size_t sz;
-    int64_t size_value;
-    if (JS_ToInt64(ctx, &size_value, argv[1]) || size_value < 0 ||
-        (uint64_t)size_value > SIZE_MAX) {
-        return JS_ThrowRangeError(ctx, "expected size to be a non-negative integer");
-    }
-    sz = (size_t)size_value;
-    if (ptr == NULL && sz > 0) {
-        return JS_ThrowRangeError(ctx, "null pointer requires a zero size");
-    }
-    return TJS_NewUint8ArrayExternal(ctx, ptr, sz);
-}
-
-static JSValue js_deref_ptr(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    unsigned times = 1;
-    if (argc <= 0 || !JS_IS_PTR(ctx, argv[0])) {
-        JS_ThrowTypeError(ctx, "expected argument 1 to be pointer");
-        return JS_EXCEPTION;
-    }
-    if (argc == 2) {
-        if (JS_ToUint32(ctx, &times, argv[1])) {
-            JS_ThrowTypeError(ctx, "expected argument 2 to be integer");
-            return JS_EXCEPTION;
-        }
-    }
-    void *ptr;
-    if (js_to_uintptr(ctx, &ptr, argv[0]) < 0) return JS_EXCEPTION;
-    for (unsigned i = 0; i < times; i++) {
-        ptr = *(void **) ptr;
-    }
-    return JS_NEW_UINTPTR_T(ctx, ptr);
-}
-
-static JSValue js_get_current_event_loop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    (void)this_val;
-    (void)argc;
-    (void)argv;
-    return JS_NEW_UINTPTR_T(ctx, tjs_get_loop(ctx));
 }
 
 #if defined(_WIN32)
-#define LIBC_NAME "msvcrt.dll"
-#define LIBM_NAME "msvcrt.dll"
+#define FFI_C_LIBRARY_NAME "msvcrt.dll"
+#define FFI_M_LIBRARY_NAME "msvcrt.dll"
 #elif defined(__APPLE__)
-#define LIBC_NAME "libSystem.dylib"
-#define LIBM_NAME "libSystem.dylib"
+#define FFI_C_LIBRARY_NAME "libSystem.dylib"
+#define FFI_M_LIBRARY_NAME "libSystem.dylib"
 #elif defined(__GLIBC__)
 #include <gnu/lib-names.h>
-#define LIBC_NAME LIBC_SO
-#define LIBM_NAME LIBM_SO
+#define FFI_C_LIBRARY_NAME LIBC_SO
+#define FFI_M_LIBRARY_NAME LIBM_SO
 #elif defined(__linux__)
-#define LIBC_NAME "libc.so"
-#define LIBM_NAME "libm.so"
+#define FFI_C_LIBRARY_NAME "libc.so"
+#define FFI_M_LIBRARY_NAME "libm.so"
 #else
-#error('unknown os')
+#error unsupported platform
 #endif
 
-#pragma endregion "other helpers"
+static const JSCFunctionListEntry library_proto[]={JS_CFUNC_DEF("bind",1,library_bind),JS_CFUNC_DEF("symbol",1,library_symbol),JS_CFUNC_DEF("read",1,library_read),JS_CFUNC_DEF("close",0,library_close)};
+static const JSCFunctionListEntry bound_proto[]={JS_CGETSET_DEF("pointer",bound_pointer,NULL)};
+static const JSCFunctionListEntry callback_proto[]={JS_CGETSET_DEF("pointer",callback_pointer,NULL),JS_CFUNC_DEF("close",0,callback_close)};
+static const JSCFunctionListEntry owned_proto[]={JS_CFUNC_DEF("close",0,owned_close),JS_CFUNC_DEF("release",0,owned_release)};
+static int register_class(JSContext*ctx,JSClassID*id,JSClassDef*def,const JSCFunctionListEntry*props,size_t count,JSCFunction*dispose){JSRuntime*rt=JS_GetRuntime(ctx);JS_NewClassID(rt,id);if(JS_NewClass(rt,*id,def)<0)return -1;JSValue proto=JS_NewObject(ctx);if(JS_IsException(proto))return -1;if(props&&JS_SetPropertyFunctionList(ctx,proto,props,(int)count)<0){JS_FreeValue(ctx,proto);return -1;}if(dispose){JSValue f=JS_NewCFunction(ctx,dispose,"[Symbol.dispose]",0);if(JS_IsException(f)||JS_DefinePropertyValue(ctx,proto,JS_ATOM_Symbol_dispose,f,JS_PROP_CONFIGURABLE|JS_PROP_WRITABLE)<0){JS_FreeValue(ctx,proto);return -1;}}JS_SetClassProto(ctx,*id,proto);return 0;}
+static int add_type(JSContext*ctx,JSValueConst types,const char*name,ffi_type*ffi,TypeKind kind){JSValue token=new_type(ctx,ffi,kind,name);return JS_IsException(token)?-1:JS_SetPropertyStr(ctx,types,name,token);}
 
-#pragma region "FfiClosure class definition"
-
-static thread_local JSClassID js_ffi_closure_classid;
-typedef struct {
-    ffi_closure closure;
-    void *code;
-    JSValue cif;
-    JSValue func;
-    JSContext *ctx;
-} js_ffi_closure;
-
-void js_ffi_closure_invoke(ffi_cif *cif, void *ret, void **args, void *userptr) {
-    js_ffi_closure *jscl = (js_ffi_closure *)userptr;
-    JSContext *ctx = jscl->ctx;
-    size_t return_sz = ffi_type_get_sz(cif->rtype);
-    JSValue *jsargs = NULL;
-    if (cif->nargs > 0) jsargs = js_malloc(ctx, sizeof(JSValue) * cif->nargs);
-    if (cif->nargs > 0 && !jsargs) {
-        fprintf(stderr, "js_ffi_closure_invoke: out of memory\n");
-        if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-        return;
-    }
-    for (unsigned i = 0; i < cif->nargs; i++) {
-        // Copy libffi stack memory into a real buffer to prevent UAF
-        // if JS code stores the array beyond this callback
-        size_t arg_sz = ffi_type_get_sz(cif->arg_types[i]);
-        void *arg_copy = js_malloc(ctx, arg_sz);
-        if (!arg_copy) {
-            // Cleanup on OOM
-            for (unsigned j = 0; j < i; j++) {
-                JS_FreeValue(ctx, jsargs[j]);
-            }
-            js_free(ctx, jsargs);
-            if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-            return;
-        }
-        memcpy(arg_copy, args[i], arg_sz);
-        jsargs[i] = JS_NewArrayBuffer(ctx, arg_copy, arg_sz, 0, js__free_rt, NULL, false);
-        if (JS_IsException(jsargs[i])) {
-            /* JS_NewArrayBuffer does not own an externally supplied buffer
-             * when construction fails. Reclaim the copy here before the
-             * partial-argument cleanup below. */
-            js_free(ctx, arg_copy);
-            for (unsigned j = 0; j < i; j++)
-                JS_FreeValue(ctx, jsargs[j]);
-            js_free(ctx, jsargs);
-            if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-            return;
-        }
-    }
-    /* The callback may drop the last reference to its own FfiClosure, which
-     * frees jscl->func and the cif that 'cif' points into. Hold both for the
-     * duration of the call and cache nargs, as tjs_call_handler does. */
-    unsigned nargs = cif->nargs;
-    JSValue func_ref = JS_DupValue(ctx, jscl->func);
-    JSValue cif_ref = JS_DupValue(ctx, jscl->cif);
-    JSValue jsret = JS_Call(ctx, func_ref, JS_UNDEFINED, nargs, jsargs);
-    for (unsigned i = 0; i < nargs; i++) {
-        JS_FreeValue(ctx, jsargs[i]);
-    }
-    js_free(ctx, jsargs);
-    JS_FreeValue(ctx, func_ref);
-    if (JS_IsException(jsret)) {
-        fprintf(stderr, "js_ffi_closure_invoke: function returned exception\n");
-        TJS_DumpException(ctx);
-        if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-        JS_FreeValue(ctx, cif_ref);
-        return;
-    }
-    size_t sz;
-    uint8_t *buf = JS_GetUint8Array(ctx, &sz, jsret);
-    if (buf == NULL) {
-        fprintf(stderr, "js_ffi_closure_invoke: function returned non-buffer\n");
-        TJS_DumpException(ctx);
-        if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-        JS_FreeValue(ctx, jsret);
-        JS_FreeValue(ctx, cif_ref);
-        return;
-    }
-    if (sz != return_sz) {
-        fprintf(stderr, "js_ffi_closure_invoke: return buffer size mismatch (expected %zu, got %zu)\n", return_sz, sz);
-        if (return_sz > 0 && ret != NULL) memset(ret, 0, return_sz);
-        JS_FreeValue(ctx, jsret);
-        JS_FreeValue(ctx, cif_ref);
-        return;
-    }
-    /* libffi owns the callback return storage. It is only guaranteed to fit
-     * the declared C type, not ffi_arg, so never widen writes here. */
-    if (return_sz > 0 && ret != NULL) memcpy(ret, buf, return_sz);
-    JS_FreeValue(ctx, jsret);
-    JS_FreeValue(ctx, cif_ref);
-}
-
-static JSValue js_ffi_closure_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "expected FfiCif and callback");
-    }
-    TJS_CHECK_ARG_RET(ctx, JS_IsObject(argv[0]), 0, "object");
-    TJS_CHECK_ARG_RET(ctx, JS_IsFunction(ctx, argv[1]), 1, "function");
-
-    js_ffi_cif *cif = JS_GetOpaque(argv[0], js_ffi_cif_classid);
-    if (!cif) {
-        JS_ThrowTypeError(ctx, "argument 1 is expected to be FfiCif");
-        return JS_EXCEPTION;
-    }
-
-    JSValue obj = JS_NewObjectClass(ctx, js_ffi_closure_classid);
-    if (JS_IsException(obj)) {
-        return obj;
-    }
-
-    void *code;
-    js_ffi_closure *jscl = ffi_closure_alloc(sizeof(js_ffi_closure), &code);
-    if (!jscl) {
-        JS_FreeValue(ctx, obj);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    jscl->code = code;
-    ffi_status ret = ffi_prep_closure_loc(&jscl->closure, &cif->ffi_cif, js_ffi_closure_invoke, jscl, jscl->code);
-    if (ret != FFI_OK) {
-        ffi_closure_free(jscl);
-        JS_FreeValue(ctx, obj);
-        JS_ThrowTypeError(ctx, "failed to prepare closure");
-        return JS_EXCEPTION;
-    }
-
-    jscl->cif = JS_DupValue(ctx, argv[0]);
-    jscl->func = JS_DupValue(ctx, argv[1]);
-    jscl->ctx = ctx;
-
-    JS_SetOpaque(obj, jscl);
-    return obj;
-}
-
-static void js_ffi_closure_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    js_ffi_closure *u = JS_GetOpaque(val, js_ffi_closure_classid);
-    if (u) {
-        JS_MarkValue(rt, u->cif, mark_func);
-        JS_MarkValue(rt, u->func, mark_func);
-    }
-}
-
-static void js_ffi_closure_finalizer(JSRuntime *rt, JSValue val) {
-    js_ffi_closure *u = JS_GetOpaque(val, js_ffi_closure_classid);
-    if (u) {
-        JS_FreeValueRT(rt, u->cif);
-        JS_FreeValueRT(rt, u->func);
-        ffi_closure_free(u);
-    }
-}
-
-JSClassDef js_ffi_closure_class = { "FfiClosure",
-                                    .finalizer = js_ffi_closure_finalizer,
-                                    .gc_mark = js_ffi_closure_mark };
-
-static JSValue js_ffi_closure_get_addr(JSContext *ctx, JSValue this_val) {
-    js_ffi_closure *ptr = JS_GetOpaque(this_val, js_ffi_closure_classid);
-    if (ptr == NULL) {
-        JS_ThrowTypeError(ctx, "expected this to be FfiClosure");
-        return JS_EXCEPTION;
-    }
-    return JS_NEW_UINTPTR_T(ctx, ptr->code);
-}
-static const JSCFunctionListEntry js_ffi_closure_proto_funcs[] = {
-    TJS_CGETSET_DEF("addr", js_ffi_closure_get_addr, NULL),
-};
-
-
-#pragma endregion "FfiClosure class definition"
-
-static const JSCFunctionListEntry funcs[] = {
-    // basic functions from libc
-    TJS_CFUNC_DEF("errno", 0, js_libc_errno),
-    TJS_CFUNC_DEF("strerror", 1, js_libc_strerror),
-
-    // other helpers
-    TJS_CFUNC_DEF("getArrayBufPtr", 1, js_array_buffer_get_ptr),
-    TJS_CFUNC_DEF("getCString", 1, js_get_cstring),
-    TJS_CFUNC_DEF("derefPtr", 2, js_deref_ptr),
-    TJS_CFUNC_DEF("ptrToBuffer", 2, js_ptr_to_buffer),
-    TJS_CFUNC_DEF("getCurrentEventLoop", 0, js_get_current_event_loop),
-
-    TJS_CONST_STRING_DEF(LIBC_NAME),
-    TJS_CONST_STRING_DEF(LIBM_NAME),
-};
-
-#define REGISTER_CLASS(ctx, name)                                                                                      \
-    JS_NewClassID(JS_GetRuntime(ctx), &name##_classid);                                                                \
-    JS_NewClass(JS_GetRuntime(ctx), name##_classid, &name##_class);                                                    \
-    JSValue name##_proto = JS_NewObject(ctx);                                                                          \
-    JS_SetPropertyFunctionList(ctx, name##_proto, name##_proto_funcs, countof(name##_proto_funcs));                    \
-    JS_SetClassProto(ctx, name##_classid, name##_proto);
-
-#define CLASS_CREATE_CONSTRUCTOR(ctx, name, ns, constructor)                                                           \
-    JSValue name##_constructor =                                                                                       \
-        JS_NewCFunction2(ctx, constructor, name##_class.class_name, 1, JS_CFUNC_constructor, 0);                       \
-	JS_SetConstructor(ctx, name##_constructor, name##_proto);                                                      \
-    JS_DefinePropertyValueStr(ctx,                                                                                     \
-                              ns,                                                                                      \
-                              name##_class.class_name,                                                                 \
-                              name##_constructor,                                                                      \
-                              JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
-
-
-#define ADD_SIMPLE_TYPE(ctx, obj, name)                                                                                \
-    JSValue name##_jsval = ffi_type_create_existing(ctx, &ffi_##name, #name);                                          \
-    JS_SetPropertyStr(ctx, obj, #name, name##_jsval)
-#define ADD_ALIAS_TYPE(ctx, obj, alias, oldname) JS_SetPropertyStr(ctx, obj, #alias, JS_DupValue(ctx, oldname##_jsval))
-
-
-void tjs__mod_ffi_init(JSContext *ctx, JSValue ffiobj) {
-    JS_SetPropertyFunctionList(ctx, ffiobj, funcs, countof(funcs));
-
-    REGISTER_CLASS(ctx, js_ffi_type);
-    CLASS_CREATE_CONSTRUCTOR(ctx, js_ffi_type, ffiobj, js_ffi_type_create_struct);
-
-    REGISTER_CLASS(ctx, js_uv_dlsym);
-    CLASS_CREATE_CONSTRUCTOR(ctx, js_uv_dlsym, ffiobj, js_uv_dlsym_create);
-
-    REGISTER_CLASS(ctx, js_ffi_cif);
-    CLASS_CREATE_CONSTRUCTOR(ctx, js_ffi_cif, ffiobj, js_ffi_cif_create);
-
-    REGISTER_CLASS(ctx, js_uv_lib);
-    CLASS_CREATE_CONSTRUCTOR(ctx, js_uv_lib, ffiobj, js_uv_lib_create);
-
-    REGISTER_CLASS(ctx, js_ffi_closure);
-    CLASS_CREATE_CONSTRUCTOR(ctx, js_ffi_closure, ffiobj, js_ffi_closure_create);
-
-
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_void);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uint8);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sint8);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uint16);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sint16);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uint32);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sint32);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uint64);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sint64);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_float);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_double);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_pointer);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_longdouble);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uchar);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_schar);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_ushort);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sshort);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_uint);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_sint);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_ulong);
-    ADD_SIMPLE_TYPE(ctx, ffiobj, type_slong);
-
+void tjs__mod_ffi_init(JSContext *ctx, JSValue ffi_object) {
+    if(register_class(ctx,&type_class,&type_def,NULL,0,NULL)<0||register_class(ctx,&pointer_class,&pointer_def,NULL,0,NULL)<0||
+       register_class(ctx,&owned_class,&owned_def,owned_proto,countof(owned_proto),owned_close)<0||register_class(ctx,&library_class,&library_def,library_proto,countof(library_proto),library_close)<0||
+       register_class(ctx,&bound_class,&bound_def,bound_proto,countof(bound_proto),NULL)<0||register_class(ctx,&callback_class,&callback_def,callback_proto,countof(callback_proto),callback_close)<0)return;
+    JSValue types=JS_NewObject(ctx);if(JS_IsException(types))return;
+#define ADD(n,f,k) if(add_type(ctx,types,n,&f,k)<0){JS_FreeValue(ctx,types);return;}
+    ADD("void",ffi_type_void,K_VOID);ADD("bool",ffi_type_uint8,K_BOOL);ADD("i8",ffi_type_sint8,K_I8);ADD("u8",ffi_type_uint8,K_U8);
+    ADD("i16",ffi_type_sint16,K_I16);ADD("u16",ffi_type_uint16,K_U16);ADD("i32",ffi_type_sint32,K_I32);ADD("u32",ffi_type_uint32,K_U32);
+    ADD("i64",ffi_type_sint64,K_I64);ADD("u64",ffi_type_uint64,K_U64);ADD("f32",ffi_type_float,K_F32);ADD("f64",ffi_type_double,K_F64);
+    ADD("pointer",ffi_type_pointer,K_POINTER);ADD("buffer",ffi_type_pointer,K_BUFFER);ADD("function",ffi_type_pointer,K_FUNCTION);
+    ADD("schar",ffi_type_schar,K_I8);ADD("uchar",ffi_type_uchar,K_U8);ADD("short",ffi_type_sshort,K_I16);ADD("ushort",ffi_type_ushort,K_U16);
+    ADD("int",ffi_type_sint,K_I32);ADD("uint",ffi_type_uint,K_U32);
+#if LONG_MAX == INT32_MAX
+    ADD("long",ffi_type_slong,K_I32);ADD("ulong",ffi_type_ulong,K_U32);
+#elif LONG_MAX == INT64_MAX
+    ADD("long",ffi_type_slong,K_I64);ADD("ulong",ffi_type_ulong,K_U64);
+#else
+#error unsupported long width
+#endif
+    ADD("longLong",ffi_type_sint64,K_I64);ADD("ulongLong",ffi_type_uint64,K_U64);
 #if SIZE_MAX == UINT32_MAX
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_size, type_uint32);
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_ssize, type_sint32);
-#elif SIZE_MAX == UINT64_MAX
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_size, type_uint64);
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_ssize, type_sint64);
+    ADD("usize",ffi_type_uint32,K_U64);ADD("isize",ffi_type_sint32,K_I64);
 #else
-#error("unhandled size_t size")
+    ADD("usize",ffi_type_uint64,K_U64);ADD("isize",ffi_type_sint64,K_I64);
 #endif
-
-#if ULLONG_MAX == UINT64_MAX
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_ull, type_uint64);
-#else
-#error("unhandled unsigned long long size")
-#endif
-#if LLONG_MAX == INT64_MAX
-    ADD_ALIAS_TYPE(ctx, ffiobj, type_sll, type_sint64);
-#else
-#error("unhandled signed long long size")
-#endif
-
-    // ffi also supports some complex types, currently not implemented
+    ADD("longDouble",ffi_type_longdouble,K_LONG_DOUBLE);
+#undef ADD
+    JS_SetPropertyStr(ctx,types,"struct",JS_NewCFunction(ctx,types_struct,"struct",1));JS_SetPropertyStr(ctx,types,"array",JS_NewCFunction(ctx,types_array,"array",2));if(JS_FreezeObject(ctx,types)<0){JS_FreeValue(ctx,types);return;}
+    JSValue libraries=JS_NewObject(ctx);JS_SetPropertyStr(ctx,libraries,"c",JS_NewString(ctx,FFI_C_LIBRARY_NAME));JS_SetPropertyStr(ctx,libraries,"m",JS_NewString(ctx,FFI_M_LIBRARY_NAME));if(JS_FreezeObject(ctx,libraries)<0){JS_FreeValue(ctx,types);JS_FreeValue(ctx,libraries);return;}
+    JSValue unsafe=JS_NewObject(ctx);static const JSCFunctionListEntry uf[]={JS_CFUNC_DEF("address",1,unsafe_address),JS_CFUNC_DEF("fromAddress",1,unsafe_from_address),JS_CFUNC_DEF("pointerOf",1,unsafe_pointer_of),JS_CFUNC_DEF("offset",2,unsafe_offset),JS_CFUNC_DEF("deref",1,unsafe_deref),JS_CFUNC_DEF("view",2,unsafe_view),JS_CFUNC_DEF("readCString",1,unsafe_cstring),JS_CFUNC_DEF("currentEventLoop",0,unsafe_loop),JS_CFUNC_DEF("adopt",2,unsafe_adopt)};JS_SetPropertyFunctionList(ctx,unsafe,uf,countof(uf));
+    static const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("open",1,ffi_open_js),JS_CFUNC_DEF("function",2,ffi_function_js),JS_CFUNC_DEF("callback",2,callback_create),JS_CFUNC_DEF("errno",0,ffi_errno_js),JS_CFUNC_DEF("strerror",1,ffi_strerror_js)};JS_SetPropertyFunctionList(ctx,ffi_object,funcs,countof(funcs));JS_SetPropertyStr(ctx,ffi_object,"types",types);JS_SetPropertyStr(ctx,ffi_object,"libraries",libraries);JS_SetPropertyStr(ctx,ffi_object,"unsafe",unsafe);
 }

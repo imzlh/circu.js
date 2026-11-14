@@ -7,6 +7,7 @@ project(cjs LANGUAGES C)
 include(ExternalProject)
 include(FetchContent)
 include(GNUInstallDirs)
+include(CTest)
 
 if (NOT CMAKE_BUILD_TYPE)
     message(STATUS "No build type selected, default to Release")
@@ -266,6 +267,7 @@ add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 add_library(libcjs STATIC
     src/binary.c
+    src/capability.c
     src/mod_error.c
     src/mem.c
     src/modules.c
@@ -463,6 +465,31 @@ set_target_properties(cjs-cli
     PROPERTIES OUTPUT_NAME cjs
                ENABLE_EXPORTS ON
 )
+
+# ffi and capability test.
+add_library(ffi_fixture SHARED tests/native/ffi_fixture.c)
+set_target_properties(ffi_fixture PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(ffi_fixture PRIVATE Threads::Threads)
+endif()
+add_dependencies(cjs-cli ffi_fixture)
+
+if(BUILD_TESTING)
+    add_executable(capability_test tests/native/capability.c)
+    target_link_libraries(capability_test PRIVATE libcjs uv_a)
+    target_link_options(capability_test PRIVATE ${cjs_ldflags})
+    add_test(NAME capability_test COMMAND capability_test)
+
+    # Manual, non-gating microbenchmark. Timings are deliberately not a test:
+    # CI scheduling noise makes fixed performance thresholds misleading.
+    add_executable(capability_benchmark EXCLUDE_FROM_ALL benchmark/capability.c)
+    target_link_libraries(capability_benchmark PRIVATE libcjs uv_a)
+    target_link_options(capability_benchmark PRIVATE ${cjs_ldflags})
+endif()
 # cjs-cli includes tjs.h which needs uv.h and iconv.h
 if(Iconv_FOUND)
     target_include_directories(cjs-cli PRIVATE ${Iconv_INCLUDE_DIR})

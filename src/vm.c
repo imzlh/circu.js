@@ -26,6 +26,7 @@
 #include "private.h"
 #include "tjs.h"
 #include "binary.h"
+#include "capability.h"
 
 #include <signal.h>
 #include <stdatomic.h>
@@ -599,11 +600,18 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->timers.timers = NULL;
     qrt->timers.next_timer = 1;
 
+    qrt->console.counters = NULL;
+    qrt->console.timers = NULL;
+    qrt->console.group_indent = 0;
+
     return qrt;
 }
 
 void TJS_FreeRuntime(TJSRuntime* qrt) {
+    TJS_SetCapabilityHook(qrt, NULL, NULL, 0);
     qrt->freeing = true;
+
+    tjs__console_cleanup_runtime(qrt);
 
     /* Raw DNS queries retain JS callbacks and their UDP context independently
      * of the Promise object.  Release those JS references while the runtime is
@@ -704,6 +712,7 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0) {
         /* drain */
     }
+    tjs__mod_ffi_drain_runtime(qrt);
 
     /* Release Node-API persistent JS references before QuickJS leak checking.
      * The env structs remain alive until JS_FreeRuntime finalizers, so JS object
@@ -713,12 +722,14 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
         uv_run(&qrt->loop, UV_RUN_NOWAIT);
     }
     JS_RunGC(qrt->rt);
+    tjs__mod_ffi_drain_runtime(qrt);
     tjs__drain_closing_handles(qrt, 64);
     tjs__nodeapi_cleanup_runtime(qrt);
     for (int i = 0; i < 5; i++) {
         uv_run(&qrt->loop, UV_RUN_NOWAIT);
     }
     JS_RunGC(qrt->rt);
+    tjs__mod_ffi_drain_runtime(qrt);
     tjs__drain_closing_handles(qrt, 64);
 
     /* Release the runtime's context references. Sandbox wrapper finalizers may
@@ -738,7 +749,10 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     }
 
     /* Destroy the JS engine. */
+    tjs__mod_ffi_drain_runtime(qrt);
     JS_FreeRuntime(qrt->rt);
+    /* Finalizers run by JS_FreeRuntime may enqueue native-only disposers. */
+    tjs__mod_ffi_drain_runtime(qrt);
 
     /* Context opaque pointers remain valid through JS_FreeRuntime finalizers;
      * App storage itself has no QuickJS references and can now be released. */
@@ -878,6 +892,7 @@ void tjs__execute_jobs(TJSRuntime* trt) {
     do {
         tjs__run_next_ticks(trt);
     } while (!tjs__execute_pending_jobs(trt) && trt->jobs.ticks_pending && !trt->jobs.paused);
+    tjs__mod_ffi_drain_runtime(trt);
 }
 
 static void uv__check_cb(uv_check_t* handle) {

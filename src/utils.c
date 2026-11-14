@@ -38,6 +38,7 @@
 #include "utils.h"
 
 #include "private.h"
+#include "capability.h"
 #include "tjs.h"
 
 #include <stdlib.h>
@@ -716,12 +717,12 @@ int tjs__load_file(JSContext *ctx, DynBuf *dbuf, const char *filename) {
     return r;
 }
 
-JSValue TJS_EvalModuleContent(JSContext *ctx,
-                              const char *specifier,
-                              bool is_main,
-                              bool use_real_path,
-                              const char *content,
-                              size_t len) {
+static JSValue tjs__eval_module_content(JSContext *ctx,
+                                        const char *specifier,
+                                        bool is_main,
+                                        bool use_real_path,
+                                        const char *content,
+                                        size_t len) {
     /* Compile then run to be able to set import.meta */
     JSValue ret = JS_Eval(ctx, content, len, specifier, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     if (!JS_IsException(ret)) {
@@ -741,11 +742,23 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
     return ret;
 }
 
+JSValue TJS_EvalModuleContent(JSContext *ctx,
+                              const char *specifier,
+                              bool is_main,
+                              bool use_real_path,
+                              const char *content,
+                              size_t len) {
+    if (use_real_path) { TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "runtime.evalModuleContent", specifier), (void)0); }
+    return tjs__eval_module_content(ctx, specifier, is_main, use_real_path, content, len);
+}
+
 JSValue TJS_EvalScript(JSContext *ctx, const char *filename) {
     DynBuf dbuf;
     size_t dbuf_size;
     int r;
     JSValue ret;
+
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "runtime.evalScript", filename), (void)0);
 
     tjs_dbuf_init(ctx, &dbuf);
     r = tjs__load_file(ctx, &dbuf, filename);
@@ -772,6 +785,8 @@ JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main) {
     int r;
     JSValue ret;
 
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "runtime.evalModule", filename), (void)0);
+
     tjs_dbuf_init(ctx, &dbuf);
     r = tjs__load_file(ctx, &dbuf, filename);
     if (r != 0) {
@@ -785,7 +800,7 @@ JSValue TJS_EvalModule(JSContext *ctx, const char *filename, bool is_main) {
     /* Add null termination, required by JS_Eval. */
     dbuf_putc(&dbuf, '\0');
 
-    ret = TJS_EvalModuleContent(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size);
+    ret = tjs__eval_module_content(ctx, filename, is_main, true, (char *) dbuf.buf, dbuf_size);
 
     dbuf_free(&dbuf);
     return ret;

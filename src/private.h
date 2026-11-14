@@ -55,6 +55,8 @@ enum {
 
 typedef struct TJSTimer TJSTimer;
 typedef struct TJSEvBus TJSEvBus;
+typedef struct ConsoleCounter ConsoleCounter;
+typedef struct ConsoleTimer ConsoleTimer;
 
 typedef struct DebugControlBlock DebugControlBlock;
 
@@ -69,6 +71,10 @@ struct TJSRuntime {
     TJSRunOptions options;
     JSRuntime *rt;
     JSContext *main_ctx;
+    TJSCapabilityHook capability_hook;
+    void *capability_userdata;
+    uint32_t capability_hook_flags;
+    uint32_t capability_hook_depth;
     uv_loop_t loop;
     struct {
         uv_check_t check;
@@ -119,11 +125,19 @@ struct TJSRuntime {
     struct list_head dns_getaddrinfo;
     struct list_head dns_getnameinfo;
 
+    /* Opaque cleanup queue owned by mod_ffi.c. */
+    void *ffi_cleanup;
+
 	bool freeing;
     struct {
         TJSTimer *timers;
         int64_t next_timer;
     } timers;
+    struct {
+        ConsoleCounter *counters;
+        ConsoleTimer *timers;
+        int group_indent;
+    } console;
     struct {
         JSValue promise_hook_fn;
 		JSValue message_pipe;	// for worker messaging
@@ -221,7 +235,9 @@ JSValue tjs__mod_evbus_dispatch_runtime_event(JSContext *ctx, int32_t event_name
 void tjs__evbus_cleanup(App *app);
 void tjs__evbus_cleanup_rt(TJSRuntime *trt);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
+void tjs__console_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
+void tjs__mod_ffi_drain_runtime(TJSRuntime *trt);
 void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns);
 void tjs__mod_fs_init(JSContext* ctx, JSValue ns);
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns);
