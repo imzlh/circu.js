@@ -39,18 +39,7 @@
 #include <winioctl.h>
 #include <fileapi.h>
 
-/*
- * `_wopen` opens without FILE_SHARE_DELETE, so a file cno holds open cannot be
- * unlinked or renamed by anyone — including cno itself. libuv always passes
- * FILE_SHARE_READ|WRITE|DELETE, so real Node deletes an open file happily while
- * cno returned EACCES (sync) / EBUSY (async). Measured: holding a read fd then
- * unlinking gives "OK" on Node v24.18.0 and EACCES here. That surfaced as five
- * separate `cts.lock` EACCES test failures, which looked like a locking bug
- * rather than an open-flags bug.
- *
- * The CRT exposes no share-delete flag (`_SH_DENY*` cannot express it), so open
- * through CreateFileW and adopt the handle into a CRT fd.
- */
+/* _wopen lacks FILE_SHARE_DELETE; open via CreateFileW and adopt the CRT fd. */
 static int tjs__wopen_shared(const WCHAR *wpath, int flags, int mode) {
     DWORD access;
     switch (flags & (O_RDONLY | O_WRONLY | O_RDWR)) {
@@ -70,20 +59,7 @@ static int tjs__wopen_shared(const WCHAR *wpath, int flags, int mode) {
     DWORD attrs = ((flags & O_CREAT) && !(mode & 0200)) ? FILE_ATTRIBUTE_READONLY
                                                         : FILE_ATTRIBUTE_NORMAL;
 
-    /*
-     * Setting this makes it possible to open a DIRECTORY, which libuv does
-     * unconditionally in fs__open ("Setting this flag makes it possible to open a
-     * directory"). Without it, opening a directory failed ERROR_ACCESS_DENIED.
-     * Measured 2026-08-04, and note Node distinguishes read from write intent:
-     *
-     *                       cno (before)   node v24.18.0
-     *   openSync(dir,'r')   EACCES         returns an fd
-     *   openSync(dir,'w')   EACCES         EISDIR
-     *   readFileSync(dir)   EACCES         EISDIR
-     *
-     * cno's own async path already matched Node on all three, because it goes
-     * through uv_fs_open -- the same sync/async tell as rename and unlink.
-     */
+    /* Without it, opening a directory fails; libuv's fs__open sets it too. */
     attrs |= FILE_FLAG_BACKUP_SEMANTICS;
 
     HANDLE h = CreateFileW(wpath, access,
@@ -96,23 +72,8 @@ static int tjs__wopen_shared(const WCHAR *wpath, int flags, int mode) {
             case ERROR_FILE_NOT_FOUND:
             case ERROR_PATH_NOT_FOUND:    errno = ENOENT; break;
             case ERROR_FILE_EXISTS:
-                /*
-                 * libuv's fs__open: "when ERROR_FILE_EXISTS happens and
-                 * UV_FS_O_CREAT was specified, it means the path referred to a
-                 * directory". That is how a write-intent open of a directory
-                 * becomes EISDIR instead of EEXIST, for both creating
-                 * dispositions -- CREATE_ALWAYS for 'w' (O_CREAT|O_TRUNC) and
-                 * OPEN_ALWAYS for 'a' (O_CREAT). The !O_EXCL guard is
-                 * load-bearing and copied deliberately: with O_CREAT|O_EXCL the
-                 * disposition is CREATE_NEW, and an existing plain FILE must keep
-                 * reporting EEXIST ('wx'/'ax').
-                 *
-                 * ERROR_ALWAYS_EXISTS is deliberately NOT folded in here, unlike
-                 * an earlier draft of this patch: OPEN_ALWAYS/CREATE_ALWAYS report
-                 * ERROR_ALREADY_EXISTS as a non-error last-error on SUCCESS, so a
-                 * genuine failure carrying it is not the directory case and must
-                 * stay EEXIST. libuv special-cases only ERROR_FILE_EXISTS.
-                 */
+                /* O_CREAT && !O_EXCL: ERROR_FILE_EXISTS means the path is a
+                 * directory -> EISDIR; never fold ALREADY_EXISTS in here. */
                 if ((flags & O_CREAT) && !(flags & O_EXCL)) errno = EISDIR;
                 else                                        errno = EEXIST;
                 break;
@@ -591,13 +552,7 @@ static int crt2uv(int crt_err) {
 #define THROW2(msg) abort();    // windows only, should never happen
 #endif
 
-/* Sync fs paths set a CRT `errno`, NOT a Win32 error code. The two numbering
- * spaces overlap but mean different things, so feeding errno to
- * uv_translate_sys_error() silently mistranslates: EACCES(13) reads as
- * ERROR_INVALID_DATA(13) -> UV_EINVAL, and codes with no Win32 twin come out
- * UV_UNKNOWN, which no `e.code === 'ENOENT'` check can ever match. Use this
- * wherever the error came from errno; use uv_translate_sys_error(GetLastError())
- * for genuine Win32 failures. Measured against real Node v24.18.0 before/after. */
+/* CRT errno is not a Win32 code: uv_translate_sys_error() mistranslates it. */
 static inline int fs_errno2uv(int crt_err) {
 #ifdef _WIN32
     return crt2uv(crt_err);
@@ -802,34 +757,8 @@ static inline JSValue build_stat_obj(JSContext* ctx, struct stat* st) {
 }
 
 #ifdef _WIN32
-/*
- * Windows stat timestamps, full 64-bit.
- *
- * libuv's uv_stat_t carries uv_timespec_t, whose tv_sec is a 32-bit `long` on
- * Windows (see the "not 2038-proof" note in deps/libuv/include/uv.h and libuv
- * issue 3864). uv__filetime_to_timespec computes the seconds as int64 and then
- * assigns them into that 32-bit field, so uv_fs_stat silently truncates any
- * timestamp at or beyond 2^31 seconds: a year-2038 stamp reads back as
- * -2147483648 (year 1901), and 4294967297 s reads back as 1 s.
- *
- * Measured 2026-08-03 on Windows 11: real Deno 2.9.3 round-trips both 2^31 and
- * 4294967297 on this same OS, and Node v24.18.0 wraps unsigned at 2^32, so this
- * is a cno defect rather than an OS limit -- and matching Node would not be
- * enough. The write path is already correct (it uses SetFileTime directly).
- *
- * The sub-second part survives (tv_nsec comes from filetime % TICKS_PER_SEC and
- * always fits), but the truncated seconds cannot be recovered from the low 32
- * bits alone, so read the FILETIME directly instead.
- *
- * FILETIME counts 100-ns ticks since 1601-01-01; the Unix epoch is 11644473600
- * seconds later, i.e. 116444736000000000 ticks, and 1 ms is 10000 ticks.
- * Verified both directions against a real file: 4294967297 s encodes to
- * 159394408970000000 ticks, which decodes back to 4294967297000 ms.
- *
- * tjs_win_stat_times_t and the two path/fd readers are declared in private.h so
- * mod_asyncfs.c can reuse them; the HANDLE-taking helper stays static because
- * private.h does not include windows.h.
- */
+/* libuv's uv_stat_t tv_sec is 32-bit on Windows: stat times past 2^31
+ * truncate, so read FILETIME directly instead of the uv_stat fields. */
 #define TJS_FILETIME_UNIX_EPOCH_TICKS 116444736000000000LL
 #define TJS_FILETIME_TICKS_PER_MS 10000LL
 
@@ -882,9 +811,8 @@ void tjs_win_stat_times_from_path(const char* path,
         flags |= FILE_FLAG_OPEN_REPARSE_POINT;
     }
 
-    /* FILE_READ_ATTRIBUTES only, so this never blocks on a file opened for
-       exclusive data access. FILE_FLAG_BACKUP_SEMANTICS is what lets a
-       directory be opened at all. */
+    /* FILE_READ_ATTRIBUTES only, so this never blocks on an exclusive open;
+       FILE_FLAG_BACKUP_SEMANTICS is what lets a directory be opened. */
     handle = CreateFileW(wpath,
                          FILE_READ_ATTRIBUTES,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -911,9 +839,7 @@ void tjs_win_stat_times_from_fd(int fd, tjs_win_stat_times_t* out) {
     tjs_win_stat_times_from_handle((HANDLE) raw, out);
 }
 
-/* times may be NULL or invalid, in which case libuv's own (possibly truncated)
-   timespec values are used -- a stat never fails just because the extra
-   FILETIME read did. */
+/* times may be NULL/invalid; a stat never fails if the FILETIME read does. */
 static inline JSValue build_uv_stat_obj(JSContext* ctx,
                                         const uv_stat_t* st,
                                         const tjs_win_stat_times_t* times) {
@@ -1507,17 +1433,8 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
         return err;
     }
 
-    /*
-     * A directory is now openable read-only (see FILE_FLAG_BACKUP_SEMANTICS in
-     * tjs__wopen_shared), so reject it here instead of letting the read loop below
-     * run. Node reports EISDIR for readFileSync on a directory, and so does
-     * libuv's fs__read on a directory fd -- measured 2026-08-04, cno's own async
-     * fh.read(dirfd) returned UV_EISDIR (-4068). Without this check the read would
-     * fail with ERROR_INVALID_FUNCTION -> EINVAL, which matches neither.
-     *
-     * S_ISDIR works on both legs: MSVC has no S_ISDIR, so this file defines it at
-     * :105 in terms of _S_IFDIR.
-     */
+    /* Directories open fine now (see tjs__wopen_shared); reject them so the
+     * read below fails EISDIR, not ERROR_INVALID_FUNCTION -> EINVAL. */
     if (S_ISDIR(st.st_mode)) {
         close(fd);
         JSValue err = tjs_throw_errno_path(ctx, UV_EISDIR, path);
@@ -1528,7 +1445,6 @@ static JSValue tjs_syncfs_read_file(JSContext* ctx, JSValueConst this_val, int a
     size_t size = st.st_size;
 
     // For pseudo-files (like /proc/*, /sys/*), st_size may be 0 but content exists
-    // Use dynamic buffer for such cases
     if (size == 0) {
         size_t capacity = 4096;
         size_t total_read = 0;
@@ -1723,18 +1639,7 @@ static JSValue tjs_syncfs_rmdir(JSContext* ctx, JSValueConst this_val, int argc,
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.rmdir", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than calling _wrmdir, for consistency with the
-     * unlink path above: both end up in libuv's fs__unlink_rmdir, so a directory
-     * carrying the readonly attribute is removable, matching Node.
-     *
-     * It also fixes the error code for a non-directory target. Measured
-     * 2026-08-04: rmdirSync on a FILE symlink gave EINVAL here (_wrmdir sets
-     * ERROR_DIRECTORY) where node v24.18.0 gives ENOENT. libuv maps that case to
-     * UV_ENOENT explicitly.
-     *
-     * Error convention: negative UV code from uv_fs_*, used as-is.
-     */
+    /* _wrmdir fails on readonly dirs and file symlinks; use uv_fs_rmdir. */
     uv_fs_t req;
     int ret = uv_fs_rmdir(NULL, &req, path, NULL);
     int uv_err = ret;
@@ -1768,33 +1673,8 @@ static JSValue tjs_syncfs_unlink(JSContext* ctx, JSValueConst this_val, int argc
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.unlink", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than calling _wunlink.
-     *
-     * _wunlink is DeleteFileW, which refuses a DIRECTORY reparse point:
-     * ERROR_ACCESS_DENIED -> EACCES. POSIX unlink(2) removes a symlink whatever
-     * its target is, and Node does too. Measured 2026-08-04 vs node v24.18.0,
-     * with the three Win32 reparse shapes tested separately because they take
-     * different kernel paths:
-     *
-     *                       cno fs.unlinkSync   node fs.unlinkSync
-     *   directory symlink   THREW EACCES        OK
-     *   junction            THREW EACCES        OK
-     *   file symlink        OK                  OK      <- so not a blanket bug
-     *   readonly file       THREW EACCES        OK
-     *
-     * Only the two DIRECTORY-shaped reparse points and the readonly file fail,
-     * which is exactly the DeleteFileW signature. cno's own async fsp.unlink and
-     * Deno.removeSync already handled all of them, because uv_fs_unlink opens
-     * with FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, verifies
-     * the reparse point is a real symlink, and deletes with
-     * FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE.
-     *
-     * Deleting a link must not touch the target; verified intact in the repro.
-     *
-     * Error convention: uv_fs_* yields a negative UV code, passed through
-     * unchanged. fs_errno2uv() is for CRT errno only.
-     */
+    /* _wunlink (DeleteFileW) refuses directory symlinks, junctions and
+     * readonly files; uv_fs_unlink deletes them like Node and POSIX. */
     uv_fs_t req;
     int ret = uv_fs_unlink(NULL, &req, path, NULL);
     int uv_err = ret;
@@ -2079,23 +1959,7 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.readlink", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv, which is what Node itself uses.
-     *
-     * The previous hand-rolled DeviceIoControl path only accepted
-     * IO_REPARSE_TAG_SYMLINK, so a **junction** (IO_REPARSE_TAG_MOUNT_POINT) —
-     * which is exactly what `cts/src/resolve/linker.ts` creates via
-     * `asyncfs.symlink(..., FS_SYMLINK_JUNCTION)` — left `link_path` NULL. The
-     * guard then read `GetLastError()` *after a successful DeviceIoControl*, so
-     * it formatted error code 0 and threw the nonsense
-     * "Failed to read symbolic link: The operation completed successfully."
-     * Measured: `readlinkSync` on a junction gave UNKNOWN(-4094) here while Node
-     * returned the target. That accounted for 4 failures in linker.test.ts.
-     *
-     * uv_fs_readlink handles SYMLINK, MOUNT_POINT and APPEXECLINK. A NULL loop
-     * runs it synchronously — same pattern as the uv_fs_stat call at :697, which
-     * likewise passes the negative `ret` (a UV code) rather than `errno`.
-     */
+    /* uv_fs_readlink covers SYMLINK, MOUNT_POINT and APPEXECLINK tags. */
     uv_fs_t req;
     int ret = uv_fs_readlink(NULL, &req, path, NULL);
     if (ret < 0) {
@@ -2263,9 +2127,7 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "Source is not a regular file");
     }
 
-    // Open destination file (create, write-only, with same permissions as source).
-    // No O_TRUNC here: truncating before the identity check below would destroy
-    // the source when dest is the same file.
+    // No O_TRUNC: it would destroy the source before the same-file check below.
     dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_CLOEXEC, src_stat.st_mode);
     if (dest_fd == -1) {
         int uv_err = fs_errno2uv(errno);
@@ -2411,32 +2273,8 @@ static JSValue tjs_syncfs_rename(JSContext* ctx, JSValueConst this_val, int argc
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.rename", oldpath), (JS_FreeCString(ctx, oldpath), JS_FreeCString(ctx, newpath)));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than calling _wrename.
-     *
-     * POSIX rename(2) REPLACES an existing destination silently, and both Node
-     * and Deno do the same on Windows. MSVC's _wrename does not: it fails with
-     * EEXIST as soon as the target exists. Measured 2026-08-04 on Windows 11
-     * against node v24.18.0:
-     *
-     *   cno  fs.renameSync(a, b)   b exists -> THREW EEXIST
-     *   cno  Deno.renameSync(a, b) b exists -> THREW EEXIST
-     *   cno  Deno.rename  (async)  b exists -> OK          <- already correct
-     *   node fs.renameSync(a, b)   b exists -> OK          <- the oracle
-     *
-     * The async path was already right because uv_fs_rename passes
-     * MOVEFILE_REPLACE_EXISTING to MoveFileExW; that sync/async split inside cno
-     * is what rules out "Windows cannot do this". Using uv_fs_rename here also
-     * fixes the error code for the failure cases: _wrename reported EEXIST for
-     * renaming onto a directory, where Node reports EPERM.
-     *
-     * A NULL loop runs the request synchronously, the same pattern already used
-     * by uv_fs_stat at :816 and uv_fs_readlink at :1785.
-     *
-     * Error convention: uv_fs_* returns a negative UV code in `ret`, so it goes
-     * to tjs_throw_errno_path() AS-IS. Passing it through fs_errno2uv() would be
-     * a double translation, since that helper expects a CRT errno.
-     */
+    /* _wrename never replaces an existing dest (EEXIST); uv_fs_rename passes
+     * MOVEFILE_REPLACE_EXISTING like Node. `ret` stays a UV code. */
     uv_fs_t req;
     int ret = uv_fs_rename(NULL, &req, oldpath, newpath, NULL);
     int uv_err = ret;
@@ -2649,10 +2487,8 @@ static JSValue tjs_syncfs_realpath(JSContext* ctx,
     if (wcsncmp(out, L"\\\\?\\", 4) == 0) {
         out += 4;
         if (wcsncmp(out, L"UNC\\", 4) == 0) {
-            // Convert \\?\UNC\server\share to \\server\share
-            // We need to modify the buffer, so use a non-const pointer
-            // out points at "UNC\server\share"; the 'C' is two WCHARs ahead and
-            // is followed by '\', so overwriting it with '\' gives "\\server\share".
+            // out+2 overwrites 'C' with '\'; correct only because the next
+            // WCHAR is already '\', giving "\\server\share".
             WCHAR* out_mut = (WCHAR*) out;
             out_mut += 2;
             *out_mut = L'\\';
@@ -2702,10 +2538,8 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "fs.flock", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_FLOCK(pin, fd));
 
 #ifdef _WIN32
-    /* Byte-range locks belong to the handle passed to LockFileEx and are
-     * released when that handle closes. The duplicate only pins identity while
-     * the hook runs; lock the caller's still-current handle so the lock lives
-     * until that fd is closed or explicitly unlocked. */
+    /* Lock the caller's handle, not the pin's duplicate: LockFileEx locks
+     * belong to that handle and die when it closes. */
     HANDLE hFile = (HANDLE) _get_osfhandle(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
         return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
@@ -2841,22 +2675,7 @@ static JSValue tjs_syncfs_truncate(JSContext* ctx, JSValueConst this_val, int ar
     WCHAR *wpath = utf8_to_wcs(path);
     if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
 
-    /*
-     * Share flags matter here. This used to pass dwShareMode 0, which denies all
-     * concurrent access, so truncating a file that anything else -- including cno
-     * itself -- had open failed. Measured 2026-08-04:
-     *
-     *   cno  openSync(p,'r') then truncateSync(p, 2) -> THREW EBUSY
-     *   node openSync(p,'r') then truncateSync(p, 2) -> OK, size 2
-     *
-     * libuv opens with FILE_SHARE_READ|WRITE|DELETE (fs__open), and the long
-     * comment at the top of this file records the same class of bug for _wopen
-     * lacking FILE_SHARE_DELETE. Matching libuv's share set fixes it.
-     *
-     * Kept as CreateFileW rather than uv_fs_open + uv_fs_ftruncate to stay a
-     * one-line semantic change; the remaining known divergence is that truncating
-     * a DIRECTORY reports EPERM here and EINVAL in Node (see the survey).
-     */
+    /* Share mode 0 denies all concurrent access; match libuv's share set. */
     HANDLE hFile = CreateFileW(wpath, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2956,22 +2775,7 @@ static JSValue tjs_syncfs_chmod(JSContext* ctx, JSValueConst this_val, int argc,
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.chmod", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than calling _chmod.
-     *
-     * libuv's fs__chmod is _wchmod, i.e. the same CRT call with a wide path, so
-     * the semantics are identical -- only the read-only attribute moves either
-     * way. The reason to route through uv is the path encoding: `_chmod` takes a
-     * char* and interprets it in the ANSI code page. No failure was OBSERVED here
-     * (this host is ACP 65001, so UTF-8 bytes survive), but that is a machine
-     * property; on a CP1252 host a Japanese or Cyrillic filename would not
-     * round-trip. Every other Windows leg in this file already converts with
-     * utf8_to_wcs, so this was the odd one out.
-     *
-     * Error convention: negative UV code from uv_fs_*, used as-is. Note libuv
-     * feeds _doserrno (a Win32 code) to SET_REQ_WIN32_ERROR here, so the decoding
-     * happens inside libuv and must not be repeated with fs_errno2uv().
-     */
+    /* _chmod takes an ANSI codepage char*; uv_fs_chmod uses the wide path. */
     uv_fs_t req;
     int ret = uv_fs_chmod(NULL, &req, path, mode, NULL);
     int uv_err = ret;
@@ -3007,35 +2811,7 @@ static JSValue tjs_syncfs_fchmod(JSContext* ctx, JSValueConst this_val, int argc
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fchmod", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than refusing.
-     *
-     * The old code here returned a bare JS_ThrowInternalError("fchmod not
-     * supported on Windows"), which was wrong on two counts: it carried no errno
-     * (so it surfaced as code UNKNOWN, matching no `e.code` check), and Windows
-     * does in fact support this. libuv's fs__fchmod
-     * (deps/libuv/src/win/fs.c:2567) implements it with ReOpenFile(
-     * FILE_WRITE_ATTRIBUTES) + NtSetInformationFile, so Node succeeds.
-     *
-     * Contrast fchown/chown/lchown immediately below: libuv's fs__fchown
-     * (:3105) really IS a bare SET_REQ_RESULT(req, 0) no-op, because Windows has
-     * no POSIX uid/gid. Grouping fchmod with those was the original mistake --
-     * only the chown family is genuinely unsupported.
-     *
-     * Measured 2026-08-04 vs node v24.18.0, mode read back with fstatSync:
-     *
-     *   route                        node            cno (before)
-     *   fs.fchmodSync(fd, 0o444)     OK, 666->444    UNKNOWN, stays 666
-     *   fs.fchmod(fd, 0o444, cb)     OK, 666->444    UNKNOWN, stays 666
-     *   FileHandle.chmod(0o444)      OK, 666->444    OK, 666->444   <- already right
-     *
-     * That last row is the same sync/async tell as rename, unlink and open: the
-     * async path already reached the correct behaviour through uv_fs_fchmod, so
-     * "Windows cannot do this" was never the explanation.
-     *
-     * Error convention: uv_fs_* returns a negative UV code, passed through
-     * as-is. fs_errno2uv() is for CRT errno only and must not be applied here.
-     */
+    /* uv_fs_fchmod really works; only the fchown family is a libuv no-op. */
     uv_fs_t req;
     int ret = uv_fs_fchmod(NULL, &req, fd, mode, NULL);
     int uv_err = ret;
@@ -3269,30 +3045,8 @@ static JSValue tjs_syncfs_access(JSContext* ctx, JSValueConst this_val, int argc
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "fs.access", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    /*
-     * Delegate to libuv rather than calling _access.
-     *
-     * _access only accepts mode bits 00/02/04/06. X_OK is 1, so accessSync(p,
-     * X_OK) trips the UCRT invalid-parameter handler. Measured 2026-08-04:
-     *
-     *   cno  fs.accessSync(file, X_OK) -> THREW EINVAL, and the UCRT printed
-     *        "minkernel\crts\ucrt\src\appcrt\filesystem\waccess.cpp(20) :
-     *         Assertion failed: (access_mode & (~6)) == 0"
-     *        straight to the console, which no JS program can suppress
-     *   node fs.accessSync(file, X_OK) -> OK
-     *
-     * There is no executable bit on Windows, so libuv's fs__access ignores X_OK
-     * and only rejects W_OK against FILE_ATTRIBUTE_READONLY. That also corrects a
-     * second divergence measured in the same run: W_OK on a readonly file gave
-     * EACCES here and EPERM in Node, because libuv reports UV_EPERM for it.
-     *
-     * As a bonus this stops passing a char* path to an ANSI CRT entry point.
-     * Nothing was observed to break there -- this host runs ACP 65001 (UTF-8), so
-     * `_access` happened to accept UTF-8 -- but that is a property of the machine,
-     * not of the code, and it would fail on a CP1252 host.
-     *
-     * Error convention: negative UV code from uv_fs_*, used as-is.
-     */
+    /* _access trips the UCRT assert on X_OK; uv_fs_access ignores X_OK and
+     * maps W_OK on a readonly file to EPERM, matching Node. */
     uv_fs_t req;
     int ret = uv_fs_access(NULL, &req, path, mode, NULL);
     int uv_err = ret;

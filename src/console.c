@@ -332,11 +332,7 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
     int consumed = 0;
 
     if (JS_IsString(argv[0])) {
-        /* Node short-circuits a lone string argument: formatWithOptionsInternal
-         * returns `first` verbatim when args.length === 1, so no specifier
-         * processing happens at all and `%%` is NOT collapsed
-         * (util.format('a%%b') === 'a%%b'). With further arguments the
-         * specifier pass does run and `%%` does collapse to `%`. */
+        /* Node skips specifiers for a lone string arg; '%%' stays verbatim. */
         if (argc == 1) {
             format_to_string(ctx, argv[0], buf);
             return true;
@@ -419,15 +415,11 @@ static bool format_args_node(JSContext* ctx, int argc, JSValueConst* argv, DynBu
     for (int i = start; i < argc; i++) {
         if (wrote) dbuf_putc(buf, ' ');
         if (JS_IsString(argv[i])) format_to_string(ctx, argv[i], buf);
-        /* Node's console.log formats its arguments with util.inspect's DEFAULT
-         * depth of 2, not 3 — passing 3 rendered one level deeper than node
-         * before collapsing to `[Object]`. */
+        /* Node inspects at util.inspect's default depth 2, not 3. */
         else format_value_with_depth(ctx, argv[i], buf, 2, false, stream);
         wrote = true;
     }
-    /* %s/%d/%f conversions can leave a pending exception (throwing toString,
-     * valueOf, Symbol.toPrimitive); drop it like format_value does so the
-     * caller does not return normally with an exception set. */
+    /* Conversions may leave a pending exception; drop it before returning. */
     JS_FreeValue(ctx, JS_GetException(ctx));
     return true;
 }
@@ -480,9 +472,7 @@ static void format_string(JSContext* ctx, JSValue val, DynBuf* buf, bool quoted,
         dbuf_printf(buf, "%.*s%s", opts->max_string_length, str, 
                    len > (size_t)opts->max_string_length ? "..." : "");
     } else {
-        /* Node picks the quote that needs the fewest escapes: single, else
-         * double, else backtick. Always escaping `'` inside single quotes
-         * rendered "it's" as 'it\'s' where node gives "it's". */
+        /* Node picks the quote needing the fewest escapes. */
         char quote = '\'';
         if (strchr(str, '\'') != NULL) {
             if (strchr(str, '"') == NULL) quote = '"';
@@ -540,17 +530,8 @@ static void format_bigint(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     if (str) JS_FreeCString(ctx, str);
 }
 
-/* Classify a callable the way Node's util.inspect does.
- *
- * Node keys `[class ...]` off the *source text* starting with `class`, not off
- * the presence of [[Construct]] — every ordinary function is a constructor, so
- * JS_IsConstructor() labelled plain functions `[class ...]`. Async/generator
- * kinds come from Object.prototype.toString's builtinTag, which QuickJS reports
- * identically to V8 (measured).
- *
- * Returns a static string: "class", "Function", "AsyncFunction",
- * "GeneratorFunction" or "AsyncGeneratorFunction".
- */
+/* Classify a callable like Node's util.inspect: [class] keys off source text
+ * starting with "class", not JS_IsConstructor. Returns a static string. */
 static const char* function_kind(JSContext* ctx, JSValue val) {
     /* Resolve Function.prototype.toString rather than val.toString, so a user
      * override cannot steer the classification. */
@@ -705,9 +686,7 @@ static void format_symbol(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
 }
 
 static void format_date(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
-	/* Node renders a Date as its ISO-8601 form (util.inspect uses
-	 * toISOString), not the local-timezone toString. The local form also made
-	 * output depend on the host timezone, so it could not be asserted on. */
+	/* Node renders a Date as toISOString (ISO-8601), not local time. */
 	put_color(buf, opts, ANSI_MAGENTA);
 
 	double t = 0;
@@ -910,9 +889,7 @@ static void format_array(JSContext* ctx, JSValue val, int depth, VisitStack* sta
     put_color(buf, opts, ANSI_CYAN);
     dbuf_putstr(buf, "[");
     put_reset(buf, opts);
-    /* Node pads inline array contents: `[ 1, 2 ]`, not `[1, 2]`. This is not
-     * conditional on show_hidden — format_object does the same unconditionally
-     * for `{ a: 1 }`. The empty-array early return above keeps `[]` bare. */
+    /* Node pads inline arrays: `[ 1, 2 ]`; not conditional on show_hidden. */
     if (inline_disp) dbuf_putstr(buf, " ");
 
     int64_t show = len < opts->max_array_length ? len : opts->max_array_length;
@@ -976,10 +953,7 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
 
     visit_push(stack, val);
 
-    /* A null prototype is load-bearing information — it is the shape that
-     * prototype-pollution guards produce, and dropping the marker made a
-     * hardened object indistinguishable from a plain one. Node prints
-     * `[Object: null prototype] { ... }`. */
+    /* Node prints `[Object: null prototype]`; keep the null-proto marker. */
     JSValue own_proto = JS_GetPrototype(ctx, val);
     bool null_proto = JS_IsNull(own_proto);
     if (JS_IsException(own_proto)) {
@@ -1027,10 +1001,8 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
         /* No own enumerable props: fall back to prototype getters (e.g. TS class with only get accessors).
          * Only one level up — avoids showing every Object.prototype method. */
         JSValue proto = JS_GetPrototype(ctx, val);
-        /* ...but never walk Object.prototype itself. Doing so invoked its
-         * `__proto__` accessor and rendered a bare `{}` as
-         * `{\n  __proto__: {}\n}`. Only a *subclass* prototype can carry
-         * meaningful accessors. */
+        /* Never walk Object.prototype itself: its `__proto__` accessor fires
+         * and renders a bare `{}` as `{ __proto__: {} }`. */
         JSValue obj_proto = JS_UNDEFINED;
         {
             JSValue g = JS_GetGlobalObject(ctx);
@@ -1221,11 +1193,7 @@ static void format_typed_array(JSContext* ctx, JSValue val, int depth, VisitStac
         return;
     }
 
-    /* JS_GetTypedArrayBuffer yields the length in BYTES and the element size
-     * separately; the element count is the quotient. Printing byte_len here
-     * overstated the length for every multi-byte element type and made the
-     * loop read past the end, rendering elements that do not exist as
-     * `undefined`. */
+    /* JS_GetTypedArrayBuffer gives bytes; element count is byte_len / per. */
     size_t len = per ? byte_len / per : byte_len;
 
     put_color(buf, opts, ANSI_MAGENTA);
@@ -1277,9 +1245,8 @@ static void format_dataview(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
         data = JS_GetArrayBuffer(ctx, &size, buffer);
     }
 
-    /* Restrict the dump to the view's own window. The getters can run user
-     * code, so clamp against the size captured above and re-validate nothing
-     * else afterwards: `data` stays valid because `buffer` is still held. */
+    /* The getters can run user code, so clamp to the size captured above;
+     * `data` stays valid because `buffer` is still held. */
     size_t view_off = 0, view_len = size;
     if (data) {
         int64_t off = 0, len = 0;
@@ -1718,10 +1685,7 @@ static JSValue js_console_dir(JSContext* ctx, JSValueConst this_val, int argc, J
     InspectOptions opts;
     parse_inspect_options(ctx, opts_val, &opts);
 
-    /* These were unconditional assignments, which silently discarded a
-     * caller-supplied depth/showHidden/compact — `console.dir(o, {depth: 1})`
-     * behaved exactly like `console.dir(o)`. Apply them only as defaults, so an
-     * explicit option wins while a bare `console.dir(o)` is unchanged. */
+    /* Options are only defaults: an explicit option must win over them. */
     if (JS_IsObject(opts_val)) {
         JSValue v = JS_GetPropertyStr(ctx, opts_val, "depth");
         bool has_depth = JS_IsNumber(v);

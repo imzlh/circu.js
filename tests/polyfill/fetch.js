@@ -1,10 +1,6 @@
 
 const { XMLHttpRequest, ResponseType } = use('xhr');
-/**
- * Parse XHR response headers string into Headers object
- * @param {string} headerString - Raw header string from getAllResponseHeaders()
- * @returns {Headers} Headers instance
- */
+/** Parse XHR response headers string into Headers object. */
 function parseHeaders(headerString) {
     const headers = new Headers();
     if (!headerString) return headers;
@@ -20,11 +16,7 @@ function parseHeaders(headerString) {
     return headers;
 }
 
-/**
- * Normalize request body to XHR-compatible format
- * @param {any} body - The request body from Request object
- * @returns {Promise<string|ArrayBuffer|null>} Normalized body for XHR.send()
- */
+/** Normalize request body to XHR-compatible format for XHR.send(). */
 async function normalizeBody(body) {
     if (body == null) return null;
 
@@ -61,12 +53,7 @@ async function normalizeBody(body) {
     }
 }
 
-/**
- * Main fetch implementation using CModuleXHR
- * @param {RequestInfo|URL} input - URL string, URL object, or Request object
- * @param {RequestInit} [init={}] - Optional request configuration
- * @returns {Promise<Response>} Promise resolving to Response object
- */
+/** Main fetch implementation using CModuleXHR. */
 async function fetch(input, init = {}) {
     const request = new Request(input, init);
 
@@ -250,10 +237,7 @@ if (typeof Response === 'undefined') {
             return this._bodyUsed;
         }
 
-        /**
-         * Read response body as text - key requirement
-         * @returns {Promise<string>} Resolves to response text
-         */
+        /** Read response body as text. */
         async text() {
             if (this._bodyUsed) {
                 throw new TypeError('Body already read');

@@ -64,16 +64,11 @@
     } \
 } while(0)
 
-/* Implemented in utils.c. Declared locally rather than in utils.h because that
- * header is shared with concurrent work; the definition and both call sites
- * (here and vm.c) are the whole surface. */
+/* Implemented in utils.c. */
 size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped);
 size_t tjs__native_stack_total_size(void);
 
-/* PromiseHook 
- * Called SYNCHRONOUSLY, matching V8: PromiseHook events describe a moment, so
- * dispatching them later reports the wrong moment.
- */
+/* PromiseHook: called synchronously, matching V8; events describe a moment. */
 static thread_local bool tjs__in_promise_hook = false;
 
 static void tjs__promise_hook(JSContext* ctx, JSPromiseHookType type,
@@ -266,22 +261,11 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 		return JS_ThrowTypeError(ctx, "new Module() requires 2 argument");
 	}
 
-	/* Convert the module name BEFORE acquiring argv[0]'s backing store: if
-	 * argv[1] is an object, JS_ToCString runs a user toString() that can detach
-	 * argv[0]. On the zero-copy "guarded" path below, `source` points straight
-	 * into that backing store and JS_Eval would then compile freed heap. */
+	/* Convert argv[1] first: its toString() can detach argv[0], whose buffer
+	 * the zero-copy path reads -- JS_Eval would compile freed heap. */
 	const char *_mname = JS_ToCString(ctx, argv[1]);
-	/* Propagate instead of falling back to "<module>". This is NOT an OOM-only
-	 * path: argv[1] may be any object, so the JS_ToCString above runs a user
-	 * toString() (the very reason it was hoisted here), and that throw landed in
-	 * ctx as a pending exception while the old code carried on to compile and
-	 * return a module. OBSERVED before this change:
-	 *   new Module('export const x = 1;', { toString(){ throw new Error('x') } })
-	 * returned a usable module object, resolve() and eval() both succeeded and
-	 * the process exited 0 -- the user's exception vanished. Node/V8 propagate a
-	 * throwing toString() from an argument conversion, so returning JS_EXCEPTION
-	 * is both the correct protocol and the matching behaviour. Nothing is
-	 * allocated yet at this point, so a bare return needs no cleanup. */
+	/* Propagate: argv[1] may be any object whose toString() can throw;
+	 * nothing is allocated yet, so a bare return needs no cleanup. */
 	if (!_mname) return JS_EXCEPTION;
 	const char *module_name = _mname;
 
@@ -299,10 +283,8 @@ static JSValue js_module_constructor(JSContext *ctx, JSValueConst new_target, in
 			return JS_ThrowTypeError(ctx, "new Module() source must be a string or UTF-8 bytes");
 		}
 
-		/* JS_Eval requires source[len] == '\0' (see quickjs.c). engine.toSharedBytes()
-		 * and oxc's transpileSharedBytes() supply this NUL guard past the exposed
-		 * view; anything else (e.g. a raw fs.readFile() buffer) is not guaranteed
-		 * to have it, so copy+terminate rather than risk a 1-byte heap overread. */
+		/* JS_Eval needs a NUL at source[len]; not every buffer has one,
+		 * copy+terminate otherwise rather than overread 1 byte. */
 		bool guarded = false;
 		if (JS_GetTypedArrayType(argv[0]) == JS_TYPED_ARRAY_UINT8) {
 			size_t offset = 0, view_len = 0, bytes_per_element = 0, buffer_len = 0;
@@ -350,12 +332,8 @@ static JSValue js_module_eval(JSContext *ctx, JSValueConst this_val, int argc, J
     tjs_module_t* mt = JS_GetOpaque2(ctx, this_val, js_module_class_id);
     if(!mt) return JS_EXCEPTION;
     JSValue mod_val = JS_MKPTR(JS_TAG_MODULE, mt->def);
-    /* Resolve dependencies and initialize import.meta (including metaloader
-     * / init hook) before evaluating. The standard QuickJS eval path in
-     * quickjs-libc.c does JS_ResolveModule → js_module_set_import_meta →
-     * JS_EvalFunction, but js_module_eval was only calling the last step,
-     * so the entry module's import.meta was never set up and the init hook
-     * (which fires Debugger.scriptParsed) never triggered. */
+    /* Resolve and set import.meta before evaluating, mirroring the standard
+     * QuickJS eval path; skipping either skips the init hook. */
     if (JS_ResolveModule(ctx, mod_val) < 0)
         return JS_EXCEPTION;
     if (js_module_set_import_meta(ctx, mod_val, false, false) < 0)
@@ -393,9 +371,7 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
     list_for_each(pos, &mt->local_def){
         tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
         if(name == me->atom){
-            /* Don't free the var_ref here! JS_DefineModuleExport will reuse
-             * the same var_ref and just update its value. The var_ref is owned
-             * by the module and will be freed when the module is destroyed. */
+            /* var_ref is module-owned; JS_DefineModuleExport reuses it. */
             JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
             JS_FreeAtom(ctx, name);
             goto end;
@@ -788,33 +764,13 @@ static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, J
     if (JS_ToUint32(ctx, &v, argv[0])) {
         return JS_EXCEPTION;
     }
-    /* This is the ONLY live path for --max-stack-size: the CLI parses it in
-     * src/commands/run.ts:123 and cts/src/config.ts:356 calls straight through
-     * to here. Passing the request to QuickJS unchecked put its soft limit at
-     * or below the guard page for any value >= the thread's real stack, and an
-     * ordinary recursion then died on the guard page with rc 0xC00000FD and
-     * NOTHING on stdout or stderr — see the OBSERVED table above
-     * tjs__clamp_stack_size in utils.c. A clamped value still throws a
-     * catchable RangeError; an unclamped one cannot.
-     *
-     * The clamp reads the OS stack bounds, not the stack pointer, which is
-     * required here: this runs many JS frames deep, so an sp-relative
-     * measurement would under-report the available stack badly. */
+    /* Unchecked, a limit >= the real stack dies on the guard page silently;
+     * clamped throws catchable RangeError. Bounds are OS-derived, not sp. */
     bool clamped = false;
     size_t limit = tjs__clamp_stack_size((size_t) v, &clamped);
     if (clamped) {
-        /* Report it. A silently ignored resource flag is the failure mode that
-         * let --memory-limit=16MB allow 4GB (src/commands/run.ts:115-121), and
-         * the requirement for this flag is that no value may produce an empty
-         * diagnostic. Only fires when the caller asked for more than the
-         * thread can address, so the default tiers (2/4/6MB, cts/src/config.ts:37-41)
-         * never print.
-         *
-         * Prints the thread's TOTAL stack rather than the usable ceiling: the
-         * ceiling is by construction equal to `limit` whenever clamped is true,
-         * so naming it would print the same number twice and read like a bug.
-         * The total is also the actionable figure, since it is what /STACK (or
-         * the thread's dwStackSize / RLIMIT_STACK) controls. */
+        /* Report the clamp -- no resource flag may fail silently. Prints the
+         * thread's total stack, not the ceiling (= limit). */
         fprintf(stderr,
                 "cno: --max-stack-size=%zu does not fit in this thread's %zu-byte stack; "
                 "using %zu instead\n",
@@ -895,11 +851,8 @@ static JSValue tjs_deserialize(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 }
 
-/* Run a value previously produced by JS_Eval(..., JS_EVAL_FLAG_COMPILE_ONLY)
- * (either global/script or module code) — generic counterpart to
- * js_module_eval, but not tied to the Module class wrapper. Needed to
- * actually execute a plain compiled-script value round-tripped through
- * tjs_serialize()/tjs_deserialize() (the JS_TAG_FUNCTION_BYTECODE case). */
+/* Runs a JS_Eval(COMPILE_ONLY) value (script or module): js_module_eval's
+ * counterpart, for values round-tripped through serialize/deserialize. */
 static JSValue tjs_eval_compiled(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "evalCompiled(compiledValue) requires 1 argument");
     return JS_EvalFunction(ctx, JS_DupValue(ctx, argv[0]));
@@ -1001,19 +954,15 @@ void tjs__run_next_ticks(TJSRuntime* trt) {
 
     JSContext* ctx = trt->main_ctx;
 
-    /* Cleared BEFORE the call so a tick callback that queues another tick can
-     * re-raise it. The JS drain loops until its queue is empty, so the common
-     * case costs one crossing per checkpoint, not one per callback. */
+    /* Cleared before the call so a tick callback can re-raise it. */
     trt->jobs.ticks_pending = false;
     trt->jobs.ticks_draining = true;
     JSValue ret = JS_Call(ctx, trt->builtins.nexttick_drain_fn, JS_UNDEFINED, 0, NULL);
     trt->jobs.ticks_draining = false;
 
     if (JS_IsException(ret)) {
-        /* The JS drain catches each callback and only rethrows when there is no
-         * 'uncaughtException' listener. Route that exactly like a failed promise
-         * job: today the drain runs AS a promise job, so this is the same path
-         * the error already takes, diagnostic and exit code included. */
+        /* The drain rethrows only without an 'uncaughtException' listener;
+         * route that like a failed promise job (same path, same exit code). */
         JSValue js_err = JS_GetException(ctx);
         if (JS_IsUncatchableError(js_err)) {
             tjs__stop_uncatchable_error(ctx, js_err);

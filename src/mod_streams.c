@@ -530,9 +530,8 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
         if (JS_IsException(args[0])) {
             args[0] = JS_UNDEFINED;
             args[1] = JS_GetException(ctx);
-            /* QuickJS falls back to throwing null if even the error object
-             * cannot be allocated. The backing store is now freed, so retry
-             * before passing a falsy error to the JavaScript read handler. */
+            /* QuickJS throws null when even the error object cannot be
+             * allocated; retry before passing a falsy error to JS. */
             if (JS_IsNull(args[1])) {
                 JS_ThrowOutOfMemory(ctx);
                 args[1] = JS_GetException(ctx);
@@ -624,12 +623,8 @@ static void uv__write_cb(uv_write_t *req, int status) {
     CHECK_NOT_NULL(s);
     JSContext *ctx = s->ctx;
 
-    /* This runs from uv__run_closing_handles (the write queue is flushed with
-     * UV_ECANCELED when the handle closes), NOT from the finalizer — so it is
-     * legal and necessary to settle the promise here, otherwise an awaiting
-     * caller hangs forever. Only bail out when the runtime itself is going
-     * away. Use s->trt: it outlives the JSContext, which is freed before the
-     * final teardown drain. */
+    /* Runs from uv__run_closing_handles, not the finalizer: settle the
+     * promise here; s->trt outlives the JSContext freed in teardown. */
     TJSRuntime *qrt = s->trt;
     if (!qrt || qrt->freeing) {
         tjs_write_req_free_rt(qrt ? qrt->rt : JS_GetRuntime(ctx), wr);
@@ -700,9 +695,8 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
     memcpy(wr->data, buf, sz);
 
-    /* The completion callback can run after this function returns. Create the
-     * capability before handing the request to libuv so an allocation failure
-     * never leaves a queued write with an invalid promise record. */
+    /* Create the promise before uv_write(): the callback can run after we
+     * return, so an allocation failure must never leave a queued write. */
     JSValue promise = TJS_InitPromise(ctx, &wr->result);
     s->write_starting = false;
     if (JS_IsException(promise)) {
@@ -753,9 +747,7 @@ static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t 
     JSContext *ctx = s->ctx;
     TJSReadReq *rr = s->read_req;
 
-    /* libuv uses nread == 0 for "would block / try again later", not EOF.
-     * Do not stop the one-shot read or settle the promise in that case,
-     * otherwise transient wakeups become false EOFs in JS. */
+    /* libuv: nread == 0 is "would block", not EOF — do not settle here. */
     if (nread == 0)
         return;
 
@@ -765,9 +757,7 @@ static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t 
     uv_read_stop(&s->h.stream);
     s->read_req = NULL;
 
-    /* close() can race with a pending one-shot read. If the request was
-     * already cleaned up while the handle was shutting down, ignore the
-     * cancellation callback instead of dereferencing freed state. */
+    /* close() can race a pending one-shot read: rr may already be freed. */
     if (!rr)
         return;
 
@@ -1245,10 +1235,8 @@ void tjs__free_orphaned_streams(TJSRuntime *qrt) {
         if (!s->closing_for_runtime || !s->closed || s->finalized)
             continue;
 
-        /* Some runtime-owned globals can survive until JS_FreeRuntime without
-         * their class finalizer running. At that point no JS callback can run,
-         * but the libuv close callback has completed, so release the native
-         * stream object from the runtime-owned list. */
+        /* Globals can reach JS_FreeRuntime without a finalizer run; with no
+         * JS callbacks possible and the libuv close done, free here. */
         stream_unlink(s);
         tjs__free(s);
     }

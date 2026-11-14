@@ -46,31 +46,10 @@ typedef struct TJSApp App;
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-/* External native module ABI.
- *
- * A loadable `.so`/`.dll` must export a single function:
- *
- *     TJS_EXPORT const TJSModuleInfo *tjs_module_info(void);
- *
- * Use the DEF_MODULE() macro below to declare it.  The loader validates
- * `abi_version` against TJS_ABI_VERSION before reading any other field,
- * so adding fields in future versions does not break old `.so`s.
- */
 #define TJS_ABI_VERSION 1u
 
-/* Runtime capability hook ABI.
- *
- * A mask is one category bit in the high 16 bits plus one or more generic
- * operation bits in the low 16 bits. A descriptor still contains exactly one
- * category: the one-hot encoding lets validation reject accidental category
- * combinations instead of silently interpreting them as a different tag.
- *
- * `api` names the libcjs operation for diagnostics and coarse routing. It is
- * not a second permission system; policy should be expressed by `mask`.
- * `details.resource` is an optional best-effort name (path, endpoint,
- * environment variable, library, and so on). Console events instead select
- * `details.console`. All strings and JS values are borrowed for the duration
- * of the hook. */
+/* Capability hook ABI: one category bit (high 16) plus operation bits (low 16);
+ * strings and JS values are borrowed for the duration of the hook. */
 #define TJS_CAPABILITY_ABI_VERSION 1u
 
 typedef uint32_t TJSCapabilityMask;
@@ -140,9 +119,7 @@ struct TJSCapability {
     TJSCapabilityDetailsV1 details;
 };
 
-/* Minimum prefix understood by capability ABI v1. Future fields may only be
- * appended; validators must use this prefix rather than future sizeof values
- * so a newer libcjs can still accept a v1 descriptor. */
+/* ABI freeze: validators must use this v1 prefix, never a future sizeof. */
 #define TJS_CAPABILITY_V1_SIZE \
     (offsetof(TJSCapability, details) + sizeof(TJSCapabilityDetailsV1))
 
@@ -150,16 +127,13 @@ typedef JSValue (*TJSCapabilityHook)(JSContext *ctx,
                                      const TJSCapability *capability,
                                      void *userdata);
 
-/* Return PASS to continue, JS_EXCEPTION with a pending exception to abort, or
- * an owned JSValue to replace a descriptor marked REPLACEABLE. Async
- * replacements are returned unchanged; libcjs does not wrap them in Promise. */
+/* PASS continues, JS_EXCEPTION aborts, an owned JSValue replaces a
+ * REPLACEABLE descriptor (async values returned unwrapped). */
 #define TJS_CAPABILITY_PASS JS_UNINITIALIZED
 
 enum {
-    /* Every PASS from this hook promises that it did not execute user JS, call
-     * back into libcjs, or mutate state used by the pending native operation.
-     * This is an installation-time promise because descriptor/fd protection
-     * may have to happen before the hook is called. */
+    /* PASS promises no user JS, no re-entry into libcjs, and no mutation of
+     * state the pending native operation relies on. */
     TJS_CAPABILITY_HOOK_PASS_IS_STABLE = UINT32_C(1) << 0,
 };
 

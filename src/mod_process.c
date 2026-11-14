@@ -69,9 +69,6 @@
 #endif
 
 
-/* ============================================================
- * Windows ConPTY — dynamic load from kernel32
- * ============================================================ */
 #ifdef _WIN32
 typedef HRESULT (WINAPI *CreatePseudoConsolePtr)(COORD, HANDLE, HANDLE, DWORD, HPCON *);
 typedef HRESULT (WINAPI *ResizePseudoConsolePtr)(HPCON, COORD);
@@ -95,15 +92,8 @@ static bool load_conpty(void) {
 #endif /* _WIN32 */
 
 
-/* ============================================================
- * TJSProcess — unified normal-process + PTY + raw fork
- *
- * Normal mode:  uv_process_t + stdio Pipe objects.
- * PTY mode:     fork+openpty (Unix) / ConPTY (Windows).
- *               p->process is NOT initialized in PTY mode.
- * Fork mode:    raw forked PID, tracked with waitpid + a libuv timer.
- *               p->process is NOT initialized in fork mode.
- * ============================================================ */
+/* Modes: normal (uv_process_t + Pipe objects), PTY (fork+openpty / ConPTY),
+ * raw fork (waitpid + timer). p->process is NOT initialized in PTY/fork. */
 static thread_local JSClassID tjs_process_class_id;
 static thread_local struct list_head tjs_fork_processes;
 static thread_local bool tjs_fork_processes_initialized;
@@ -157,11 +147,6 @@ static WCHAR *spawn_sync_resolve_win_app(JSContext *ctx, const WCHAR *app);
 static WCHAR *spawn_sync_build_win_cmdline(JSContext *ctx, char **args, bool verbatim);
 static WCHAR *spawn_sync_build_win_env(JSContext *ctx, char **env);
 #endif
-
-
-/* ============================================================
- * Shared helpers
- * ============================================================ */
 
 static JSValue make_exit_obj(JSContext *ctx, int64_t es, int ts) {
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
@@ -592,11 +577,6 @@ static TJSProcess *tjs_process_new(JSContext *ctx, JSValue *obj_out) {
     return p;
 }
 
-
-/* ============================================================
- * Lifecycle — close / finalize / GC mark
- * ============================================================ */
-
 static void uv__proc_close_cb(uv_handle_t *handle) {
     TJSProcess *p = handle->data;
     CHECK_NOT_NULL(p);
@@ -627,16 +607,7 @@ static void maybe_close(TJSProcess *p) {
 }
 
 #ifdef _WIN32
-/* Close the pseudoconsole exactly once.
- *
- * ConPTY owns the write end of the master output pipe and holds it open until
- * ClosePseudoConsole(), so EOF on p->pty_readable is otherwise unreachable: a
- * read-to-EOF loop hangs forever even after the child has exited. Nulling hpc
- * before the call makes every later caller a no-op, so the GC finalizer and
- * this exit path can both call it.
- *
- * Bytes already buffered in the pipe stay readable after the close, so calling
- * this the moment the child exits does not truncate output. */
+/* Null hpc first so the finalizer and exit path both become no-ops. */
 static void pty_win_close_hpcon(TJSProcess *p) {
     HPCON hpc = p->hpc;
     p->hpc = NULL;
@@ -652,11 +623,8 @@ static void process_finish(TJSProcess *p, int64_t exit_status, int term_signal) 
     p->status.term_signal = term_signal;
 
 #ifdef _WIN32
-    /* Every caller reaches here only once the child is confirmed dead
-     * (uv__exit_cb, uv__pty_wait_cb's WAIT_OBJECT_0, waitSync's INFINITE
-     * wait), so releasing the pseudoconsole here cannot cut a live child off.
-     * Done before the promise settles so EOF is already in flight by the time
-     * JS observes the exit. */
+    /* Reached only after the child is confirmed dead; close before the
+     * promise settles so EOF is already in flight when JS sees the exit. */
     if (p->pty_mode) pty_win_close_hpcon(p);
 #endif
 
@@ -747,17 +715,13 @@ static void process_lose_fork_waiter(TJSProcess *p, int err) {
 }
 
 #ifndef _WIN32
-/* A raw fork does not create a uv_process_t, so libuv cannot deliver the
- * normal exit callback. Poll waitpid from the runtime loop instead, matching
- * the existing Unix PTY child path. */
+/* A raw fork has no uv_process_t, so libuv cannot deliver the exit callback. */
 static bool fork_handle_is_foreign(const TJSProcess *p) {
     return p->fork_mode && p->fork_owner_pid != getpid();
 }
 
-/* A later fork inherits the parent's Process wrappers and their timers. Those
- * wrappers are still valid JS objects, but their PIDs are not children of the
- * new process. Disarm the inherited timer as soon as it gets a turn in the
- * child loop so it cannot spin on ECHILD or keep the child alive. */
+/* A later fork inherits Process wrappers whose PIDs are not children of the
+ * new process; disarm the inherited timer so it cannot spin on ECHILD. */
 static void fork_disown_in_child(TJSProcess *p) {
     uv_timer_stop(&p->fork_waiter);
     process_lose_fork_waiter(p, uv_translate_sys_error(ECHILD));
@@ -854,16 +818,7 @@ static JSClassDef tjs_process_class = {
     .gc_mark   = tjs_process_mark,
 };
 
-
-/* ============================================================
- * PTY spawn — Unix
- * ============================================================ */
 #ifndef _WIN32
-/*
- * On success: populates p->pty_pid, p->master_fd, p->pty_readable/writable.
- *             Returns JS_UNDEFINED.
- * On failure: returns JS_EXCEPTION (exception is set).
- */
 static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
                                const char *name, const char *cwd,
                                char **env_arr, char **argv_arr, int argc_val,
@@ -918,9 +873,8 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
         _exit(1);
     }
 
-    /* Parent — hand the master fd to libuv via uv_pipe_open.
-       libuv then owns the fd and will close it when the pipe is closed.
-       We keep master_fd as an integer for ioctl (resize / getwinsize). */
+    /* uv_pipe_open hands the master fd to libuv, which owns and closes it;
+     * master_fd stays an integer solely for ioctl (resize/getwinsize). */
     close(slave_fd);
 
     JSValue pipe_obj = tjs_new_pipe(ctx);
@@ -952,10 +906,6 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
 }
 #endif /* !_WIN32 */
 
-
-/* ============================================================
- * PTY spawn — Windows (ConPTY)
- * ============================================================ */
 #ifdef _WIN32
 static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
                               const char *name, const char *cwd,
@@ -1026,19 +976,8 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     STARTUPINFOEXW siEx = { 0 };
     siEx.StartupInfo.cb = sizeof(STARTUPINFOEXW);
     siEx.lpAttributeList = attrList;
-    /* Bind the child's stdio to the pseudoconsole.
-     *
-     * Without STARTF_USESTDHANDLES, CreateProcessW propagates *this* process's
-     * standard handle values into the child, and the console-attach path only
-     * re-points them at the pseudoconsole when they already are console
-     * handles. So whenever cno's own stdio is a pipe or a file (test harness,
-     * CI, any redirection) the child keeps the parent's stdio: its output lands
-     * on our stdout, the PTY master only ever sees ConPTY's 16-byte handshake,
-     * and isatty() is false in the child. Setting the flag with NULL handles
-     * leaves the child's std handles empty, and the pseudoconsole attach then
-     * supplies real ConDrv handles. bInheritHandles stays false: there is
-     * nothing to inherit, and passing true instead hands the child our own
-     * un-inheritable handle values. */
+    /* Without STARTF_USESTDHANDLES the child keeps the parent's stdio when
+     * ours is a pipe/file; NULL handles and bInheritHandles=false fix that. */
     siEx.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
     siEx.StartupInfo.hStdInput  = NULL;
     siEx.StartupInfo.hStdOutput = NULL;
@@ -1119,10 +1058,6 @@ cleanup:
 }
 #endif /* _WIN32 */
 
-
-/* ============================================================
- * uv exit callback — normal mode only
- * ============================================================ */
 /* ---- Argument parsing ---- */
 
 static char **tjs__parse_args(JSContext *ctx, JSValue arg0) {
@@ -1592,9 +1527,7 @@ static WCHAR *spawn_sync_utf8_to_wide(JSContext *ctx, const char *s) {
     return w;
 }
 
-/* CreateProcess does not search PATH when lpApplicationName is supplied.
- * Resolve the PTY executable first so argv[0] can remain independent from the
- * executable path, matching the Unix spawn contract. */
+/* CreateProcess does not search PATH with lpApplicationName; resolve first. */
 static WCHAR *spawn_sync_resolve_win_app(JSContext *ctx, const WCHAR *app) {
     DWORD capacity = MAX_PATH;
     for (;;) {
@@ -1897,10 +1830,6 @@ static void uv__exit_cb(uv_process_t *handle, int64_t exit_status, int term_sign
     process_finish(p, exit_status, term_signal);
 }
 
-
-/* ============================================================
- * spawn(args, opts?) — entry point
- * ============================================================ */
 static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc == 0) return JS_ThrowTypeError(ctx, "spawn: expected at least 1 argument");
 
@@ -2048,9 +1977,8 @@ pty_fail:
     bool has_stdio_extra = false;
     bool use_ipc = false;
     uint32_t ipc_fd = 3;
-    /* Set once uv_spawn() has been entered: from that point on &p->process is
-     * linked into loop->handle_queue and must be uv_close()d, never freed.
-     * Declared before the first `goto fail` so the fail path always sees it. */
+    /* Once uv_spawn() is entered, &p->process is linked into the loop's
+     * handle queue and must be uv_close()d, never freed. */
     bool spawn_attempted = false;
 #ifdef _WIN32
     options.flags = UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME;
@@ -2070,10 +1998,8 @@ pty_fail:
     if (argc >= 2 && JS_IsObject(argv[1])) {
         JSValue arg1 = argv[1];
 
-        /* argv0: run options.file but let the child see a different argv[0]
-         * (Node semantics). options.file currently aliases options.args[0], so
-         * take ownership of the executable string before replacing args[0] —
-         * otherwise tjs__free_args would leave options.file dangling. */
+        /* options.file aliases options.args[0]; take ownership of the
+         * executable string before replacing args[0] or it dangles on free. */
         JSValue js_argv0 = JS_GetPropertyStr(ctx, arg1, "argv0");
         if (JS_IsException(js_argv0)) {
             JS_FreeValue(ctx, js_argv0);
@@ -2081,13 +2007,8 @@ pty_fail:
         }
         if (JS_IsString(js_argv0)) {
             const char *s = JS_ToCString(ctx, js_argv0);
-            /* Bail rather than fall through: JS_ToCString left an exception
-             * pending, and continuing would spawn the child and return a live
-             * process object with that exception still set -- while also
-             * silently ignoring the caller's argv0. js_argv0 is already known to
-             * be a string, so the only way here is a failed js_alloc_string
-             * inside JS_ToCStringLen2, i.e. OOM; nothing else in that function
-             * runs user JS for a string input. */
+            /* Bail: the pending exception must not survive a successful spawn
+             * of a live process object (only OOM reaches here for a string). */
             if (!s) {
                 JS_FreeValue(ctx, js_argv0);
                 goto fail;
@@ -2115,16 +2036,13 @@ pty_fail:
         bool clear_env;
         if (bool_prop(ctx, arg1, "clearEnv", &clear_env) < 0) goto fail;
         if (clear_env) {
-            /* Passing a non-NULL environment array makes libuv use it as the
-             * complete child environment. This vendored libuv has no exact
-             * environment flag, so an empty array clears inheritance. */
+            /* Vendored libuv has no exact-env flag: an empty array clears
+             * inheritance. */
             if (!options.env) {
                 options.env = empty_env(ctx);
                 if (!options.env) goto fail;
             }
-// #ifdef _WIN32
-//             options.flags |= UV_PROCESS_WINDOWS_CLEAR_ENV;
-// #endif
+// #ifdef _WIN32: options.flags |= UV_PROCESS_WINDOWS_CLEAR_ENV; #endif
         }
 
         JSValue js_cwd = JS_GetPropertyStr(ctx, arg1, "cwd");
@@ -2197,11 +2115,8 @@ pty_fail:
                 JS_FreeValue(ctx, js_ipc);
                 goto fail;
             }
-            /* UV_NONBLOCK_PIPE is part of the IPC contract, not an
-             * optimization: the parent writes this pipe from the event loop,
-             * and a blocking pipe can stall the loop when the child stops
-             * draining. libuv documents that a child not designed for a
-             * non-blocking pipe may lose data, so child.send() relies on it. */
+            /* UV_NONBLOCK_PIPE is IPC contract, not optimization: the parent
+             * writes from the event loop, and a blocking pipe can stall it. */
             options.stdio[ipc_fd].flags = UV_CREATE_PIPE | UV_READABLE_PIPE |
                                            UV_WRITABLE_PIPE | UV_NONBLOCK_PIPE;
             options.stdio[ipc_fd].data.stream = NULL;
@@ -2221,11 +2136,8 @@ pty_fail:
         JS_FreeValue(ctx, js_bg);
         if (is_background < 0) goto fail;
         if (is_background) options.flags |= UV_PROCESS_WINDOWS_HIDE;
-        /* windowsVerbatimArguments: hand the command line to CreateProcess
-         * unmodified. Without it libuv's quote_cmd_arg() rewrites inner " as \"
-         * and cmd.exe passes the backslashes through literally, so any shell
-         * command containing quotes is corrupted. Node exposes the same option
-         * and forces it on for shell spawns. */
+        /* Without it libuv's quote_cmd_arg() rewrites inner quotes and cmd.exe
+         * passes backslashes through literally, corrupting shell commands. */
         JSValue js_verbatim = JS_GetPropertyStr(ctx, arg1, "windowsVerbatimArguments");
         if (JS_IsException(js_verbatim)) { JS_FreeValue(ctx, js_verbatim); goto fail; }
         int is_verbatim = JS_IsEqual(ctx, js_verbatim, JS_TRUE);
@@ -2258,9 +2170,8 @@ pty_fail:
     options.exit_cb = uv__exit_cb;
     spawn_attempted = true;
     int r = uv_spawn(tjs_get_loop(ctx), &p->process, &options);
-    /* Even a failed uv_spawn() leaves this handle registered with the loop
-     * until the fail path's uv_close callback runs. A raw fork in that window
-     * would copy the same invalid process handle into the child. */
+    /* Even a failed uv_spawn() leaves the handle registered with the loop
+     * until its close callback runs; a fork in that window copies it. */
     p->counted_nonfork = true;
     tjs_live_nonfork_processes++;
     if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
@@ -2369,13 +2280,8 @@ static int fork_check_allowed(JSContext *ctx, TJSRuntime **runtime_out) {
 }
 #endif
 
-/*
- * fork() — duplicate the current runtime and return to JS in both branches.
- *
- * The child must repair libuv's inherited kernel state before any other loop
- * operation. It deliberately returns null rather than allocating a Process
- * wrapper; only the parent owns and reaps the new PID.
- */
+/* The child must repair libuv's inherited kernel state before any other loop
+ * operation; it returns null — only the parent owns and reaps the new PID. */
 static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     (void)this_val;
     (void)argv;
@@ -2398,13 +2304,11 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
 
     if (pid == 0) {
         int r = uv_loop_fork(tjs_get_loop(ctx));
-        /* libuv may already have partially rebuilt the inherited backend when
-         * this fails. Returning to JS would let user code continue on a loop
-         * whose invariants are unknown, so terminate only this failed child. */
+        /* A failed uv_loop_fork() may leave the backend half-rebuilt; keep
+         * user JS off that loop by terminating only this failed child. */
         if (r != 0) _exit(127);
-        /* A zygote forks siblings sequentially. Any Process handles already
-         * created belong only to the original parent; invalidate their copied
-         * wait promises before returning control to child JS. */
+        /* Any Process handles created before the fork belong only to the
+         * original parent; invalidate the child's copied wait promises. */
         disown_inherited_fork_handles();
         return JS_NULL;
     }
@@ -2463,11 +2367,6 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     return obj;
 #endif
 }
-
-
-/* ============================================================
- * Process methods
- * ============================================================ */
 
 /* pid — works for both modes */
 static JSValue tjs_process_pid_get(JSContext *ctx, JSValue this_val) {
@@ -2712,10 +2611,8 @@ static JSValue tjs_process_resize(JSContext *ctx, JSValue this_val, int argc, JS
     TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "process.resize"), (void)0, if (tjs_process_resize_revalidate(ctx, this_val, &p, &pty_fd) < 0) return JS_EXCEPTION);
 
 #ifdef _WIN32
-    /* After the child exits the pseudoconsole is gone (process_finish releases
-     * it so the master pipe can reach EOF). POSIX still accepts a resize on the
-     * surviving master fd, so keep the tracked size coherent rather than
-     * throwing on a difference JS callers cannot see. */
+    /* After child exit the pseudoconsole is gone; POSIX still resizes the
+     * master fd, so keep the tracked size coherent instead of throwing. */
     if (!p->hpc) {
         p->pty_cols = cols; p->pty_rows = rows;
         return JS_UNDEFINED;
@@ -2762,11 +2659,6 @@ static JSValue tjs_process_getwinsize(JSContext *ctx, JSValue this_val) {
 #endif
     return obj;
 }
-
-
-/* ============================================================
- * Global functions: kill(pid, signal?) and exec(args)
- * ============================================================ */
 
 static JSValue tjs_kill(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc == 0 || JS_IsUndefined(argv[0]))
@@ -2833,11 +2725,6 @@ static JSValue tjs_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     return err;
 #endif
 }
-
-
-/* ============================================================
- * Proto / function tables + module init
- * ============================================================ */
 
 /* clang-format off */
 static const JSCFunctionListEntry tjs_process_proto_funcs[] = {

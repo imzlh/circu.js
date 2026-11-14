@@ -50,10 +50,7 @@ static void uv__timer_close(uv_handle_t *handle) {
     tjs__free(th);
 }
 
-/* Release the JS values owned by a timer that has not been inserted into the
- * runtime hash yet.  The normal destroy_timer() path also removes the hash
- * entry and closes the uv handle, so keep this helper limited to construction
- * failures. */
+/* Frees values of a timer not yet in the hash; construction failures only. */
 static void free_timer_values(JSContext *ctx, TJSTimer *th) {
     if (!th) return;
     if (!JS_IsUndefined(th->func)) {
@@ -77,10 +74,8 @@ static void destroy_timer(TJSTimer *th) {
         return;
     }
 
-    /* The callback owns the argument array while JS_Call is on the stack.
-     * Defer releasing those JS values when clearTimeout() is called from the
-     * callback itself; otherwise a refcounted object can be freed underneath
-     * QuickJS while it is still being passed as an argument. */
+    /* Callback owns the args while JS_Call is on the stack: defer freeing when
+     * clearTimeout() is called from the callback itself. */
     if (th->in_cb) {
         HASH_DEL(qrt->timers.timers, th);
         th->values_pending = true;
@@ -127,9 +122,8 @@ static void uv__timer_cb(uv_timer_t *handle) {
     tjs_call_handler(th->ctx, th->func, th->argc, th->argv);
 
     if (!th->interval) {
-        /* clearTimeout() from inside the callback may already have started
-         * closing this handle. Avoid a second destroy, while the in_cb guard
-         * keeps `th` valid until the close callback is complete. */
+        /* clearTimeout() inside the callback may already be closing the
+         * handle; avoid a second destroy. in_cb keeps `th` alive meanwhile. */
         if (!uv_is_closing((uv_handle_t *) handle))
             destroy_timer(th);
     }
@@ -206,10 +200,8 @@ static JSValue tjs_setTimeout(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     uv_update_time(tjs_get_loop(ctx));
-    /* libuv treats repeat=0 as a one-shot timer.  A zero-delay interval must
-     * still repeat; use libuv's minimum practical repeat period to avoid
-     * leaving a one-shot timer (and its JS callback arguments) retained in
-     * the timer table forever. */
+    /* libuv treats repeat=0 as one-shot; a zero-delay interval must still
+     * repeat, or the timer (and its JS args) stay in the table forever. */
     uint64_t repeat = magic ? (delay == 0 ? 1u : (uint64_t)delay) : 0;
     uv_r = uv_timer_start(&th->handle, uv__timer_cb, (uint64_t)delay, repeat);
     if (uv_r != 0) {

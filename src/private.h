@@ -82,10 +82,8 @@ struct TJSRuntime {
         uv_prepare_t prepare;
 		bool paused;
 		int waitio_depth;  /* Track nested waitIO calls */
-		/* Set by engine.notifyNextTick() when a callback lands in an empty
-		 * nextTick queue, cleared by tjs__run_next_ticks() before it calls the
-		 * JS drain. ticks_draining guards against re-entering the drain when a
-		 * tick callback synchronously pumps the loop again. */
+		/* Set by engine.notifyNextTick(), cleared by tjs__run_next_ticks();
+		 * ticks_draining blocks drain re-entry from a tick callback. */
 		bool ticks_pending;
 		bool ticks_draining;
     } jobs;
@@ -96,25 +94,12 @@ struct TJSRuntime {
     /* Worker exit uses an uncatchable exception only to unwind JS. */
     bool explicit_exit;
     int exit_code;
-    /* `process.exitCode = N` pushed in from JS by os.setExitCode().
-     *
-     * Deliberately NOT stored in exit_code: TJS_Run returns early whenever
-     * exit_code is nonzero (vm.c:1056, the fatal path), so a top-level
-     * `process.exitCode = 3` written straight into that field would return
-     * before the event loop ever ran and silently truncate every pending timer
-     * and IO callback. This pair is read only at the teardown sites, where the
-     * loop has already drained.
-     *
-     * A flag rather than a sentinel because 0 is a meaningful value: node honours
-     * `process.exitCode = 3` followed by `= 0` as rc 0 (OBSERVED v24.18.0). */
+    /* JS-pushed process.exitCode, NOT exit_code: TJS_Run early-returns on a
+     * nonzero exit_code (fatal path). Flag, not sentinel: 0 is meaningful. */
     int js_exit_code;
     bool js_exit_code_set;
-    /* Set once EV_EXIT has been dispatched, by whichever path got there first
-     * (uv__stop, os.exit, or the natural-drain path in TJS_Run). Gates both
-     * 'beforeunload' and EV_EXIT so an explicit exit cannot be followed by a
-     * second teardown when the loop later drains. Deno 2.9.3 fires 'unload' but
-     * NOT 'beforeunload' for an explicit exit (OBSERVED), which is exactly what
-     * one shared flag produces here. */
+    /* Set once EV_EXIT is dispatched (uv__stop, os.exit, or natural drain);
+     * gates a second teardown when the loop drains afterwards. */
     bool unload_dispatched;
     struct list_head workers;
     struct list_head streams;
@@ -142,9 +127,8 @@ struct TJSRuntime {
         JSValue promise_hook_fn;
 		JSValue message_pipe;	// for worker messaging
 		JSValue worker_udata;	// user-data passed from parent
-		/* process.nextTick drain, registered from cno/src/node/process/mod.ts
-		 * via engine.setNextTickDrain(). Node keeps the nextTick queue OUTSIDE
-		 * the promise job queue; this is how tjs__execute_jobs() reaches it. */
+		/* nextTick drain registered via engine.setNextTickDrain(); the nextTick
+		 * queue lives outside the promise job queue. */
 		JSValue nexttick_drain_fn;
     } builtins;
 	struct {
@@ -212,14 +196,10 @@ typedef enum {
 	EV_JOB_EXCEPTION,
 	EV_EXIT,
 	EV_LOAD,
-	/* Appended last on purpose: JS hardcodes 0-3 as fallbacks when the engine
-	 * enum is unreadable (cts/src/runtime/event-mux.ts:31-45), so renumbering
-	 * the existing members would silently misroute every event. */
+	/* Append-only: JS hardcodes 0-3 as fallbacks; renumbering misroutes events. */
 	EV_BEFORE_UNLOAD,
-	/* Node's 'beforeExit'. Same append-only rule as above: the JS fallback table
-	 * pins 0-4, so this must stay last. Dispatched from tjs__lifecycle_drain()
-	 * BEFORE EV_BEFORE_UNLOAD, and re-dispatched for as long as a listener keeps
-	 * queueing work, which is what node does. */
+	/* Must stay last (JS fallback table pins 0-4); dispatched before
+	 * EV_BEFORE_UNLOAD and re-fired while listeners queue work. */
 	EV_BEFORE_EXIT
 } TJSEvents;
 
@@ -280,18 +260,8 @@ void tjs__mod_brotli_init(JSContext* ctx, JSValue ns);
 #endif
 
 #ifdef _WIN32
-/* Full 64-bit Windows stat timestamps, shared by mod_fs.c (sync) and
- * mod_asyncfs.c (async) so the two agree.
- *
- * libuv's uv_timespec_t.tv_sec is a 32-bit `long` on Windows (libuv's own
- * "not 2038-proof" note, libuv#3864), so every uv_fs_stat/lstat/fstat result
- * truncates at 2^31 seconds. These readers go to the FILETIME directly.
- * Implemented in mod_fs.c; declared here so the ~110 lines are not duplicated.
- *
- * Both readers are best-effort: on any failure they leave valid == 0 and the
- * caller falls back to libuv's own (truncated) timespec, so a stat never fails
- * merely because the extra read did.
- */
+/* 64-bit Windows stat timestamps via FILETIME (libuv's tv_sec is 32-bit and
+ * truncates). Best-effort: on failure valid == 0 and the caller falls back. */
 typedef struct {
     int valid;
     double atim_ms;

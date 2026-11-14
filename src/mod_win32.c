@@ -306,9 +306,7 @@ static void tjs_regwatch_finalizer(JSRuntime *rt, JSValue val) {
     regwatch_stop(w);
     JS_FreeValueRT(rt, w->callback);
     w->callback = JS_UNDEFINED;
-    /* Two-flag rendezvous: the close cb may already have run (explicit
-     * close()), or may still be in flight — free only when both sides are
-     * done, whichever lands last. */
+    /* Two-flag rendezvous with the close cb: free on whichever lands last. */
     w->finalized = 1;
     if (w->closed) {
         tjs__free(w);

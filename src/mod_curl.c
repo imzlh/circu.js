@@ -36,29 +36,8 @@
 #include <windows.h>
 #endif
 
-/*
- * Design notes
- * ------------
- * Async transfers run on libuv's event loop through curl_multi + uv_poll +
- * uv_timer (the socket_callback / timer_callback machinery). That is genuine
- * non-blocking IO: no worker thread is parked for the lifetime of a request,
- * which is exactly why we do NOT add a uv_queue_work(curl_easy_perform)
- * fallback -- that would tie up a threadpool slot per in-flight request and
- * scale far worse than the multi interface we already drive.
- *
- * performSync() stays honestly blocking (curl_easy_perform on a private easy
- * handle that never touches the pool) for callers that *want* to block, e.g.
- * CLI scripts and startup paths.
- *
- * Memory: every struct that owns a libuv handle (pool, socket polls) is
- * allocated/freed with tjs__malloc/tjs__free so it can be torn down during
- * runtime shutdown when the JSContext may already be gone. The TJSCURL object
- * is a regular GC object and uses js_malloc/js_free_rt.
- *
- * Bodies are bytes at the core: the buffered response `body` is an ArrayBuffer
- * with a lazily-decoding `text` getter, setBody() accepts ArrayBuffer /
- * TypedArray / string, and onData() streams ArrayBuffer chunks.
- */
+/* Pool/socket-poll structs use tjs__malloc: shutdown frees them after the
+ * JSContext is gone. Async IO runs on curl_multi; no uv_queue_work fallback. */
 
 #pragma region Type Definitions
 
@@ -194,10 +173,8 @@ static void curl_detach_self(TJSCURL *curl) {
     curl->self_obj = JS_UNDEFINED;
 }
 
-/* `self_obj` is a strong reference used only while a transfer is in flight.
- * Pool teardown runs outside the CURL object's finalizer, so it must release
- * this reference with the runtime-aware API.  The field is cleared before the
- * free because releasing it can synchronously invoke tjs_curl_finalizer(). */
+/* Teardown runs outside the finalizer: free with the RT-aware API, and
+ * clear self_obj first -- the release can synchronously run the finalizer. */
 static void curl_release_self_rt(JSRuntime *rt, TJSCURL *curl) {
     JSValue self = curl->self_obj;
     if (JS_IsUndefined(self)) return;
@@ -205,9 +182,7 @@ static void curl_release_self_rt(JSRuntime *rt, TJSCURL *curl) {
     JS_FreeValueRT(rt, self);
 }
 
-/* libcurl rejects multi API calls made from inside its own callbacks
- * (CURLM_RECURSIVE_API_CALL), so close()/abort()/reset() must not tear state
- * down while a JS callback invoked from libcurl is running. */
+/* libcurl rejects multi API calls made from inside its own callbacks. */
 static void pool_enter_callback(TJSConnPool *pool) {
     if (pool) pool->callback_depth++;
 }
@@ -296,18 +271,14 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     TJSCURL *curl = (TJSCURL *) userdata;
     size_t realsize = size * nmemb;
 
-    /* New HTTP status line means a new response (e.g. redirect hop).
-     * Reset the buffer and the fired-flag so onHeadersComplete fires again
-     * for the final response status/headers. */
+    /* New status line (redirect hop): reset so onHeadersComplete refires. */
     if (realsize >= 5 &&
             ptr[0] == 'H' && ptr[1] == 'T' && ptr[2] == 'T' && ptr[3] == 'P' && ptr[4] == '/') {
         dbuf_free(&curl->response_headers);
         tjs_dbuf_init(curl->ctx, &curl->response_headers);
         curl->headers_complete_fired = false;
         curl->header_status_code = 0;
-        /* Parse the status from this line instead of CURLINFO_RESPONSE_CODE:
-         * the latter is only updated for the final hop and mislabels 100/103
-         * blocks when several response heads arrive on one transfer. */
+        /* CURLINFO_RESPONSE_CODE only reflects the final hop. */
         size_t i = 5;
         while (i < realsize && ptr[i] != ' ') i++;
         while (i < realsize && ptr[i] == ' ') i++;
@@ -494,8 +465,7 @@ static void connpool_close_uv_handles(TJSConnPool *pool) {
     }
 }
 
-/* Detach every live easy handle from the multi handle and tear it down.
- * Never calls into JS, so it is safe from the GC finalizer. Pending promises
+/* Never calls into JS, so it is safe from the GC finalizer; pending promises
  * are freed (not rejected) here; explicit abort()/close() reject beforehand. */
 static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
     struct list_head *el, *el1;
@@ -514,9 +484,8 @@ static void connpool_teardown_multi(JSRuntime *rt, TJSConnPool *pool) {
         if (TJS_IsPromisePending(pool->ctx, &c->promise)) {
             TJS_FreePromiseRT(rt, &c->promise);
         }
-        /* Detach every native back-reference before releasing the self pin.
-         * JS_FreeValueRT may run the CURL finalizer immediately when this was
-         * the last reference, so nothing may touch `c` after that call. */
+        /* JS_FreeValueRT may run the CURL finalizer immediately when this is
+         * the last reference: detach back-refs first, then touch nothing. */
         c->pool = NULL;
         list_del(&c->link);
         init_list_head(&c->link);
@@ -992,12 +961,8 @@ static void tjs_connpool_gc_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *m
     if (!pool) return;
 
     JS_MarkValue(rt, pool->err_cb, mark_func);
-    /* Do NOT mark in-flight curls' self_obj here. self_obj is the curl wrapper's
-     * own C-held strong ref (refcount keeps it alive while in-flight); the curl
-     * in turn holds pool_obj, keeping the pool alive. Marking self_obj from the
-     * pool created a pool<->curl reference cycle with no external root, which the
-     * QuickJS cycle collector would reclaim while uv timer/socket handles were
-     * still live -> SEGV. Each curl's own gc_mark already marks its callbacks. */
+    /* Do NOT mark in-flight self_obj here: curl holds pool_obj, so marking
+     * builds an unrooted pool<->curl cycle that QuickJS reclaims -> SEGV. */
 }
 
 #pragma endregion
@@ -1232,9 +1197,7 @@ static void curl_apply_default_opts(TJSCURL *curl) {
     curl_easy_setopt(curl->handle, CURLOPT_DEBUGFUNCTION, debug_callback);
     curl_easy_setopt(curl->handle, CURLOPT_DEBUGDATA, curl);
     curl_easy_setopt(curl->handle, CURLOPT_NOPROGRESS, 0L);
-    /* libcurl otherwise forwards an HTTPS proxy's CONNECT response through
-     * HEADERFUNCTION before the target response, which confuses consumers that
-     * resolve headers from that callback. */
+    /* Without it, a proxy CONNECT response also hits HEADERFUNCTION. */
 #if LIBCURL_VERSION_NUM >= 0x073600
     curl_easy_setopt(curl->handle, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
 #endif
@@ -1347,11 +1310,8 @@ static JSValue curl_transfer_capability(JSContext *ctx,
 
     JSValue result;
     if (curl_is_file_url(destination)) {
-        /* libcurl can select upload semantics through generic options too, so
-         * the binding cannot infer a reliable direction from its own body
-         * fields. Conservatively expose both possible file effects. A file URL
-         * is not a native path until it has been decoded and its authority has
-         * been resolved, so do not expose a misleading substring as `path`. */
+        /* libcurl may pick upload semantics via generic options, so both IO
+         * directions are exposed; a file URL is not a native `path`. */
         result = tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, flags, api, NULL);
     } else {
         /* Following redirects authorizes a response-selected destination. A
@@ -1418,9 +1378,7 @@ static JSValue tjs_curl_set_method(JSContext *ctx, JSValueConst this_val, int ar
     } else if (strcmp(method, "HEAD") == 0) {
         curl_easy_setopt(curl->handle, CURLOPT_NOBODY, 1L);
     } else {
-        /* PUT/DELETE/PATCH/... via CUSTOMREQUEST so an in-memory body set with
-         * setBody() (CURLOPT_POSTFIELDS) is still sent. Streaming uploads use
-         * setUploadData()/setUploadFile() which enable CURLOPT_UPLOAD. */
+        /* CUSTOMREQUEST still sends an in-memory CURLOPT_POSTFIELDS body. */
         curl_easy_setopt(curl->handle, CURLOPT_CUSTOMREQUEST, method);
     }
     JS_FreeCString(ctx, method);
@@ -1964,9 +1922,7 @@ static JSValue curl_info_value(JSContext *ctx, CURL *handle, CURLINFO info) {
             return JS_NewInt64(ctx, (int64_t) v);
         }
         case CURLINFO_SLIST: {
-            /* CURLINFO_PTR shares this type bit (CERTINFO, TLS_SESSION,
-             * TLS_SSL_PTR); those are not curl_slist results that we may
-             * walk or free. Only the real slist infos are allowed. */
+            /* CURLINFO_PTR shares this bit; it yields no freeable slist. */
             if (info != CURLINFO_COOKIELIST && info != CURLINFO_SSL_ENGINES) return JS_NULL;
             struct curl_slist *list = NULL;
             if (curl_easy_getinfo(handle, info, &list) != CURLE_OK) return JS_NULL;

@@ -30,9 +30,7 @@
 
 #include <stdatomic.h>
 
-/* Process-wide negative cache. The count is not policy state: the runtime is
- * still checked by the internal dispatcher. It exists so the normal case in
- * which no runtime has a hook is one relaxed load and one predicted branch. */
+/* Process-wide count so the no-hook case is one relaxed load plus a branch. */
 extern TJS__HIDDEN _Atomic uint32_t tjs__capability_hook_count;
 
 enum {
@@ -56,24 +54,8 @@ static TJS__ALWAYS_INLINE uint32_t tjs__capability_call_state(
                : 0;
 }
 
-/* A native JS entry point spends one source line on capability plumbing.
- * Do not evaluate check_ at all in the overwhelmingly common no-hook case:
- * descriptor construction can otherwise dominate small native operations.
- * Native entry points must propagate conversion failures where they occur;
- * making every capability site probe QuickJS' exception state would double
- * the cost of the no-hook path. cleanup_ runs only when an active hook throws
- * or replaces the operation.
- *
- * The REVALIDATE form runs revalidate_ only after this invocation actually
- * calls a conservative hook and it returns PASS. A hook installed with
- * TJS_CAPABILITY_HOOK_PASS_IS_STABLE skips it. It reacquires state that hook
- * code may have invalidated. revalidate_ owns its failure cleanup and may
- * return; do not use break or continue. Wrap comma expressions in parentheses
- * and multi-statement arguments in do { ... } while (0).
- *
- * The GUARDED form additionally runs prepare_ before a conservative hook.
- * Use it for protection which would be too late after the hook, such as
- * duplicating an fd whose numeric slot hook code could close and reuse. */
+/* No-hook path skips check_ (zero overhead). REVALIDATE re-acquires state and
+ * owns its cleanup (may return); GUARDED prepares before the hook. */
 #define TJS_CAPABILITY(check_, cleanup_)                                  \
     do {                                                                  \
         uint32_t _tjs_capability_state = tjs__capability_call_state(ctx);  \
@@ -86,10 +68,8 @@ static TJS__ALWAYS_INLINE uint32_t tjs__capability_call_state(
         }                                                                 \
     } while (0)
 
-/* Keep this body direct rather than forwarding the arguments through a
- * helper macro. QuickJS value constants can contain commas after expansion;
- * forwarding a revalidation statement such as `return JS_EXCEPTION` would
- * therefore be parsed as extra macro arguments. */
+/* Not forwarded via a helper macro: commas in value constants or a `return
+ * JS_EXCEPTION` argument would parse as extra macro arguments. */
 #define TJS_CAPABILITY_REVALIDATE(check_, cleanup_, revalidate_)          \
     do {                                                                  \
         uint32_t _tjs_capability_state = tjs__capability_call_state(ctx);  \

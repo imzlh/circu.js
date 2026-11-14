@@ -615,10 +615,7 @@ static int decode_dns_name(const uint8_t* packet, size_t packet_len,
 				jump_offset = pos + 2;
 				jumped = 1;
 			}
-			// Bound the number of compression-pointer jumps to defeat
-			// malicious packets whose pointers reference each other (a
-			// loop that never consumes a label would otherwise spin
-			// forever, since pointer follows do not advance label_count).
+			// Cap compression-pointer jumps: loops never advance label_count.
 			if (++jumps > 128) return -1;
 			pos = ((len & 0x3F) << 8) | packet[pos + 1];
 			if (pos >= packet_len) return -1;
@@ -1103,9 +1100,7 @@ static JSValue dns_answer_to_js(JSContext* ctx, dns_answer_t* ans) {
 
 // ============ UDP DNS Query ===========
 
-/* A query remains in the runtime registry until libuv has run its close
- * callback.  This keeps the native context alive for a pending send callback
- * (libuv cancels sends before invoking the UDP close callback). */
+/* Registered until the uv close cb: keeps the ctx alive for pending sends. */
 static void dns_udp_unlink(dns_udp_ctx_t* ctx) {
 	if (ctx->linked) {
 		list_del(&ctx->link);
@@ -1150,9 +1145,7 @@ static void dns_udp_close(dns_udp_ctx_t* ctx) {
 	}
 }
 
-/* Runtime teardown cannot use a JSContext or invoke user code.  Keep this
- * separate from the normal path so every JS reference retained by a query is
- * released exactly once even when its Promise was dropped before shutdown. */
+/* RT teardown: no JSContext/user code; JS refs released exactly once. */
 static void dns_udp_release_js_rt(dns_udp_ctx_t* ctx, JSRuntime* rt) {
 	if (!rt) return;
 	if (!JS_IsUndefined(ctx->controller)) {
@@ -1204,9 +1197,7 @@ void tjs__mod_dns_cleanup_runtime(TJSRuntime* trt) {
 
 void tjs__mod_dns_drain_runtime(TJSRuntime* trt) {
 	if (!trt) return;
-	/* uv_cancel() schedules the completion callback on the loop.  Keep every
-	 * request allocation alive until that callback has unregistered it; this is
-	 * required even when cancellation races with a worker already in flight. */
+	/* uv_cancel runs the cb on the loop: keep allocations alive until then. */
 	while (!list_empty(&trt->dns_getaddrinfo) ||
 		   !list_empty(&trt->dns_getnameinfo)) {
 		uv_run(&trt->loop, UV_RUN_ONCE);
@@ -1330,9 +1321,7 @@ static void udp_recv_callback(uv_udp_t* handle, ssize_t nread,
 				JS_SetPropertyUint32(js_ctx, result, i, ans_obj);
 			}
 			free_dns_answers(answers, answer_count);
-			/* Mark and detach the native operation before entering QuickJS.  A
-			 * promise hook can run GC/re-enter and otherwise leave the callback
-			 * observing a second completion or a freed context. */
+			/* Detach before entering QuickJS: hooks may run GC and re-enter. */
 			ctx->done = true;
 			JSValue resolve_func = JS_DupValue(js_ctx, ctx->resolve_func);
 			dns_udp_finish(ctx);

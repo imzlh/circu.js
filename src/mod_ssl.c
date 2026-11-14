@@ -243,9 +243,7 @@ static int alpn_cb(SSL* ssl, const unsigned char** out, unsigned char* outlen,
 	/* Pass the full ALPN list to SSL_select_next_proto.
 	 * The list format is [len1][proto1][len2][proto2]... with total length */
 	unsigned char* list = (unsigned char*) arg;
-	/* Recover the context (and thus the authoritative binary list length) from
-	 * the SSL_CTX app data. The list is a length-prefixed binary blob, so it is
-	 * NOT NUL-terminated — strlen() on it would read out of bounds. */
+	/* ALPN list is length-prefixed, not NUL-terminated: strlen reads OOB. */
 	TJSSSLContext *ssl_ctx = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
 	if (ssl_ctx && ssl_ctx->alpn_list && ssl_ctx->alpn_list_len > 0) {
 		if (SSL_select_next_proto((unsigned char**) out, outlen,
@@ -693,9 +691,7 @@ static JSValue tjs_ssl_pipe_handshake_capability(JSContext *ctx,
         return JS_ThrowTypeError(ctx, "reentrant SSL handshake capability check");
     }
 
-    /* The enclosing TJS_CAPABILITY gate calls this helper only for an active,
-     * non-reentrant hook. A temporary nested-hook bypass therefore never marks
-     * this pipe as checked for later untrusted calls. */
+    /* Nested-hook bypass must not mark this pipe as capability-checked. */
     pipe->handshake_capability_checking = true;
     JSValue result = tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ,
                                      TJS_CAP_FLAG_REPLACEABLE, api);
@@ -1162,9 +1158,7 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
                                                  int argc, JSValueConst *argv) {
     JSValue options = argc > 0 ? argv[0] : JS_UNDEFINED;
 
-    /* Parse options. cn_val and days_val are always owned references that
-     * must be freed regardless of argc. cn_owned tracks whether cn came from
-     * JS_ToCString (and so requires JS_FreeCString) vs a static fallback. */
+    /* cn_val/days_val owned; free regardless of argc; cn_owned: FreeCString. */
     JSValue cn_val = JS_IsObject(options) ? JS_GetPropertyStr(ctx, options, "commonName") : JS_UNDEFINED;
     if (JS_IsException(cn_val)) return JS_EXCEPTION;
     const char *cn = "localhost";

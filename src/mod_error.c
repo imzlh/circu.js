@@ -149,9 +149,7 @@ static JSCFunctionListEntry tjs__error_funcs[] = {
 };
 
 void tjs__mod_error_init(JSContext *ctx, JSValue ns) {
-	/* JS_CFUNC_DEF2 was misused here: its 4th arg is prop_flags, not cproto,
-	 * so Error was always generic and `new error.Error(code)` threw.
-	 * constructor_or_func allows both call and new. */
+	/* constructor_or_func so Error works both called and with new. */
 	JSValue error_ctor = JS_NewCFunction2(ctx, tjs_error_constructor, "Error", 1,
 	                                      JS_CFUNC_constructor_or_func, 0);
 	JS_DefinePropertyValueStr(ctx, ns, "Error", error_ctor,

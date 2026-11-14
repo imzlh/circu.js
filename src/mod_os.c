@@ -93,17 +93,8 @@ static JSValue tjs_exit(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     exit(status);
 }
 
-/* Record `process.exitCode = N` without exiting.
- *
- * The JS binding is a plain module-scoped `let` (cno/src/node/process/mod.ts:1049),
- * so nothing native could ever see it: on a natural drain TJS_Run returned
- * qrt->exit_code, which no assignment had touched, and the status was lost
- * (OBSERVED: a code assigned from a 'exit' listener exited 0 where node
- * v24.18.0 exits with it). Pushing the value at assignment time makes the
- * teardown reads in vm.c see it.
- *
- * Writes js_exit_code, never exit_code — see the field comment in private.h for
- * why conflating them would return before the event loop ran. */
+/* The JS binding is a module-scoped let, so push at assignment time or the
+ * teardown reads in vm.c never see it. Writes js_exit_code, never exit_code. */
 static JSValue tjs_set_exit_code(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSRuntime *trt = TJS_GetRuntime(ctx);
     if (!trt) {
@@ -732,11 +723,6 @@ static JSValue tjs_sleep(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
 
 /* ── IPC helpers ───────────────────────────────────────────────────── */
 
-/**
- * Create a pipe pair for IPC.
- * Returns [readable_fd, writable_fd].
- * On Windows, uses _pipe(); on POSIX, uses pipe().
- */
 typedef struct {
     uint32_t count;
 } TJSRefHandleCount;
@@ -780,15 +766,6 @@ static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue 
     return arr;
 }
 
-/**
- * Send a file descriptor over a Unix domain socket.
- * Uses sendmsg with SCM_RIGHTS ancillary data.
- * (POSIX only, throws on Windows)
- *
- * @param socket_fd - Unix domain socket file descriptor
- * @param fd_to_send - File descriptor to send
- * @returns bytes sent (>= 0) on success
- */
 static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
     return JS_ThrowInternalError(ctx, "sendfd is not supported on Windows");
@@ -848,14 +825,6 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
 #endif
 }
 
-/**
- * Receive a file descriptor from a Unix domain socket.
- * Uses recvmsg with SCM_RIGHTS ancillary data.
- * (POSIX only, throws on Windows)
- *
- * @param socket_fd - Unix domain socket file descriptor
- * @returns received file descriptor (>= 0) on success
- */
 static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
     return JS_ThrowInternalError(ctx, "recvfd is not supported on Windows");

@@ -261,10 +261,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
             strm.avail_out = out_size;
             out_size = new_size;
         } else {
-            /* Output space remains but inflate made no further progress
-             * (input exhausted without Z_STREAM_END, i.e. a truncated
-             * stream).  Do not spin on Z_BUF_ERROR, and do not hand back
-             * partial output as if it were complete. */
+            /* Z_BUF_ERROR with room = input truncated before Z_STREAM_END. */
             inflateEnd(&strm);
             js_free(ctx, out);
             return JS_ThrowTypeError(ctx, "Unexpected end of compressed data");
@@ -520,9 +517,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
     size_t data_len = 0;
     const uint8_t* data = NULL;
 
-    /* flush(mode) has no data argument; deflate(data, mode) and finish(data)
-     * do. Keep scalar conversion ahead of acquiring a buffer pointer because
-     * it may run user code capable of detaching the input buffer. */
+    /* Convert scalars first: that may run user code which detaches buffers. */
     bool is_flush_method = magic == Z_SYNC_FLUSH;
     int flush = magic;
     int flush_arg = is_flush_method ? 0 : 1;
@@ -653,9 +648,7 @@ static JSValue tjs_deflate_params(JSContext* ctx, JSValueConst this_val, int arg
         return JS_EXCEPTION;
     }
     
-    /* deflateParams() may run deflate(Z_BLOCK) when the compression function
-     * changes, so it needs a live output buffer of its own. Grow it and retry
-     * on Z_BUF_ERROR with a full buffer, and return whatever was flushed. */
+    /* deflateParams may emit Z_BLOCK needing output room; retry Z_BUF_ERROR. */
     size_t out_size = 1024;
     size_t produced = 0;
     uint8_t* out = js_malloc(ctx, out_size);
@@ -793,10 +786,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
             break;
         }
         
-        /* Corrupt input is an ordinary, catchable failure (zlib streams throw
-         * on bad data). An InternalError is uncatchable in this engine, so a
-         * catchable type is used whenever the input caused the error; only a
-         * Z_STREAM_ERROR (bad parameters / stream state) stays internal. */
+        /* Corrupt input is catchable; only Z_STREAM_ERROR stays internal. */
         if (ret != Z_OK && ret != Z_BUF_ERROR) {
             js_free(ctx, out);
             if (ret == Z_STREAM_ERROR) {
@@ -889,9 +879,6 @@ static JSValue tjs_inflate_total_out(JSContext* ctx, JSValueConst this_val, int 
     return JS_NewInt64(ctx, i->strm.total_out);
 }
 
-/* Inflate.finished - true once the stream has seen the trailer or been finished.
- * Exposed so callers can test the state instead of pattern-matching the
- * "Inflate stream already finished" message that inflate()/finish() throws. */
 static JSValue tjs_inflate_finished(JSContext* ctx, JSValue this_val) {
     TJSInflate* i = JS_GetOpaque2(ctx, this_val, tjs_inflate_class_id);
     if (!i) {

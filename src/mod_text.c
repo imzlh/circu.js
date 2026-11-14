@@ -37,30 +37,21 @@
 #include "private.h"
 #include "tjs.h"
 
-/* ============================================================================
- * Tunables
- * ============================================================================ */
+/* ===== Tunables ===== */
 #define INITIAL_BUFFER_SIZE 1024
-/* Minimum free space we keep available before each iconv() call. Must be >= 4
- * so a single multi-byte code unit always fits and we cannot livelock on a
- * spurious E2BIG that makes no progress. */
+/* Headroom kept before each iconv() call; must be >= 4 so one multi-byte code
+ * unit always fits and a no-progress E2BIG cannot livelock. */
 #define MIN_OUT_HEADROOM    64
-/* Max bytes held back for an incomplete multi-byte sequence while streaming.
- * 8 covers every stateful/stateless encoding iconv supports (UTF-32 = 4,
- * ISO-2022 shift sequences are short); we keep a little slack. */
+/* Max bytes held back for an incomplete sequence while streaming; 8 covers
+ * every encoding iconv supports (UTF-32 = 4), with slack. */
 #define MAX_PENDING_BUFFER  16
 
 /* UTF-8 encoding of U+FFFD REPLACEMENT CHARACTER. */
 static const uint8_t kUtf8Replacement[3] = { 0xEF, 0xBF, 0xBD };
 
-/* ============================================================================
- * Instance state
- * ============================================================================ */
+/* ===== Instance state ===== */
 
-/*
- * TextDecoder instance state
- * Web API: https://encoding.spec.whatwg.org/#textdecoder
- */
+/* TextDecoder instance state; https://encoding.spec.whatwg.org/#textdecoder */
 typedef struct {
     iconv_t cd;                          /* iconv conversion descriptor      */
     char *encoding;                      /* normalized encoding name         */
@@ -71,10 +62,7 @@ typedef struct {
     size_t pending_len;
 } decoder_t;
 
-/*
- * TextEncoder instance state
- * Web API: https://encoding.spec.whatwg.org/#textencoder
- */
+/* TextEncoder instance state; https://encoding.spec.whatwg.org/#textencoder */
 typedef struct {
     iconv_t cd;
     char *encoding;
@@ -85,9 +73,7 @@ typedef struct {
 static thread_local JSClassID tjs_text_decoder_class_id;
 static thread_local JSClassID tjs_text_encoder_class_id;
 
-/* ============================================================================
- * Growable output buffer
- * ============================================================================ */
+/* ===== Growable output buffer ===== */
 typedef struct {
     char *buf;
     size_t size; /* allocated capacity   */
@@ -136,13 +122,10 @@ static inline int gb_put(JSContext *ctx, growbuf_t *gb, const uint8_t *src, size
     return 0;
 }
 
-/* ============================================================================
- * Utility Functions
- * ============================================================================ */
+/* ===== Utility Functions ===== */
 
-/* Return the BOM byte sequence for an encoding (written into out[0..3]) and
- * its length, or 0 if the encoding has no BOM. Comparing against the assembled
- * input lets us recognize a BOM that is split across streamed chunks. */
+/* BOM byte sequence for an encoding into out[0..3]; comparing the assembled
+ * input recognizes a BOM split across streamed chunks. */
 static size_t bom_bytes(const char *encoding, uint8_t out[4]) {
     if (strcasecmp(encoding, "UTF-8") == 0) {
         out[0] = 0xEF; out[1] = 0xBB; out[2] = 0xBF;
@@ -163,9 +146,7 @@ static size_t bom_bytes(const char *encoding, uint8_t out[4]) {
     return 0;
 }
 
-/* Normalize a few common encoding aliases. Returns either a static literal or
- * the input pointer; the caller must js_strdup the result if it needs to own
- * a copy (it never frees the returned pointer directly). */
+/* Returns a static literal or the input pointer; js_strdup it to own a copy. */
 static const char *normalize_encoding_name(const char *enc) {
     if (!enc || enc[0] == '\0')
         return "UTF-8";
@@ -190,20 +171,8 @@ static const char *normalize_encoding_name(const char *enc) {
     return enc;
 }
 
-/* Code-unit width, in bytes, of a *source* encoding. EILSEQ recovery must
- * resync on a code-unit boundary: dropping a single byte of a UTF-16 or UTF-32
- * stream misaligns every unit that follows, so the whole remainder decodes to
- * garbage with no error raised.
- *
- * Only fixed-width multi-byte families are listed. Byte-oriented encodings
- * (UTF-8, ISO-8859-*, ASCII, Shift_JIS, GB18030, ...) must keep skipping one
- * byte: they resync at byte granularity, and widening them here would corrupt
- * input that decodes correctly today. Anything unrecognized falls back to 1,
- * which is the pre-existing behaviour.
- *
- * Normalized spellings come from normalize_encoding_name(); the bare "UTF-16"/
- * "UTF-32" and UCS aliases are also matched because a label that normalizer
- * does not rewrite is handed to iconv verbatim and can still reach here. */
+/* EILSEQ resync width of a *source* encoding: splitting a UTF-16/32 unit
+ * misaligns the rest, so only fixed-width families widen; unknown stays 1. */
 static size_t encoding_unit_width(const char *enc) {
     if (!enc)
         return 1;
@@ -222,10 +191,8 @@ static bool encoding_is_utf8(const char *enc) {
     return enc && strcasecmp(enc, "UTF-8") == 0;
 }
 
-/* Classify the UTF-8 sequence at p. A zero return denotes one complete,
- * well-formed scalar. When width is requested it receives the byte count of
- * that scalar, or, for EILSEQ/EINVAL, the length of the maximal valid prefix
- * (WHATWG "maximal subpart"; at least 1), so one replacement can cover it. */
+/* Returns 0 for a well-formed scalar; *width is its byte count, or the
+ * maximal valid prefix (WHATWG "maximal subpart") for EILSEQ/EINVAL. */
 static int utf8_failure_kind(const uint8_t *p, size_t len, size_t *width) {
     const uint8_t lead = p[0];
     size_t need;
@@ -275,9 +242,7 @@ static int utf8_failure_kind(const uint8_t *p, size_t len, size_t *width) {
     return 0;
 }
 
-/* Count UTF-16 code units in the first `n` bytes of a (valid) UTF-8 buffer.
- * Used by encodeInto() to report `read` per the WHATWG spec. iconv only ever
- * consumes whole code points, so `n` always lands on a code-point boundary. */
+/* UTF-16 code units in the first n bytes, for encodeInto()'s WHATWG `read`. */
 static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
     size_t units = 0, i = 0;
     while (i < n) {
@@ -296,25 +261,8 @@ static size_t utf8_prefix_utf16_units(const char *s, size_t n) {
     return units;
 }
 
-/* ============================================================================
- * Core iconv driver
- *
- * Converts `inlen` bytes from `inbuf` through `cd`, appending output to `gb`.
- *
- *  - Grows `gb` on E2BIG (never drops output, never overflows).
- *  - On EILSEQ: if `fatal`, throws and returns -1; otherwise emits one
- *    replacement (U+FFFD for UTF-8 targets, '?' otherwise) and resyncs by
- *    skipping one source code unit -- `unit` bytes, from
- *    encoding_unit_width() of the *input* encoding. For UTF-8 input the skip
- *    is the maximal invalid prefix instead, so a truncated sequence yields one
- *    replacement; `whole_surrogate` (encoder only) also skips a complete
- *    ED A0..BF 80..BF lone-surrogate triplet as one unit.
- *  - On EINVAL (incomplete trailing sequence): stops and reports the number of
- *    unconsumed trailing bytes via *trailing_out (caller decides whether to
- *    buffer them for streaming or treat them as an error / replacement).
- *
- * Returns 0 on success (exception-free) or -1 with a pending JS exception.
- * ==========================================================================*/
+/* Core driver: E2BIG grows gb; EILSEQ throws (fatal) or emits one replacement
+ * and resyncs by a source code unit; EINVAL reports *trailing_out. */
 static int iconv_drive(JSContext *ctx, iconv_t cd,
                        const char *inbuf, size_t inlen,
                        bool fatal, bool to_utf8, bool source_is_utf8, size_t unit,
@@ -338,9 +286,8 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
         gb->len = gb->size - outleft; /* commit whatever iconv produced */
 
 #ifdef _WIN32
-        /* Some libiconv builds keep errno in another CRT. An output buffer
-         * below our headroom must be retried; otherwise UTF-8 identifies the
-         * input error or an unrepresentable target character. */
+        /* Some libiconv builds keep errno in another CRT, so e == 0 means
+         * retry below headroom or classify the UTF-8 input ourselves. */
         if (ret == (size_t)-1 && e == 0) {
             if (outleft < MIN_OUT_HEADROOM) {
                 e = E2BIG;
@@ -355,9 +302,8 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
         if (ret != (size_t)-1)
             break; /* all input consumed */
 
-        /* GNU libiconv can report EINVAL for a short prefix whose next byte
-         * is already an invalid continuation. Treat that as malformed input
-         * so streaming decoders resynchronize immediately. */
+        /* GNU libiconv reports EINVAL for a prefix whose next byte is already
+         * an invalid continuation; treat that as EILSEQ to resync now. */
         if (e == EINVAL && source_is_utf8 && inleft > 0 &&
             utf8_failure_kind((const uint8_t *)inptr, inleft, NULL) == EILSEQ)
             e = EILSEQ;
@@ -380,14 +326,8 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
                 JS_ThrowTypeError(ctx, "The encoded data was not valid");
                 return -1;
             }
-            /* Resync on a code-unit boundary and emit a single replacement.
-             * Advancing a single byte would misalign every following unit of a
-             * UTF-16/UTF-32 stream, silently garbling the whole remainder. A
-             * short tail (fewer than `unit` bytes left) is consumed whole so
-             * one bad unit yields exactly one replacement. `unit` is >= 1 and
-             * `inleft` is > 0 here, so `skip` is always >= 1 and the loop
-             * always makes progress. A valid UTF-8 scalar rejected only by the
-             * target encoding is skipped as one character instead. */
+            /* Skip a whole source code unit; a single byte would misalign a
+             * UTF-16/32 stream. unit >= 1 and inleft > 0 guarantee progress. */
             size_t skip = (inleft < unit) ? inleft : unit;
             if (source_is_utf8) {
                 const uint8_t *ip = (const uint8_t *)inptr;
@@ -422,9 +362,7 @@ static int iconv_drive(JSContext *ctx, iconv_t cd,
     return 0;
 }
 
-/* ============================================================================
- * TextDecoder
- * ============================================================================ */
+/* ===== TextDecoder ===== */
 static void tjs_text_decoder_finalizer(JSRuntime *rt, JSValue val) {
     decoder_t *dec = JS_GetOpaque(val, tjs_text_decoder_class_id);
     if (!dec)
@@ -524,9 +462,7 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
     if (!dec)
         return JS_EXCEPTION;
 
-    /* Parse options first (may run user getters) before acquiring any raw
-     * buffer pointer, so a getter cannot detach/resize the input out from
-     * under us. */
+    /* Parse options (may run user getters) before taking any raw buffer. */
     bool stream;
     if (read_stream_option(ctx, argc, argv, &stream) < 0)
         return JS_EXCEPTION;
@@ -557,14 +493,8 @@ static JSValue tjs_text_decoder_decode(JSContext *ctx, JSValueConst this_val,
         return JS_NewStringLen(ctx, "", 0);
     }
 
-    /* Assemble pending + new bytes into one contiguous run first, so a BOM (or
-     * any multi-byte sequence) split across streamed chunks is handled
-     * correctly.
-     *
-     * IMPORTANT: Always copy input into a QJS-managed buffer. The source
-     * `inbuf` may point into WASM linear memory (via a typed array view),
-     * which can be invalidated by memory.grow or other WASM runtime events.
-     * We must not rely on the raw pointer remaining valid past this point. */
+    /* Merge pending+new so split sequences/BOMs work; always copy into a
+     * QJS-managed buffer as `inbuf` may alias WASM memory (memory.grow). */
     const char *conv_in;
     size_t conv_len = dec->pending_len + inlen;
     char *merged = js_malloc(ctx, conv_len ? conv_len : 1);
@@ -688,9 +618,7 @@ static const JSCFunctionListEntry tjs_text_decoder_proto_funcs[] = {
     JS_CGETSET_DEF("ignoreBOM", tjs_text_decoder_get_ignore_bom, NULL),
 };
 
-/* ============================================================================
- * TextEncoder
- * ============================================================================ */
+/* ===== TextEncoder ===== */
 static void tjs_text_encoder_finalizer(JSRuntime *rt, JSValue val) {
     encoder_t *enc = JS_GetOpaque(val, tjs_text_encoder_class_id);
     if (!enc)
@@ -771,10 +699,8 @@ static JSValue tjs_text_encoder_encode(JSContext *ctx, JSValueConst this_val,
     iconv(enc->cd, NULL, NULL, NULL, NULL); /* reset shift state */
 
     growbuf_t gb = {0};
-    /* TextEncoder never throws on bad data; unrepresentable chars in a custom
-     * target encoding become '?'. */
-    /* The source is always the UTF-8 C-string from JS, never enc->encoding
-     * (which is the *target*), so malformed input resyncs byte by byte. */
+    /* Never throws: unrepresentable chars in a custom target become '?'. The
+     * source is always the UTF-8 C-string from JS, so resyncs are by byte. */
     int rc = iconv_drive(ctx, enc->cd, str, str_len,
                          /*fatal=*/false, /*to_utf8=*/enc->is_utf8,
                          /*source_is_utf8=*/true, /*unit=*/1,
@@ -901,9 +827,7 @@ static const JSCFunctionListEntry tjs_text_encoder_proto_funcs[] = {
     JS_CGETSET_DEF("encoding", tjs_text_encoder_get_encoding, NULL),
 };
 
-/* ============================================================================
- * Standalone conversion helpers
- * ============================================================================ */
+/* ===== Standalone conversion helpers ===== */
 
 /* convert(fromEncoding, toEncoding, data) -> string | Uint8Array */
 static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
@@ -932,11 +856,8 @@ static JSValue tjs_text_convert(JSContext *ctx, JSValueConst this_val,
     }
 
     bool is_to_utf8 = (strcasecmp(to_n, "UTF-8") == 0);
-    /* Resync width of the *source* encoding. Must be computed here, BEFORE the
-     * JS_FreeCString() below: normalize_encoding_name() returns either a static
-     * literal or its own argument, so for any label it does not rewrite
-     * (e.g. "windows-1252") `from_n` aliases into `from` and reading it after
-     * the free is a use-after-free. Same reason `is_to_utf8` is computed early. */
+    /* Computed BEFORE JS_FreeCString(): for labels the normalizer does not
+     * rewrite, from_n aliases `from`; reading it after the free is a UAF. */
     size_t from_unit = encoding_unit_width(from_n);
     bool from_is_utf8 = encoding_is_utf8(from_n);
 
@@ -1025,9 +946,7 @@ static const JSCFunctionListEntry tjs_text_funcs[] = {
     JS_CFUNC_DEF("listEncodings", 0, tjs_text_list_encodings),
 };
 
-/* ============================================================================
- * Module init
- * ============================================================================ */
+/* ===== Module init ===== */
 void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 

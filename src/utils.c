@@ -22,15 +22,7 @@
  * THE SOFTWARE.
  */
 
-/* pthread_getattr_np (used by tjs__native_stack_bounds below) is a GNU
- * extension: glibc hides it behind __USE_GNU, which only _GNU_SOURCE sets. It
- * has to be defined before ANY header is pulled in, hence above "utils.h" —
- * that header reaches <uv.h> and from there the libc headers. Without it the
- * call is an implicit declaration, and the POSIX build compiles with
- * -Wall -Werror (CMakeLists.txt:58), so it is a hard build break on Linux;
- * modern gcc/clang reject implicit declarations outright regardless. MSVC
- * takes the _WIN32 branch and never sees it, so /Zs on Windows cannot catch
- * this. Same guard style as src/mod_ffi.c:1-3. */
+/* _GNU_SOURCE must precede any header: pthread_getattr_np is GNU-only. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
@@ -57,40 +49,8 @@
 #endif
 
 
-/* ---- native stack bounds -------------------------------------------------
- *
- * JS_SetMaxStackSize only stores the number; QuickJS derives its soft limit as
- * `stack_limit = stack_top - stack_size` (deps/quickjs/quickjs.c,
- * update_stack_limit at :3473) and nothing checks that against the stack the
- * thread actually owns. Once stack_size reaches the real stack size the limit
- * lands at or below the guard page, js_check_stack_overflow (:2320) can never
- * fire, and an ordinary JS recursion walks into the guard page instead of
- * raising a RangeError.
- *
- * OBSERVED 2026-08-06, Windows 11 x64, build/stage/cno.exe (Debug build, links
- * /STACK:8388608 per CMakeLists.txt:51), script recursing until it catches:
- *
- *     --max-stack-size=8160KB -> rc 0, "CAUGHT RangeError depth= 382"
- *     --max-stack-size=8176KB -> rc -1073741571 (0xC00000FD,
- *                                STATUS_STACK_OVERFLOW) with stdout AND
- *                                stderr COMPLETELY EMPTY
- *     --max-stack-size=8MB..1GB -> same silent 0xC00000FD
- *
- * So the cliff sat ~16-32KB under the 8MB reserve, i.e. exactly at the guard
- * region. Real node has the same defect (`node --stack-size=16000` dies with
- * no output at all, OBSERVED), so clamping here is hardening past node rather
- * than a parity fix.
- *
- * A requested size of 0 is NOT "engine default" either: update_stack_limit
- * reads 0 as "no limit", which is the same silent crash with no way to opt out
- * of it. tjs__clamp_stack_size therefore maps 0 onto the platform maximum.
- *
- * Both bounds come from the OS, never from the current stack pointer, so the
- * answer does not depend on how deep the caller happens to be. That is
- * required: the CLI flag arrives via engine.setMaxStackSize() from
- * cts/src/config.ts:356, dozens of JS frames deep, where an sp-relative
- * measurement would under-report by hundreds of KB.
- */
+/* JS_SetMaxStackSize only stores the number; QuickJS derives its soft limit
+ * as stack_top - stack_size, never checked against the real stack. */
 static bool tjs__native_stack_bounds(uintptr_t *low, uintptr_t *high) {
 #if defined(_WIN32)
     ULONG_PTR lo = 0, hi = 0;
@@ -127,9 +87,7 @@ static bool tjs__native_stack_bounds(uintptr_t *low, uintptr_t *high) {
     *high = (uintptr_t) addr + size;
     return true;
 #else
-    /* Portable fallback: no way to locate the stack, so only its SIZE is
-     * known. Report a synthetic window of that size ending at the current
-     * frame — tjs__clamp_stack_size only ever uses (high - low). */
+    /* No real bounds: synthetic window; the clamp only uses (high - low). */
     struct rlimit rl;
     if (getrlimit(RLIMIT_STACK, &rl) != 0) {
         return false;
@@ -147,19 +105,12 @@ static bool tjs__native_stack_bounds(uintptr_t *low, uintptr_t *high) {
 #endif
 }
 
-/* Headroom kept below QuickJS's soft limit, so that the limit fires while
- * there is still real stack left for the guard region and for the C frames
- * that build and propagate the RangeError. The observed cliff needed only
- * ~32KB; 512KB costs ~6% of usable depth on an 8MB stack and absorbs the
- * platform-to-platform variation in guard size and frame cost. Small stacks
- * (Darwin secondary threads default to 512KB) take the proportional branch so
- * the headroom can never consume the whole stack. */
+/* Headroom so the limit fires with stack left for the guard region and the
+ * C frames building the RangeError; small stacks take the /8 branch. */
 #define TJS__STACK_HEADROOM   (512 * 1024)
 #define TJS__STACK_MIN_LIMIT  (64 * 1024)
 
-/* Mirrors TJS__DEFAULT_STACK_SIZE (vm.c:49). Duplicated rather than shared
- * because that macro lives in vm.c, not in a header, and utils.h is owned
- * elsewhere. Keep the two in sync. */
+/* Mirrors TJS__DEFAULT_STACK_SIZE in vm.c; keep in sync. */
 #define TJS__STACK_FALLBACK   (6 * 1024 * 1024)
 
 size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped) {
@@ -170,9 +121,7 @@ size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped) {
     }
 
     if (!tjs__native_stack_bounds(&low, &high)) {
-        /* Platform did not tell us. Honour the request rather than silently
-         * shrinking it — but never leave it at 0/"no limit", which is the one
-         * value guaranteed to crash. */
+        /* Honour the request, but never 0: "no limit" crashes. */
         return requested == 0 ? (size_t) TJS__STACK_FALLBACK : requested;
     }
 
@@ -197,10 +146,7 @@ size_t tjs__clamp_stack_size(size_t requested, bool *was_clamped) {
     return requested;
 }
 
-/* Total bytes the current thread's stack spans, or 0 when the platform did not
- * report bounds. Only feeds the diagnostic in mod_engine.c, which is reached
- * exclusively on the path where tjs__clamp_stack_size DID find bounds, so a 0
- * can never reach a printed message. */
+/* Stack bytes on this thread, or 0 when no bounds were reported. */
 size_t tjs__native_stack_total_size(void) {
     uintptr_t low = 0, high = 0;
 
@@ -382,11 +328,8 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
 }
 
 JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
-    /* Callers commonly queue a libuv request before creating the promise.
-     * Keep every field in a known state before entering QuickJS: on an OOM
-     * path JS_NewPromiseCapability() returns JS_EXCEPTION and leaves its
-     * resolving_funcs output unspecified.  A late native callback must be
-     * able to observe that state and release its own resources safely. */
+    /* Initialize fields first: OOM leaves JS_NewPromiseCapability's outputs
+     * unspecified and a late native callback must see a known state. */
     p->p = JS_UNDEFINED;
     p->rfuncs[0] = JS_UNDEFINED;
     p->rfuncs[1] = JS_UNDEFINED;
@@ -394,9 +337,7 @@ JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
     JSValue rfuncs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     p->p = JS_NewPromiseCapability(ctx, rfuncs);
     if (JS_IsException(p->p)) {
-        /* QuickJS is allowed to leave partially-created resolving functions
-         * in the output array when capability construction fails.  Release
-         * any such values before returning the exception. */
+        /* Failed capability creation may leave partial rfuncs in the array. */
         JS_FreeValue(ctx, rfuncs[0]);
         JS_FreeValue(ctx, rfuncs[1]);
         p->p = JS_UNDEFINED;
@@ -409,16 +350,13 @@ JSValue TJS_InitPromise(JSContext *ctx, TJSPromise *p) {
 
 bool TJS_IsPromisePending(JSContext *ctx, TJSPromise *p) {
     (void)ctx;
-    /* JS_EXCEPTION is never a usable promise.  Treat it as non-pending too
-     * for compatibility with callers that inspect a partially initialized
-     * request after promise allocation failed. */
+    /* JS_EXCEPTION is never usable; treat as non-pending for OOM callers. */
     return !JS_IsUndefined(p->p) && !JS_IsException(p->p);
 }
 
 void TJS_FreePromise(JSContext *ctx, TJSPromise *p) {
-    /* Detach before dropping references. JS_FreeValue() can run native
-     * finalizers, so reading from an enclosing request after the first free
-     * is not safe. Clearing first also makes repeated teardown a no-op. */
+    /* Detach first: JS_FreeValue can run finalizers that touch the enclosing
+     * request; clearing also makes repeated teardown a no-op. */
     TJSPromise owned = *p;
     TJS_ClearPromise(ctx, p);
     JS_FreeValue(ctx, owned.rfuncs[0]);
@@ -447,29 +385,23 @@ void TJS_MarkPromise(JSRuntime *rt, TJSPromise *p, JS_MarkFunc *mark_func) {
 }
 
 void TJS_SettlePromise(JSContext *ctx, TJSPromise *p, bool is_reject, int argc, JSValue *argv) {
-    /* A native operation may have been queued before promise allocation.  If
-     * allocation failed (or teardown already cleared the promise), there is
-     * no resolver to call.  The callback still owns `argv`, so release those
-     * values and clear the record before returning. */
+    /* No resolver when allocation failed or teardown cleared; the callback
+     * still owns argv, so release it and clear the record. */
     if (!TJS_IsPromisePending(ctx, p)) {
         TJSPromise owned = *p;
         TJS_ClearPromise(ctx, p);
         for (int i = 0; i < argc; i++) {
             JS_FreeValue(ctx, argv[i]);
         }
-        /* Normally all three fields are already undefined here.  Freeing the
-         * detached copy also covers a partially-created capability and keeps
-         * this path leak-free if a future QuickJS version returns one. */
+        /* Freeing the detached copy also covers a partial capability. */
         JS_FreeValue(ctx, owned.rfuncs[0]);
         JS_FreeValue(ctx, owned.rfuncs[1]);
         JS_FreeValue(ctx, owned.p);
         return;
     }
 
-    /* Resolving a promise invokes the host promise hook synchronously. That
-     * hook is user JS and may re-enter the native object that owns `p` (or
-     * even finalize it). Move the capability out and mark the record settled
-     * before calling JS; afterwards, never dereference `p` again. */
+    /* Resolving invokes the host promise hook (user JS) synchronously; it may
+     * re-enter or finalize the owner. Detach first, never touch p after. */
     TJSPromise owned = *p;
     TJS_ClearPromise(ctx, p);
 
@@ -494,9 +426,7 @@ static inline JSValue tjs__settled_promise(JSContext *ctx, bool is_reject, int a
 
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise)) {
-        /* The helper takes ownership of argv even when promise creation
-         * fails.  Release it here; otherwise every OOM on a fast-path
-         * resolved/rejected promise leaks the result value. */
+        /* Owns argv even on failure; release it or OOM leaks the values. */
         for (int i = 0; i < argc; i++) {
             JS_FreeValue(ctx, argv[i]);
         }

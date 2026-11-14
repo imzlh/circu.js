@@ -76,12 +76,7 @@ struct FfiType {
 typedef struct {
     void *addr;
     JSValue owner;
-    /* Non-owning identity for a backing store pinned by pointerOf(). Safe as a
-     * weak back-reference under two invariants: the owner chain is strongly
-     * gc_marked so the backing object outlives this pointer, and the fork GC
-     * runs every finalizer before freeing any object, so JS_IsLiveObject in
-     * the finalizer never reads freed memory. Never store a pinned pointer
-     * without an owner. */
+    /* Weak back-ref: owner chain gc_marked; GC frees after all finalizers. */
     JSValue pinned_backing;
     FfiLibraryState *state;
     FfiCallback *callback;
@@ -307,9 +302,7 @@ static int pointer_check(JSContext *ctx, FfiPointer *p) {
     if (!p || !p->valid) return JS_ThrowTypeError(ctx, "pointer is closed or released"), -1;
     if (p->state && p->state->closed) return JS_ThrowTypeError(ctx, "pointer belongs to a closed library"), -1;
     if (p->callback && p->callback->closed) return JS_ThrowTypeError(ctx, "pointer belongs to a closed callback"), -1;
-    /* Native-derived pointers keep their source Pointer as owner. Follow that
-     * chain so close/release invalidation propagates to every later offset or
-     * dereference instead of leaving a usable address into freed storage. */
+    /* Derived ptrs chain to their source: close/release invalidates them. */
     if (!JS_IsUndefined(p->owner)) {
         FfiPointer *owner = get_pointer(p->owner);
         if (owner && pointer_check(ctx, owner) < 0) return -1;
@@ -750,9 +743,7 @@ static JSValue unsafe_view(JSContext*ctx,JSValueConst self,int argc,JSValueConst
 static JSValue unsafe_cstring(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc<1||argc>2)return JS_ThrowTypeError(ctx,"readCString expects Pointer");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;if(argc==1)return JS_NewString(ctx,p->addr);int64_t n;if(strict_integer(ctx,argv[1],&n,"maximum length")<0)return JS_EXCEPTION;if(n<0||(uint64_t)n>SIZE_MAX)return JS_ThrowRangeError(ctx,"invalid maximum length");return JS_NewStringLen(ctx,p->addr,strnlen(p->addr,(size_t)n));}
 static JSValue unsafe_loop(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;(void)argc;(void)argv;return new_pointer(ctx,tjs_get_loop(ctx),JS_UNDEFINED,NULL,NULL);}
 static JSValue unsafe_adopt(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){(void)self;if(argc!=2)return JS_ThrowTypeError(ctx,"adopt expects pointer and disposer");if(JS_GetOpaque(argv[0],owned_class))return JS_ThrowTypeError(ctx,"cannot adopt an owned pointer; release it instead");FfiPointer*p=require_pointer(ctx,argv[0]);if(!p)return JS_EXCEPTION;
-    /* GC fallback runs from a native cleanup queue after the JS owner may have
-     * been finalized. Borrowed buffer and callback addresses therefore cannot
-     * safely become owned resources; adopt is for independent native storage. */
+    /* Borrowed ptrs can't be owned: GC fallback runs after owner is freed. */
     if(p->callback||(!p->state&&!JS_IsUndefined(p->owner)))return JS_ThrowTypeError(ctx,"cannot adopt a borrowed buffer or callback pointer");
     FfiBound*b=JS_GetOpaque(argv[1],bound_class);if(!b||b->sig.fixed>=0||b->sig.nargs!=1||b->sig.types[0]->kind!=K_VOID||b->sig.types[1]->kind!=K_POINTER||b->callback)return JS_ThrowTypeError(ctx,"disposer must be a native bound void(pointer) function");if(b->state&&b->state->closed)return JS_ThrowTypeError(ctx,"disposer belongs to a closed FFI owner");JSValue obj=JS_NewObjectClass(ctx,owned_class);if(JS_IsException(obj))return obj;OwnedPointer*o=js_mallocz(ctx,sizeof(*o));FfiDisposeJob*job=tjs__mallocz(sizeof(*job));if(!o||!job){js_free(ctx,o);tjs__free(job);JS_FreeValue(ctx,obj);return JS_EXCEPTION;}job->resource_addr=p->addr;job->disposer_addr=b->addr;job->arg_types[0]=&ffi_type_pointer;job->state=b->state;job->resource_state=p->state!=b->state?p->state:NULL;ffi_status st=ffi_prep_cif(&job->cif,b->sig.cif.abi,1,&ffi_type_void,job->arg_types);if(st!=FFI_OK){js_free(ctx,o);tjs__free(job);JS_FreeValue(ctx,obj);return JS_ThrowTypeError(ctx,"cannot prepare disposer: %s",status_name(st));}state_owned_ref(job->state);state_owned_ref(job->resource_state);o->pointer.addr=p->addr;o->pointer.owner=JS_DupValue(ctx,argv[0]);o->pointer.state=p->state;o->pointer.callback=p->callback;o->pointer.valid=true;o->job=job;o->armed=true;JS_SetOpaque(obj,o);return obj;}
 

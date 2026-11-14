@@ -37,10 +37,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Branch hints for the trace hot path. MSVC has no __builtin_expect, so these
- * degrade to a plain expression there; GCC/Clang use them to keep the common
- * free-running path as the straight-line fall-through and push the break path
- * out of line. */
+/* Branch hints: no __builtin_expect on MSVC; degrades to a plain expression. */
 #if defined(__GNUC__) || defined(__clang__)
 #  define DC_LIKELY(x)   __builtin_expect(!!(x), 1)
 #  define DC_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -123,11 +120,8 @@ typedef struct {
     RingSlot slots[RING_CAP];
 } MsgRing;
 
-/* A message copied out of the ring. For inline messages, `data` points at the
- * struct's own inline_buf. For heap messages, `data` points at a malloc'd
- * buffer that the consumer MUST release with ring_msg_free(). Either way the
- * payload has been fully copied out before the slot is released, so it is safe
- * to keep using after ring_pop() returns. */
+/* A message copied out of the ring: `data` points at inline_buf, or at a
+ * malloc'd buffer the consumer MUST ring_msg_free(). Safe after ring_pop(). */
 typedef struct {
     uint32_t type;
     uint32_t id;
@@ -137,9 +131,7 @@ typedef struct {
     uint8_t  inline_buf[MSG_INLINE_MAX];
 } RingMsg;
 
-/* GCC false-positive: -Wstringop-overflow fires when memcpy-ing into a
- * RingSlot payload accessed via &r->slots[...] because the _Atomic head
- * field confuses GCC's offset analysis (GCC Bug #101836).              */
+/* GCC bug #101836: -Wstringop-overflow false positive on _Atomic head. */
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -208,9 +200,7 @@ static inline void ring_msg_free(RingMsg *m) {
 #define MSG_SET_STEP     5
 #define MSG_SET_BP_ACTIVE 6
 
-/* Inspect class (←5b) →carried to_main, handled by JS onBreak loop.
- * A single generic carrier type is used; the real CDP method lives in the
- * payload as `method '\0' params '\0'`. */
+/* Generic carrier: CDP method lives in payload as method '\0' params '\0'. */
 #define MSG_INSPECT      10
 #define MSG_RESUME       15
 
@@ -342,15 +332,8 @@ static bool debug_breakpoint_matches(JSContext *ctx, const TJSBreakpoint *bp, JS
     return bp->col == -1 || bp->col == col;
 }
 
-/* ---- structured payload (de)serialization -------------------------------- *
- * CDP params, results and event payloads are plain data (no functions, no
- * bytecode), so they travel as a QuickJS object-serialization blob instead of
- * JSON text: no parsing, no printing, no string interning on the message path.
- * Flags mirror the worker postMessage convention (SAB | REFERENCE); BYTECODE is
- * deliberately omitted →we never ship code across the debug channel. The blob
- * is allocated on `ctx`'s runtime allocator, so it must be freed with
- * js_free(ctx, .); ring_push copies it into a neutral buffer before it crosses
- * to the other runtime. */
+/* ---- structured payload (de)serialization -------------------------------- */
+/* js_free(ctx, .) the blob; no BYTECODE flag: code never crosses runtimes. */
 #define DC_WRITE_FLAGS (JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_STRIP_SOURCE)
 #define DC_READ_FLAGS  (JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE)
 
@@ -440,9 +423,7 @@ static bool dcb_apply_control(JSContext *ctx, TJSRuntime *trt, const RingMsg *m)
     }
 }
 
-/* Drain all pending control-class messages while the program is RUNNING
- * (called from the trace hook). Inspect/resume messages must not arrive while
- * running; if one does it is dropped. Keeps main_sem balanced with to_main. */
+/* Drain while RUNNING: late inspect/resume is dropped; main_sem balanced. */
 static void dcb_drain_control(JSContext *ctx, DebugControlBlock *cb) {
     TJSRuntime *trt = TJS_GetRuntime(ctx);
     RingMsg m;
@@ -463,9 +444,7 @@ enum {
     TJS_DEBUG_INTERRUPT  = 4,
 };
 
-/* Guard against re-entering the break logic while already paused. Debugger-
- * driven evaluation (evalInFrame / engine.eval) runs JS with the trace hook
- * still installed; it must never recursively invoke onBreak. */
+/* Debugger-driven eval runs JS with hook installed: no recursive onBreak. */
 static thread_local bool tjs__in_debug_break = false;
 
 static inline int tjs__debug_current_pause_depth(TJSRuntime *trt, JSContext *ctx) {
@@ -497,13 +476,8 @@ static int tjs__debug_trace_cb(JSContext *ctx, JSAtom filename, JSAtom funcname,
     DebugControlBlock *cb = trt->debug.channel;
     bool interrupted = false;
 
-    /* Hot-path gate. This callback fires on *every* traced line, so it does the
-     * absolute minimum. All three loads below are relaxed (plain MOVs, no
-     * barrier): `tail` is written only by us (the consumer); `head` and
-     * `interrupt` are written by the worker, and observing either one line late
-     * is harmless for a debugger. We only touch the ring or perform the costly
-     * lock-prefixed atomic_exchange when something is actually pending →the
-     * previous code ran an unconditional drain + atomic_exchange every line. */
+    /* Hot path: all three loads are relaxed — `tail` is consumer-only, and late
+     * observation of worker-written `head`/`interrupt` is harmless. */
     if (cb) {
         uint32_t h = atomic_load_explicit(&cb->to_main.head, memory_order_relaxed);
         uint32_t t = atomic_load_explicit(&cb->to_main.tail, memory_order_relaxed);
@@ -579,9 +553,7 @@ do_break:;
     bool prev_in_break = tjs__in_debug_break;
     tjs__in_debug_break = true;
     if (cb) atomic_store(&cb->state, DCB_STATE_PAUSED);
-    /* onBreak may call debug.stop()/start() or dc.stop(), which free the
-     * callback and can drop the last ref on the channel: hold the callback
-     * across the call and re-read the weak channel pointer afterwards. */
+    /* onBreak may stop/free cb and channel: hold cb; re-read weak ptr after. */
     JSValue on_break = JS_DupValue(ctx, trt->debug.onBreak);
     JSValue ret = JS_Call(ctx, on_break, JS_UNDEFINED, 6, argv);
     JS_FreeValue(ctx, on_break);
@@ -947,9 +919,7 @@ static void tjs_dc_main_finalizer(JSRuntime *rt, JSValue val) {
 #ifdef _WIN32
         if (h->stop_event) CloseHandle(h->stop_event);
 #endif
-        /* debug.stop()/dc.stop() normally clear the weak trt->debug.channel
-         * pointer first; a handle collected without that must not leave it
-         * dangling. h->cb is NULL once dc.stop() ran (ref already released). */
+        /* GC'd without stop(): must not leave trt->debug.channel dangling. */
         if (h->cb) {
             TJSRuntime *trt = JS_GetRuntimeOpaque(rt);
             if (trt && trt->debug.channel == h->cb) trt->debug.channel = NULL;
@@ -993,10 +963,6 @@ static JSValue tjs_dc_main_notify(JSContext *ctx, JSValue this_val, int argc, JS
     return JS_NewBool(ctx, ok);
 }
 
-/* dc.waitRequest() →blocks on main_sem; applies control msgs inline and only
- * returns inspect / resume requests to JS. Shapes:
- *   { kind: 'inspect', id, method, params }
- *   { kind: 'resume',  step }                                                */
 static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSDCMain *h = tjs_dc_main_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
@@ -1019,9 +985,7 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
                 JS_SetPropertyStr(ctx, obj, "kind", JS_NewInt32(ctx, MSG_REQ_RESUME));
                 JS_SetPropertyStr(ctx, obj, "step", JS_NewUint32(ctx, step));
             } else {
-                /* inspect carrier: method '\0' + JS_WriteObject(params) bytes. The
-                 * params half is binary (may contain NULs), so it is delimited by
-                 * offset, not by a terminator. */
+                /* params is binary (NULs): offset-delimited, not terminated. */
                 const char *method = (const char *)m.data;
                 uint32_t poff = 0;
                 while (poff < m.len && m.data[poff] != '\0') poff++;
@@ -1037,10 +1001,7 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
             ring_msg_free(&m);
             return obj;
         }
-        /* Block until a message arrives or stop() signals stop_event.
-         * On Windows, WaitForMultipleObjects lets us wait on both the
-         * semaphore (message arrived) and stop_event (dc.stop()) at once,
-         * so dc.stop() wakes this thread immediately without needing uv. */
+        /* WaitForMultipleObjects waits on both: dc.stop() wakes this thread. */
 #ifdef _WIN32
         /* Register Ctrl+C handler: libuv signals need the event loop to dispatch,
          * but we're blocked here →go direct via SetConsoleCtrlHandler. */
@@ -1435,9 +1396,7 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
         return JS_ThrowTypeError(ctx, "null debug channel pointer");
     TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.getDebugChannel"), (void)0, do { data = (uint8_t *)JS_GetArrayBuffer(ctx, &byte_len, argv[0]); if (!data || byte_len != sizeof(void *)) return JS_ThrowTypeError(ctx, "invalid handle ArrayBuffer (expected an 8-byte channel pointer)"); memcpy(&cb, data, sizeof cb); if (!cb) return JS_ThrowTypeError(ctx, "null debug channel pointer"); } while (0));
 
-    /* Worker claims the second baked-in ref (refcount started at 2) →do NOT
-     * increment here. The handle bytes are cleared once the claim succeeds
-     * (see the end of this function). */
+    /* Worker claims the 2nd baked-in ref (count started at 2): no increment. */
 
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_dc_worker_proto_funcs, countof(tjs_dc_worker_proto_funcs));
@@ -1451,9 +1410,7 @@ static JSValue tjs_debug_get_channel(JSContext *ctx, JSValue this_val, int argc,
     JS_SetOpaque(obj, h);
     JS_SetPrototype(ctx, obj, proto);
     JS_FreeValue(ctx, proto);
-    /* The pointer carries exactly one baked-in ref. Zero the handle bytes so a
-     * second getDebugChannel() on the same buffer fails instead of claiming
-     * (and later releasing) that ref again. */
+    /* Zero the handle bytes so a second claim can't retake the baked-in ref. */
     data = (uint8_t *)JS_GetArrayBuffer(ctx, &byte_len, argv[0]);
     if (data && byte_len == sizeof(void *)) memset(data, 0, byte_len);
     return obj;

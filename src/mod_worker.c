@@ -47,22 +47,16 @@ enum {
 
 static thread_local JSClassID tjs_msgpipe_class_id;
 
-/* Messages received before an onmessage listener is installed remain pending
- * until the listener is attached. Do not cap this queue: a MessagePipe has
- * message-delivery semantics, so silently discarding a burst here is worse
- * than retaining it (the JS Worker layer has its own startup queue too). */
+/* Messages arriving before onmessage is installed stay pending; never cap
+ * this queue -- delivery semantics forbid silently dropping a burst. */
 
-/* A Worker wrapper can be finalized before its thread returns, so qrt->workers
- * is not a complete fork-safety guard. Keep a process-wide count until the
- * worker thread has finished tearing down its native runtime. The mutex is
- * initialized once and intentionally lives for the process lifetime. */
+/* A Worker wrapper can be GC'd before its thread returns, so keep a
+ * process-wide count until the native runtime teardown finishes. */
 static uv_once_t tjs_worker_count_once = UV_ONCE_INIT;
 static uv_mutex_t tjs_worker_count_lock;
 static size_t tjs_worker_count;
 
-/* The transfer table is out of band.  A token is deliberately used instead of
- * putting a process-local pointer on the wire: a complete frame must claim the
- * token while holding the registry lock before it can touch QuickJS objects. */
+/* Transfer table is out of band; a token, not a pointer, is sent on the wire. */
 typedef struct {
     uint32_t magic;
     uint16_t version;
@@ -143,9 +137,7 @@ struct TJSMessagePipeFrame {
     int committed;
 };
 
-/* The wrapper is allocated in neutral memory, rather than on the sender's JS
- * stack. One reference is held by the write request and one by the frame
- * header delivered to the peer. */
+/* Allocated in neutral memory; refs held by the write request and the frame. */
 struct TJSMessagePipeTransferOwner {
     _Atomic unsigned refs;
     JSAutoTransferTab tab;
@@ -156,9 +148,7 @@ enum {
     MSGPIPE_FRAME_VERSION = 1,
 };
 
-/* One registry reference is reserved by every published entry.  Claim moves
- * that reference to the reader; cancel drops it.  The other owner reference
- * belongs to the write request until its callback runs. */
+/* Each entry reserves one ref: claim moves it to the reader, cancel drops it. */
 typedef struct TJSMessagePipeTransferRegistryEntry {
     uint64_t token;
     TJSMessagePipeTransferOwner *owner;
@@ -493,10 +483,8 @@ static TJSMessagePipe *tjs_msgpipe_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_msgpipe_class_id);
 }
 
-/* Message delivery runs from a libuv callback, not from a JS call frame. An
- * exception left on the context there would have no caller to observe it, so
- * make an allocation failure follow the runtime's existing uncatchable-error
- * path rather than silently losing the message. */
+/* Delivery runs from a libuv callback: an exception there has no caller, so
+ * OOM follows the uncatchable-error path instead of losing the message. */
 static void msgpipe_oom(TJSMessagePipe *p) {
     JSContext *ctx = p->ctx;
     JS_ThrowOutOfMemory(ctx);
@@ -598,9 +586,7 @@ static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg, size_t
                 }
                 JSValue *grown = js_realloc(ctx, p->pending, new_cap * sizeof(JSValue));
                 if (!grown) {
-                    /* Allocation failure is exceptional, unlike a queue cap.
-                     * Keep the existing queue intact and surface the failure
-                     * through the runtime's normal OOM path. */
+                    /* Keep the queue intact and surface the OOM normally. */
                     msgpipe_oom(p);
                     return;
                 }
@@ -730,9 +716,7 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
     CHECK_EQ(p->reading.nread, total_size);
 
 deserialize_frame:
-    /* We have a complete frame now. The structured reader consumes the
-     * out-of-band transfer table; it never expects descriptor bytes in blob.
-     * Claim only now, after the complete header and blob have arrived. */
+    /* Claim only after the complete header and blob have arrived. */
     p->frame->transfers = msgpipe_transfer_registry_claim(
         p->frame->header.transfer_token, p->frame->header.transfer_count);
     if (!p->frame->transfers) {
@@ -935,9 +919,7 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     wr->frame.header.blob_len = len;
     wr->frame.header.transfer_count = owner->tab.len;
 
-    /* JS_WriteObject2() returns QuickJS-owned memory.  The uv_write callback can
-     * run during runtime shutdown, so copy the payload into neutral memory now
-     * and release the QuickJS allocation while ctx is still valid. */
+    /* Copy to neutral memory: the uv_write cb can run after ctx is freed. */
     wr->data = tjs__malloc(len ? len : 1);
     if (!wr->data) {
         js_free(ctx, buf);
@@ -1178,12 +1160,8 @@ static TJSRuntime *worker_get_runtime(TJSWorker *w) {
     return wrt;
 }
 
-/* Request a stop AND deliver it while still holding the lock.
- * TJS_Stop() must not be called on a runtime pointer that escaped the lock:
- * worker_mark_exited() clears w->wrt under the same lock and the worker thread
- * then runs TJS_FreeRuntime(), which uv_close()s wrt->stop and frees wrt. A
- * stop delivered after that window is a use-after-free / send on a closed
- * handle. Serializing against worker_mark_exited() closes it. */
+/* Stop and deliver under the lock: TJS_Stop on a pointer that escaped it is
+ * a use-after-free once worker_mark_runtime_stopped() clears w->wrt. */
 static void worker_stop_locked(TJSWorker *w) {
     uv_mutex_lock(&w->lock);
     if (!w->terminated) {
@@ -1208,10 +1186,8 @@ static void worker_mark_joined(TJSWorker *w) {
     uv_mutex_unlock(&w->lock);
 }
 
-/* Atomically mark that the GC finalizer has run and decide, under the lock,
- * whether the finalizer is the party responsible for freeing the struct.
- * The finalizer frees only if the worker thread has already returned; else it
- * defers to the thread (which will observe finalized_by_gc under the lock). */
+/* Decide under the lock who frees: the finalizer only if the thread has
+ * already returned, else the thread (it observes finalized_by_gc). */
 static bool worker_gc_claim_free(TJSWorker *w) {
     bool free_now;
     uv_mutex_lock(&w->lock);
@@ -1221,9 +1197,7 @@ static bool worker_gc_claim_free(TJSWorker *w) {
     return free_now;
 }
 
-/* Atomically mark the worker thread as returned and decide, under the lock,
- * whether the thread is responsible for freeing the struct (i.e. the GC
- * finalizer already ran and deferred to us). */
+/* Decide under the lock whether the thread frees (GC finalizer deferred). */
 static bool worker_thread_claim_free(TJSWorker *w) {
     bool free_now;
     uv_mutex_lock(&w->lock);
@@ -1248,9 +1222,7 @@ void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w) {
 static void worker_entry(void *arg) {
     worker_data_t *wd = arg;
 
-    /* The parent owns the transfer table until it has committed the
-     * serialization.  Do not create a runtime or touch workerData before the
-     * parent has published that result. */
+    /* Wait for the parent's transfer commit before touching workerData. */
     uv_sem_wait(wd->start_sem);
     if (atomic_load_explicit(&wd->commit_error, memory_order_acquire)) {
         TJSWorker *owner = wd->worker;
@@ -1319,14 +1291,8 @@ static void worker_entry(void *arg) {
 
     TJS_FreeRuntime(wrt);
 
-    /* If the parent GC already ran tjs_worker_finalizer while we were still
-     * alive, the finalizer deferred freeing the TJSWorker struct to us. The
-     * parent-side message_pipe is owned by its own JS wrapper on the parent's
-     * loop and is released independently of this thread.
-     * The exited flag is set only here, after every worker-thread access to the
-     * owner is complete. The flag and finalized_by_gc read are one atomic
-     * decision under the lock, so the finalizer cannot free the owner while the
-     * thread is still using it. */
+    /* Free the struct only if the finalizer deferred to us; exited is set
+     * here, after all worker-thread access to the owner is complete. */
     if (owner && worker_thread_claim_free(owner)) {
         uv_mutex_destroy(&owner->lock);
         tjs__free(owner);
@@ -1340,33 +1306,22 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     TJSWorker *w = JS_GetOpaque(val, tjs_worker_class_id);
     if (!w) return;
 
-    /* self_obj is always a dup of this Worker wrapper.  Once QuickJS is
-     * finalizing the wrapper, dropping that self-reference must not recurse
-     * into JS_FreeValueRT() on the same JSObject. */
+    /* Detach self first: freeing it here would recurse on the same JSObject. */
     worker_detach_self(w);
 
-    /* Signal the worker thread to stop, but don't block in finalizer.
-     * Blocking here can cause hangs if the worker thread is stuck in a
-     * synchronous operation (deadloop, blocking syscall).
-     * The thread will clean up when it exits.
-     * Don't call uv_thread_join here - it can block indefinitely if the
-     * worker thread is stuck. */
+    /* Signal stop but never block or join in a finalizer: a stuck worker
+     * thread would hang the GC. The thread cleans up when it exits. */
     worker_stop_locked(w);
 
-    /* Drop our reference to the msgpipe wrapper. Its finalizer closes the
-     * handle (setting p->finalized so uv__close_cb frees the C struct once the
-     * close cb fires), which is correct whether or not the worker thread has
-     * exited — the parent and child hold different handles on different loops
-     * over the two ends of the socketpair. */
+    /* Drop the msgpipe ref: its finalizer closes the parent-side handle,
+     * correct whether or not the worker thread has exited. */
     JSValue message_pipe = w->message_pipe;
     w->message_pipe = JS_UNDEFINED;
     JS_FreeValueRT(rt, message_pipe);
 
     if (w->link.next) list_del(&w->link);
 
-    /* Decide ownership of the struct free atomically under the lock. If the
-     * worker thread has already returned we free now; otherwise the thread
-     * frees it when it exits (observing finalized_by_gc under the same lock). */
+    /* Free now only if the thread returned; else it frees on exit. */
     if (worker_gc_claim_free(w)) {
         uv_mutex_destroy(&w->lock);
         tjs__free(w);
@@ -1552,9 +1507,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         msgpipe_transfer_owner_release_unsent(transfer_owner);
         return tjs_throw_errno(ctx, r);
     }
-	/* The child is blocked on this semaphore until the transfer commit has
-	 * completed. This keeps a failed commit from exposing a half-detached
-	 * workerData table to JS_ReadObject3(). */
+	/* Child blocks until commit; no half-detached workerData is exposed. */
 	int commit_error = JS_CommitArrayBufferTransfers(ctx, &transfer_owner->tab);
 	atomic_store_explicit(&worker_data->commit_error, commit_error,
         memory_order_release);

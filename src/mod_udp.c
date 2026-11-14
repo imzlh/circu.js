@@ -117,9 +117,7 @@ static void maybe_close(TJSUdp *u) {
 static void tjs_udp_finalizer(JSRuntime *rt, JSValue val) {
     TJSUdp *u = JS_GetOpaque(val, tjs_udp_class_id);
     if (u) {
-        /* A recv callback can still be queued when GC runs the finalizer.
-         * Stop it and make the callback take its runtime-teardown path before
-         * releasing the backing store and promise values. */
+        /* Queued recv cbs must hit the RT-safe path before values are freed. */
         u->finalized = 1;
         u->read.canceled = 1;
         u->read.settled = 1;
@@ -172,10 +170,7 @@ static JSValue tjs_udp_close(JSContext *ctx, JSValue this_val, int argc, JSValue
     u->read.canceled = 1;
     u->read.settled = pending ? 1 : u->read.settled;
     uv_udp_recv_stop(&u->udp);
-    /* Once recv has been stopped, no new packet can consume this buffer.  A
-     * late cancellation callback only observes the canceled flag and clears
-     * the already-empty slot, so release it here instead of retaining it
-     * until the UDP object is collected. */
+    /* Recv stopped: late cbs only see the canceled flag; free buffer now. */
     tjs_udp_read_buffer_clear(ctx, u);
     if (pending) {
         JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
@@ -204,9 +199,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
     JSRuntime *rt = ctx ? JS_GetRuntime(ctx) : NULL;
     TJSRuntime *qrt = rt ? JS_GetRuntimeOpaque(rt) : NULL;
 
-    /* A finalizer/runtime teardown can leave one recv callback in libuv's
-     * queue.  Do not touch QuickJS values in that case; the finalizer and this
-     * path both use the RT-safe buffer release helper. */
+    /* Finalizer/teardown may leave a queued recv cb: no QuickJS values here. */
     if (u->finalized || !qrt || qrt->freeing) {
         uv_udp_recv_stop(handle);
         if (rt) {
@@ -215,10 +208,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
         return;
     }
 
-    /* libuv signals "no data available right now" with nread==0 && addr==NULL.
-     * This is NOT a datagram (an empty datagram has addr != NULL), so keep the
-     * recv armed and wait for a real packet instead of stopping and then
-     * dereferencing a NULL addr in tjs_addr2obj. */
+    /* nread==0 && addr==NULL is libuv's "nothing yet", not a datagram. */
     if (nread == 0 && addr == NULL) {
         return;
     }
@@ -259,9 +249,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
     }
 
     u->read.settled = 1;
-    /* TJS_SettlePromise may run a host hook and re-enter GC.  Release all
-     * request-owned storage before that call and never dereference `u` after
-     * it. */
+    /* SettlePromise may hook/re-enter GC: free storage first, no `u` after. */
     tjs_udp_read_buffer_clear(ctx, u);
     TJS_SettlePromise(ctx, &u->read.result, is_reject, 1, &arg);
 }
@@ -300,9 +288,7 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
     u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
-        /* A promise hook may have closed/finalized the receiver. Its close
-         * path owns the embedded promise and read buffer; only drop the
-         * caller's duplicate here. */
+        /* Hook may have closed the receiver: only drop our duplicate ref. */
         JS_FreeValue(ctx, promise);
         return JS_EXCEPTION;
     }
@@ -354,10 +340,7 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
-    /* arg 1: target address — resolved BEFORE acquiring argv[0]'s backing
-     * store. tjs_obj2addr reads .ip/.port and converts them, so it can run a
-     * user getter/toString/valueOf that detaches argv[0]; doing it afterwards
-     * left `buf`/`size` dangling and sent freed heap over the network. */
+    /* Resolve addr before taking argv[0]'s buffer: getters may detach it. */
     struct sockaddr_storage ss;
     struct sockaddr *sa = NULL;
     int r;

@@ -941,9 +941,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         EC_GROUP_free((EC_GROUP*)group);
         return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
     }
-    /* priv_key now owns a copy of the group. Release our standalone copy and
-     * borrow priv_key's group for the remaining operations so we don't leak
-     * the EC_GROUP on the many return paths below. */
+    /* priv_key owns a copy now: free ours, borrow priv_key's to avoid leaks. */
     EC_GROUP_free((EC_GROUP*)group);
     group = EC_KEY_get0_group(priv_key);
     
@@ -1061,12 +1059,6 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     return result;
 }
 
-/* Generic key agreement over ENCODED keys (PKCS#8/SEC1/PEM private, SPKI/PEM
- * public). Unlike ecdhDerive*, the algorithm comes from the key material rather
- * than a fixed curve magic, so this covers X25519/X448 and DH as well as the
- * named EC curves -- i.e. everything node's crypto.diffieHellman() accepts.
- * The output length is queried from OpenSSL: for X25519 it is the 32-byte
- * u-coordinate, for EC the field size, and for DH the prime size. */
 static JSValue tjs_crypto_derive_shared_secret(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     size_t priv_len, pub_len;
     const uint8_t *priv_data, *pub_data;
@@ -1700,9 +1692,7 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
 static uint32_t crc32_table[256];
 static uv_once_t crc32_table_once = UV_ONCE_INIT;
 
-/* Process-global table built lazily; crc32() also runs on worker threads, so a
- * plain `static int initialized` flag races (one thread reads a half-built
- * table). uv_once is safe. */
+/* crc32() runs on worker threads: a plain init flag races, so use uv_once. */
 static void init_crc32_table_once(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
@@ -1913,10 +1903,6 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
     return result;
 }
 
-/* GCM encrypt with AAD support - one-shot function
- * Arguments: key, iv, plaintext, aad (optional), tagLength (optional, default 16)
- * Returns: {ciphertext: ArrayBuffer, tag: ArrayBuffer}
- */
 static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     size_t key_len, iv_len, plaintext_len, aad_len = 0;
     const uint8_t *key, *iv, *plaintext, *aad = NULL;
@@ -2029,10 +2015,6 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
     return result;
 }
 
-/* GCM decrypt with AAD support - one-shot function
- * Arguments: key, iv, ciphertext, tag, aad (optional)
- * Returns: {plaintext: ArrayBuffer, verified: boolean}
- */
 static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     size_t key_len, iv_len, ciphertext_len, tag_len, aad_len = 0;
     const uint8_t *key, *iv, *ciphertext, *tag, *aad = NULL;
@@ -2127,9 +2109,7 @@ static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int
         JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, plaintext, plaintext_len));
         JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 1));
     } else {
-        /* Authentication failed. Never release unauthenticated plaintext, and
-         * do not use final_len (undefined when EVP_DecryptFinal_ex fails).
-         * Return an empty buffer so callers cannot accidentally trust it. */
+        /* Never release unauthenticated plaintext; final_len undefined here. */
         js_free(ctx, plaintext);
         JS_SetPropertyStr(ctx, result, "plaintext", js_fastab(ctx, NULL, 0));
         JS_SetPropertyStr(ctx, result, "verified", JS_NewBool(ctx, 0));
@@ -2472,10 +2452,6 @@ static JSClassDef tjs_gcm_class = {
     .finalizer = tjs_gcm_finalizer,
 };
 
-// Constructor: new GCM(mode, key, iv)
-// mode: 'encrypt' or 'decrypt'
-// key: ArrayBuffer (16/24/32 bytes for AES-128/192/256)
-// iv: ArrayBuffer (recommended 12 bytes)
 static JSValue tjs_gcm_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv) {
     if (argc < 3) {
@@ -2601,9 +2577,6 @@ static JSValue tjs_gcm_set_aad(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, ret == 1);
 }
 
-// Method: update(data)
-// data: ArrayBuffer with data to encrypt/decrypt
-// Returns: ArrayBuffer with processed data
 static JSValue tjs_gcm_update(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv) {
     TJSGCMContext *gctx = JS_GetOpaque2(ctx, this_val, tjs_gcm_class_id);
@@ -2641,9 +2614,6 @@ static JSValue tjs_gcm_update(JSContext *ctx, JSValueConst this_val,
     return js_fastab(ctx, out_data, out_len);
 }
 
-// Method: final(tag)
-// For encryption: returns {data: ArrayBuffer, tag: ArrayBuffer}
-// For decryption: tag is required parameter, returns {data: ArrayBuffer, verified: boolean}
 static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
     TJSGCMContext *gctx = JS_GetOpaque2(ctx, this_val, tjs_gcm_class_id);

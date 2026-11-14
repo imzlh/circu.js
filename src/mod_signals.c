@@ -128,9 +128,7 @@ static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *a
 
     r = uv_signal_start(&sh->handle, uv__signal_cb, sig_num);
     if (r != 0) {
-        /* handle was registered with the loop; we must uv_close it before
-         * freeing the backing memory. The close cb frees sh once both
-         * closed=1 and finalized=1 are set. */
+        /* uv_close before free; close cb frees sh when closed && finalized. */
         sh->finalized = 1;
         uv_close((uv_handle_t *) &sh->handle, uv__signal_close_cb);
         JS_FreeValue(ctx, obj);

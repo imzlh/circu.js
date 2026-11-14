@@ -1,6 +1,4 @@
-/**
- * circu.js test suite entry point.
- */
+/** circu.js test suite entry point. */
 // @ts-check
 
 const { use } = import.meta;

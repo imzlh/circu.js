@@ -9,10 +9,7 @@ function encode(str) {
     return new TextEncoder().encode(str);
 }
 
-/**
- * 
- * @param {CModuleHTTP.Parser} parser 
- */
+/** @param {CModuleHTTP.Parser} parser */
 function initHandler(parser) {
     parser.onBody = () => void 0;
     parser.onHeaderField = () => void 0;

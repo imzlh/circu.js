@@ -185,9 +185,7 @@ typedef struct {
     TJSPromise result;
 } TJSReadFileReq;
 
-/* uv_fs_* may allocate path strings, result buffers, or an expanded iovec
- * before returning a synchronous error.  The request must be cleaned up even
- * though no completion callback will run on that path. */
+/* uv_fs_* may allocate before a synchronous error; cleanup with no callback. */
 static inline void tjs_fsreq_free_immediate(JSContext *ctx, TJSFsReq *fr) {
     if (!fr) return;
     uv_fs_req_cleanup(&fr->req);
@@ -301,9 +299,8 @@ static TJSDirEnt *tjs_dirent_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_dirent_class_id);
 }
 
-/* On Windows the caller also passes the full 64-bit FILETIME-derived times,
- * because uv_stat_t's tv_sec is only 32 bits wide there. times may be NULL or
- * invalid, in which case libuv's own (truncated) values are used. */
+/* Windows: uv_stat_t's tv_sec is 32-bit, so the caller passes full 64-bit
+ * FILETIME times; NULL/invalid falls back to libuv's truncated values. */
 #ifdef _WIN32
 static JSValue tjs_new_stat(JSContext *ctx, uv_stat_t *st, const tjs_win_stat_times_t *times) {
 #else
@@ -502,11 +499,8 @@ static void uv__fs_req_cb(uv_fs_t *req) {
         case UV_FS_FSTAT:
 #ifdef _WIN32
         {
-            /* Re-read the timestamps as 64-bit FILETIMEs; uv_stat_t truncated
-             * them to 32 bits. Safe here: uv__fs_done runs this callback on the
-             * loop thread, and uv_fs_req_cleanup() (which frees req.path) is
-             * only called further down at the end of this function, so both
-             * req.path and req.file.fd are still valid. */
+            /* Re-read 64-bit FILETIMEs (uv_stat_t truncated to 32 bits); safe
+             * because uv_fs_req_cleanup() runs at the end of this function. */
             tjs_win_stat_times_t wtimes;
             wtimes.valid = 0;
             if (req->fs_type == UV_FS_FSTAT) {
@@ -651,10 +645,8 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
     memset(fr, 0, sizeof(*fr));
 
-    /* Own the I/O buffer in a local until after tjs_fsreq_init(); that helper
-     * resets the fr->rw.* fields, so assigning them earlier gets clobbered
-     * (leaving rw.data == NULL -> NULL-deref on the read copy-back, and a leak
-     * of the I/O buffer on write). */
+    /* tjs_fsreq_init() resets fr->rw.*; assign after it or rw.data is
+     * clobbered (NULL-deref on read copy-back, I/O buffer leak on write). */
     uint8_t *data = js_malloc(ctx, size);
     if (!data) {
         tjs_fsreq_free_immediate(ctx, fr);
@@ -681,10 +673,8 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return err;
     }
 
-    /* tjs_fsreq_init returns a dup'd promise reference for the caller to own.
-     * Do NOT discard it and return fr->result.p directly — that would leak
-     * one reference and break ref-counting on promise settlement.
-     * Assign rw.* AFTER init: tjs_fsreq_init() zeroes them. */
+    /* tjs_fsreq_init() returns a dup'd promise ref; returning fr->result.p
+     * directly would leak a reference and break settlement ref-counting. */
     f->pending++;
     JSValue promise = tjs_file_fsreq_init(ctx, fr, this_val);
     fr->rw.data = data;
@@ -1639,9 +1629,8 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
             js_free_rt(rt, fr->filename);
             js_free_rt(rt, fr);
         } else {
-            /* This should not occur while libuv still owns the runtime, but
-             * keep the native allocation recoverable if a custom embedder
-             * invokes the callback after detaching the opaque runtime. */
+            /* Embedder may invoke this after detaching the runtime: free
+             * without rt. */
             tjs__free(fr->filename);
             tjs__free(fr);
         }
@@ -1705,9 +1694,8 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     fr->req.data = fr;
     JS_FreeCString(ctx, path);
 
-    /* Create the capability before queueing work.  A worker completion can
-     * arrive after this function returns, so its result record must already
-     * be in a known state even when Promise allocation fails. */
+    /* Create the promise before queueing work: completion can arrive after
+     * this function returns, even when Promise allocation fails. */
     JSValue promise = TJS_InitPromise(ctx, &fr->result);
     if (JS_IsException(promise)) {
         js_free(ctx, fr->filename);

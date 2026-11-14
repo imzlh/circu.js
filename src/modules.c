@@ -97,12 +97,8 @@ static const struct TJSModule tjs_modules[] = {
 #endif
 };
 
-/* Load an external native module registered via tjs__module_register.
- * Returns the namespace object on success, JS_NULL when the module is
- * registered but not loadable in this context (e.g. not worker-safe), or
- * an exception for real errors (file missing, ABI mismatch, bad symbols).
- * The uv_lib_t handle is added to qrt->module.dyn_libs on success and
- * freed by TJS_FreeRuntime after JS shutdown. */
+/* Returns the namespace, JS_NULL when registered but not loadable here, or an
+ * exception for errors. On success the uv_lib_t is freed by TJS_FreeRuntime. */
 static JSValue tjs__dynmod_load(JSContext *ctx, const char *name, const char *path) {
 	TJSRuntime *qrt = TJS_GetRuntime(ctx);
 
@@ -331,10 +327,7 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
 			// try class Module — initialize import.meta and fire init hook
 			JSModuleDef* m = tjs__module_getdef(ctx, ret);
 			if (m) {
-				/* js_module_set_import_meta needs a JS_TAG_MODULE value;
-				 * construct it from the JSModuleDef pointer. The module
-				 * is alive (referenced by the Module class instance), so
-				 * this temporary tagged value is safe to pass. */
+				/* JS_MKPTR temp value is safe: the Module instance holds m. */
 				js_module_set_import_meta(ctx, JS_MKPTR(JS_TAG_MODULE, m), false, false);
 			}
 			JS_FreeValue(ctx, ret);
@@ -447,9 +440,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
 		return 0;
 	}
 
-    /* realpath() cannot be used with builtin modules
-        because the corresponding module source code is not
-        necessarily present */
+    /* realpath() cannot resolve builtin modules: their source may not exist. */
     if (use_realpath) {
         uv_fs_t req;
         r = uv_fs_realpath(NULL, &req, module_name, NULL);
@@ -464,9 +455,6 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
         js__pstrcat(buf, sizeof(buf), req.ptr);
         uv_fs_req_cleanup(&req);
 
-        // When using realpath we have the opportunity to extract the dirname
-        // and basename and add them to the meta. Since the path is now absolute
-        // all we need to do is split on the last path separator.
         const char *start = buf + 7; /* skip file:// */
         char *p = strrchr(start, TJS__PATHSEP);
         if (p) {
@@ -611,9 +599,6 @@ static char *tjs__module_normalizer_impl(JSContext *ctx, const char *base_name, 
     }
     strcat(filename, r);
 
-    /* Re-normalize the path. The name part will have posix style paths, so
-     * normalize it to the platform native separator.
-     */
     tjs__normalize_pathsep(filename);
 
     return filename;

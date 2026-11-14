@@ -53,12 +53,7 @@
 
 /* ---------- Structures ---------- */
 
-/*
- * Compact mapping: stores source/name as indices into the FileSourceMap arrays
- * rather than duplicating the strings per node.  A typical source map has
- * thousands of mappings all pointing to the same handful of source files, so
- * this eliminates O(n) strdup calls and the matching O(n) free calls.
- */
+/* source/name are indices into FileSourceMap arrays, not per-node strdup. */
 typedef struct {
     int generated_line;
     int generated_column;
@@ -92,10 +87,7 @@ typedef struct FileSourceMap {
     int              mappings_count;
     int              ref_count;
 
-    /*
-     * Flat sorted array of node pointers, used for O(log n) nearest-mapping
-     * binary search.  Rebuilt lazily (sorted_dirty flag) after any insert.
-     */
+    /* Sorted pointers for binary search; lazily rebuilt (sorted_dirty). */
     MappingNode **sorted;
     int           sorted_count;
     int           sorted_cap;
@@ -152,9 +144,8 @@ static int decode_vlq(const char **input, int *value) {
     return 1;
 }
 
-/* Returns the array (NULL when empty) and sets *count. Entries keep their
- * original index: non-string entries become "" so mapping indices stay aligned.
- * Returns NULL with *err = 1 (and a pending JS exception) on failure. */
+/* Returns the array (NULL when empty) and sets *count; non-string entries
+ * become "" so indices stay aligned. On failure returns NULL with *err = 1. */
 static char **parse_json_array(JSContext *ctx, JSValue array, int *count, int *err) {
     *count = 0;
     *err = 0;
@@ -275,12 +266,8 @@ static FileSourceMap *find_file_map(MappingContext *ctx, const char *path) {
 
 static FileSourceMap *get_or_create_file_map(MappingContext *ctx, const char *path) {
     FileSourceMap *map = find_file_map(ctx, path);
-    /* Returns a map with an EXTRA reference held by the caller (the loader),
-     * on top of the one owned by the ctx->files[] slot. The loader runs
-     * arbitrary JS (property getters / Proxy traps / toString) while holding
-     * this pointer, and that JS can call sourcemap.remove() on the same path;
-     * without the temp ref that would free the map underneath us. The caller
-     * MUST release it with free_file_map() on every exit path. */
+    /* Extra caller ref on top of the ctx->files[] slot: the loader runs
+     * arbitrary JS that may remove() this path and free the map underneath. */
     if (map) { map->ref_count++; return map; }
 
     map = create_file_map(path);
@@ -372,10 +359,7 @@ static void rebuild_sorted(FileSourceMap *map) {
     map->sorted_dirty = 0;
 }
 
-/*
- * O(log n) nearest-mapping: find the largest (line,col) <= (target_line, target_col).
- * This replaces the original O(n) linear scan.
- */
+/* O(log n): largest mapping with (line,col) <= (target_line, target_col). */
 static SourceMapping *find_nearest_mapping(FileSourceMap *map, int line, int col) {
     rebuild_sorted(map);
     if (map->sorted_count == 0) return NULL;
@@ -422,11 +406,8 @@ static int parse_mappings(FileSourceMap *map, const char *mappings_str) {
              * pointer to avoid an infinite loop on malformed input. */
             if (p == before) { decode_failed = 1; break; }
         }
-        /* On a malformed segment, skip to the next segment/line separator so
-         * the outer loop always makes progress (otherwise p never advances),
-         * and DISCARD the segment: decode_vlq leaves *value unwritten on
-         * failure, and all five fields are cumulative deltas, so committing a
-         * bogus 0 would corrupt every well-formed segment that follows. */
+        /* Skip to the next separator (progress) and DISCARD the segment: the
+         * fields are cumulative deltas; a bogus 0 corrupts later segments. */
         if (decode_failed) {
             while (*p && *p != ',' && *p != ';') p++;
             continue;
@@ -483,10 +464,8 @@ bool js_has_sourcemap(MappingContext *ctx, const char *file_path) {
     return file_path && find_file_map(ctx, file_path) != NULL;
 }
 
-/* Returns 1 on success, 0 when nothing could be loaded, -1 with a pending JS
- * exception. All JS-visible reads (getters, Proxy traps, toString) happen into
- * locals first; the map is only touched afterwards, so re-entrant load() or
- * remove() calls from that JS cannot leave it half-updated. */
+/* Returns 1 on success, 0 when nothing loaded, -1 with a pending exception.
+ * JS-visible reads go to locals first; re-entrant load()/remove() is safe. */
 int js_load_sourcemap(MappingContext *ctx, JSContext *js_ctx,
                        const char *file_path, JSValue sm_obj) {
     if (!ctx || !file_path || !JS_IsObject(sm_obj)) return 0;
@@ -694,10 +673,8 @@ static JSValue tjs__get_source_mapping(JSContext *ctx, JSValueConst this_val,
     MappingResult res = js_get_source_mapping(rt->module.mapctx, fp, line, col);
     JS_FreeCString(ctx, fp);
 
-    /* res.original_file / function_name point into the map's own storage. Build
-     * both strings before any property write, and define (not set) the
-     * properties so Object.prototype setters cannot run JS that remove()s the
-     * map and frees those strings mid-way. */
+    /* res points into map storage; build the strings first and define (not
+     * set) the properties, so setters cannot run JS that frees the map. */
     JSValue file_val = JS_NewString(ctx, res.original_file ? res.original_file : "");
     if (JS_IsException(file_val)) return JS_EXCEPTION;
     JSValue name_val = JS_NewString(ctx, res.function_name ? res.function_name : "");

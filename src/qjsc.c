@@ -190,16 +190,7 @@ static uint8_t* extract_attached_data(uint8_t *file_data, size_t file_size, uint
     return attach;
 }
 
-/**
- * Build binary with auto-detection of existing attached data.
- * Automatically strips old bytecode before attaching new.
- * 
- * file: File opened in rb+ mode
- * binary: Bytecode to attach
- * size: Size of bytecode
- * 
- * Returns 0 on success, -1 on error
- */
+/* Strips any previously attached bytecode before writing the new one. */
 int tjs__build_binary_auto(FILE* file, uint8_t *binary, uint32_t size) {
     size_t original_size;
     uint8_t *original_data = read_file_into_buffer(file, &original_size);
@@ -789,9 +780,7 @@ int main(int argc, char **argv) {
         if (output_type == OUTPUT_C_MAIN) {
             fprintf(outfile, "#include \"quickjs-libc.h\"\n\n");
         } else {
-            /* The generated blob only uses fixed-width integer types.  Keep
-             * the header portable to MSVC, which provides stdint.h but not
-             * inttypes.h in some supported toolchains. */
+            /* Keep the header portable to MSVC (may lack inttypes.h). */
             fprintf(outfile, "#include <stdint.h>\n\n");
         }
     }

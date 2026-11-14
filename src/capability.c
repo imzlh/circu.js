@@ -108,10 +108,8 @@ uint32_t tjs__capability_runtime_state(JSContext *ctx) {
                 : TJS__CAPABILITY_REVALIDATE);
 }
 
-/* This is the active half of the internal dispatch. TJS_CAPABILITY performs
- * the gate before evaluating its check expression, while the public checker
- * gates after validating an external descriptor. Keeping the gate out of this
- * function avoids two runtime lookups for every hook invocation. */
+/* Internal dispatch half: the macro gates before check_, the public checker
+ * gates here after validating, saving a second runtime lookup. */
 static JSValue tjs__capability_dispatch_active(
     JSContext *ctx,
     const TJSCapability *capability) {
@@ -167,9 +165,7 @@ JSValue TJS_CheckCapability(JSContext *ctx,
         return JS_ThrowTypeError(ctx, "invalid capability descriptor");
     }
 
-    /* The hook is trusted embedder code. Let it use libcjs for diagnostics
-     * without recursively entering itself. Native entry points must still
-     * tolerate the state changes caused by such a nested call. */
+    /* Trusted embedder hook: may re-enter libcjs without self-recursion. */
     if (tjs__capability_call_state(ctx) == 0) return TJS_CAPABILITY_PASS;
 
     return tjs__capability_dispatch_active(ctx, capability);
