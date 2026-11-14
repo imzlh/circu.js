@@ -224,11 +224,14 @@ static JSValue tjs_sock_from_fd(JSContext *ctx, JSValue this_val, int argc, JSVa
         }
     }
 
+    /* Gate before the SO_TYPE probe: a rejecting hook must not allow — or be
+     * preceded by — any syscall on the borrowed descriptor. */
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.createFrom", NULL), (void)0);
+
     /* validate fd by probing socket type */
     int dummy; socklen_t dlen = sizeof(dummy);
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *) &dummy, &dlen) < 0)
         return JS_ThrowTypeError(ctx, "not a valid socket descriptor");
-    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.createFrom", NULL), (void)0);
 
     return tjs_sock_new_from_fd(ctx, fd, close_on_close);
 }
@@ -643,16 +646,18 @@ static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue
         s->poll_init = true;
     }
 
-    if (!JS_IsUndefined(s->callback))
-        JS_FreeValue(ctx, s->callback);
+    JSValue old_callback = s->callback;
     s->callback = JS_DupValue(ctx, argv[1]);
 
     int ret = uv_poll_start(&s->poll, events, tjs_sock_uv_poll_cb);
     if (ret < 0) {
         JS_FreeValue(ctx, s->callback);
-        s->callback = JS_UNDEFINED;
+        /* An active poll keeps its previous registration on a failed restart;
+         * put the old callback back so state stays consistent with libuv. */
+        s->callback = old_callback;
         return tjs_throw_errno(ctx, ret);
     }
+    JS_FreeValue(ctx, old_callback);
     if (JS_IsUndefined(s->this_obj))
         s->this_obj = JS_DupValue(ctx, this_val);
     return JS_UNDEFINED;

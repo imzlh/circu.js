@@ -1371,6 +1371,10 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
         return JS_ThrowInternalError(ctx, "connect already in progress");
+    /* Keep unconditional: without a hook the revalidate block below never
+     * runs, and uv_tcp_open would fail with a bare EBUSY instead. */
+    if (stream_get_fd(t) >= 0)
+        return JS_ThrowInternalError(ctx, "socket already open");
 
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
