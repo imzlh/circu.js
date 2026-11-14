@@ -197,21 +197,34 @@ static JSValue js_module_static_create(JSContext *ctx, JSValueConst new_target, 
 
 // callback to export all private value
 static int js_module_init_fn(JSContext *ctx, JSModuleDef *m) {
-    JSPropertyEnum* ep;
-    JSValueConst raw_object = JS_GetModulePrivateValue(ctx, m);
-    int len = JS_GetOwnPropertyNames(ctx, &ep, NULL, raw_object, JS_GPN_STRING_MASK);
-    if (len == -1) {
+    JSPropertyEnum *ep;
+    uint32_t len;
+    JSValue raw_object = JS_GetModulePrivateValue(ctx, m);
+    if (JS_GetOwnPropertyNames(ctx, &ep, &len, raw_object,
+                               JS_GPN_STRING_MASK) < 0) {
         JS_FreeValue(ctx, raw_object);
         return -1;
     }
-    for (int i = 0; i < len; i++) {
+    for (uint32_t i = 0; i < len; i++) {
         const char* name = JS_AtomToCString(ctx, ep[i].atom);
-        JSValueConst val = JS_GetProperty(ctx, raw_object, ep[i].atom);
-        if (JS_IsException(val)){
-            JS_FreeCString(ctx, name);
-            continue;
+        if (!name) {
+            JS_FreePropertyEnum(ctx, ep, len);
+            JS_FreeValue(ctx, raw_object);
+            return -1;
         }
-        JS_SetModuleExport(ctx, m, name, val);
+        JSValue val = JS_GetProperty(ctx, raw_object, ep[i].atom);
+        if (JS_IsException(val)) {
+            JS_FreeCString(ctx, name);
+            JS_FreePropertyEnum(ctx, ep, len);
+            JS_FreeValue(ctx, raw_object);
+            return -1;
+        }
+        if (JS_SetModuleExport(ctx, m, name, val) < 0) {
+            JS_FreeCString(ctx, name);
+            JS_FreePropertyEnum(ctx, ep, len);
+            JS_FreeValue(ctx, raw_object);
+            return -1;
+        }
         JS_FreeCString(ctx, name);
     }
     JS_FreePropertyEnum(ctx, ep, len);
@@ -239,15 +252,22 @@ static JSValue js_module_static_from(JSContext *ctx, JSValueConst new_target, in
     }
 
     // export all keys
-    JSPropertyEnum* ep;
-    int len = JS_GetOwnPropertyNames(ctx, &ep, NULL, raw_object, JS_GPN_STRING_MASK);
-    if (len == -1) {
+    JSPropertyEnum *ep;
+    uint32_t len;
+    if (JS_GetOwnPropertyNames(ctx, &ep, &len, raw_object,
+                               JS_GPN_STRING_MASK) < 0) {
         JS_FreeValue(ctx, raw_object);
         return JS_EXCEPTION;
     }
-    for (int i = 0; i < len; i++) {
+    for (uint32_t i = 0; i < len; i++) {
         const char* ename = JS_AtomToCString(ctx, ep[i].atom);
-        JS_AddModuleExport(ctx, m, ename);
+        if (!ename || JS_AddModuleExport(ctx, m, ename) < 0) {
+            if (ename)
+                JS_FreeCString(ctx, ename);
+            JS_FreePropertyEnum(ctx, ep, len);
+            JS_FreeValue(ctx, raw_object);
+            return JS_EXCEPTION;
+        }
         JS_FreeCString(ctx, ename);
     }
     JS_FreePropertyEnum(ctx, ep, len);
@@ -361,10 +381,9 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_ThrowTypeError(ctx, "export() requires 2 arguments: export_name string and value");
     }
 
-    const char *export_name = JS_ToCString(ctx, argv[0]);
-    if(!export_name) return JS_EXCEPTION;
-    JSAtom name = JS_NewAtom(ctx, export_name);
-    JS_FreeCString(ctx, export_name);
+    JSAtom name = JS_ValueToAtom(ctx, argv[0]);
+    if (name == JS_ATOM_NULL)
+        return JS_EXCEPTION;
 
     // find whether export exists
     struct list_head* pos;
@@ -372,24 +391,26 @@ static JSValue js_module_export(JSContext *ctx, JSValueConst this_val, int argc,
         tjs_module_export_t* me = list_entry(pos, tjs_module_export_t, list);
         if(name == me->atom){
             /* var_ref is module-owned; JS_DefineModuleExport reuses it. */
-            JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
+            void *def = JS_DefineModuleExport(ctx, mt->def, name,
+                                              JS_DupValue(ctx, argv[1]));
             JS_FreeAtom(ctx, name);
+            if (!def)
+                return JS_EXCEPTION;
             goto end;
         }
     }
 
-    // add to list
-    void* def = JS_DefineModuleExport(ctx, mt->def, name, JS_DupValue(ctx, argv[1]));
-    if(!def){
-        JS_FreeAtom(ctx, name);
-        return JS_EXCEPTION;
-    }
-
     tjs_module_export_t* me = js_malloc(ctx, sizeof(tjs_module_export_t));
     if (!me) {
-        /* def's var_ref is owned by the module; only the atom is ours. */
         JS_FreeAtom(ctx, name);
         return JS_ThrowOutOfMemory(ctx);
+    }
+    void* def = JS_DefineModuleExport(ctx, mt->def, name,
+                                      JS_DupValue(ctx, argv[1]));
+    if (!def) {
+        js_free(ctx, me);
+        JS_FreeAtom(ctx, name);
+        return JS_EXCEPTION;
     }
     me->atom = name;
     me->var = def;

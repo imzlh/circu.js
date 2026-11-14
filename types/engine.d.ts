@@ -327,12 +327,16 @@ declare namespace CModuleEngine {
          * Get the live module namespace object.
          *
          * This is a native namespace reference. Do not shallow-copy it to keep a
-         * module alive; keep the `Module` instance reachable instead.
+         * module alive; keep the `Module` instance reachable instead. A compiled
+         * source module must be linked or evaluated before reading this property.
          */
         get namespace(): Record<string, unknown>;
 
         /**
          * Export module as bytecode
+         *
+         * C modules and compiled modules with runtime-defined exports cannot
+         * be serialized.
          * @param flag Serialize options, default `DUMP_DEFAULT`
          */
         dump(flag?: number): ArrayBuffer;
@@ -349,7 +353,12 @@ declare namespace CModuleEngine {
         resolve(): void;
 
         /**
-         * (For modules created with `from`) Add export member
+         * Add or update a live runtime export.
+         *
+         * Note:
+         *  - existing runtime exports may still be updated afterwards.
+         *  - A runtime export cannot replace a statically declared export.
+         *  - Modules with runtime-defined exports cannot be dumped as bytecode.
          * @param name Export member name
          * @param value Export member value
          */
