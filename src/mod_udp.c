@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 
+#include "capability.h"
 #include "mem.h"
 #include "private.h"
 #include "utils.h"
@@ -152,6 +153,16 @@ static TJSUdp *tjs_udp_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_udp_class_id);
 }
 
+static TJSUdp *tjs_udp_get_open(JSContext *ctx, JSValueConst obj) {
+    TJSUdp *u = JS_GetOpaque2(ctx, obj, tjs_udp_class_id);
+    if (!u) return NULL;
+    if (u->closed || u->finalized || uv_is_closing((uv_handle_t *) &u->udp)) {
+        JS_ThrowInternalError(ctx, "UDP closed");
+        return NULL;
+    }
+    return u;
+}
+
 static JSValue tjs_udp_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSUdp *u = tjs_udp_get(ctx, this_val);
     if (!u) {
@@ -257,7 +268,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
 
 static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected receive buffer");
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
@@ -270,6 +281,7 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (!JS_GetUint8Array(ctx, &size, argv[0])) {
         return JS_EXCEPTION;
     }
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "udp.recv", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; if (TJS_IsPromisePending(ctx, &u->read.result)) return tjs_throw_errno(ctx, UV_EBUSY); if (!JS_GetUint8Array(ctx, &size, argv[0])) return JS_EXCEPTION; } while (0));
     u->read.b.tarray = JS_DupValue(ctx, argv[0]);
     u->read.b.data = js_malloc(ctx, size);
     if (!u->read.b.data) {
@@ -285,6 +297,14 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (JS_IsException(promise)) {
         tjs_udp_read_clear(ctx, u);
         return promise;
+    }
+    u = tjs_udp_get_open(ctx, this_val);
+    if (!u) {
+        /* A promise hook may have closed/finalized the receiver. Its close
+         * path owns the embedded promise and read buffer; only drop the
+         * caller's duplicate here. */
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
     }
 
     int r = uv_udp_recv_start(&u->udp, uv__udp_alloc_cb, uv__udp_recv_cb);
@@ -329,7 +349,7 @@ static void uv__udp_send_cb(uv_udp_send_t *req, int status) {
 
 static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected data buffer");
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
@@ -348,13 +368,15 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
         }
         sa = (struct sockaddr *) &ss;
     }
+    u = tjs_udp_get_open(ctx, this_val);
+    if (!u) return JS_EXCEPTION;
 
-    /* arg 0: data buffer */
+    /* Validate the data buffer before the hook, then reacquire its backing
+     * store afterwards because the hook can detach it. */
     size_t size;
     uint8_t *buf = JS_GetUint8Array(ctx, &size, argv[0]);
-    if (!buf) {
-        return JS_EXCEPTION;
-    }
+    if (!buf) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE | (sa ? TJS_CAP_IO_CONNECT : 0), TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "udp.send", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; buf = JS_GetUint8Array(ctx, &size, argv[0]); if (!buf) return JS_EXCEPTION; } while (0));
 
     /* First try to do the write inline */
     uv_buf_t b;
@@ -396,6 +418,13 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
         tjs_udp_send_req_free(ctx, sr);
         return promise;
     }
+    u = tjs_udp_get_open(ctx, this_val);
+    if (!u) {
+        TJS_FreePromise(ctx, &sr->result);
+        JS_FreeValue(ctx, promise);
+        tjs_udp_send_req_free(ctx, sr);
+        return JS_EXCEPTION;
+    }
 
     b = uv_buf_init((char *) sr->data, size);
     r = uv_udp_send(&sr->req, &u->udp, &b, 1, sa, uv__udp_send_cb);
@@ -410,23 +439,22 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
 }
 
 static JSValue tjs_udp_fileno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "udp.fileno", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; } while (0));
     int r;
     uv_os_fd_t fd;
     r = uv_fileno((uv_handle_t *) &u->udp, &fd);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
     }
-    int32_t rfd;
 #if defined(_WIN32)
-    rfd = (int32_t) (intptr_t) fd;
+    return JS_NewBigUint64(ctx, (uint64_t) (uintptr_t) fd);
 #else
-    rfd = fd;
+    return JS_NewInt32(ctx, fd);
 #endif
-    return JS_NewInt32(ctx, rfd);
 }
 
 static JSValue tjs_new_udp(JSContext *ctx, int af) {
@@ -469,15 +497,17 @@ static JSValue tjs_udp_constructor(JSContext *ctx, JSValue new_target, int argc,
     if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
         return JS_EXCEPTION;
     }
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "udp.create", NULL), (void)0);
     return tjs_new_udp(ctx, af);
 }
 
 static JSValue tjs_udp_getsockpeername(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "udp.getsockname" : "udp.getpeername", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; } while (0));
     int r;
     int namelen;
     struct sockaddr_storage addr;
@@ -498,7 +528,7 @@ static JSValue tjs_udp_getsockpeername(JSContext *ctx, JSValue this_val, int arg
 
 static JSValue tjs_udp_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
@@ -510,6 +540,9 @@ static JSValue tjs_udp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    u = tjs_udp_get_open(ctx, this_val);
+    if (!u) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "udp.connect", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; } while (0));
     r = uv_udp_connect(&u->udp, (struct sockaddr *) &ss);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -519,11 +552,12 @@ static JSValue tjs_udp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
 }
 
 static JSValue tjs_udp_disconnect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
 
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "udp.disconnect", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; } while (0));
     int r = uv_udp_connect(&u->udp, NULL);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);
@@ -534,7 +568,7 @@ static JSValue tjs_udp_disconnect(JSContext *ctx, JSValue this_val, int argc, JS
 
 static JSValue tjs_udp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
-    TJSUdp *u = tjs_udp_get(ctx, this_val);
+    TJSUdp *u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
         return JS_EXCEPTION;
     }
@@ -551,6 +585,9 @@ static JSValue tjs_udp_bind(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    u = tjs_udp_get_open(ctx, this_val);
+    if (!u) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "udp.bind", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; } while (0));
     r = uv_udp_bind(&u->udp, (struct sockaddr *) &ss, flags);
     if (r != 0) {
         return tjs_throw_errno(ctx, r);

@@ -1,284 +1,184 @@
 /**
- * POSIX Socket bindings for TJS
+ * Synchronous socket operations.
  *
- * @example
+ * Prefer `streams.TCP` or `udp.UDP` for ordinary asynchronous networking.
+ * This module is intended for raw sockets, polling, ancillary data, and other
+ * cases that need direct access to operating-system socket features.
+ *
+ * @example TCP listener
  * ```ts
- * const { PosixSocket, defines } = import.meta.use('socket');
- * const { AF_INET, SOCK_STREAM, IPPROTO_TCP, SOL_SOCKET, SO_REUSEADDR } = defines;
+ * const socket = import.meta.use('socket');
+ *
+ * const server = new socket.Socket(socket.AF_INET, socket.SOCK_STREAM);
+ * server.bind({ ip: '127.0.0.1', port: 8080 });
+ * server.listen();
+ *
+ * console.log(server.sockname); // { family: 4, ip: '127.0.0.1', port: 8080 }
+ * ```
+ *
+ * @example TCP client
+ * ```ts
+ * const socket = import.meta.use('socket');
+ *
+ * const client = new socket.Socket(socket.AF_INET, socket.SOCK_STREAM);
+ * client.connect({ ip: '127.0.0.1', port: 8080 });
+ * client.send(new TextEncoder().encode('hello'));
+ * client.close();
  * ```
  */
-
 declare namespace CModuleSocket {
-    // Defines
+    /** A `number` POSIX fd or a lossless `bigint` Windows socket handle. */
+    export type SocketDescriptor = number | bigint;
 
-    export interface SocketDefines {
-        // Address families
-        readonly AF_INET: number;
-        readonly AF_INET6: number;
-        readonly AF_UNIX?: number;  // not on Windows
-        readonly AF_NETLINK?: number; // Linux only
-        readonly AF_PACKET?: number; // Linux only
+    /** IPv4 or IPv6 endpoint accepted by {@link Socket.bind} and {@link Socket.connect}. */
+    export type Address = {
+        ip: string;
+        port: number;
+    };
 
-        // Socket types
-        readonly SOCK_STREAM: number;
-        readonly SOCK_DGRAM: number;
-        readonly SOCK_RAW: number;
-        readonly SOCK_SEQPACKET: number;
-        readonly SOCK_RDM?: number;
+    /** Decoded local or peer endpoint. */
+    export type AddressInfo = CModuleStreams.AddressInfo;
 
-        // Levels
-        readonly SOL_SOCKET: number;
-        readonly SOL_PACKET?: number; // Linux only
-        readonly SOL_NETLINK?: number; // Linux only
-
-        // SO_* options
-        readonly SO_REUSEADDR: number;
-        readonly SO_KEEPALIVE: number;
-        readonly SO_LINGER: number;
-        readonly SO_BROADCAST: number;
-        readonly SO_RCVBUF: number;
-        readonly SO_SNDBUF: number;
-        readonly SO_ERROR: number;
-        readonly SO_TYPE: number;
-        readonly SO_REUSEPORT?: number;
-        readonly SO_PRIORITY?: number;
-
-        // Protocols
-        readonly IPPROTO_IP: number;
-        readonly IPPROTO_IPV6: number;
-        readonly IPPROTO_ICMP: number;
-        readonly IPPROTO_TCP: number;
-        readonly IPPROTO_UDP: number;
-    }
-
-    export interface UvPollEventBits {
-        readonly READABLE: number;
-        readonly WRITABLE: number;
-        readonly DISCONNECT: number;
-        readonly PRIORITIZED: number;
-    }
-
-    // Socket info
-
-    export interface SocketSockInfo {
-        type?: number;
-        domain?: number;
-        protocol?: number;
-    }
-
+    /** Socket properties reported by the operating system when available. */
     export interface SocketInfo {
-        socket?: SocketSockInfo;
+        readonly type?: number;
+        readonly domain?: number;
+        readonly protocol?: number;
     }
 
-    // recvmsg result
-
-    export interface RecvMsgResult {
-        /** Sender address as raw sockaddr bytes */
-        addr: Uint8Array;
-        /** Received payload */
-        data: Uint8Array;
-        /** Control (ancillary) data, present only if controlsize was requested */
-        control?: Uint8Array;
+    export interface CreateFromOptions {
+        /** Close the wrapped descriptor when the wrapper closes. Defaults to `false`. */
+        closeOnClose?: boolean;
     }
 
-    // PosixSocket
+    /** Result of {@link Socket.recvmsg}. */
+    export interface RecvMessage {
+        /** Sender endpoint. Omitted when the operating system returns no address. */
+        readonly address?: AddressInfo;
+        readonly data: Uint8Array;
+        /** Raw ancillary data requested with `controlSize`. */
+        readonly control?: Uint8Array;
+    }
 
     /**
-     * Thin wrapper around a POSIX/Winsock socket file descriptor.
-     * All operations are synchronous and non-blocking behaviour must be arranged
-     * by the caller (e.g. via {@link PosixSocket.poll}).
+     * Thin synchronous wrapper around a POSIX or Winsock socket.
      *
-     * @example TCP server
-     * ```ts
-     * const { PosixSocket, create_sockaddr_inet, defines } = import.meta.use('socket');
-     * const { AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR } = defines;
-     *
-     * const srv = new PosixSocket(AF_INET, SOCK_STREAM, 0);
-     * const opt = new Uint8Array(4); new DataView(opt.buffer).setUint32(0, 1, true);
-     * srv.setopt(SOL_SOCKET, SO_REUSEADDR, opt);
-     * srv.bind(create_sockaddr_inet({ host: '0.0.0.0', port: 8080 }));
-     * srv.listen(128);
-     * // ... poll for READABLE, then srv.accept()
-     * ```
-     *
-     * @example UDP broadcast (Wake-on-LAN)
-     * ```ts
-     * const { PosixSocket, create_sockaddr_inet, defines } = import.meta.use('socket');
-     * const { AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_BROADCAST } = defines;
-     *
-     * const sock = new PosixSocket(AF_INET, SOCK_DGRAM, 0);
-     * const opt = new Uint8Array(4); new DataView(opt.buffer).setUint32(0, 1, true);
-     * sock.setopt(SOL_SOCKET, SO_BROADCAST, opt);
-     * sock.connect(create_sockaddr_inet({ host: '255.255.255.255', port: 9 }));
-     * sock.send(magicPacket);
-     * sock.close();
-     * ```
+     * Operations can block unless the socket is configured as non-blocking.
+     * Use {@link poll} to integrate readiness notifications with the event loop.
      */
-    export class PosixSocket {
-        /**
-         * Create a new socket.
-         * @param domain   Address family, e.g. `defines.AF_INET`
-         * @param type     Socket type, e.g. `defines.SOCK_STREAM`
-         * @param protocol Protocol, usually `0` for auto-select
-         */
-        constructor(domain: number, type: number, protocol: number);
+    export class Socket {
+        /** Create a socket. `protocol` defaults to `0` (automatic selection). */
+        constructor(domain: number, type: number, protocol?: number);
 
-        // Connection lifecycle
+        /** Bind directly from an IP endpoint object. */
+        bind(address: Address): void;
 
-        /** Bind to a local address (use {@link create_sockaddr_inet} to build the buffer). */
-        bind(addr: Uint8Array): void;
+        /** Connect directly from an IP endpoint object. */
+        connect(address: Address): void;
 
-        /**
-         * Connect to a remote address.
-         * On UDP sockets this only sets the default destination (no handshake),
-         * enabling {@link send} to work without an explicit address; a portable
-         * alternative to `sendto`.
-         */
-        connect(addr: Uint8Array): void;
+        /** Mark the socket as passive. The default backlog is `511`. */
+        listen(backlog?: number): void;
 
-        /** Mark socket as passive (server). */
-        listen(backlog: number): void;
+        /** Accept one connection. The peer endpoint is available as `peername`. */
+        accept(): Socket;
 
-        /**
-         * Accept an incoming connection.
-         * The returned socket has a `_sockaddr` property with the peer address bytes.
-         */
-        accept(): PosixSocket;
-
-        /**
-         * Shut down one or both directions.
-         * @param how  0 = RD, 1 = WR, 2 = RDWR
-         */
+        /** Shut down reading, writing, or both (`0`, `1`, or `2`). */
         shutdown(how: 0 | 1 | 2): void;
 
-        /** Close the socket. Cannot be called from within a poll callback. */
+        /** Close the socket. */
         close(): void;
 
-        // I/O
-
-        /**
-         * Receive up to `count` bytes.
-         * Returns `null` on EOF / graceful peer close.
-         * @param flags  Optional recv flags (e.g. `MSG_PEEK`)
-         */
+        /** Receive up to `count` bytes; returns `null` on an orderly peer close. */
         recv(count: number, flags?: number): Uint8Array | null;
 
-        /**
-         * Send bytes.
-         * Returns the number of bytes actually sent.
-         * @param flags  Optional send flags (e.g. `MSG_DONTWAIT`)
-         */
+        /** Send bytes and return the number accepted by the operating system. */
         send(data: Uint8Array, flags?: number): number;
 
-        /**
-         * Receive a datagram with ancillary data. **POSIX only.**
-         * @param bufsize     Maximum payload size
-         * @param controlsize Maximum ancillary data size (omit if not needed)
-         */
-        recvmsg(bufsize: number, controlsize?: number): RecvMsgResult;
+        /** Receive payload, sender endpoint, and optional ancillary data. POSIX only. */
+        recvmsg(bufferSize: number, controlSize?: number): RecvMessage;
 
         /**
-         * Send a message with optional address and ancillary data. **POSIX only.**
-         * @param addr     Destination address bytes, or `undefined` for connected sockets
-         * @param control  Ancillary (cmsg) data, or `undefined`
-         * @param flags    Send flags
-         * @param data     One or more data buffers (scatter-gather)
+         * Send scatter-gather payload with an optional destination and ancillary
+         * data. Pass `null` for `address` on a connected socket. POSIX only.
          */
         sendmsg(
-            addr: Uint8Array | undefined,
-            control: Uint8Array | undefined,
+            address: Address | null | undefined,
+            control: Uint8Array | null | undefined,
             flags: number,
-            ...data: Uint8Array[]
+            ...data: [Uint8Array, ...Uint8Array[]]
         ): number;
 
-        // Options
+        /** Set a platform socket option using its native byte representation. */
+        setopt(level: number, option: number, value: Uint8Array): void;
 
-        /**
-         * Set a socket option.
-         * @example Enable SO_REUSEADDR
-         * ```ts
-         * const opt = new Uint8Array(4);
-         * new DataView(opt.buffer).setUint32(0, 1, true);
-         * sock.setopt(SOL_SOCKET, SO_REUSEADDR, opt);
-         * ```
-         */
-        setopt(level: number, optname: number, optval: Uint8Array): void;
+        /** Read a platform socket option using its native byte representation. */
+        getopt(level: number, option: number, length?: number): Uint8Array;
 
-        /**
-         * Get a socket option as raw bytes.
-         * @param optlen  Expected buffer size (defaults to `sizeof(sockaddr_storage)`)
-         */
-        getopt(level: number, optname: number, optlen?: number): Uint8Array;
-
-        // Poll / event loop
-
-        /**
-         * Start polling for I/O readiness via libuv.
-         * The callback receives `(status: number, events: number)` where `events`
-         * is a bitmask of {@link UvPollEventBits}.
-         *
-         * @example
-         * ```ts
-         * const { uv_poll_event_bits } = import.meta.use('socket');
-         * srv.poll(uv_poll_event_bits.READABLE, (status, events) => {
-         *     if (status < 0) { console.error(uv_strerror(status)); return; }
-         *     const client = srv.accept();
-         * });
-         * ```
-         */
+        /** Start event-loop polling with a combination of `READABLE`, `WRITABLE`, etc. */
         poll(events: number, callback: (status: number, events: number) => void): void;
 
-        /** Stop polling. Cannot be called from within the poll callback. */
-        pollStop(): void;
+        /** Stop polling. */
+        stopPoll(): void;
 
-        // Getters
-
-        /** `true` while a poll is active. */
         readonly polling: boolean;
-
-        /** The underlying file descriptor number. */
-        readonly fileno: number;
-
-        /** Type/domain/protocol info queried from the OS. */
+        readonly fileno: SocketDescriptor;
         readonly info: SocketInfo;
+        readonly sockname: AddressInfo;
+        readonly peername: AddressInfo;
+        readonly [Symbol.toStringTag]: 'Socket';
     }
 
-
     /**
-     * Build a raw `sockaddr` buffer from a plain address object.
-     * Accepts IPv4 and IPv6 addresses.
-     * @example
-     * ```ts
-     * const addr = create_sockaddr_inet({ ip: '127.0.0.1', port: 3000 });
-     * sock.connect(addr);
-     * ```
+     * Wrap an existing socket descriptor without taking ownership by default.
+     * Set `closeOnClose` only when transferring ownership of the descriptor.
      */
-    export function create_sockaddr_inet(addr: { ip: string; port: number }): Uint8Array;
+    export function createFrom(fd: SocketDescriptor, options?: CreateFromOptions): Socket;
 
-    /**
-     * Wrap an existing socket file descriptor.
-     * Validates that the fd is a live socket before wrapping.
-     */
-    export function socket_from_fd(fd: number): PosixSocket;
-
-    /** Compute an IP one's-complement checksum over a buffer. */
+    /** Compute an IP one's-complement checksum. */
     export function checksum(data: Uint8Array): number;
 
-    /** Translate a libuv error code to a human-readable string. */
-    export function uv_strerror(code: number): string;
+    /** Convert a network-interface name such as `eth0` to its index. */
+    export function ifNameToIndex(name: string): number;
 
-    /** Convert a network interface name (e.g. `"eth0"`) to its index. */
-    export function if_nametoindex(name: string): number;
+    /** Convert a network-interface index to its name. */
+    export function ifIndexToName(index: number): string;
 
-    /** Convert a network interface index to its name. */
-    export function if_indextoname(index: number): string;
+    export const AF_INET: number;
+    export const AF_INET6: number;
+    export const AF_UNIX: number | undefined;
+    export const AF_NETLINK: number | undefined;
+    export const AF_PACKET: number | undefined;
 
-    /** Size of `struct sockaddr` on this platform. */
-    export const sizeof_struct_sockaddr: number;
+    export const SOCK_STREAM: number;
+    export const SOCK_DGRAM: number;
+    export const SOCK_RAW: number;
+    export const SOCK_SEQPACKET: number;
+    export const SOCK_RDM: number | undefined;
 
-    /** Socket-related constants (`AF_*`, `SOCK_*`, `SO_*`, `IPPROTO_*`, etc.). */
-    export const defines: SocketDefines;
+    export const SOL_SOCKET: number;
+    export const SOL_PACKET: number | undefined;
+    export const SOL_NETLINK: number | undefined;
 
-    /** libuv poll event bit flags (`READABLE`, `WRITABLE`, `DISCONNECT`, `PRIORITIZED`). */
-    export const uv_poll_event_bits: UvPollEventBits;
+    export const SO_REUSEADDR: number;
+    export const SO_KEEPALIVE: number;
+    export const SO_LINGER: number;
+    export const SO_BROADCAST: number;
+    export const SO_RCVBUF: number;
+    export const SO_SNDBUF: number;
+    export const SO_ERROR: number;
+    export const SO_TYPE: number;
+    export const SO_REUSEPORT: number | undefined;
+    export const SO_PRIORITY: number | undefined;
+
+    export const IPPROTO_IP: number;
+    export const IPPROTO_IPV6: number;
+    export const IPPROTO_ICMP: number;
+    export const IPPROTO_TCP: number;
+    export const IPPROTO_UDP: number;
+
+    /** libuv readiness flags used by {@link Socket.poll}. */
+    export const READABLE: number;
+    export const WRITABLE: number;
+    export const DISCONNECT: number;
+    export const PRIORITIZED: number;
 }

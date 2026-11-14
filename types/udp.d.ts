@@ -13,6 +13,8 @@
 declare namespace CModuleUDP {
     export type AddressInfo = CModuleStreams.AddressInfo;
     export type Address = { ip: string; port: number };
+    /** A `number` POSIX fd or a lossless `bigint` Windows socket handle. */
+    export type SocketDescriptor = number | bigint;
 
     /**
      * UDP socket object
@@ -49,7 +51,7 @@ declare namespace CModuleUDP {
          * Get file descriptor (synchronous)
          * @returns File descriptor
          */
-        fileno(): number;
+        fileno(): SocketDescriptor;
 
         /**
          * Get socket name (synchronous, wraps uv_udp_getsockname)
@@ -88,10 +90,9 @@ declare namespace CModuleUDP {
      * UDP socket constructor
      * @param af Address family (e.g., AF_UNSPEC, AF_INET, AF_INET6)
      */
-    export const UDP: {
-        new (af?: number): UDP;
-        prototype: UDP;
-    };
+    export class UDP {
+        constructor(af?: number);
+    }
 
     /** Listen on IPv6 only, reject mapped IPv4 addresses */
     export const UDP_IPV6ONLY: number;

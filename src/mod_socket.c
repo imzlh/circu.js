@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 
+#include "capability.h"
 #include "mem.h"
 #include "private.h"
 
@@ -55,11 +56,12 @@
 #endif
 
 /* ── Types ─────────────────────────────────────────────────────────── */
-#define TJS_SOCK_CLASS_NAME "PosixSocket"
+#define TJS_SOCK_CLASS_NAME "Socket"
 static thread_local JSClassID tjs_sock_classid;
 
 typedef struct {
     sock_fd_t  sock;
+    bool       close_on_close;
     bool       closed, poll_init, in_cb, finalized;
     bool       poll_closing;  /* uv_close on poll handle initiated */
     bool       poll_closed;   /* poll close_cb has fired */
@@ -67,6 +69,21 @@ typedef struct {
     JSContext *jsctx;
     uv_poll_t  poll;
 } tjs_sock_t;
+
+static bool tjs_sock_reget(JSContext *ctx, JSValueConst this_val,
+                           tjs_sock_t **result) {
+    tjs_sock_t *s = JS_GetOpaque(this_val, tjs_sock_classid);
+    if (!s) {
+        JS_ThrowTypeError(ctx, "expected " TJS_SOCK_CLASS_NAME);
+        return false;
+    }
+    if (s->closed) {
+        JS_ThrowInternalError(ctx, "Socket closed");
+        return false;
+    }
+    *result = s;
+    return true;
+}
 
 /* ── Macros ────────────────────────────────────────────────────────── */
 
@@ -81,6 +98,15 @@ typedef struct {
     if (!s) return JS_ThrowTypeError(ctx, "expected " TJS_SOCK_CLASS_NAME);  \
     if (s->closed) return JS_ThrowInternalError(ctx, "Socket closed")
 
+/* Argument conversion and capability hooks can synchronously close or
+ * otherwise re-enter this wrapper. Never use an opaque pointer or descriptor
+ * cached across either boundary. */
+#define REGET_SOCK(ctx, this_val, s)                                         \
+    do {                                                                    \
+        if (!tjs_sock_reget((ctx), (this_val), &(s)))                       \
+            return JS_EXCEPTION;                                           \
+    } while (0)
+
 #define RET_THROW_ERRNO(ctx, cond)  if (!(cond)) return THROW_STRERROR()
 
 /* Get Uint8Array from argv[n] into ptr/sz, return JS_EXCEPTION on failure */
@@ -91,10 +117,12 @@ typedef struct {
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
-static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
+static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd, bool close_on_close) {
     JSValue obj = JS_NewObjectClass(ctx, tjs_sock_classid);
-    if (JS_IsException(obj))
+    if (JS_IsException(obj)) {
+        if (close_on_close) sock_close(fd);
         return obj;
+    }
 
     /* The socket wrapper can outlive JS finalization while libuv finishes
      * closing the poll handle, so keep the host object on neutral heap
@@ -102,13 +130,14 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd) {
     tjs_sock_t *s = tjs__mallocz(sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
-        sock_close(fd);
+        if (close_on_close) sock_close(fd);
         return JS_ThrowOutOfMemory(ctx);
     }
-    s->sock      = fd;
-    s->callback  = JS_UNDEFINED;
-    s->this_obj  = JS_DupValue(ctx, obj);
-    s->jsctx     = ctx;
+    s->sock           = fd;
+    s->close_on_close = close_on_close;
+    s->callback       = JS_UNDEFINED;
+    s->this_obj       = JS_UNDEFINED;
+    s->jsctx          = ctx;
     JS_SetOpaque(obj, s);
     return obj;
 }
@@ -125,29 +154,83 @@ static void tjs_sock_poll_close_cb(uv_handle_t *handle) {
 }
 
 static JSValue tjs_sock_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 3) return JS_ThrowTypeError(ctx, "expected domain, type, and protocol");
-    unsigned domain, type, protocol;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "expected domain and type");
+    unsigned domain, type, protocol = 0;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &domain,   argv[0]), 0, "uint");
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &type,     argv[1]), 1, "uint");
-    TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &protocol, argv[2]), 2, "uint");
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToUint32(ctx, &protocol, argv[2]))
+        return JS_EXCEPTION;
 
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.create", NULL), (void)0);
     sock_fd_t fd = socket(domain, type, protocol);
     RET_THROW_ERRNO(ctx, sock_valid(fd));
-    return tjs_sock_new_from_fd(ctx, fd);
+    return tjs_sock_new_from_fd(ctx, fd, true);
 }
 
-static JSValue tjs_sock_create_from_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static int tjs_sock_fd_from_js(JSContext *ctx, JSValueConst value, sock_fd_t *result) {
+#ifdef _WIN32
+    const uint64_t maximum = (uint64_t) UINTPTR_MAX;
+#else
+    const uint64_t maximum = INT_MAX;
+#endif
+    uint64_t raw;
+
+    if (JS_IsBigInt(value)) {
+        int negative = 0;
+        size_t count = 1;
+        uint64_t word = 0;
+        if (JS_GetBigIntWords(ctx, value, &negative, &count, &word) < 0)
+            return -1;
+        if (negative || count > 1 || word > maximum)
+            return JS_ThrowRangeError(ctx, "socket descriptor is out of range"), -1;
+        raw = word;
+    } else {
+        double number;
+        if (!JS_IsNumber(value) || JS_ToFloat64(ctx, &number, value) < 0)
+            return JS_ThrowTypeError(ctx, "socket descriptor must be a number or bigint"), -1;
+        if (!isfinite(number) || trunc(number) != number || number < 0 ||
+            number > 9007199254740991.0 || number > (double) maximum)
+            return JS_ThrowRangeError(ctx, "socket descriptor is out of range"), -1;
+        raw = (uint64_t) number;
+    }
+
+#ifdef _WIN32
+    *result = (sock_fd_t) (uintptr_t) raw;
+#else
+    *result = (sock_fd_t) raw;
+#endif
+    return 0;
+}
+
+static JSValue tjs_sock_from_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected socket fd");
-    unsigned ufd;
-    TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &ufd, argv[0]), 0, "uint");
-    sock_fd_t fd = (sock_fd_t) ufd;
+    sock_fd_t fd;
+    if (tjs_sock_fd_from_js(ctx, argv[0], &fd) < 0)
+        return JS_EXCEPTION;
+    bool close_on_close = false;
+
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
+        if (!JS_IsObject(argv[1]))
+            return JS_ThrowTypeError(ctx, "createFrom options must be an object");
+        JSValue value = JS_GetPropertyStr(ctx, argv[1], "closeOnClose");
+        if (JS_IsException(value)) return JS_EXCEPTION;
+        if (!JS_IsUndefined(value)) {
+            int close_value = JS_ToBool(ctx, value);
+            JS_FreeValue(ctx, value);
+            if (close_value < 0) return JS_EXCEPTION;
+            close_on_close = close_value != 0;
+        } else {
+            JS_FreeValue(ctx, value);
+        }
+    }
 
     /* validate fd by probing socket type */
     int dummy; socklen_t dlen = sizeof(dummy);
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *) &dummy, &dlen) < 0)
-        return JS_ThrowTypeError(ctx, "%u is not a valid socket fd", ufd);
+        return JS_ThrowTypeError(ctx, "not a valid socket descriptor");
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.createFrom", NULL), (void)0);
 
-    return tjs_sock_new_from_fd(ctx, fd);
+    return tjs_sock_new_from_fd(ctx, fd, close_on_close);
 }
 
 static void close_sock(tjs_sock_t *s) {
@@ -165,7 +248,8 @@ static void close_sock(tjs_sock_t *s) {
         }
         s->poll_init = false;
     }
-    sock_close(s->sock);
+    if (s->close_on_close)
+        sock_close(s->sock);
     s->closed = true;
 }
 
@@ -175,7 +259,8 @@ static void tjs_sock_finalizer(JSRuntime *rt, JSValue val) {
         s->finalized = true;
         JS_FreeValueRT(rt, s->callback);
         s->callback = JS_UNDEFINED;
-        /* this_obj is a self-pin of the socket wrapper being finalized. */
+        /* this_obj is only set while polling and keeps the wrapper alive until
+         * stopPoll() or close() releases the native strong reference. */
         s->this_obj = JS_UNDEFINED;
         close_sock(s);
         /* Free now only if the poll close_cb will not run later. If a close
@@ -192,7 +277,9 @@ static void tjs_sock_gc_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func)
     if (s) {
         if (!JS_IsUndefined(s->callback))
             JS_MarkValue(rt, s->callback, mark_func);
-        JS_MarkValue(rt, s->this_obj, mark_func);
+        /* Do not mark this_obj: it is a C-owned root rather than an edge owned
+         * by this JS object. Marking the self-reference would let cycle GC
+         * collect a wrapper while its uv_poll_t can still call back. */
     }
 }
 
@@ -203,6 +290,12 @@ JSClassDef tjs_sock_class = {
 };
 
 /* ── Socket methods ────────────────────────────────────────────────── */
+
+static socklen_t tjs_sock_addrlen(const struct sockaddr_storage *addr) {
+    return addr->ss_family == AF_INET6
+        ? sizeof(struct sockaddr_in6)
+        : sizeof(struct sockaddr_in);
+}
 
 static JSValue tjs_sock_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     DECL_SOCK(ctx, this_val, s);
@@ -218,48 +311,44 @@ static JSValue tjs_sock_close(JSContext *ctx, JSValue this_val, int argc, JSValu
 }
 
 static JSValue tjs_sock_bind(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address buffer");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     GET_SOCK(ctx, this_val, s);
-    ARGV_BUF(ctx, argv, 0, buf, sz);
-    RET_THROW_ERRNO(ctx, bind(s->sock, (struct sockaddr *) buf, sz) == 0);
+    struct sockaddr_storage addr;
+    if (tjs_obj2addr(ctx, argv[0], &addr) != 0) return JS_EXCEPTION;
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.bind", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    RET_THROW_ERRNO(ctx, bind(s->sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr)) == 0);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_sock_connect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address buffer");
+    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address");
     GET_SOCK(ctx, this_val, s);
-    ARGV_BUF(ctx, argv, 0, buf, sz);
-    RET_THROW_ERRNO(ctx, connect(s->sock, (struct sockaddr *) buf, sz) == 0);
+    struct sockaddr_storage addr;
+    if (tjs_obj2addr(ctx, argv[0], &addr) != 0) return JS_EXCEPTION;
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "socket.connect", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    RET_THROW_ERRNO(ctx, connect(s->sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr)) == 0);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_sock_listen(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "expected backlog");
     GET_SOCK(ctx, this_val, s);
-    unsigned backlog;
-    TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &backlog, argv[0]), 0, "uint");
+    unsigned backlog = 511;
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
+        return JS_EXCEPTION;
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.listen", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
     RET_THROW_ERRNO(ctx, listen(s->sock, backlog) == 0);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_sock_accept(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     GET_SOCK(ctx, this_val, s);
-    socklen_t sz = sizeof(struct sockaddr_storage);
-    struct sockaddr *addr = js_malloc(ctx, sz);
-    if (!addr)
-        return JS_ThrowOutOfMemory(ctx);
-    sock_fd_t fd = accept(s->sock, addr, &sz);
-    if (!sock_valid(fd)) {
-        js_free(ctx, addr);
-        return THROW_STRERROR();
-    }
-    JSValue newSock = tjs_sock_new_from_fd(ctx, fd);
-    if (JS_IsException(newSock)) {
-        js_free(ctx, addr);
-        return newSock;
-    }
-    JS_SetPropertyStr(ctx, newSock, "_sockaddr", TJS_NewUint8Array(ctx, (uint8_t *) addr, sz));
-    return newSock;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.accept", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    sock_fd_t fd = accept(s->sock, NULL, NULL);
+    RET_THROW_ERRNO(ctx, sock_valid(fd));
+    return tjs_sock_new_from_fd(ctx, fd, true);
 }
 
 static JSValue tjs_sock_shutdown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -267,6 +356,8 @@ static JSValue tjs_sock_shutdown(JSContext *ctx, JSValue this_val, int argc, JSV
     GET_SOCK(ctx, this_val, s);
     unsigned how;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &how, argv[0]), 0, "uint");
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.shutdown", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
     RET_THROW_ERRNO(ctx, shutdown(s->sock, how) == 0);
     return JS_UNDEFINED;
 }
@@ -281,6 +372,8 @@ static JSValue tjs_sock_recv(JSContext *ctx, JSValue this_val, int argc, JSValue
         JS_ToUint32(ctx, &flags, argv[1]))
         return JS_EXCEPTION;
 
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recv", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
     uint8_t *buf = js_malloc(ctx, count);
     if (!buf && count != 0)
         return JS_ThrowOutOfMemory(ctx);
@@ -301,7 +394,11 @@ static JSValue tjs_sock_send(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (argc > 1 && !JS_IsUndefined(argv[1]) &&
         JS_ToUint32(ctx, &flags, argv[1]))
         return JS_EXCEPTION;
-    ARGV_BUF(ctx, argv, 0, buf, sz);
+    REGET_SOCK(ctx, this_val, s);
+    size_t sz;
+    uint8_t *buf = JS_GetUint8Array(ctx, &sz, argv[0]);
+    if (!buf) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "socket.send", NULL), (void)0, do { REGET_SOCK(ctx, this_val, s); buf = JS_GetUint8Array(ctx, &sz, argv[0]); if (!buf) return JS_EXCEPTION; } while (0));
     int ret = send(s->sock, (const char *) buf, sz, (int) flags);
     RET_THROW_ERRNO(ctx, ret >= 0);
     return JS_NewUint32(ctx, ret);
@@ -313,7 +410,11 @@ static JSValue tjs_sock_setsockopt(JSContext *ctx, JSValue this_val, int argc, J
     unsigned level, optname;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &level,   argv[0]), 0, "uint");
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &optname, argv[1]), 1, "uint");
-    ARGV_BUF(ctx, argv, 2, optval, optlen);
+    REGET_SOCK(ctx, this_val, s);
+    size_t optlen;
+    uint8_t *optval = JS_GetUint8Array(ctx, &optlen, argv[2]);
+    if (!optval) return JS_EXCEPTION;
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.setopt", NULL), (void)0, do { REGET_SOCK(ctx, this_val, s); optval = JS_GetUint8Array(ctx, &optlen, argv[2]); if (!optval) return JS_EXCEPTION; } while (0));
     RET_THROW_ERRNO(ctx, setsockopt(s->sock, level, optname, (const char *) optval, optlen) == 0);
     return JS_UNDEFINED;
 }
@@ -332,6 +433,8 @@ static JSValue tjs_sock_getsockopt(JSContext *ctx, JSValue this_val, int argc, J
         optlen = (socklen_t)optlen32;
     }
 
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.getopt", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
     void *optval = js_malloc(ctx, optlen);
     if (!optval && optlen != 0)
         return JS_ThrowOutOfMemory(ctx);
@@ -351,25 +454,23 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (JS_ToInt32(ctx, &bufsz, argv[0])) return JS_EXCEPTION;
     TJS_CHECK_ARG_RET(ctx, bufsz > 0, 0, "positive integer");
 
+    uint32_t ctrlsz = 0;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToUint32(ctx, &ctrlsz, argv[1])) return JS_EXCEPTION;
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recvmsg", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+
     struct msghdr msg = {0};
     msg.msg_namelen = sizeof(struct sockaddr_storage);
     msg.msg_name    = js_malloc(ctx, msg.msg_namelen);
     if (!msg.msg_name)
         return JS_ThrowOutOfMemory(ctx);
 
-    if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        uint32_t ctrlsz;
-        if (JS_ToUint32(ctx, &ctrlsz, argv[1])) {
+    if (ctrlsz > 0) {
+        msg.msg_controllen = ctrlsz;
+        msg.msg_control    = js_malloc(ctx, ctrlsz);
+        if (!msg.msg_control) {
             js_free(ctx, msg.msg_name);
-            return JS_EXCEPTION;
-        }
-        if (ctrlsz > 0) {
-            msg.msg_controllen = ctrlsz;
-            msg.msg_control    = js_malloc(ctx, ctrlsz);
-            if (!msg.msg_control) {
-                js_free(ctx, msg.msg_name);
-                return JS_ThrowOutOfMemory(ctx);
-            }
+            return JS_ThrowOutOfMemory(ctx);
         }
     }
 
@@ -398,20 +499,34 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         js_free(ctx, iov.iov_base);
         return result;
     }
-    JSValue addr = TJS_NewUint8Array(ctx, (uint8_t *) msg.msg_name, msg.msg_namelen);
+    if (msg.msg_namelen > 0) {
+        JSValue addr = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(addr)) {
+            JS_FreeValue(ctx, result);
+            js_free(ctx, msg.msg_name);
+            js_free(ctx, msg.msg_control);
+            js_free(ctx, iov.iov_base);
+            return JS_EXCEPTION;
+        }
+        tjs_addr2obj(ctx, addr, msg.msg_name, false);
+        if (JS_HasException(ctx)) {
+            JS_FreeValue(ctx, addr);
+            JS_FreeValue(ctx, result);
+            js_free(ctx, msg.msg_name);
+            js_free(ctx, msg.msg_control);
+            js_free(ctx, iov.iov_base);
+            return JS_EXCEPTION;
+        }
+        if (JS_SetPropertyStr(ctx, result, "address", addr) < 0) {
+            JS_FreeValue(ctx, result);
+            js_free(ctx, msg.msg_name);
+            js_free(ctx, msg.msg_control);
+            js_free(ctx, iov.iov_base);
+            return JS_EXCEPTION;
+        }
+    }
+    js_free(ctx, msg.msg_name);
     msg.msg_name = NULL;
-    if (JS_IsException(addr)) {
-        JS_FreeValue(ctx, result);
-        js_free(ctx, msg.msg_control);
-        js_free(ctx, iov.iov_base);
-        return JS_EXCEPTION;
-    }
-    if (JS_SetPropertyStr(ctx, result, "addr", addr) < 0) {
-        JS_FreeValue(ctx, result);
-        js_free(ctx, msg.msg_control);
-        js_free(ctx, iov.iov_base);
-        return JS_EXCEPTION;
-    }
     if (msg.msg_control) {
         JSValue control = TJS_NewUint8Array(ctx, msg.msg_control, msg.msg_controllen);
         msg.msg_control = NULL;
@@ -439,43 +554,58 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     return result;
 }
 
-static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    /* argv: addr|undefined, control|undefined, flags, ...data_bufs */
-    if (argc < 3) return JS_ThrowTypeError(ctx, "expected address, control, and flags");
-    GET_SOCK(ctx, this_val, s);
-    if (argc < 4) return JS_ThrowInternalError(ctx, "expected at least 4 arguments");
+static int tjs_sock_sendmsg_buffers(JSContext *ctx, struct msghdr *msg,
+                                    JSValue *argv) {
+    msg->msg_control = NULL;
+    msg->msg_controllen = 0;
+    if (!JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        size_t size;
+        uint8_t *buffer = JS_GetUint8Array(ctx, &size, argv[1]);
+        if (!buffer) return -1;
+        msg->msg_control = buffer;
+        msg->msg_controllen = size;
+    }
 
-    /* Convert flags BEFORE capturing any backing store: JS_ToUint32 can run a
-     * user valueOf() that detaches argv[0]/argv[1]. No JS may run between
-     * acquiring a raw buffer pointer and sendmsg(). */
+    for (size_t i = 0; i < (size_t) msg->msg_iovlen; i++) {
+        size_t size;
+        uint8_t *buffer = JS_GetUint8Array(ctx, &size, argv[i + 3]);
+        if (!buffer) return -1;
+        msg->msg_iov[i] = (struct iovec) { buffer, size };
+    }
+    return 0;
+}
+
+static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    /* argv: address|null, control|null, flags, ...data_bufs */
+    if (argc < 4) return JS_ThrowTypeError(ctx, "expected address, control, flags, and data");
+    GET_SOCK(ctx, this_val, s);
+
+    /* Convert every JS value before capturing backing stores. No JS may run
+     * between acquiring raw buffer pointers and sendmsg(). */
     unsigned flags;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &flags, argv[2]), 2, "uint");
 
     struct msghdr msg = {0};
+    struct sockaddr_storage addr;
 
-    if (!JS_IsUndefined(argv[0])) {
-        ARGV_BUF(ctx, argv, 0, abuf, asz);
-        msg.msg_name    = abuf;
-        msg.msg_namelen = asz;
+    if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        if (tjs_obj2addr(ctx, argv[0], &addr) != 0) return JS_EXCEPTION;
+        msg.msg_name = &addr;
+        msg.msg_namelen = tjs_sock_addrlen(&addr);
     }
-    if (!JS_IsUndefined(argv[1])) {
-        ARGV_BUF(ctx, argv, 1, cbuf, csz);
-        msg.msg_control    = cbuf;
-        msg.msg_controllen = csz;
-    }
+    REGET_SOCK(ctx, this_val, s);
 
     msg.msg_iovlen = argc - 3;
     if ((size_t)msg.msg_iovlen > SIZE_MAX / sizeof(struct iovec)) {
         return JS_ThrowRangeError(ctx, "too many data buffers");
     }
-    msg.msg_iov    = js_malloc(ctx, sizeof(struct iovec) * msg.msg_iovlen);
+    msg.msg_iov = js_malloc(ctx, sizeof(struct iovec) * msg.msg_iovlen);
     if (!msg.msg_iov) return JS_ThrowOutOfMemory(ctx);
-    for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
-        size_t sz;
-        uint8_t *buf = JS_GetUint8Array(ctx, &sz, argv[i + 3]);
-        if (!buf) { js_free(ctx, msg.msg_iov); return JS_EXCEPTION; }
-        msg.msg_iov[i] = (struct iovec){ buf, sz };
+    if (tjs_sock_sendmsg_buffers(ctx, &msg, argv) < 0) {
+        js_free(ctx, msg.msg_iov);
+        return JS_EXCEPTION;
     }
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE | (msg.msg_name ? TJS_CAP_IO_CONNECT : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.sendmsg", NULL), js_free(ctx, msg.msg_iov), do { if (!tjs_sock_reget(ctx, this_val, &s) || tjs_sock_sendmsg_buffers(ctx, &msg, argv) < 0) { js_free(ctx, msg.msg_iov); return JS_EXCEPTION; } } while (0));
 
     int ret = sendmsg(s->sock, &msg, flags);
     js_free(ctx, msg.msg_iov);
@@ -498,11 +628,13 @@ static void tjs_sock_uv_poll_cb(uv_poll_t *handle, int status, int events) {
 
 static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 2) return JS_ThrowTypeError(ctx, "expected events and callback");
-    DECL_SOCK(ctx, this_val, s);  /* allow polling on closed? no – keep closed check */
-    if (s->closed) return JS_ThrowInternalError(ctx, "Socket closed");
+    GET_SOCK(ctx, this_val, s);
     unsigned events;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &events, argv[0]) && events > 0, 0, "uint");
     TJS_CHECK_ARG_RET(ctx, JS_IsFunction(ctx, argv[1]), 1, "function");
+
+    REGET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WATCH | ((events & UV_READABLE) ? TJS_CAP_IO_READ : 0) | ((events & UV_WRITABLE) ? TJS_CAP_IO_WRITE : 0) | ((events & (UV_DISCONNECT | UV_PRIORITIZED)) ? TJS_CAP_IO_CONTROL : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.poll", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
 
     if (!s->poll_init) {
         int ret = uv_poll_init_fd(tjs_get_loop(ctx), &s->poll, s->sock);
@@ -521,6 +653,8 @@ static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue
         s->callback = JS_UNDEFINED;
         return tjs_throw_errno(ctx, ret);
     }
+    if (JS_IsUndefined(s->this_obj))
+        s->this_obj = JS_DupValue(ctx, this_val);
     return JS_UNDEFINED;
 }
 
@@ -531,14 +665,48 @@ static JSValue tjs_sock_poll_stop(JSContext *ctx, JSValue this_val, int argc, JS
         return JS_ThrowInternalError(ctx, "Poll not active");
     int ret = uv_poll_stop(&s->poll);
     if (ret < 0) return tjs_throw_errno(ctx, ret);
+    if (!JS_IsUndefined(s->callback)) {
+        JS_FreeValue(ctx, s->callback);
+        s->callback = JS_UNDEFINED;
+    }
+    if (!JS_IsUndefined(s->this_obj)) {
+        JSValue obj = s->this_obj;
+        s->this_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, obj);
+    }
     return JS_UNDEFINED;
 }
 
 /* ── Getters ───────────────────────────────────────────────────────── */
 
 static JSValue tjs_sock_get_fd(JSContext *ctx, JSValue this_val) {
-    DECL_SOCK(ctx, this_val, s);
-    return JS_NewUint32(ctx, (uint32_t) s->sock);
+    GET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.fileno", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+#ifdef _WIN32
+    return JS_NewBigUint64(ctx, (uint64_t) (uintptr_t) s->sock);
+#else
+    return JS_NewInt32(ctx, s->sock);
+#endif
+}
+
+static JSValue tjs_sock_get_sockpeername(JSContext *ctx, JSValue this_val, int magic) {
+    GET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "socket.sockname" : "socket.peername", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    int ret = magic == 0
+        ? getsockname(s->sock, (struct sockaddr *) &addr, &len)
+        : getpeername(s->sock, (struct sockaddr *) &addr, &len);
+    RET_THROW_ERRNO(ctx, ret == 0);
+
+    JSValue result = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(result)) return result;
+    tjs_addr2obj(ctx, result, (struct sockaddr *) &addr, false);
+    if (JS_HasException(ctx)) {
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+    return result;
 }
 
 static JSValue tjs_sock_get_polling(JSContext *ctx, JSValue this_val) {
@@ -547,24 +715,23 @@ static JSValue tjs_sock_get_polling(JSContext *ctx, JSValue this_val) {
 }
 
 static JSValue tjs_sock_get_info(JSContext *ctx, JSValue this_val) {
-    DECL_SOCK(ctx, this_val, s);
+    GET_SOCK(ctx, this_val, s);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.info", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
     JSValue info = JS_NewObject(ctx);
-    JSValue sock_info = JS_NewObject(ctx);
-    int cnt = 0;
+    if (JS_IsException(info)) return info;
 
 #ifdef __APPLE__
     struct socket_fdinfo sfi;
     if (proc_pidfdinfo(getpid(), s->sock, PROC_PIDFDSOCKETINFO, &sfi, sizeof sfi) > 0) {
-        JS_SetPropertyStr(ctx, sock_info, "type",     JS_NewInt32(ctx, sfi.psi.soi_type));
-        JS_SetPropertyStr(ctx, sock_info, "domain",   JS_NewInt32(ctx, sfi.psi.soi_family));
-        JS_SetPropertyStr(ctx, sock_info, "protocol", JS_NewInt32(ctx, sfi.psi.soi_protocol));
-        cnt = 3;
+        JS_SetPropertyStr(ctx, info, "type",     JS_NewInt32(ctx, sfi.psi.soi_type));
+        JS_SetPropertyStr(ctx, info, "domain",   JS_NewInt32(ctx, sfi.psi.soi_family));
+        JS_SetPropertyStr(ctx, info, "protocol", JS_NewInt32(ctx, sfi.psi.soi_protocol));
     }
 #else
     int val; socklen_t vlen = sizeof(val);
 # define TRY_SOCKOPT(name, key) \
     if (getsockopt(s->sock, SOL_SOCKET, name, (char*)&val, &vlen) == 0) { \
-        JS_SetPropertyStr(ctx, sock_info, key, JS_NewInt32(ctx, val)); cnt++; }
+        JS_SetPropertyStr(ctx, info, key, JS_NewInt32(ctx, val)); }
 
     TRY_SOCKOPT(SO_TYPE, "type")
 # ifndef _WIN32
@@ -573,68 +740,28 @@ static JSValue tjs_sock_get_info(JSContext *ctx, JSValue this_val) {
 # endif
 # undef TRY_SOCKOPT
 #endif
-
-    if (cnt > 0)
-        JS_SetPropertyStr(ctx, info, "socket", sock_info);
-    else
-        JS_FreeValue(ctx, sock_info);
     return info;
 }
 
 /* ── Utilities ─────────────────────────────────────────────────────── */
 
-static JSValue tjs_uv_strerror(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "expected error code");
-    int code;
-    TJS_CHECK_ARG_RET(ctx, !JS_ToInt32(ctx, &code, argv[0]), 0, "int");
-    return JS_NewString(ctx, uv_strerror(code));
-}
-
-static JSValue tjs_sock_sockaddr_inet(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "expected address object");
-    struct sockaddr_storage *ss = js_malloc(ctx, sizeof(*ss));
-    if (!ss)
-        return JS_ThrowOutOfMemory(ctx);
-    if (tjs_obj2addr(ctx, argv[0], ss) != 0) {
-        js_free(ctx, ss);
-        return JS_EXCEPTION;
-    }
-
-    size_t addr_len;
-    if (ss->ss_family == AF_INET6)
-        addr_len = sizeof(struct sockaddr_in6);
-    else if (ss->ss_family == AF_INET)
-        addr_len = sizeof(struct sockaddr_in);
-#if defined(AF_UNIX) && !defined(_WIN32)
-    else if (ss->ss_family == AF_UNIX)
-        addr_len = sizeof(struct sockaddr_un);
-#endif
-    else
-        addr_len = sizeof(struct sockaddr_storage);
-
-    struct sockaddr *addr = js_realloc(ctx, ss, addr_len);
-    if (!addr) {
-        js_free(ctx, ss);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    return TJS_NewUint8Array(ctx, (uint8_t *) addr, addr_len);
-}
-
-static JSValue tjs_posix_if_nametoindex(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_sock_if_name_to_index(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected interface name");
     TJS_CHECK_ARG_RET(ctx, JS_IsString(argv[0]), 0, "string");
     const char *name = JS_ToCString(ctx, argv[0]);
     TJS_CHECK_ARG_RET(ctx, name, 0, "string");
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.ifNameToIndex", name), JS_FreeCString(ctx, name));
     unsigned idx = if_nametoindex(name);
     JS_FreeCString(ctx, name);
     RET_THROW_ERRNO(ctx, idx > 0);
     return JS_NewUint32(ctx, idx);
 }
 
-static JSValue tjs_posix_if_indextoname(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_sock_if_index_to_name(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected interface index");
     unsigned idx;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &idx, argv[0]), 0, "uint");
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.ifIndexToName", NULL), (void)0);
     char buf[IF_NAMESIZE];
     RET_THROW_ERRNO(ctx, if_indextoname(idx, buf) == buf);
     return JS_NewString(ctx, buf);
@@ -664,7 +791,7 @@ static uint16_t ip_checksum(const void *data, size_t len) {
     return htons(~acc);
 }
 
-static JSValue tjs_posix_checksum(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_sock_checksum(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected data buffer");
     ARGV_BUF(ctx, argv, 0, data, len);
     return JS_NewUint32(ctx, ip_checksum(data, len));
@@ -684,7 +811,7 @@ static const JSCFunctionListEntry tjs_sock_proto_funcs[] = {
     TJS_CFUNC_DEF("setopt",   3, tjs_sock_setsockopt),
     TJS_CFUNC_DEF("getopt",   3, tjs_sock_getsockopt),
     TJS_CFUNC_DEF("poll",     2, tjs_sock_poll),
-    TJS_CFUNC_DEF("pollStop", 0, tjs_sock_poll_stop),
+    TJS_CFUNC_DEF("stopPoll", 0, tjs_sock_poll_stop),
 #ifndef _WIN32
     TJS_CFUNC_DEF("recvmsg",  2, tjs_sock_recvmsg),
     TJS_CFUNC_DEF("sendmsg",  4, tjs_sock_sendmsg),
@@ -692,81 +819,79 @@ static const JSCFunctionListEntry tjs_sock_proto_funcs[] = {
     TJS_CGETSET_DEF("polling", tjs_sock_get_polling, NULL),
     TJS_CGETSET_DEF("fileno",  tjs_sock_get_fd,      NULL),
     TJS_CGETSET_DEF("info",    tjs_sock_get_info,    NULL),
+    JS_CGETSET_MAGIC_DEF("sockname", tjs_sock_get_sockpeername, NULL, 0),
+    JS_CGETSET_MAGIC_DEF("peername", tjs_sock_get_sockpeername, NULL, 1),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", TJS_SOCK_CLASS_NAME, JS_PROP_CONFIGURABLE),
 };
 
-#define JS_PROT_INT_DEF(x)  JS_PROP_INT32_DEF(#x, x, JS_PROP_ENUMERABLE)
+#define TJS_SOCK_CONST(x) JS_PROP_INT32_DEF(#x, x, JS_PROP_ENUMERABLE)
 
 /* clang-format off */
-static const JSCFunctionListEntry defines_list[] = {
-    JS_PROT_INT_DEF(AF_INET),
-    JS_PROT_INT_DEF(AF_INET6),
+static const JSCFunctionListEntry socket_constants[] = {
+    TJS_SOCK_CONST(AF_INET),
+    TJS_SOCK_CONST(AF_INET6),
 #ifdef AF_UNIX
-    JS_PROT_INT_DEF(AF_UNIX),
+    TJS_SOCK_CONST(AF_UNIX),
 #endif
 #ifdef AF_NETLINK
-    JS_PROT_INT_DEF(AF_NETLINK),
+    TJS_SOCK_CONST(AF_NETLINK),
 #endif
 #ifdef AF_PACKET
-    JS_PROT_INT_DEF(AF_PACKET),
+    TJS_SOCK_CONST(AF_PACKET),
 #endif
-    JS_PROT_INT_DEF(SOCK_STREAM),
-    JS_PROT_INT_DEF(SOCK_DGRAM),
-    JS_PROT_INT_DEF(SOCK_RAW),
-    JS_PROT_INT_DEF(SOCK_SEQPACKET),
+    TJS_SOCK_CONST(SOCK_STREAM),
+    TJS_SOCK_CONST(SOCK_DGRAM),
+    TJS_SOCK_CONST(SOCK_RAW),
+    TJS_SOCK_CONST(SOCK_SEQPACKET),
 #ifdef SOCK_RDM
-    JS_PROT_INT_DEF(SOCK_RDM),
+    TJS_SOCK_CONST(SOCK_RDM),
 #endif
-    JS_PROT_INT_DEF(SOL_SOCKET),
+    TJS_SOCK_CONST(SOL_SOCKET),
 #ifdef SOL_PACKET
-    JS_PROT_INT_DEF(SOL_PACKET),
+    TJS_SOCK_CONST(SOL_PACKET),
 #endif
 #ifdef SOL_NETLINK
-    JS_PROT_INT_DEF(SOL_NETLINK),
+    TJS_SOCK_CONST(SOL_NETLINK),
 #endif
-    JS_PROT_INT_DEF(SO_REUSEADDR),
-    JS_PROT_INT_DEF(SO_KEEPALIVE),
-    JS_PROT_INT_DEF(SO_LINGER),
-    JS_PROT_INT_DEF(SO_BROADCAST),
-    JS_PROT_INT_DEF(SO_RCVBUF),
-    JS_PROT_INT_DEF(SO_SNDBUF),
-    JS_PROT_INT_DEF(SO_ERROR),
-    JS_PROT_INT_DEF(SO_TYPE),
+    TJS_SOCK_CONST(SO_REUSEADDR),
+    TJS_SOCK_CONST(SO_KEEPALIVE),
+    TJS_SOCK_CONST(SO_LINGER),
+    TJS_SOCK_CONST(SO_BROADCAST),
+    TJS_SOCK_CONST(SO_RCVBUF),
+    TJS_SOCK_CONST(SO_SNDBUF),
+    TJS_SOCK_CONST(SO_ERROR),
+    TJS_SOCK_CONST(SO_TYPE),
 #ifdef SO_REUSEPORT
-    JS_PROT_INT_DEF(SO_REUSEPORT),
+    TJS_SOCK_CONST(SO_REUSEPORT),
 #endif
 #ifdef SO_PRIORITY
-    JS_PROT_INT_DEF(SO_PRIORITY),
+    TJS_SOCK_CONST(SO_PRIORITY),
 #endif
-    JS_PROT_INT_DEF(IPPROTO_IP),
-    JS_PROT_INT_DEF(IPPROTO_IPV6),
-    JS_PROT_INT_DEF(IPPROTO_ICMP),
-    JS_PROT_INT_DEF(IPPROTO_TCP),
-    JS_PROT_INT_DEF(IPPROTO_UDP),
+    TJS_SOCK_CONST(IPPROTO_IP),
+    TJS_SOCK_CONST(IPPROTO_IPV6),
+    TJS_SOCK_CONST(IPPROTO_ICMP),
+    TJS_SOCK_CONST(IPPROTO_TCP),
+    TJS_SOCK_CONST(IPPROTO_UDP),
 };
 
-static const JSCFunctionListEntry tjs_uv_poll_events[] = {
+/* clang-format on */
+
+static const JSCFunctionListEntry socket_module_funcs[] = {
+    TJS_CFUNC_DEF("createFrom",    1, tjs_sock_from_fd),
+    TJS_CFUNC_DEF("ifNameToIndex", 1, tjs_sock_if_name_to_index),
+    TJS_CFUNC_DEF("ifIndexToName", 1, tjs_sock_if_index_to_name),
+    TJS_CFUNC_DEF("checksum",      1, tjs_sock_checksum),
+
     TJS_UVCONST(READABLE),
     TJS_UVCONST(WRITABLE),
     TJS_UVCONST(DISCONNECT),
     TJS_UVCONST(PRIORITIZED),
 };
-/* clang-format on */
-
-static const JSCFunctionListEntry posix_ns_funcs[] = {
-    TJS_CFUNC_DEF("create_sockaddr_inet", 1, tjs_sock_sockaddr_inet),
-    TJS_CFUNC_DEF("uv_strerror",          1, tjs_uv_strerror),
-    TJS_CFUNC_DEF("socket_from_fd",       1, tjs_sock_create_from_fd),
-    TJS_CFUNC_DEF("if_nametoindex",       1, tjs_posix_if_nametoindex),
-    TJS_CFUNC_DEF("if_indextoname",       1, tjs_posix_if_indextoname),
-    TJS_CFUNC_DEF("checksum",             1, tjs_posix_checksum),
-    TJS_CONST2("sizeof_struct_sockaddr",  sizeof(struct sockaddr)),
-    JS_OBJECT_DEF("defines",             defines_list,        countof(defines_list),        JS_PROP_C_W_E),
-    JS_OBJECT_DEF("uv_poll_event_bits",  tjs_uv_poll_events,  countof(tjs_uv_poll_events),  JS_PROP_C_W_E),
-};
 
 /* ── Module init ───────────────────────────────────────────────────── */
 
-void tjs__mod_socket_init(JSContext *ctx, JSValue ns) {JSRuntime *rt = JS_GetRuntime(ctx);
+void tjs__mod_socket_init(JSContext *ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     JS_NewClassID(rt, &tjs_sock_classid);
     JS_NewClass(rt, tjs_sock_classid, &tjs_sock_class);
 
@@ -774,8 +899,10 @@ void tjs__mod_socket_init(JSContext *ctx, JSValue ns) {JSRuntime *rt = JS_GetRun
     JS_SetPropertyFunctionList(ctx, proto, tjs_sock_proto_funcs, countof(tjs_sock_proto_funcs));
     JS_SetClassProto(ctx, tjs_sock_classid, proto);
 
-    JS_SetPropertyFunctionList(ctx, ns, posix_ns_funcs, countof(posix_ns_funcs));
-    JS_DefinePropertyValueStr(ctx, ns, TJS_SOCK_CLASS_NAME,
-        JS_NewCFunction2(ctx, tjs_sock_create, TJS_SOCK_CLASS_NAME, 3, JS_CFUNC_constructor, 0),
-        JS_PROP_C_W_E);
+    JS_SetPropertyFunctionList(ctx, ns, socket_module_funcs, countof(socket_module_funcs));
+    JS_SetPropertyFunctionList(ctx, ns, socket_constants, countof(socket_constants));
+    JSValue constructor = JS_NewCFunction2(
+        ctx, tjs_sock_create, TJS_SOCK_CLASS_NAME, 2, JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, constructor, proto);
+    JS_DefinePropertyValueStr(ctx, ns, TJS_SOCK_CLASS_NAME, constructor, JS_PROP_C_W_E);
 }
