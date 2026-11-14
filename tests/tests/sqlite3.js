@@ -2,6 +2,18 @@
 
 const sqlite3 = import.meta.use('sqlite3');
 
+function assertThrows(fn, messagePart) {
+    let error;
+    try {
+        fn();
+    } catch (caught) {
+        error = caught;
+    }
+    assert(error !== undefined, `expected an exception containing ${messagePart}`);
+    assert(String(error).toLowerCase().includes(messagePart.toLowerCase()),
+        `exception ${String(error)} does not contain ${messagePart}`);
+}
+
 // ========== Database Open/Close ==========
 await test('sqlite3.open - create in-memory database', () => {
     const db = sqlite3.open(':memory:', sqlite3.O_CREATE | sqlite3.O_READWRITE);
@@ -110,6 +122,36 @@ await test('sqlite3.Statement.all - with params', () => {
     assertEquals(rows[0].name, 'Alice', 'Should be Alice');
     
     stmt.finalize();
+    db.close();
+});
+
+await test('sqlite3.Statement.bind - array getter can finalize during binding', () => {
+    const db = sqlite3.open(':memory:', sqlite3.O_CREATE | sqlite3.O_READWRITE);
+    const stmt = db.prepare('SELECT ? AS first, ? AS second');
+    const params = [1, 2];
+    Object.defineProperty(params, 1, {
+        get() {
+            stmt.finalize();
+            return 2;
+        },
+    });
+
+    assertThrows(() => stmt.bind(params), 'finalized');
+    db.close();
+});
+
+await test('sqlite3.Statement.all - object getter can finalize during binding', () => {
+    const db = sqlite3.open(':memory:', sqlite3.O_CREATE | sqlite3.O_READWRITE);
+    const stmt = db.prepare('SELECT :first AS first, :second AS second');
+    const params = {
+        ':first': 1,
+        get ':second'() {
+            stmt.finalize();
+            return 2;
+        },
+    };
+
+    assertThrows(() => stmt.all(params), 'finalized');
     db.close();
 });
 
