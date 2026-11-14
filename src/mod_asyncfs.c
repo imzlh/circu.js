@@ -1260,28 +1260,46 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
     uv_file fd;
 
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+
+    /* Path conversion and the capability hook can re-enter and reuse fd's
+     * numeric slot. Keep the original file description alive throughout. */
+    TJSPinnedFd pin = TJS_PinFd(fd);
+    if (pin.error)
+        return tjs_throw_errno(ctx, uv_translate_sys_error(pin.error));
+
     if (argc > 1 && !JS_IsUndefined(argv[1])) {
         path = JS_ToCString(ctx, argv[1]);
-        if (!path) return JS_EXCEPTION;
+        if (!path) {
+            TJS_UnpinFd(&pin);
+            return JS_EXCEPTION;
+        }
     }
 
-    /* Gate before the fstat probe: a rejecting hook must not observe or allow
-     * any syscall on the fd, matching the order of every other asyncfs entry. */
-    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.createFrom", path), if (path) JS_FreeCString(ctx, path));
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.createFrom", path), (TJS_UnpinFd(&pin), path ? JS_FreeCString(ctx, path) : (void)0));
 
     uv_fs_t req;
-    int r = uv_fs_fstat(NULL, &req, fd, NULL);
+    int r = uv_fs_fstat(NULL, &req, pin.fd, NULL);
     uv_fs_req_cleanup(&req);
     if (r < 0) {
+        TJS_UnpinFd(&pin);
         if (path) JS_FreeCString(ctx, path);
         return tjs_throw_errno(ctx, r);
     }
 
-    /* Ownership transfers only after the wrapper exists. On exception the
-     * caller still owns fd and is responsible for closing it. */
-    JSValue obj = tjs_new_file(ctx, fd, path);
+    /* The wrapper always owns the duplicate and never the caller's numeric
+     * descriptor. Besides making createFrom borrowed by construction, this
+     * avoids an unavoidable compare/use race if another thread closes and
+     * reuses fd after any attempted identity check. */
+    JSValue obj = tjs_new_file(ctx, pin.fd, path);
 
     if (path) JS_FreeCString(ctx, path);
+
+    if (JS_IsException(obj)) {
+        TJS_UnpinFd(&pin);
+        return obj;
+    }
+
+    pin.owned = false;
 
     return obj;
 }

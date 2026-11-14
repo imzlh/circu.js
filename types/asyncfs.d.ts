@@ -282,5 +282,11 @@ declare namespace CModuleAsyncFS {
      * @internal
      * @param path - (Only used for FileHandle.path) mark up fd path
      */
+    /**
+     * Create a file handle from a duplicate of `fd`.
+     *
+     * The caller retains ownership of `fd`; closing the returned handle never
+     * closes the descriptor passed here.
+     */
     export function createFrom(fd: number, path?: string): FileHandle;
 }

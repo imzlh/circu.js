@@ -34,8 +34,13 @@ await test('asyncfs.createFrom accepts an omitted path', async () => {
     const fd = fs.open(TEST_FILE, 'r');
     const file = asyncfs.createFrom(fd);
     assertEquals(file.path, undefined);
-    assertEquals(file.fileno(), fd);
+    assert(file.fileno() !== fd, 'createFrom should wrap a duplicate descriptor');
     await file.close();
+    try {
+        fs.fstat(fd);
+    } finally {
+        fs.close(fd);
+    }
 });
 
 await test('asyncfs.createFrom retains fd ownership when construction fails', async () => {
