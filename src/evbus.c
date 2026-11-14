@@ -27,7 +27,7 @@
 
 #include <stdint.h>
 
-#define TJS_RUNTIME_EVENT_NAMESPACE "circu.runtime"
+#define TJS_RUNTIME_EVENT_NAMESPACE "core"
 #define TJS_RUNTIME_EVENT_NAME "event"
 
 typedef struct TJSEvBusValue {

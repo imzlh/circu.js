@@ -1080,7 +1080,7 @@ class CJSRepl {
 }
 
 // Keep the REPL alive after asynchronous errors.
-evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, ({ name }) =>
+evbus.on<CModuleEvBus.RuntimeEvent>(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, ({ name }) =>
     name === engine.EventType.JOB_EXCEPTION ? true : false,
     -100,
 );

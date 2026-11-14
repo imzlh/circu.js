@@ -12,7 +12,7 @@
  */
 declare namespace CModuleEvBus {
     /** Native runtime events are published under this namespace and event. */
-    export const RUNTIME_NAMESPACE: "circu.runtime";
+    export const RUNTIME_NAMESPACE: "core";
     export const RUNTIME_EVENT: "event";
 
     export interface RuntimeEventContext {
