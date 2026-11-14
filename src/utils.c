@@ -551,7 +551,7 @@ JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size) {
     return array;
 }
 
-const char *tjs_signal_map[] = {
+static const char *const tjs_signal_map[] = {
 #ifdef SIGHUP
     [SIGHUP] = "SIGHUP",
 #endif
@@ -656,25 +656,45 @@ const char *tjs_signal_map[] = {
 #endif
 };
 
-size_t tjs_signal_map_count = ARRAY_SIZE(tjs_signal_map);
+JSValue TJS_NewSignalEnum(JSContext *ctx) {
+    JSValue signals = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(signals)) return signals;
 
-const char *tjs_getsig(int sig) {
-    if (sig < 0 || sig >= tjs_signal_map_count || !tjs_signal_map[sig]) {
-        return NULL;
-    }
-
-    return tjs_signal_map[sig];
-}
-
-int tjs_getsignum(const char *sig_str) {
-    for (int i = 0; i < tjs_signal_map_count; i++) {
-        const char *s = tjs_signal_map[i];
-        if (s && strcmp(sig_str, s) == 0) {
-            return i;
+    for (size_t i = 0; i < ARRAY_SIZE(tjs_signal_map); i++) {
+        const char *name = tjs_signal_map[i];
+        if (name && JS_SetPropertyStr(ctx, signals, name, JS_NewInt32(ctx, (int32_t)i)) < 0) {
+            JS_FreeValue(ctx, signals);
+            return JS_EXCEPTION;
         }
     }
 
-    return -1;
+    return signals;
+}
+
+int TJS_ToSignal(JSContext *ctx, JSValueConst value, int default_signal) {
+    if (JS_IsUndefined(value)) {
+        if (default_signal >= 0) return default_signal;
+        JS_ThrowTypeError(ctx, "signal must be a number from signals.signals");
+        return -1;
+    }
+    if (!JS_IsNumber(value)) {
+        JS_ThrowTypeError(ctx, "signal must be a number from signals.signals");
+        return -1;
+    }
+
+    double number;
+    int32_t signal;
+    if (JS_ToFloat64(ctx, &number, value) < 0 || JS_ToInt32(ctx, &signal, value) < 0) return -1;
+    if (number != (double)signal || signal < 0) {
+        JS_ThrowRangeError(ctx, "invalid signal number");
+        return -1;
+    }
+
+    if ((size_t)signal >= ARRAY_SIZE(tjs_signal_map) || !tjs_signal_map[signal]) {
+        JS_ThrowRangeError(ctx, "unknown signal number: %d", signal);
+        return -1;
+    }
+    return signal;
 }
 
 void tjs_dbuf_init(JSContext *ctx, DynBuf *s) {

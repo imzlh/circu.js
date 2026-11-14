@@ -23,6 +23,7 @@
  */
 
 #include "mem.h"
+#include "capability.h"
 #include "private.h"
 #include "utils.h"
 
@@ -87,19 +88,22 @@ static void uv__signal_cb(uv_signal_t *handle, int sig_num) {
 }
 
 static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (TJS_GetRuntime(ctx)->is_worker) {
+        return JS_ThrowTypeError(ctx, "signal() is unavailable inside a worker");
+    }
     if (argc < 2) {
         return JS_ThrowTypeError(ctx, "signal(number, callback) requires two arguments");
     }
 
-    int32_t sig_num;
-    if (JS_ToInt32(ctx, &sig_num, argv[0])) {
-        return JS_EXCEPTION;
-    }
+    int sig_num = TJS_ToSignal(ctx, argv[0], -1);
+    if (sig_num < 0) return JS_EXCEPTION;
 
     JSValue func = argv[1];
     if (!JS_IsFunction(ctx, func)) {
         return JS_ThrowTypeError(ctx, "not a function");
     }
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_WATCH, TJS_CAP_FLAG_REPLACEABLE, "signals.watch"), (void)0);
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_signal_handler_class_id);
     if (JS_IsException(obj)) {
@@ -160,7 +164,7 @@ static JSValue tjs_signal_handler_signal_get(JSContext *ctx, JSValue this_val) {
     if (!sh) {
         return JS_EXCEPTION;
     }
-    return sh->sig_num == 0 ? JS_NULL : JS_NewString(ctx, tjs_getsig(sh->sig_num));
+    return JS_NewInt32(ctx, sh->sig_num);
 }
 
 static const JSCFunctionListEntry tjs_signal_handler_proto_funcs[] = {
@@ -182,13 +186,7 @@ void tjs__mod_signals_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, proto, tjs_signal_handler_proto_funcs, countof(tjs_signal_handler_proto_funcs));
     JS_SetClassProto(ctx, tjs_signal_handler_class_id, proto);
 
-    JSValue signals = JS_NewObjectProto(ctx, JS_NULL);
-    for (int i = 0; i < tjs_signal_map_count; i++) {
-        const char *signame = tjs_signal_map[i];
-        if (signame) {
-            JS_SetPropertyStr(ctx, signals, signame, JS_NewInt32(ctx, i));
-        }
-    }
+    JSValue signals = TJS_NewSignalEnum(ctx);
     JS_SetPropertyStr(ctx, ns, "signals", signals);
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_signal_funcs, countof(tjs_signal_funcs));

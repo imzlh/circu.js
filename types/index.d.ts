@@ -14,6 +14,7 @@ interface TjsModules {
     bjson: typeof CModuleBJSON,
     os: typeof CModuleOS,
     process: typeof CModuleProcess,
+    signals: typeof CModuleSignals,
     sqlite3: typeof CModuleSQLite3,
     streams: typeof CModuleStreams,
     timers: typeof CModuleTimers,
@@ -37,7 +38,6 @@ interface TJSOptionalModules {
     'brotli': typeof CModuleBrotli,
     'wasm': typeof CModuleWASM,
     'win32': typeof CModuleWin32,
-    'signals': typeof CModuleSignals,
     'nodeapi': typeof CModuleNodeApi,
 }
 
@@ -54,8 +54,8 @@ interface UseFN {
      * Load an optional or context-limited built-in module by name.
      * Returns `null` when the current build or platform does not provide it.
      * Also returns `null` in workers for modules marked not worker-safe by the
-     * native module table, such as `signals`, `nodeapi`, and `wasm`.
-     * @param name The name of the module to load (e.g. "wasm" or "signals")
+     * native module table, such as `nodeapi` and `wasm`.
+     * @param name The name of the module to load (e.g. "wasm" or "nodeapi")
      * @returns The corresponding module object or null if module not found
      */
     <K extends keyof TJSOptionalModules>(name: K): TJSOptionalModules[K] | null;

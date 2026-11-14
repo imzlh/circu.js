@@ -16,18 +16,6 @@ declare namespace CModuleProcess {
     export type StdioOption = 'inherit' | 'pipe' | 'ignore' | number;
 
     /**
-     * Process signals
-     */
-    export type Signal =
-        | 'SIGHUP' | 'SIGINT' | 'SIGQUIT' | 'SIGILL' | 'SIGTRAP'
-        | 'SIGABRT' | 'SIGBUS' | 'SIGFPE' | 'SIGKILL' | 'SIGUSR1'
-        | 'SIGSEGV' | 'SIGUSR2' | 'SIGPIPE' | 'SIGALRM' | 'SIGTERM'
-        | 'SIGSTKFLT' | 'SIGCHLD' | 'SIGCONT' | 'SIGSTOP' | 'SIGTSTP'
-        | 'SIGBREAK' | 'SIGTTIN' | 'SIGTTOU' | 'SIGURG' | 'SIGXCPU'
-        | 'SIGXFSZ' | 'SIGVTALRM' | 'SIGPROF' | 'SIGWINCH' | 'SIGPOLL'
-        | 'SIGLOST' | 'SIGPWR' | 'SIGINFO' | 'SIGSYS';
-
-    /**
      * Spawn options
      */
     export interface SpawnOptions<T extends boolean = false> {
@@ -84,7 +72,7 @@ declare namespace CModuleProcess {
         stdout: ArrayBuffer | null;
         stderr: ArrayBuffer | null;
         status: number | null;
-        signal: string | null;
+        signal: CModuleSignals.Signal | null;
         resourceUsage: ResourceUsage;
         error?: Error;
     }
@@ -105,7 +93,7 @@ declare namespace CModuleProcess {
      */
     export interface ExitInfo {
         exit_status: number;
-        term_signal: string | null;
+        term_signal: CModuleSignals.Signal | null;
     }
 
     /**
@@ -164,9 +152,9 @@ declare namespace CModuleProcess {
 
         /**
          * Send signal to process
-         * @param signal Signal to send (default SIGTERM, can be string or number)
+         * @param signal Signal number from `signals.signals` (default SIGTERM)
          */
-        kill(signal?: Signal | number): void;
+        kill(signal?: CModuleSignals.Signal): void;
 
         /**
          * Resize PTY window (PTY mode only)
@@ -201,7 +189,7 @@ declare namespace CModuleProcess {
         /** Block until the forked child exits. */
         waitSync(): ExitInfo;
         /** Send a signal to the forked child. */
-        kill(signal?: Signal | number): void;
+        kill(signal?: CModuleSignals.Signal): void;
     }
 
     /**
@@ -246,7 +234,13 @@ declare namespace CModuleProcess {
     /**
      * Send signal to specified process
      * @param pid Process ID
-     * @param signal Signal (string or number, default SIGTERM)
+     * @param signal Signal number from `signals.signals` (default SIGTERM)
      */
-    export function kill(pid: number, signal?: Signal | number): void;
+    export function kill(pid: number, signal?: CModuleSignals.Signal): void;
+
+    /**
+     * Test whether a process or POSIX process group exists without sending a signal.
+     * A permissions error still counts as alive.
+     */
+    export function isAlive(pid: number): boolean;
 }

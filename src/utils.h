@@ -141,10 +141,9 @@ JSValue TJS_NewRejectedPromise(JSContext *ctx, int argc, JSValue *argv);
 /* Consumes js_malloc'd data on success and failure. */
 JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size);
 
-extern const char *tjs_signal_map[];
-extern size_t tjs_signal_map_count;
-const char *tjs_getsig(int sig);
-int tjs_getsignum(const char *sig_str);
+/* Signal enum shared by the signals and process modules. */
+JSValue TJS_NewSignalEnum(JSContext *ctx);
+int TJS_ToSignal(JSContext *ctx, JSValueConst value, int default_signal);
 
 #define TJS_THROW_ARG_ERR(ctx, argno, expected)                                                                        \
     JS_ThrowTypeError(ctx, "expected argument %d to be %s", argno + 1, expected)

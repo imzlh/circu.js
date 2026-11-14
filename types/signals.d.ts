@@ -1,10 +1,15 @@
 /**
  * POSIX/libuv signal handling.
  *
- * `signals` is not worker-safe; `import.meta.use('signals')` returns `null`
- * inside workers.
+ * Workers can read `signals`, but cannot register a process-level handler with
+ * `signal()`.
  */
 declare namespace CModuleSignals {
+    const signalBrand: unique symbol;
+
+    /** A native signal number obtained from `signals.*`. */
+    export type Signal = number & { readonly [signalBrand]: never };
+
     export interface SignalHandler {
         /**
          * Stop monitoring this signal. Calling `close()` more than once is safe.
@@ -12,9 +17,9 @@ declare namespace CModuleSignals {
         close(): void;
 
         /**
-         * Signal name for this handler, or `null` when the number is unknown.
+         * Signal number monitored by this handler.
          */
-        readonly signal: string | null;
+        readonly signal: Signal;
 
         readonly [Symbol.toStringTag]: "Signal Handler";
     }
@@ -27,56 +32,56 @@ declare namespace CModuleSignals {
      * also be present.
      */
     export const signals: {
-        readonly SIGHUP: number;
-        readonly SIGINT: number;
-        readonly SIGQUIT: number;
-        readonly SIGILL: number;
-        readonly SIGTRAP: number;
-        readonly SIGABRT: number;
-        readonly SIGBUS: number;
-        readonly SIGFPE: number;
-        readonly SIGKILL: number;
-        readonly SIGUSR1: number;
-        readonly SIGSEGV: number;
-        readonly SIGUSR2: number;
-        readonly SIGPIPE: number;
-        readonly SIGALRM: number;
-        readonly SIGTERM: number;
-        readonly SIGCHLD: number;
-        readonly SIGCONT: number;
-        readonly SIGSTOP: number;
-        readonly SIGTSTP: number;
-        readonly SIGTTIN: number;
-        readonly SIGTTOU: number;
-        readonly SIGURG: number;
-        readonly SIGXCPU: number;
-        readonly SIGXFSZ: number;
-        readonly SIGVTALRM: number;
-        readonly SIGPROF: number;
-        readonly SIGWINCH: number;
-        readonly SIGPWR: number;
-        readonly SIGSYS: number;
-        readonly SIGBREAK?: number;
-        readonly SIGSTKFLT?: number;
-        readonly SIGPOLL?: number;
-        readonly SIGLOST?: number;
-        readonly SIGINFO?: number;
-        readonly [name: string]: number | undefined;
+        readonly SIGHUP: Signal;
+        readonly SIGINT: Signal;
+        readonly SIGQUIT: Signal;
+        readonly SIGILL: Signal;
+        readonly SIGTRAP: Signal;
+        readonly SIGABRT: Signal;
+        readonly SIGBUS: Signal;
+        readonly SIGFPE: Signal;
+        readonly SIGKILL: Signal;
+        readonly SIGUSR1: Signal;
+        readonly SIGSEGV: Signal;
+        readonly SIGUSR2: Signal;
+        readonly SIGPIPE: Signal;
+        readonly SIGALRM: Signal;
+        readonly SIGTERM: Signal;
+        readonly SIGCHLD: Signal;
+        readonly SIGCONT: Signal;
+        readonly SIGSTOP: Signal;
+        readonly SIGTSTP: Signal;
+        readonly SIGTTIN: Signal;
+        readonly SIGTTOU: Signal;
+        readonly SIGURG: Signal;
+        readonly SIGXCPU: Signal;
+        readonly SIGXFSZ: Signal;
+        readonly SIGVTALRM: Signal;
+        readonly SIGPROF: Signal;
+        readonly SIGWINCH: Signal;
+        readonly SIGPWR: Signal;
+        readonly SIGSYS: Signal;
+        readonly SIGBREAK?: Signal;
+        readonly SIGSTKFLT?: Signal;
+        readonly SIGPOLL?: Signal;
+        readonly SIGLOST?: Signal;
+        readonly SIGINFO?: Signal;
+        readonly [name: string]: Signal | undefined;
     };
 
     /**
      * Register a callback for a signal number.
+     *
+     * @throws {TypeError} When called inside a worker.
      *
      * The native handle is immediately `uv_unref()`'d, so it does not keep the
      * runtime alive by itself.
      *
      * @example
      * const signalsMod = import.meta.use('signals');
-     * if (!signalsMod) throw new Error('signals are unavailable in workers');
-     *
      * const sigint = signalsMod.signal(signalsMod.signals.SIGINT, () => {
      *   sigint.close();
      * });
      */
-    export function signal(sigNum: number, handler: () => void): SignalHandler;
+    export function signal(sigNum: Signal, handler: () => void): SignalHandler;
 }

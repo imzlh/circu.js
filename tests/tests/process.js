@@ -1,6 +1,7 @@
 // tests/tests/process.js - Process management module tests
 
 const proc = import.meta.use('process');
+const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
@@ -8,6 +9,17 @@ const worker = import.meta.use('worker');
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 
 if (worker.isWorker && worker.workerData?.type === 'processForkProbe') {
+    assert(signals !== null, 'workers should be able to load signal numbers');
+    assertEquals(typeof signals.signals.SIGTERM, 'number',
+        'worker signal enum values should be numbers');
+    try {
+        signals.signal(signals.signals.SIGTERM, () => {});
+        assert(false, 'workers should not register process-level signal handlers');
+    } catch (cause) {
+        assert(cause instanceof TypeError,
+            'worker signal handler registration should throw TypeError');
+    }
+
     let error = null;
     try {
         proc.fork();
@@ -90,9 +102,10 @@ if (os.platform === 'linux') {
             return;
         }
 
-        first.kill('SIGTERM');
+        first.kill(signals.signals.SIGTERM);
         const [firstStatus, secondStatus] = await Promise.all([first.wait(), second.wait()]);
-        assertEquals(firstStatus.term_signal, 'SIGTERM', 'parent should still own first child');
+        assertEquals(firstStatus.term_signal, signals.signals.SIGTERM,
+            'parent should still own first child');
         assertEquals(secondStatus.exit_status, 41,
             'later child should reject the inherited parent-only wait promise');
     });
@@ -116,7 +129,7 @@ if (os.platform === 'linux') {
             return;
         }
 
-        child.kill('SIGTERM');
+        child.kill(signals.signals.SIGTERM);
         const status = await child.wait();
         assert(status.exit_status !== 0 || status.term_signal !== null,
             'forked child should be terminated by SIGTERM');
@@ -181,7 +194,7 @@ if (os.platform === 'linux') {
             assert(String(error.message ?? error).includes('process handle'),
                 'fork error should explain the active process restriction');
         } finally {
-            runningChild.kill('SIGKILL');
+            runningChild.kill(signals.signals.SIGKILL);
             await runningChild.wait();
         }
     });
@@ -203,7 +216,7 @@ if (os.platform === 'linux') {
             assert(String(error.message ?? error).includes('process handle'),
                 'fork error should explain the active PTY restriction');
         } finally {
-            runningChild.kill('SIGKILL');
+            runningChild.kill(signals.signals.SIGKILL);
             await runningChild.wait();
         }
     });
@@ -389,7 +402,7 @@ await test('proc.kill - kill process with signal', async () => {
     // Small delay to ensure process started
     await new Promise(r => setTimeout(r, 100));
     
-    child.kill('SIGTERM');
+    child.kill(signals.signals.SIGTERM);
     
     const status = await child.wait();
     // Exit code for SIGTERM is usually 128 + 15 = 143
@@ -424,7 +437,7 @@ await test('proc.kill - kill by PID', async () => {
     await new Promise(r => setTimeout(r, 100));
     
     // Kill using global kill function
-    proc.kill(child.pid, 'SIGTERM');
+    proc.kill(child.pid, signals.signals.SIGTERM);
     
     const status = await child.wait();
     assert(status.exit_status !== 0 || status.term_signal !== null, 'Process should be terminated');
@@ -485,14 +498,14 @@ await test('proc.kill - invalid PID', () => {
     }
 });
 
-await test('proc.kill - invalid signal', async () => {
+await test('proc.kill - rejects string signals', async () => {
     const child = proc.spawn(['echo', 'test']);
     
     try {
-        child.kill('INVALID_SIGNAL');
-        assert(false, 'Should throw for invalid signal');
+        child.kill('SIGTERM');
+        assert(false, 'Should reject string signals');
     } catch (e) {
-        assert(e instanceof Error, 'Should throw Error');
+        assert(e instanceof TypeError, 'Should throw TypeError');
     }
     
     await child.wait();
