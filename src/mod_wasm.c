@@ -159,7 +159,6 @@ typedef struct TJSWasmImportGroup {
     NativeSymbol *symbols;
     uint32_t count;
     TJSWasmImportCtx *ctxs;
-    bool registered;
     struct TJSWasmImportGroup *next;
 } TJSWasmImportGroup;
 
@@ -167,8 +166,6 @@ static void tjs__wasm_free_import_groups(JSRuntime *rt,
                                          TJSWasmImportGroup *group) {
     while (group) {
         TJSWasmImportGroup *next = group->next;
-        if (group->registered)
-            wasm_runtime_unregister_natives(group->module_name, group->symbols);
         for (uint32_t index = 0; index < group->count; index++) {
             if (group->ctxs)
                 JS_FreeValueRT(rt, group->ctxs[index].func);
@@ -270,8 +267,7 @@ static thread_local TJSWasmExternRefBox *tjs__wasm_live_externrefs;
 /* Forward declarations — used by the import trampoline before their definition. */
 static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     TJSWasmInstance *inst, wasm_memory_inst_t memory);
-static void tjs__wasm_invalidate_memory(TJSWasmInstance *inst,
-                                        wasm_memory_inst_t memory);
+static void tjs__wasm_invalidate_memory(wasm_memory_inst_t memory);
 static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem);
 static wasm_valkind_t tjs__wasm_func_type_get_result_valkind_safe(WASMFuncType *func_type, uint32_t result_index);
 
@@ -683,6 +679,18 @@ static int tjs__wasm_record_extern_import(JSContext *ctx, TJSWasmModule *m,
         JS_FreeValue(ctx, source_index_value);
     }
     else if (source_is_import) {
+        if (kind == WASM_IMPORT_EXPORT_KIND_FUNC) {
+            /* WAMR resolves function aliases only through a live source
+             * instance; an import-alias binding fails instantiate, so reject
+             * it here instead of letting the failure surface later. */
+            JS_FreeValue(ctx, provider);
+            JS_FreeValue(ctx, owner);
+            JS_FreeValue(ctx, source_import_value);
+            tjs_throw_wasm_error(
+                ctx, "LinkError",
+                "function imports cannot alias sourceImportIndex; provide a live provider");
+            return -1;
+        }
         if (JS_ToUint32(ctx, &source_index, source_import_value)) {
             JS_FreeValue(ctx, provider);
             JS_FreeValue(ctx, owner);
@@ -1045,7 +1053,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
             tjs__tramp_mem_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
             if (tjs__tramp_mem_base != tjs__tramp_cache->base
                 || tjs__tramp_mem_len != tjs__tramp_cache->byte_length)
-                tjs__wasm_invalidate_memory(active_inst, tjs__tramp_mem);
+                tjs__wasm_invalidate_memory(tjs__tramp_mem);
         }
     }
 
@@ -1062,7 +1070,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
         void *tjs__after_base = wasm_memory_get_base_address(tjs__tramp_mem);
         size_t tjs__after_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
         if (tjs__after_base != tjs__tramp_mem_base || tjs__after_len != tjs__tramp_mem_len)
-            tjs__wasm_invalidate_memory(active_inst, tjs__tramp_mem);
+            tjs__wasm_invalidate_memory(tjs__tramp_mem);
     }
 
     for (uint32_t i = 0; i < param_count; i++) {
@@ -1395,7 +1403,9 @@ static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem) {
  * WAMR may move the linear-memory base when it grows (explicit growMemory or
  * an internal memory.grow during a call), leaving any previously exposed
  * ArrayBuffer pointing at freed/moved memory. Detaching makes stale access
- * throw a clean "detached ArrayBuffer" error instead of corrupting memory. */
+ * throw a clean "detached ArrayBuffer" error instead of corrupting memory.
+ * The scan covers every live instance on purpose: the same imported memory
+ * can be shared by many instances, and all of their cached views go stale. */
 static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     TJSWasmInstance *inst, wasm_memory_inst_t memory) {
     for (TJSWasmMemoryBuffer *cache = inst->memory_buffers; cache;
@@ -1406,9 +1416,7 @@ static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     return NULL;
 }
 
-static void tjs__wasm_invalidate_memory(TJSWasmInstance *inst,
-                                        wasm_memory_inst_t memory) {
-    (void)inst;
+static void tjs__wasm_invalidate_memory(wasm_memory_inst_t memory) {
     for (TJSWasmInstance *candidate = tjs__wasm_live_instances; candidate;
          candidate = candidate->live_next) {
         TJSWasmMemoryBuffer *cache =
@@ -1545,7 +1553,7 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         void *tjs__mem_base_after = tjs__mem ? wasm_memory_get_base_address(tjs__mem) : NULL;
         size_t tjs__mem_len_after = tjs__mem ? tjs__wasm_mem_byte_length(tjs__mem) : 0;
         if (tjs__mem_base_after != tjs__mem_base_before || tjs__mem_len_after != tjs__mem_len_before)
-            tjs__wasm_invalidate_memory(inst, tjs__mem);
+            tjs__wasm_invalidate_memory(tjs__mem);
     }
 
     wasm_valkind_t result_types[TJS__WASM_MAX_ARGS];
@@ -3239,7 +3247,7 @@ static JSValue tjs__wasm_memory_buffer(JSContext *ctx, TJSWasmInstance *i,
             return JS_EXCEPTION;
         if (!stale)
             return JS_DupValue(ctx, cache->buffer);
-        tjs__wasm_invalidate_memory(i, mem);
+        tjs__wasm_invalidate_memory(mem);
     }
     if (!cache) {
         cache = js_mallocz(ctx, sizeof(*cache));
@@ -3312,7 +3320,7 @@ static JSValue tjs_wasm_growmemory(JSContext *ctx, JSValue this_val, int argc, J
     }
 
     /* Base may have moved; invalidate any previously exposed buffer. */
-    tjs__wasm_invalidate_memory(i, mem);
+    tjs__wasm_invalidate_memory(mem);
 
     return JS_NewUint32(ctx, (uint32_t) old_pages);
 }
@@ -3331,7 +3339,7 @@ static JSValue tjs_wasm_growmemoryat(JSContext *ctx, JSValue this_val,
     if (delta && !wasm_memory_enlarge(memory, delta))
         return JS_ThrowRangeError(ctx, "failed to grow memory");
     if (delta)
-        tjs__wasm_invalidate_memory(i, memory);
+        tjs__wasm_invalidate_memory(memory);
     return JS_NewUint32(ctx, (uint32_t)old_pages);
 }
 
@@ -4260,9 +4268,15 @@ static JSValue tjs_wasm_runtimeinfo(JSContext *ctx, JSValue this_val, int argc,
         || JS_DefinePropertyValueStr(ctx, info, "minor",
                                      JS_NewUint32(ctx, minor), JS_PROP_C_W_E) < 0
         || JS_DefinePropertyValueStr(ctx, info, "patch",
-                                     JS_NewUint32(ctx, patch), JS_PROP_C_W_E) < 0
-        || JS_DefinePropertyValueStr(ctx, info, "runningModes", modes,
+                                     JS_NewUint32(ctx, patch),
                                      JS_PROP_C_W_E) < 0) {
+        /* `modes` has not been consumed by a define yet on this path. */
+        JS_FreeValue(ctx, info);
+        JS_FreeValue(ctx, modes);
+        return JS_EXCEPTION;
+    }
+    if (JS_DefinePropertyValueStr(ctx, info, "runningModes", modes,
+                                  JS_PROP_C_W_E) < 0) {
         JS_FreeValue(ctx, info);
         return JS_EXCEPTION;
     }
@@ -4458,7 +4472,7 @@ static JSValue tjs_wasm_instance_malloc_method(JSContext *ctx,
     if (after != before
         || (after && (wasm_memory_get_base_address(after) != before_base
                       || tjs__wasm_mem_byte_length(after) != before_length)))
-        tjs__wasm_invalidate_memory(i, before ? before : after);
+        tjs__wasm_invalidate_memory(before ? before : after);
     if (!offset)
         return JS_ThrowOutOfMemory(ctx);
     return JS_NewUint64(ctx, offset);
@@ -4502,7 +4516,7 @@ static JSValue tjs_wasm_instance_dupdata_method(JSContext *ctx,
     if (after != before
         || (after && (wasm_memory_get_base_address(after) != before_base
                       || tjs__wasm_mem_byte_length(after) != before_length)))
-        tjs__wasm_invalidate_memory(i, before ? before : after);
+        tjs__wasm_invalidate_memory(before ? before : after);
     if (!offset)
         return JS_ThrowOutOfMemory(ctx);
     return JS_NewUint64(ctx, offset);

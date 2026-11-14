@@ -3,7 +3,7 @@ const fs = import.meta.use('fs');
 const ffi = import.meta.use('ffi');
 
 function bytes() {
-    const path = fs.exists('wasm.wasm') ? 'wasm.wasm' : 'tests/wasm.wasm';
+    const path = fs.exists('native/wasm.wasm') ? 'native/wasm.wasm' : 'tests/native/wasm.wasm';
     return fs.readFile(path);
 }
 
