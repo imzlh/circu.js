@@ -28,6 +28,7 @@
 #include "utils.h"
 #include "capability.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wasm_export.h>
@@ -203,10 +204,10 @@ static thread_local JSClassID tjs_wasm_instance_class_id;
 static bool tjs__wasm_is_bytecode_module(wasm_module_t module);
 
 struct TJSWasmInstance {
-    /* The creating context is needed to detach externally-held memory
-     * ArrayBuffers during finalization. JS_GetRuntimeOpaque() returns a
-     * TJSRuntime, not a JSContext. */
-    JSContext *ctx;
+    /* Runtime identity is enough for finalizer-safe ArrayBuffer detachment and
+     * does not form the Instance -> Context -> Instance retention cycle that a
+     * duplicated JSContext reference would. */
+    JSRuntime *rt;
     wasm_module_inst_t module_inst;
     wasm_exec_env_t exec_env;
     /* Keep the loaded module alive for at least as long as the instance. */
@@ -216,9 +217,9 @@ struct TJSWasmInstance {
     JSValue weak_self;
     bool has_pending_exception;
     JSValue pending_exception;
-    /* The active provider module on which the trampoline installed the WAMR
-     * trap. It can differ from this (outer caller) instance's module. */
-    wasm_module_inst_t pending_exception_module;
+    /* WAMR copies this trap token through every provider frame; exact matches
+     * let the outer JS call clear all copies without touching other errors. */
+    char pending_exception_token[64];
     /* externref: JSValues boxed for WAMR's externref map */
     TJSWasmExternRefBox **externrefs;
     uint32_t externref_count;
@@ -233,9 +234,8 @@ struct TJSWasmInstance {
      * instance owns distinct attachments and keep-alives. */
     TJSWasmImportCtx *function_imports;
     uint32_t function_import_count;
-    /* Configuration created by instantiate({ functions }). Its strings and
-     * duplicate JS values remain alive because WAMR keeps signature pointers
-     * for the lifetime of the instance. */
+    /* Kept alive: WAMR retains these signature pointers for the instance's
+     * lifetime. */
     TJSWasmImportGroup *owned_function_groups;
     TJSWasmExternImport *owned_function_externs;
     uint32_t owned_function_extern_count;
@@ -263,22 +263,54 @@ struct TJSWasmExternRefBox {
 
 static thread_local TJSWasmInstance *tjs__wasm_live_instances;
 static thread_local TJSWasmExternRefBox *tjs__wasm_live_externrefs;
+static _Atomic uint64_t tjs__wasm_exception_serial = 1;
+
+static void tjs__wasm_new_exception_token(char *token, size_t token_size) {
+    uint64_t random_part = 0;
+    uint64_t serial = atomic_fetch_add_explicit(
+        &tjs__wasm_exception_serial, 1, memory_order_relaxed);
+    if (uv_random(NULL, NULL, &random_part, sizeof(random_part), 0, NULL) != 0)
+        random_part = serial ^ (uint64_t)(uintptr_t)token;
+    snprintf(token, token_size, "circu-js-import-%016llx-%016llx",
+             (unsigned long long)random_part, (unsigned long long)serial);
+}
+
+/* WAMR copies the raw exception buffer into every caller instance; remove
+ * only exact matches. The live list is thread-local: calls are synchronous. */
+static void tjs__wasm_clear_pending_exception_traps(TJSWasmInstance *inst) {
+    if (!inst || !inst->pending_exception_token[0])
+        return;
+
+    char expected[EXCEPTION_BUF_LEN];
+    snprintf(expected, sizeof(expected), "Exception: %s",
+             inst->pending_exception_token);
+    for (TJSWasmInstance *candidate = tjs__wasm_live_instances; candidate;
+         candidate = candidate->live_next) {
+        if (!candidate->module_inst
+            || !tjs__wasm_is_bytecode_module(
+                wasm_runtime_get_module(candidate->module_inst)))
+            continue;
+        char actual[EXCEPTION_BUF_LEN];
+        if (wasm_copy_exception(
+                (WASMModuleInstance *)candidate->module_inst, actual)
+            && !strcmp(actual, expected))
+            wasm_runtime_clear_exception(candidate->module_inst);
+    }
+    inst->pending_exception_token[0] = '\0';
+}
 
 /* Forward declarations — used by the import trampoline before their definition. */
 static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     TJSWasmInstance *inst, wasm_memory_inst_t memory);
-static void tjs__wasm_invalidate_memory(wasm_memory_inst_t memory);
+static void tjs__wasm_invalidate_memory(JSRuntime *rt,
+                                        wasm_memory_inst_t memory);
 static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem);
 static wasm_valkind_t tjs__wasm_func_type_get_result_valkind_safe(WASMFuncType *func_type, uint32_t result_index);
 
-/* WAMR-backed ArrayBuffers are marked pin-unsupported before JS can observe
- * them. A failed detach therefore means that invariant was broken after WAMR
- * may already have moved its memory. Continuing would expose a dangling
- * pointer, so clear the diagnostic and terminate instead of returning to JS. */
-static void tjs__wasm_detach_membuf(JSContext *ctx, JSValueConst buffer) {
-    if (JS_DetachArrayBuffer(ctx, buffer) < 0) {
-        JSValue exception = JS_GetException(ctx);
-        JS_FreeValue(ctx, exception);
+/* A failed detach means WAMR moved its memory; continuing would hand JS a
+ * dangling pointer, so drop the diagnostic and abort. */
+static void tjs__wasm_detach_membuf(JSRuntime *rt, JSValueConst buffer) {
+    if (JS_DetachArrayBufferRT(rt, buffer) < 0) {
         abort();
     }
 }
@@ -299,12 +331,11 @@ static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
          * the buffer is held externally beyond instance lifetime. */
         for (TJSWasmMemoryBuffer *cache = i->memory_buffers; cache;
              cache = cache->next) {
-            if (!JS_IsUndefined(cache->buffer) && i->ctx)
-                tjs__wasm_detach_membuf(i->ctx, cache->buffer);
+            if (!JS_IsUndefined(cache->buffer))
+                tjs__wasm_detach_membuf(rt, cache->buffer);
         }
-        /* WAMR owns mapped boxes through their cleanup callback. Detaching the
-         * weak creator pointer before deinstantiate lets a Table-retained box
-         * outlive this Instance without leaving a dangling owner pointer. */
+        /* Null the weak creator pointer before deinstantiate so Table-retained
+         * boxes outlive this Instance without a dangling owner. */
         for (uint32_t j = 0; j < i->externref_count; j++)
             if (i->externrefs[j])
                 i->externrefs[j]->owner = NULL;
@@ -336,8 +367,6 @@ static void tjs_wasm_instance_finalizer(JSRuntime *rt, JSValue val) {
         js_free_rt(rt, i->owned_function_externs);
         if (i->has_pending_exception)
             JS_FreeValueRT(rt, i->pending_exception);
-        if (i->ctx)
-            JS_FreeContext(i->ctx);
         js_free_rt(rt, i);
     }
 }
@@ -348,10 +377,8 @@ static void tjs_wasm_instance_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark
         if (i->has_pending_exception) {
             JS_MarkValue(rt, i->pending_exception, mark_func);
         }
-        /* Each creator owns exactly one native JSValue edge per live box.
-         * Once a retained box outlives its creator, it deliberately stops
-         * being reported as a collectable internal edge: its native duplicate
-         * is then a root until the last Table slot releases it. */
+        /* A box outliving its creator stops being a mark edge: its native
+         * duplicate is a root until the last Table slot releases it. */
         for (uint32_t j = 0; j < i->externref_count; j++) {
             if (i->externrefs[j])
                 JS_MarkValue(rt, i->externrefs[j]->value, mark_func);
@@ -439,7 +466,7 @@ static JSValue tjs_new_wasm_instance(JSContext *ctx) {
         return JS_EXCEPTION;
     }
 
-    i->ctx = JS_DupContext(ctx);
+    i->rt = JS_GetRuntime(ctx);
     i->module_owner = JS_UNDEFINED;
     i->weak_self = JS_UNDEFINED;
     i->pending_exception = JS_UNDEFINED;
@@ -454,7 +481,6 @@ static JSValue tjs_new_wasm_instance(JSContext *ctx) {
         tjs__wasm_live_instances = i->live_next;
         if (i->live_next)
             i->live_next->live_prev = NULL;
-        JS_FreeContext(i->ctx);
         js_free(ctx, i);
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
@@ -680,9 +706,8 @@ static int tjs__wasm_record_extern_import(JSContext *ctx, TJSWasmModule *m,
     }
     else if (source_is_import) {
         if (kind == WASM_IMPORT_EXPORT_KIND_FUNC) {
-            /* WAMR resolves function aliases only through a live source
-             * instance; an import-alias binding fails instantiate, so reject
-             * it here instead of letting the failure surface later. */
+            /* WAMR only resolves function aliases via a live source instance;
+             * reject the import-alias binding here instead of failing later. */
             JS_FreeValue(ctx, provider);
             JS_FreeValue(ctx, owner);
             JS_FreeValue(ctx, source_import_value);
@@ -697,9 +722,8 @@ static int tjs__wasm_record_extern_import(JSContext *ctx, TJSWasmModule *m,
             JS_FreeValue(ctx, source_import_value);
             return -1;
         }
-        /* Instantiation proceeds in kind-relative import order. Restrict an
-         * alias to an already-created slot so cycles and forward references
-         * cannot enter WAMR's in-progress instance. */
+        /* Instantiation is kind-relative: aliases must target already-created
+         * slots, keeping cycles and forward refs out of WAMR's instance. */
         if (source_index >= import_index) {
             JS_FreeValue(ctx, provider);
             JS_FreeValue(ctx, owner);
@@ -752,14 +776,7 @@ static JSValue tjs__wasm_val_to_js(JSContext *ctx, const wasm_val_t *val) {
         case WASM_I32:
             return JS_NewInt32(ctx, val->of.i32);
         case WASM_I64:
-            /* The WebAssembly JS API converts an i64 result with ToBigInt, so it
-             * is ALWAYS a BigInt -- magnitude is irrelevant. Returning a Number
-             * for int32-fitting values made `typeof f()` "number" where node says
-             * "bigint", and (once the inbound path was correctly tightened to
-             * reject Numbers) made the identity round trip `id(id(3n))` throw:
-             * the inner call handed back Number 3, which the outer call rejected.
-             * Every i64 leaving wasm -- function result, global read, table-call
-             * result -- goes through here, so this one site fixes all of them. */
+            /* Spec ToBigInt: an i64 result is a BigInt, never a Number. */
             return JS_NewBigInt64(ctx, val->of.i64);
         case WASM_F32:
             return JS_NewFloat64(ctx, (double) val->of.f32);
@@ -783,14 +800,8 @@ static bool tjs__js_to_wasm_val(JSContext *ctx, JSValue jsval, wasm_valkind_t ty
         }
         case WASM_I64: {
             int64_t i64;
-            /* The WebAssembly JS API converts an i64 parameter with ToBigInt64
-             * -- ToBigInt, then wrap mod 2^64 -- which throws TypeError for
-             * Number, null and undefined. JS_ToBigInt64 implements exactly that
-             * (quickjs.c JS_ToBigIntFree fails on JS_TAG_INT/FLOAT64/NULL/
-             * UNDEFINED and converts Boolean/String/Object per spec), so its
-             * failure MUST propagate. Clearing the exception and retrying with
-             * JS_ToInt32 handed wasm a silently truncated value instead:
-             * 2**40 arrived as 0, 1e15 as -1530494976, 1.5 as 1. */
+            /* JS_ToBigInt64 is spec ToBigInt64; its failure must propagate or
+             * wasm silently receives a truncated number. */
             if (JS_ToBigInt64(ctx, &i64, jsval)) {
                 return false;
             }
@@ -933,6 +944,28 @@ static JSValue tjs__externref_unbox(TJSWasmInstance *inst, uint32_t externref_id
     return tjs__externref_unbox_key(inst, key);
 }
 
+static void tjs__wasm_park_js_exception(JSContext *ctx,
+                                        TJSWasmInstance *inst,
+                                        wasm_module_inst_t active_module) {
+    JSValue exception = JS_GetException(ctx);
+    char token[sizeof(inst->pending_exception_token)] = { 0 };
+    tjs__wasm_new_exception_token(token, sizeof(token));
+
+    if (inst) {
+        /* A sync call consumes the parked exception before JS re-enters this
+         * boundary; a second pending value is a broken nesting invariant. */
+        assert(!inst->has_pending_exception);
+        if (inst->has_pending_exception)
+            JS_FreeValue(ctx, inst->pending_exception);
+        inst->pending_exception = exception;
+        inst->has_pending_exception = true;
+        memcpy(inst->pending_exception_token, token, sizeof(token));
+    } else {
+        JS_FreeValue(ctx, exception);
+    }
+    wasm_runtime_set_exception(active_module, token);
+}
+
 /* Raw native trampoline: called by WAMR, forwards to a JS function. */
 static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args) {
     TJSWasmImportCtx *import_ctx = wasm_runtime_get_function_attachment(exec_env);
@@ -942,11 +975,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
 
     JSContext *ctx = import_ctx->ctx;
     wasm_func_type_t func_type = import_ctx->type;
-    /* WAMR temporarily switches exec_env.module_inst while a consumer calls a
-     * provider-backed wasm function, but intentionally leaves user_data on the
-     * outer execution environment. Keep both identities: provider-local
-     * memory/externrefs belong to active_inst, while a JS exception must be
-     * parked on caller_inst so the outer JS entry point can rethrow it. */
+    /* WAMR switches module_inst but leaves user_data outer: keep both. */
     wasm_module_inst_t active_module =
         wasm_runtime_get_module_inst(exec_env);
     TJSWasmInstance *active_inst = active_module
@@ -961,9 +990,8 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
     uint32_t param_count = wasm_func_type_get_param_count(func_type);
     uint32_t result_count = wasm_func_type_get_result_count(func_type);
 
-    /* js_args is a fixed-size stack array; clamp so JS_Call and the cleanup
-     * loop below never read/free uninitialized slots on an import with more
-     * than TJS__WASM_MAX_ARGS parameters. */
+    /* Fixed-size stack array: clamp so uninitialized slots are never read
+     * or freed when an import exceeds TJS__WASM_MAX_ARGS. */
     if (param_count > TJS__WASM_MAX_ARGS)
         param_count = TJS__WASM_MAX_ARGS;
 
@@ -999,10 +1027,8 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
                 break;
             }
             case WASM_EXTERNREF: {
-                /* WAMR's raw-native ABI passes the host object pointer for an
-                 * externref.  It is the key registered by
-                 * tjs__externref_box(), so recover the original JS value from
-                 * the instance-owned keep-alive list. */
+                /* Raw-native ABI passes the box pointer registered by
+                 * tjs__externref_box(); recover the JS value from it. */
                 void *key = (void *) (uintptr_t) args[i];
                 if (!key || !active_inst) {
                     js_args[i] = JS_NULL;
@@ -1019,23 +1045,8 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
         js_args[i] = tjs__wasm_val_to_js(ctx, &val);
     }
 
-    /* ------------------------------------------------------------------
-     * Guard against stale WASM-memory ArrayBuffers.
-     *
-     * WAMR may relocate linear memory during memory.grow, freeing the old
-     * block.  If that happened earlier in the current WASM call, the cached
-     * mem_buffer still points at freed memory, and any TypedArray views
-     * derived from it are dangling pointers. WAMR can also grow memory
-     * *in place* (base pointer unchanged, committed size larger) when the
-     * grow fits inside its pre-reserved region -- so byte length must be
-     * compared too, not just the base pointer, or an in-place grow leaves
-     * a wrong-sized-but-still-"live" (non-detached) buffer that JS-side
-     * staleness checks (e.g. wasm-bindgen's `byteLength === 0`) will never
-     * catch.
-     *
-     * Invalidate BEFORE the JS call so getMemoryBuffer() hands out a fresh
-     * ArrayBuffer backed by the current memory base.
-     * ------------------------------------------------------------------ */
+    /* memory.grow may relocate memory or grow in place (same base, larger
+     * size): detect staleness by base OR length, invalidate pre-JS-call. */
     wasm_memory_inst_t tjs__tramp_mem = NULL;
     void *tjs__tramp_mem_base = NULL;
     size_t tjs__tramp_mem_len = 0;
@@ -1053,7 +1064,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
             tjs__tramp_mem_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
             if (tjs__tramp_mem_base != tjs__tramp_cache->base
                 || tjs__tramp_mem_len != tjs__tramp_cache->byte_length)
-                tjs__wasm_invalidate_memory(tjs__tramp_mem);
+                tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), tjs__tramp_mem);
         }
     }
 
@@ -1062,15 +1073,14 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
     JSValue ret = JS_Call(ctx, import_ctx->func, global_obj, param_count, js_args);
     JS_FreeValue(ctx, global_obj);
 
-    /* Re-check: the JS import may have triggered a nested WASM call that
-     * grew memory (e.g. JS → callfunction → memory.grow → return).
-     * Reuse the already-resolved memory instance to save API calls. */
+    /* The JS import may have run a nested wasm call that grew memory;
+     * reuse the already-resolved memory instance for the re-check. */
     if (tjs__tramp_mem && active_inst && tjs__tramp_cache
         && !JS_IsUndefined(tjs__tramp_cache->buffer)) {
         void *tjs__after_base = wasm_memory_get_base_address(tjs__tramp_mem);
         size_t tjs__after_len = tjs__wasm_mem_byte_length(tjs__tramp_mem);
         if (tjs__after_base != tjs__tramp_mem_base || tjs__after_len != tjs__tramp_mem_len)
-            tjs__wasm_invalidate_memory(tjs__tramp_mem);
+            tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), tjs__tramp_mem);
     }
 
     for (uint32_t i = 0; i < param_count; i++) {
@@ -1078,37 +1088,14 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
     }
 
     if (JS_IsException(ret)) {
-        /* Save the JS exception on the instance so tjs__call_wasm_func_inst can re-throw it */
-        TJSWasmInstance *inst = exception_inst;
-        if (inst) {
-            if (inst->has_pending_exception)
-                JS_FreeValue(ctx, inst->pending_exception);
-            inst->pending_exception = JS_GetException(ctx);
-            inst->has_pending_exception = true;
-            inst->pending_exception_module = active_module;
-        }
-        wasm_runtime_set_exception(active_module,
-                                   "imported function threw an exception");
-        if (caller_inst && caller_inst != active_inst
-            && caller_inst->module_inst)
-            wasm_runtime_set_exception(
-                caller_inst->module_inst,
-                "provider imported function threw an exception");
+        /* The token rides through cross-module callers; the outer JS entry
+         * point retains the value and clears exact copies before rethrowing. */
+        tjs__wasm_park_js_exception(ctx, exception_inst, active_module);
         return;
     }
 
-    /* Convert return value back to WASM.
-     *
-     * Every conversion here can fail (BigInt where a Number is required and
-     * vice versa). A failure MUST become a wasm trap carrying the JS exception:
-     *   - ignoring the return value of JS_ToInt32/JS_ToFloat64 left a *pending*
-     *     JS exception while wasm kept executing, so the next JS_Call in the
-     *     same wasm activation saw a stale exception;
-     *   - the i64 case actively cleared the exception and retried with
-     *     JS_ToInt32, so an import declared `(result i64)` that returned Number
-     *     7 handed wasm 7 instead of throwing TypeError like node does. This is
-     *     the same swallow-and-truncate bug that was fixed on the inbound
-     *     (parameter) path in tjs__js_to_wasm_val. */
+    /* Every conversion failure MUST become a wasm trap carrying the JS
+     * exception; swallowing it leaves stale exceptions or truncated i64s. */
     if (result_count > 0) {
         wasm_valkind_t ret_kind = tjs__wasm_func_type_get_result_valkind_safe(func_type, 0);
         bool conv_failed = false;
@@ -1148,12 +1135,8 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
                 break;
             }
             case WASM_EXTERNREF: {
-                /* WAMR reads args[0] unconditionally once this trampoline
-                 * returns: wasm_runtime_invoke_native_raw() has no exception
-                 * check between invoke_native_raw() and the return-value
-                 * conversion. So args[0] must hold a defined value on every
-                 * path, the allocation-failure one included, or WAMR registers
-                 * a leftover parameter cell as an externref. */
+                /* WAMR reads args[0] unconditionally after this trampoline;
+                 * keep it defined on every path (alloc failure included). */
                 uintptr_t key = UINTPTR_MAX;
                 if (active_inst
                     && !tjs__externref_box_key(active_inst, ctx, ret, &key)) {
@@ -1169,27 +1152,7 @@ static void tjs__wasm_import_trampoline(wasm_exec_env_t exec_env, uint64_t *args
         }
 
         if (conv_failed) {
-            TJSWasmInstance *inst = exception_inst;
-            if (inst) {
-                /* Drop any exception the caller already parked, then take ours. */
-                if (inst->has_pending_exception) {
-                    JS_FreeValue(ctx, inst->pending_exception);
-                    inst->pending_exception = JS_UNDEFINED;
-                    inst->has_pending_exception = false;
-                }
-                inst->pending_exception = JS_GetException(ctx);
-                inst->has_pending_exception = true;
-                inst->pending_exception_module = active_module;
-            } else {
-                JS_FreeValue(ctx, JS_GetException(ctx));
-            }
-            wasm_runtime_set_exception(active_module,
-                                       "imported function returned a value of the wrong type");
-            if (caller_inst && caller_inst != active_inst
-                && caller_inst->module_inst)
-                wasm_runtime_set_exception(
-                    caller_inst->module_inst,
-                    "provider imported function returned a value of the wrong type");
+            tjs__wasm_park_js_exception(ctx, exception_inst, active_module);
             JS_FreeValue(ctx, ret);
             return;
         }
@@ -1389,23 +1352,15 @@ fail:
     return JS_EXCEPTION;
 }
 
-/* Current committed size of a WAMR memory instance, in bytes. WAMR can grow
- * linear memory in place (same base pointer, larger committed size) when the
- * grow fits inside its pre-reserved region, so callers must not treat an
- * unchanged base pointer alone as proof that memory didn't grow. */
+/* WAMR can grow memory in place: an unchanged base pointer alone proves
+ * nothing about the committed size. */
 static size_t tjs__wasm_mem_byte_length(wasm_memory_inst_t mem) {
     uint64_t page_count = wasm_memory_get_cur_page_count(mem);
     uint64_t bytes_per_page = wasm_memory_get_bytes_per_page(mem);
     return (size_t) (page_count * bytes_per_page);
 }
 
-/* Detach and release the cached linear-memory ArrayBuffer (if any).
- * WAMR may move the linear-memory base when it grows (explicit growMemory or
- * an internal memory.grow during a call), leaving any previously exposed
- * ArrayBuffer pointing at freed/moved memory. Detaching makes stale access
- * throw a clean "detached ArrayBuffer" error instead of corrupting memory.
- * The scan covers every live instance on purpose: the same imported memory
- * can be shared by many instances, and all of their cached views go stale. */
+/* Scan all live instances: every view of one imported memory goes stale. */
 static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     TJSWasmInstance *inst, wasm_memory_inst_t memory) {
     for (TJSWasmMemoryBuffer *cache = inst->memory_buffers; cache;
@@ -1416,14 +1371,17 @@ static TJSWasmMemoryBuffer *tjs__wasm_find_memory_buffer(
     return NULL;
 }
 
-static void tjs__wasm_invalidate_memory(wasm_memory_inst_t memory) {
+static void tjs__wasm_invalidate_memory(JSRuntime *rt,
+                                        wasm_memory_inst_t memory) {
     for (TJSWasmInstance *candidate = tjs__wasm_live_instances; candidate;
          candidate = candidate->live_next) {
+        if (candidate->rt != rt)
+            continue;
         TJSWasmMemoryBuffer *cache =
             tjs__wasm_find_memory_buffer(candidate, memory);
         if (cache && !JS_IsUndefined(cache->buffer)) {
-            tjs__wasm_detach_membuf(candidate->ctx, cache->buffer);
-            JS_FreeValue(candidate->ctx, cache->buffer);
+            tjs__wasm_detach_membuf(rt, cache->buffer);
+            JS_FreeValueRT(rt, cache->buffer);
             cache->buffer = JS_UNDEFINED;
             cache->base = NULL;
             cache->byte_length = 0;
@@ -1506,10 +1464,8 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
 
     wasm_val_t results[TJS__WASM_MAX_ARGS];
 
-    /* Record linear-memory base + committed size to detect an internal
-     * memory.grow -- WAMR can grow in place (base unchanged) when the grow
-     * fits its pre-reserved region, so the base pointer alone isn't enough
-     * (see the matching comment at the import trampoline above). */
+    /* Record base + size: WAMR can grow in place, so the base pointer alone
+     * isn't enough to detect an internal memory.grow. */
     wasm_memory_inst_t tjs__mem = NULL;
     void *tjs__mem_base_before = NULL;
     size_t tjs__mem_len_before = 0;
@@ -1528,14 +1484,9 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         /* If an imported JS function threw, re-throw the original JS exception */
         if (inst->has_pending_exception) {
             JSValue exc = inst->pending_exception;
-            wasm_module_inst_t exception_module =
-                inst->pending_exception_module;
             inst->pending_exception = JS_UNDEFINED;
             inst->has_pending_exception = false;
-            inst->pending_exception_module = NULL;
-            wasm_runtime_clear_exception(inst->module_inst);
-            if (exception_module && exception_module != inst->module_inst)
-                wasm_runtime_clear_exception(exception_module);
+            tjs__wasm_clear_pending_exception_traps(inst);
             return JS_Throw(ctx, exc);
         }
 
@@ -1553,7 +1504,7 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         void *tjs__mem_base_after = tjs__mem ? wasm_memory_get_base_address(tjs__mem) : NULL;
         size_t tjs__mem_len_after = tjs__mem ? tjs__wasm_mem_byte_length(tjs__mem) : 0;
         if (tjs__mem_base_after != tjs__mem_base_before || tjs__mem_len_after != tjs__mem_len_before)
-            tjs__wasm_invalidate_memory(tjs__mem);
+            tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), tjs__mem);
     }
 
     wasm_valkind_t result_types[TJS__WASM_MAX_ARGS];
@@ -1565,9 +1516,8 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
         return JS_UNDEFINED;
     } else if (result_count == 1) {
         if (result_types[0] == WASM_EXTERNREF) {
-            /* wasm_runtime_call_wasm() finalizes externref results to the
-             * host object pointer before wasm_runtime_call_wasm_a() exposes
-             * them through wasm_val_t. */
+            /* call_wasm() finalizes externref results to the host object
+             * pointer exposed through wasm_val_t. */
             void *key = (void *) results[0].of.foreign;
             return JS_DupValue(ctx, tjs__externref_unbox_key(inst, key));
         }
@@ -1940,6 +1890,7 @@ static JSValue tjs_wasm_buildinstance(JSContext *ctx, JSValue this_val, int argc
             JSValue exception = i->pending_exception;
             i->pending_exception = JS_UNDEFINED;
             i->has_pending_exception = false;
+            tjs__wasm_clear_pending_exception_traps(i);
             JS_FreeValue(ctx, obj);
             return JS_Throw(ctx, exception);
         }
@@ -1978,10 +1929,8 @@ static JSValue tjs_wasm_buildinstance(JSContext *ctx, JSValue this_val, int argc
     }
 
 #ifdef TJS__HAS_ASAN
-    // ASAN moves local variables to a fake stack, which breaks WAMR's
-    // native stack overflow check (it compares &local against the real
-    // thread stack boundary — addresses in completely different regions).
-    // Disable the check; OS guard pages still catch real overflows.
+    // ASAN's fake stack breaks WAMR's native overflow check; OS guard pages
+    // still catch real overflows.
     wasm_runtime_set_native_stack_boundary(i->exec_env, (uint8_t *) 1);
 #endif
 
@@ -2254,13 +2203,8 @@ static JSValue tjs_wasm_moduleimports(JSContext *ctx, JSValue this_val, int argc
     return imports;
 }
 
-/*
- * moduleCustomSections(module, sectionName)
- *
- * Returns an array of ArrayBuffers for every custom section with the given name
- * in module order. WAMR links its list by prepending each section, so the
- * second pass writes matching nodes backwards into the JS array.
- */
+/* WAMR links custom sections by prepending, so the second pass writes
+ * matching nodes backwards into the JS array. */
 static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {
@@ -2326,10 +2270,8 @@ static JSValue tjs_wasm_modulecustomsections(JSContext *ctx, JSValue this_val, i
     return result;
 }
 
-/* Direct struct access wrapper for result valkind to avoid WAMR's broken API.
- * wasm_func_type_get_result_valkind asserts on VALUE_TYPE_EXTERNREF; this reads
- * WASMFuncType.types[] directly. Params are at [0..param_count), results at
- * [param_count..param_count+result_count). */
+/* wasm_func_type_get_result_valkind asserts on EXTERNREF; read types[]
+ * directly — params at [0..param_count), results right after. */
 static wasm_valkind_t tjs__wasm_func_type_get_result_valkind_safe(WASMFuncType *func_type, uint32_t result_index) {
     if (!func_type || result_index >= func_type->result_count) {
         return (wasm_valkind_t)-1;
@@ -2372,11 +2314,8 @@ static char tjs__wasm_valkind_to_sig(wasm_valkind_t kind) {
     }
 }
 
-/* Configure function imports without mutating WAMR's module-level linkage.
- * The descriptors are matched to import occurrences (not merely names), so a
- * legal module containing the same module/name with different signatures gets
- * one callback context per occurrence. instantiate() copies these contexts and
- * supplies them through InstantiationArgs2. */
+/* Imports match by occurrence, not name: identical module/name pairs with
+ * different signatures each get their own callback context. */
 static JSValue tjs_wasm_resolveimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {
@@ -2571,9 +2510,8 @@ static void tjs__wasm_rollback_extern_imports(JSContext *ctx,
     }
 }
 
-/* Resolve descriptors by import occurrence. A module may legally contain the
- * same module/name pair more than once, so name lookup alone is insufficient:
- * each descriptor consumes the first still-unmatched occurrence. */
+/* module/name pairs can legally repeat: each descriptor takes the first
+ * still-unmatched occurrence. */
 static JSValue tjs_wasm_resolveglobalimports(JSContext *ctx, JSValue this_val,
                                               int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
@@ -2712,13 +2650,6 @@ fail:
     return JS_ThrowOutOfMemory(ctx);
 }
 
-/*
- * resolveTableImports(module, tableDescs)
- *
- * tableDescs is an array of { module: string, name: string, element: string, initial: number, maximum?: number }
- * Creates a WASMTable stub with the matching type and links it into the module's import.
- * The table elements will be initialized to NULL_REF by WAMR during instantiation.
- */
 static JSValue tjs_wasm_resolvetableimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {
@@ -2818,12 +2749,8 @@ static JSValue tjs_wasm_resolvetableimports(JSContext *ctx, JSValue this_val, in
         }
         JS_FreeCString(ctx, elem_kind_str);
 
-        /* Non-GC WAMR stores a funcref table element as only a function index.
-         * A standalone JS Table element also has an owning Instance, so
-         * copying just that index would make call_indirect resolve it in the
-         * consumer's function space. Do not silently turn existing elements
-         * into nulls or mis-bound functions. Null-only tables need no seeding
-         * because WAMR already initializes every slot to NULL_REF. */
+        /* Copying just a funcref index resolves call_indirect in the
+         * consumer's function space — do not silently null elements. */
         if (elem_type == VALUE_TYPE_FUNCREF) {
             JSValue values = JS_GetPropertyStr(ctx, item, "values");
             if (JS_IsException(values)) {
@@ -2988,12 +2915,6 @@ fail:
     return JS_ThrowOutOfMemory(ctx);
 }
 
-/*
- * resolveMemoryImports(module, memoryDescs)
- *
- * memoryDescs is an array of { module: string, name: string, initial: number, maximum?: number }
- * Creates a WASMMemory stub with the matching type and links it into the module's import.
- */
 static JSValue tjs_wasm_resolvememoryimports(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSWasmModule *m = tjs_wasm_module_get(ctx, argv[0]);
     if (!m) {
@@ -3236,9 +3157,8 @@ static JSValue tjs__wasm_memory_buffer(JSContext *ctx, TJSWasmInstance *i,
     uint64_t bytes_per_page = wasm_memory_get_bytes_per_page(mem);
     size_t byte_length = (size_t) (page_count * bytes_per_page);
 
-    /* Reuse the cached buffer only while it still describes the current WAMR
-     * linear memory. Internal memory.grow can detach or resize behind our JS
-     * wrapper before growMemory() is called explicitly. */
+    /* Internal memory.grow may resize memory behind this JS wrapper;
+     * revalidate the cache before reuse. */
     TJSWasmMemoryBuffer *cache = tjs__wasm_find_memory_buffer(i, mem);
     if (cache && !JS_IsUndefined(cache->buffer)) {
         bool stale = true;
@@ -3247,7 +3167,7 @@ static JSValue tjs__wasm_memory_buffer(JSContext *ctx, TJSWasmInstance *i,
             return JS_EXCEPTION;
         if (!stale)
             return JS_DupValue(ctx, cache->buffer);
-        tjs__wasm_invalidate_memory(mem);
+        tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), mem);
     }
     if (!cache) {
         cache = js_mallocz(ctx, sizeof(*cache));
@@ -3320,7 +3240,7 @@ static JSValue tjs_wasm_growmemory(JSContext *ctx, JSValue this_val, int argc, J
     }
 
     /* Base may have moved; invalidate any previously exposed buffer. */
-    tjs__wasm_invalidate_memory(mem);
+    tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), mem);
 
     return JS_NewUint32(ctx, (uint32_t) old_pages);
 }
@@ -3339,7 +3259,7 @@ static JSValue tjs_wasm_growmemoryat(JSContext *ctx, JSValue this_val,
     if (delta && !wasm_memory_enlarge(memory, delta))
         return JS_ThrowRangeError(ctx, "failed to grow memory");
     if (delta)
-        tjs__wasm_invalidate_memory(memory);
+        tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), memory);
     return JS_NewUint32(ctx, (uint32_t)old_pages);
 }
 
@@ -3355,9 +3275,8 @@ static JSValue tjs_wasm_importedextern(JSContext *ctx, JSValue this_val,
         tjs__wasm_find_extern_import(i, kind, index);
     if (!binding || JS_IsUndefined(binding->owner))
         return JS_UNDEFINED;
-    /* An ordinary JS callback is adapted into a new wasm function belonging to
-     * this Instance. Only a wasm-origin function with a provider may preserve
-     * its original wrapper identity across a re-export. */
+    /* Only a wasm-origin function with a provider keeps its original wrapper
+     * identity across a re-export; JS callbacks get fresh wasm functions. */
     if (kind == WASM_IMPORT_EXPORT_KIND_FUNC
         && JS_IsUndefined(binding->provider))
         return JS_UNDEFINED;
@@ -3769,9 +3688,8 @@ static JSValue tjs_wasm_setglobal(JSContext *ctx, JSValue this_val, int argc, JS
             break;
         }
         case WASM_I64: {
-            /* An i64 global is written with ToBigInt64: a Number must throw,
-             * not be silently narrowed through JS_ToInt32 (which is what the
-             * cleared-exception fallback here used to do). */
+            /* i64 globals take ToBigInt64: a Number must throw, never narrow
+             * silently through JS_ToInt32. */
             int64_t v;
             if (JS_ToBigInt64(ctx, &v, argv[2])) {
                 return JS_EXCEPTION;
@@ -4472,7 +4390,7 @@ static JSValue tjs_wasm_instance_malloc_method(JSContext *ctx,
     if (after != before
         || (after && (wasm_memory_get_base_address(after) != before_base
                       || tjs__wasm_mem_byte_length(after) != before_length)))
-        tjs__wasm_invalidate_memory(before ? before : after);
+        tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), before ? before : after);
     if (!offset)
         return JS_ThrowOutOfMemory(ctx);
     return JS_NewUint64(ctx, offset);
@@ -4516,7 +4434,7 @@ static JSValue tjs_wasm_instance_dupdata_method(JSContext *ctx,
     if (after != before
         || (after && (wasm_memory_get_base_address(after) != before_base
                       || tjs__wasm_mem_byte_length(after) != before_length)))
-        tjs__wasm_invalidate_memory(before ? before : after);
+        tjs__wasm_invalidate_memory(JS_GetRuntime(ctx), before ? before : after);
     if (!offset)
         return JS_ThrowOutOfMemory(ctx);
     return JS_NewUint64(ctx, offset);

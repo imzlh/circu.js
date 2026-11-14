@@ -5,6 +5,7 @@
 const { use } = import.meta;
 const { Worker, isWorker, pipe, workerData } = use('worker');
 const console = use('console');
+const os = use('os');
 const { setTimeout, clearTimeout, setInterval, clearInterval } = use('timers');
 
 // If running inside Worker, handle worker logic
@@ -103,6 +104,14 @@ if (isWorker) {
                 }
             };
             break;
+
+        case 'exitDuringImport': {
+            const state = new Int32Array(workerData.state);
+            Atomics.store(state, 0, 1);
+            os.exit(37);
+            Atomics.store(state, 0, 2);
+            break;
+        }
             
         default:
             // Unknown worker type
@@ -261,6 +270,32 @@ await test('Worker rapid create/terminate cycles', async () => {
         const response = await waitForMessage(worker.messagePipe);
         assertEquals(response.type, 'check');
         assertEquals(response.isWorker, true);
+        await worker.terminate();
+    }
+});
+
+await test('Worker os.exit during module import tears down safely', async () => {
+    const state = new Int32Array(new SharedArrayBuffer(4));
+    const worker = new Worker({ type: 'exitDuringImport', state: state.buffer });
+
+    try {
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(
+                () => reject(new Error('Worker exit during import timed out')),
+                3000,
+            );
+            worker.messagePipe.onmessageerror = cause => {
+                clearTimeout(timer);
+                reject(cause);
+            };
+            worker.messagePipe.onclose = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+        });
+        assertEquals(Atomics.load(state, 0), 1,
+            'os.exit must unwind before later module code runs');
+    } finally {
         await worker.terminate();
     }
 });

@@ -1,10 +1,94 @@
 const wasm = import.meta.use('wasm');
 const fs = import.meta.use('fs');
 const ffi = import.meta.use('ffi');
+const engine = import.meta.use('engine');
 
 function bytes() {
     const path = fs.exists('native/wasm.wasm') ? 'native/wasm.wasm' : 'tests/native/wasm.wasm';
     return fs.readFile(path);
+}
+
+// Precompiled from tests/native/wasm-provider-chain.wat. Keep this fixture
+// inline so the test suite does not require wat2wasm at runtime.
+const PROVIDER_CHAIN_BYTES = Uint8Array.from([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x09, 0x02, 0x60, 0x00, 0x01, 0x7f, 0x60,
+    0x00, 0x01, 0x7e, 0x02, 0x26, 0x02, 0x08, 0x70,
+    0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x72, 0x08,
+    0x74, 0x68, 0x72, 0x6f, 0x77, 0x69, 0x6e, 0x67,
+    0x00, 0x00, 0x08, 0x70, 0x72, 0x6f, 0x76, 0x69,
+    0x64, 0x65, 0x72, 0x05, 0x77, 0x72, 0x6f, 0x6e,
+    0x67, 0x00, 0x01, 0x03, 0x04, 0x03, 0x00, 0x01,
+    0x00, 0x06, 0x0b, 0x02, 0x7f, 0x01, 0x41, 0x00,
+    0x0b, 0x7f, 0x01, 0x41, 0x00, 0x0b, 0x07, 0x36,
+    0x05, 0x08, 0x74, 0x68, 0x72, 0x6f, 0x77, 0x69,
+    0x6e, 0x67, 0x00, 0x02, 0x05, 0x77, 0x72, 0x6f,
+    0x6e, 0x67, 0x00, 0x03, 0x05, 0x70, 0x72, 0x6f,
+    0x62, 0x65, 0x00, 0x04, 0x0a, 0x61, 0x66, 0x74,
+    0x65, 0x72, 0x54, 0x68, 0x72, 0x6f, 0x77, 0x03,
+    0x00, 0x0a, 0x61, 0x66, 0x74, 0x65, 0x72, 0x57,
+    0x72, 0x6f, 0x6e, 0x67, 0x03, 0x01, 0x0a, 0x18,
+    0x03, 0x08, 0x00, 0x10, 0x00, 0x41, 0x01, 0x24,
+    0x00, 0x0b, 0x08, 0x00, 0x10, 0x01, 0x41, 0x01,
+    0x24, 0x01, 0x0b, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+]);
+
+function providerDescriptor(name, func, provider) {
+    const descriptor = { module: 'provider', name, func };
+    if (provider) {
+        descriptor.provider = provider;
+        descriptor.sourceIndex = provider.functionIndex(name);
+    }
+    return descriptor;
+}
+
+function providerChain(leafFunctions) {
+    const leafModule = wasm.load(PROVIDER_CHAIN_BYTES);
+    const leaf = leafModule.instantiate({
+        functions: [
+            providerDescriptor('throwing', leafFunctions.throwing),
+            providerDescriptor('wrong', leafFunctions.wrong),
+        ],
+    });
+
+    const middleModule = wasm.load(PROVIDER_CHAIN_BYTES);
+    const middle = middleModule.instantiate({
+        functions: [
+            providerDescriptor('throwing', () => 0, leaf),
+            providerDescriptor('wrong', () => 0n, leaf),
+        ],
+    });
+
+    const outerModule = wasm.load(PROVIDER_CHAIN_BYTES);
+    const outer = outerModule.instantiate({
+        functions: [
+            providerDescriptor('throwing', () => 0, middle),
+            providerDescriptor('wrong', () => 0n, middle),
+        ],
+    });
+
+    return { outer, middle, leaf };
+}
+
+function assertProviderCanReenter(instance, failureKind, instanceName) {
+    let result;
+    let thrown;
+    try {
+        result = instance.call('probe');
+    } catch (error) {
+        thrown = error;
+    }
+    assert(thrown === undefined,
+        `${failureKind} must not leave a stale exception on ${instanceName}: ${thrown}`);
+    assert(result === 42, `${instanceName} must run after the caught chain failure`);
+}
+
+function assertProviderChainRecovered(chain, failureKind) {
+    for (const [name, instance] of Object.entries(chain)) {
+        assert(instance.exception() === null,
+            `${failureKind} must clear the propagated trap from ${name}`);
+        assertProviderCanReenter(instance, failureKind, name);
+    }
 }
 
 test('wasm low-level API is object-oriented', () => {
@@ -98,4 +182,73 @@ test('wasm memory views use app offsets and detach after grow', () => {
     assert(instance.growMemory(1) === before);
     assert(view.buffer.byteLength === 0, 'memory growth must detach stale views');
     instance.free(offset);
+});
+
+test('wasm Instance finalization detaches memory without retaining its realm', () => {
+    const source = `
+        const module = wasm.load(bytes);
+        module.resolveFunctions([{ module: 'env', name: 'console_log', func() {} }]);
+        const instance = module.instantiate();
+        globalThis.buffer = instance.memoryBuffer();
+    `;
+    let sandbox = new engine.Sandbox();
+    sandbox.global.wasm = wasm;
+    sandbox.global.bytes = bytes();
+    sandbox.call(source);
+    const buffer = sandbox.global.buffer;
+    assert(buffer.byteLength > 0);
+
+    sandbox = null;
+    engine.gc.run();
+    assert(buffer.byteLength === 0,
+        'collecting an Instance realm must detach its externally held memory buffer');
+});
+
+test('wasm provider chains propagate an imported JS exception through every consumer', () => {
+    const sentinel = new Error('provider-chain sentinel');
+    const { outer, middle, leaf } = providerChain({
+        throwing() { throw sentinel; },
+        wrong() { return 0n; },
+    });
+
+    let thrown;
+    try {
+        outer.call('throwing');
+    } catch (error) {
+        thrown = error;
+    }
+
+    assert(thrown === sentinel, 'the outer call must rethrow the original JS exception');
+    assertProviderChainRecovered({ outer, middle, leaf }, 'the caught JS exception');
+    assert(leaf.getGlobal('afterThrow') === 0,
+        'the leaf must stop immediately after its JS import throws');
+    assert(middle.getGlobal('afterThrow') === 0,
+        'the middle provider must not consume an undefined import result');
+    assert(outer.getGlobal('afterThrow') === 0,
+        'the outer consumer must stop when its provider traps');
+});
+
+test('wasm provider chains propagate JS import result conversion failures', () => {
+    const { outer, middle, leaf } = providerChain({
+        throwing() { return 0; },
+        // A Number is invalid for a WebAssembly i64 result; it must be a BigInt.
+        wrong() { return 7; },
+    });
+
+    let thrown;
+    try {
+        outer.call('wrong');
+    } catch (error) {
+        thrown = error;
+    }
+
+    assert(thrown instanceof TypeError,
+        'the outer call must receive the JS i64 conversion TypeError');
+    assertProviderChainRecovered({ outer, middle, leaf }, 'the caught conversion failure');
+    assert(leaf.getGlobal('afterWrong') === 0,
+        'the leaf must stop after its JS result conversion fails');
+    assert(middle.getGlobal('afterWrong') === 0,
+        'the middle provider must not consume the invalid import result');
+    assert(outer.getGlobal('afterWrong') === 0,
+        'the outer consumer must stop when its provider conversion traps');
 });
