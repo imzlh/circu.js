@@ -791,6 +791,11 @@ static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (exclude_metadata < 0) return JS_EXCEPTION;
     bool sync_metadata = !exclude_metadata;
 
+    /* JS_ToBool can run user JS that closed the file; recheck unconditionally
+     * like every other converting file method. */
+    f = tjs_file_get_open(ctx, this_val);
+    if (!f) return JS_EXCEPTION;
+
     TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "asyncfs.file.sync", NULL), (void)0, do { f = tjs_file_get_open(ctx, this_val); if (!f) return (JS_EXCEPTION); } while (0));
 
     TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
@@ -1194,7 +1199,8 @@ static TJSCapabilityMask tjs_asyncfs_open_capability_mask(int flags) {
             break;
     }
 
-    if (flags & (O_CREAT | O_TRUNC)) {
+    /* O_APPEND alone creates a writable fd even without an r/w bit. */
+    if (flags & (O_CREAT | O_TRUNC | O_APPEND)) {
         mask |= TJS_CAP_IO_WRITE;
     }
 
@@ -1269,6 +1275,10 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
         if (!path) return JS_EXCEPTION;
     }
 
+    /* Gate before the fstat probe: a rejecting hook must not observe or allow
+     * any syscall on the fd, matching the order of every other asyncfs entry. */
+    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.createFrom", path), if (path) JS_FreeCString(ctx, path));
+
     uv_fs_t req;
     int r = uv_fs_fstat(NULL, &req, fd, NULL);
     uv_fs_req_cleanup(&req);
@@ -1276,8 +1286,6 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
         if (path) JS_FreeCString(ctx, path);
         return tjs_throw_errno(ctx, r);
     }
-
-    TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.createFrom", NULL), if (path) JS_FreeCString(ctx, path));
 
     /* Ownership transfers only after the wrapper exists. On exception the
      * caller still owns fd and is responsible for closing it. */

@@ -426,7 +426,8 @@ static TJSCapabilityMask tjs_syncfs_open_capability_mask(int flags) {
             break;
     }
 
-    if (flags & (O_CREAT | O_TRUNC)) {
+    /* O_APPEND alone creates a writable fd even without an r/w bit. */
+    if (flags & (O_CREAT | O_TRUNC | O_APPEND)) {
         mask |= TJS_CAP_IO_WRITE;
     }
 
@@ -605,67 +606,11 @@ static inline int fs_errno2uv(int crt_err) {
 #endif
 }
 
-typedef struct TJSSyncFsFdPin {
-    int fd;
-    int error;
-    bool owned;
-} TJSSyncFsFdPin;
-
-/* A capability hook may close an fd and reuse its numeric slot before it
- * returns. Pin the open resource only when a hook will actually run, then use
- * the duplicate for the operation. dup/F_DUPFD_CLOEXEC preserves the shared
- * open-file state (offset, status flags and locks) without retaining a raw JS
- * wrapper or relying on the original descriptor number after re-entry. */
+/* The dup-based fd pin core lives in utils.c and is shared with
+ * os.sendfd/recvfd; fs layers error shaping and revalidate macros on top. */
+typedef TJSPinnedFd TJSSyncFsFdPin;
 static TJSSyncFsFdPin tjs_syncfs_pin_fd(int fd) {
-    TJSSyncFsFdPin pin = { fd, 0, false };
-    int pinned_fd;
-#ifdef _WIN32
-    if (uv_get_osfhandle(fd) == INVALID_HANDLE_VALUE) {
-        errno = EBADF;
-        pinned_fd = -1;
-    } else {
-        pinned_fd = _dup(fd);
-    }
-    if (pinned_fd >= 0) {
-        HANDLE handle = uv_get_osfhandle(pinned_fd);
-        if (handle == INVALID_HANDLE_VALUE ||
-            !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
-            int saved_errno = handle == INVALID_HANDLE_VALUE ? EBADF : EINVAL;
-            _close(pinned_fd);
-            errno = saved_errno;
-            pinned_fd = -1;
-        }
-    }
-#elif defined(F_DUPFD_CLOEXEC)
-    do {
-        pinned_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    } while (pinned_fd < 0 && errno == EINTR);
-#else
-    do {
-        pinned_fd = dup(fd);
-    } while (pinned_fd < 0 && errno == EINTR);
-    if (pinned_fd >= 0) {
-        int fd_flags;
-        do {
-            fd_flags = fcntl(pinned_fd, F_GETFD);
-        } while (fd_flags < 0 && errno == EINTR);
-        if (fd_flags < 0 || fcntl(pinned_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
-            int saved_errno = errno;
-            close(pinned_fd);
-            errno = saved_errno;
-            pinned_fd = -1;
-        }
-    }
-#endif
-
-    if (pinned_fd < 0) {
-        pin.fd = -1;
-        pin.error = errno ? errno : EBADF;
-        return pin;
-    }
-    pin.fd = pinned_fd;
-    pin.owned = true;
-    return pin;
+    return TJS_PinFd(fd);
 }
 
 static TJSSyncFsFdPin tjs_syncfs_pin_posix_fd(int fd) {
@@ -678,19 +623,7 @@ static TJSSyncFsFdPin tjs_syncfs_pin_posix_fd(int fd) {
 }
 
 static void tjs_syncfs_unpin_fd(TJSSyncFsFdPin* pin) {
-    if (!pin || !pin->owned) return;
-
-    int saved_errno = errno;
-#ifdef _WIN32
-    DWORD saved_error = GetLastError();
-    _close(pin->fd);
-    SetLastError(saved_error);
-#else
-    close(pin->fd);
-#endif
-    errno = saved_errno;
-    pin->fd = -1;
-    pin->owned = false;
+    TJS_UnpinFd(pin);
 }
 
 #ifdef _WIN32

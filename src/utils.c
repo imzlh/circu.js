@@ -43,9 +43,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <io.h>
 #elif defined(__APPLE__)
 #include <pthread.h>
 #else
@@ -549,6 +552,74 @@ JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size) {
     JSValue array = JS_NewTypedArray(ctx, 1, &buffer, JS_TYPED_ARRAY_UINT8);
     JS_FreeValue(ctx, buffer);
     return array;
+}
+
+TJSPinnedFd TJS_PinFd(int fd) {
+    TJSPinnedFd pin = { fd, 0, false };
+    int pinned_fd;
+#ifdef _WIN32
+    if (uv_get_osfhandle(fd) == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        pinned_fd = -1;
+    } else {
+        pinned_fd = _dup(fd);
+    }
+    if (pinned_fd >= 0) {
+        HANDLE handle = uv_get_osfhandle(pinned_fd);
+        if (handle == INVALID_HANDLE_VALUE ||
+            !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
+            int saved_errno = handle == INVALID_HANDLE_VALUE ? EBADF : EINVAL;
+            _close(pinned_fd);
+            errno = saved_errno;
+            pinned_fd = -1;
+        }
+    }
+#elif defined(F_DUPFD_CLOEXEC)
+    do {
+        pinned_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    } while (pinned_fd < 0 && errno == EINTR);
+#else
+    do {
+        pinned_fd = dup(fd);
+    } while (pinned_fd < 0 && errno == EINTR);
+    if (pinned_fd >= 0) {
+        int fd_flags;
+        do {
+            fd_flags = fcntl(pinned_fd, F_GETFD);
+        } while (fd_flags < 0 && errno == EINTR);
+        if (fd_flags < 0 || fcntl(pinned_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            int saved_errno = errno;
+            close(pinned_fd);
+            errno = saved_errno;
+            pinned_fd = -1;
+        }
+    }
+#endif
+
+    if (pinned_fd < 0) {
+        pin.fd = -1;
+        pin.error = errno ? errno : EBADF;
+        return pin;
+    }
+    pin.fd = pinned_fd;
+    pin.owned = true;
+    return pin;
+}
+
+void TJS_UnpinFd(TJSPinnedFd *pin) {
+    if (!pin || !pin->owned) return;
+
+    int saved_errno = errno;
+#ifdef _WIN32
+    DWORD saved_error = GetLastError();
+    _close(pin->fd);
+    SetLastError(saved_error);
+#else
+    close(pin->fd);
+#endif
+    errno = saved_errno;
+    pin->fd = -1;
+    pin->owned = false;
 }
 
 static const char *const tjs_signal_map[] = {

@@ -797,7 +797,23 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
     if (JS_ToInt32(ctx, &fd_to_send, argv[1])) return JS_EXCEPTION;
 
-    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_WRITE | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.sendfd"), (void)0);
+    /* Hook JS may close and reuse either numeric slot; run the syscall on
+     * duplicates of the open descriptions instead of the raw numbers. */
+    TJSPinnedFd pin_sock = { sock_fd, 0, false };
+    TJSPinnedFd pin_send = { fd_to_send, 0, false };
+    TJS_CAPABILITY_GUARDED(
+        (pin_sock = TJS_PinFd(sock_fd), pin_send = TJS_PinFd(fd_to_send)),
+        tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_WRITE | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.sendfd"),
+        (TJS_UnpinFd(&pin_sock), TJS_UnpinFd(&pin_send)),
+        do {
+            if (pin_sock.error || pin_send.error) {
+                TJS_UnpinFd(&pin_sock);
+                TJS_UnpinFd(&pin_send);
+                return tjs_throw_errno(ctx, uv_translate_sys_error(pin_sock.error ? pin_sock.error : pin_send.error));
+            }
+            sock_fd = pin_sock.fd;
+            fd_to_send = pin_send.fd;
+        } while (0));
     // Prepare control message buffer
     struct msghdr msg = {0};
     struct iovec iov;
@@ -822,6 +838,8 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
     ssize_t ret = sendmsg(sock_fd, &msg, 0);
+    TJS_UnpinFd(&pin_sock);
+    TJS_UnpinFd(&pin_send);
     if (ret < 0) {
         return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
     }
@@ -845,7 +863,20 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     int sock_fd;
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
 
-    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_READ | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.recvfd"), (void)0);
+    /* Hook JS may close and reuse the numeric slot; receive on a duplicate of
+     * the open description instead of the raw number. */
+    TJSPinnedFd pin_sock = { sock_fd, 0, false };
+    TJS_CAPABILITY_GUARDED(
+        pin_sock = TJS_PinFd(sock_fd),
+        tjs__capability(ctx, TJS_CAP_POSIX | TJS_CAP_IO_READ | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "os.recvfd"),
+        TJS_UnpinFd(&pin_sock),
+        do {
+            if (pin_sock.error) {
+                TJS_UnpinFd(&pin_sock);
+                return tjs_throw_errno(ctx, uv_translate_sys_error(pin_sock.error));
+            }
+            sock_fd = pin_sock.fd;
+        } while (0));
     struct msghdr msg = {0};
     struct iovec iov;
     char dummy;
@@ -863,6 +894,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     msg.msg_controllen = sizeof(cmsg_buf);
 
     ret = recvmsg(sock_fd, &msg, 0);
+    TJS_UnpinFd(&pin_sock);
     if (ret < 0) {
         return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
     }

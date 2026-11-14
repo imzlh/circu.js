@@ -141,6 +141,20 @@ JSValue TJS_NewRejectedPromise(JSContext *ctx, int argc, JSValue *argv);
 /* Consumes js_malloc'd data on success and failure. */
 JSValue TJS_NewUint8Array(JSContext *ctx, uint8_t *data, size_t size);
 
+/* A capability hook may close an fd and reuse its numeric slot before it
+ * returns. Pin the open resource only when a hook will actually run, then use
+ * the duplicate for the operation. dup/F_DUPFD_CLOEXEC preserves the shared
+ * open-file state (offset, status flags and locks) without retaining a raw JS
+ * wrapper or relying on the original descriptor number after re-entry. */
+typedef struct TJSPinnedFd {
+    int fd;
+    int error;
+    bool owned;
+} TJSPinnedFd;
+
+TJSPinnedFd TJS_PinFd(int fd);
+void TJS_UnpinFd(TJSPinnedFd *pin);
+
 /* Signal enum shared by the signals and process modules. */
 JSValue TJS_NewSignalEnum(JSContext *ctx);
 int TJS_ToSignal(JSContext *ctx, JSValueConst value, int default_signal);
