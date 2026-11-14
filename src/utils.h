@@ -152,6 +152,45 @@ typedef struct TJSPinnedFd {
 TJSPinnedFd TJS_PinFd(int fd);
 void TJS_UnpinFd(TJSPinnedFd *pin);
 
+/* Compare Windows kernel-object identity without making the executable import
+ * the Windows 10-only CompareObjectHandles entry point. The cache helper is
+ * platform-independent so resolver success and negative caching can be tested
+ * without an old Windows host. Its first use must be serialized by the caller;
+ * the Windows wrapper below uses InitOnceExecuteOnce. */
+typedef enum TJSObjectHandleIdentity {
+    TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED = -1,
+    TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT = 0,
+    TJS_OBJECT_HANDLE_IDENTITY_SAME = 1,
+} TJSObjectHandleIdentity;
+
+#ifdef _WIN32
+#define TJS_OBJECT_HANDLE_CALL WINAPI
+#else
+#define TJS_OBJECT_HANDLE_CALL
+#endif
+
+typedef int (TJS_OBJECT_HANDLE_CALL *TJSObjectHandleCompareFunction)(
+    void *first, void *second);
+typedef TJSObjectHandleCompareFunction (*TJSObjectHandleCompareResolver)(
+    void *opaque);
+
+typedef struct TJSObjectHandleCompareCache {
+    TJSObjectHandleCompareFunction compare;
+    bool initialized;
+} TJSObjectHandleCompareCache;
+
+TJSObjectHandleIdentity TJS_CompareObjectHandlesCached(
+    TJSObjectHandleCompareCache *cache,
+    TJSObjectHandleCompareResolver resolver,
+    void *opaque,
+    void *first,
+    void *second);
+
+#ifdef _WIN32
+TJSObjectHandleIdentity TJS_CompareObjectHandles(void *first, void *second);
+#endif
+JSValue TJS_ThrowObjectHandleIdentityUnsupported(JSContext *ctx);
+
 /* Signal enum shared by the signals and process modules. */
 JSValue TJS_NewSignalEnum(JSContext *ctx);
 int TJS_ToSignal(JSContext *ctx, JSValueConst value, int default_signal);

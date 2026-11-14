@@ -101,6 +101,23 @@ await test('socket createFrom borrows descriptors by default', () => {
     }
 });
 
+await test('socket createFrom pins across an options getter', () => {
+    const original = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);
+    const fd = original.fileno;
+    const wrapper = socket.createFrom(fd, {
+        get closeOnClose() {
+            original.close();
+            return false;
+        },
+    });
+    try {
+        wrapper.bind(loopback);
+        assert(wrapper.sockname.port > 0);
+    } finally {
+        wrapper.close();
+    }
+});
+
 await test('UDP fileno round-trips through socket.createFrom without narrowing', () => {
     const handle = new udp.UDP();
     let wrapper;

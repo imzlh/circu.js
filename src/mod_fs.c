@@ -582,16 +582,20 @@ static void tjs_syncfs_unpin_fd(TJSSyncFsFdPin* pin) {
 }
 
 #ifdef _WIN32
-static bool tjs_syncfs_pin_matches_fd(const TJSSyncFsFdPin* pin, int fd) {
-    if (!pin->owned) return pin->fd == fd;
+static TJSObjectHandleIdentity tjs_syncfs_pin_matches_fd(
+    const TJSSyncFsFdPin* pin, int fd) {
+    if (!pin->owned) {
+        return pin->fd == fd ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+                             : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+    }
 
     HANDLE raw_handle = uv_get_osfhandle(fd);
     HANDLE pinned_handle = uv_get_osfhandle(pin->fd);
     if (raw_handle == INVALID_HANDLE_VALUE ||
         pinned_handle == INVALID_HANDLE_VALUE) {
-        return false;
+        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
     }
-    return CompareObjectHandles(raw_handle, pinned_handle) != FALSE;
+    return TJS_CompareObjectHandles(raw_handle, pinned_handle);
 }
 #endif
 
@@ -662,7 +666,13 @@ static JSValue tjs_syncfs_throw_pinned_uv(JSContext* ctx, TJSSyncFsFdPin* pin, i
 #define TJS_SYNCFS_REVALIDATE_FLOCK(pin_, fd_)                           \
     do {                                                                 \
         TJS_SYNCFS_REVALIDATE_PIN_ONLY(pin_);                            \
-        if (!tjs_syncfs_pin_matches_fd(&(pin_), (fd_)))                  \
+        TJSObjectHandleIdentity identity_ =                              \
+            tjs_syncfs_pin_matches_fd(&(pin_), (fd_));                   \
+        if (identity_ == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {       \
+            tjs_syncfs_unpin_fd(&(pin_));                                \
+            return TJS_ThrowObjectHandleIdentityUnsupported(ctx);       \
+        }                                                                \
+        if (identity_ != TJS_OBJECT_HANDLE_IDENTITY_SAME)                \
             return tjs_syncfs_throw_pinned_uv(ctx, &(pin_), UV_EBADF);   \
     } while (0)
 #else

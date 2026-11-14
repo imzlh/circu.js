@@ -552,6 +552,89 @@ void TJS_UnpinFd(TJSPinnedFd *pin) {
     pin->owned = false;
 }
 
+TJSObjectHandleIdentity TJS_CompareObjectHandlesCached(
+    TJSObjectHandleCompareCache *cache,
+    TJSObjectHandleCompareResolver resolver,
+    void *opaque,
+    void *first,
+    void *second) {
+    if (!cache->initialized) {
+        cache->compare = resolver ? resolver(opaque) : NULL;
+        cache->initialized = true;
+    }
+    if (!cache->compare) {
+        return TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED;
+    }
+    return cache->compare(first, second)
+        ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+        : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+}
+
+#ifdef _WIN32
+static INIT_ONCE tjs__compare_object_handles_once = INIT_ONCE_STATIC_INIT;
+static TJSObjectHandleCompareCache tjs__compare_object_handles_cache;
+
+static TJSObjectHandleCompareFunction tjs__resolve_compare_object_handles(
+    void *opaque) {
+    (void) opaque;
+    static const wchar_t *const module_names[] = {
+        L"kernelbase.dll",
+        L"kernel32.dll",
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(module_names); i++) {
+        HMODULE module = GetModuleHandleW(module_names[i]);
+        bool loaded_here = false;
+        if (!module) {
+            module = LoadLibraryW(module_names[i]);
+            loaded_here = module != NULL;
+        }
+        if (!module) continue;
+
+        /* This union is the warning-free conversion also used by bundled
+         * libuv: a direct FARPROC/function-pointer cast trips MSVC /W4 /WX. */
+        union {
+            FARPROC proc;
+            TJSObjectHandleCompareFunction compare;
+        } symbol;
+        symbol.proc = GetProcAddress(module, "CompareObjectHandles");
+        if (symbol.proc) {
+            /* Keep a module loaded by us resident: the cached pointer must
+             * remain valid for the rest of the process. */
+            return symbol.compare;
+        }
+        if (loaded_here) FreeLibrary(module);
+    }
+    return NULL;
+}
+
+static BOOL CALLBACK tjs__init_compare_object_handles(
+    PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void) once;
+    (void) parameter;
+    (void) context;
+    tjs__compare_object_handles_cache.compare =
+        tjs__resolve_compare_object_handles(NULL);
+    tjs__compare_object_handles_cache.initialized = true;
+    return TRUE;
+}
+
+TJSObjectHandleIdentity TJS_CompareObjectHandles(void *first, void *second) {
+    if (!InitOnceExecuteOnce(&tjs__compare_object_handles_once,
+                            tjs__init_compare_object_handles, NULL, NULL)) {
+        return TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED;
+    }
+    return TJS_CompareObjectHandlesCached(&tjs__compare_object_handles_cache,
+                                          NULL, NULL, first, second);
+}
+#endif
+
+JSValue TJS_ThrowObjectHandleIdentityUnsupported(JSContext *ctx) {
+    return JS_ThrowTypeError(
+        ctx,
+        "object handle identity comparison is not supported on this Windows version");
+}
+
 static const char *const tjs_signal_map[] = {
 #ifdef SIGHUP
     [SIGHUP] = "SIGHUP",

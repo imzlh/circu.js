@@ -127,10 +127,10 @@ declare namespace CModuleStreams {
 
         /**
          * Get underlying file descriptor
-         * @returns File descriptor number
+         * @returns File descriptor number, or a pointer-width bigint handle on Windows
          * @throws {Error} ECONNRESET when the handle is closing
          */
-        get fileno(): number;
+        get fileno(): number | bigint;
 
         /**
          * Increase event loop ref count, prevent handle from being reclaimed

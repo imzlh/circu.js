@@ -1050,7 +1050,7 @@ static JSValue tjs_stream_get_fileno(JSContext *ctx, JSValue this_val) {
     int r = uv_fileno(&s->h.handle, &fd);
     if (r != 0) return tjs_throw_errno(ctx, r);
 #ifdef _WIN32
-    return JS_NewInt32(ctx, (int32_t)(intptr_t)fd);
+    return JS_NewBigUint64(ctx, (uint64_t)(uintptr_t)fd);
 #else
     return JS_NewInt32(ctx, (int32_t)fd);
 #endif
@@ -1361,7 +1361,7 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
         return JS_ThrowInternalError(ctx, "connect already in progress");
     /* Keep unconditional: without a hook the revalidate block below never
      * runs, and uv_tcp_open would fail with a bare EBUSY instead. */
-    if (stream_get_fd(t) >= 0)
+    if (stream_has_fd(t))
         return JS_ThrowInternalError(ctx, "socket already open");
 
     struct sockaddr_storage ss;
@@ -1376,7 +1376,7 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
 
     char destination[96];
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "tcp.connectSync", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_get_fd(t) >= 0) return JS_ThrowInternalError(ctx, "socket already open"); } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "tcp.connectSync", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_has_fd(t)) return JS_ThrowInternalError(ctx, "socket already open"); } while (0));
 
 #ifndef _WIN32
     int fd = socket(ss.ss_family, SOCK_STREAM, 0);

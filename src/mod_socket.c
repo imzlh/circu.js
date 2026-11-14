@@ -39,6 +39,7 @@
 # define uv_poll_init_fd     uv_poll_init_socket
 #else
 # include <net/if.h>
+# include <sys/stat.h>
 # include <sys/socket.h>
 # include <sys/un.h>
 # include <unistd.h>
@@ -59,6 +60,16 @@
 #define TJS_SOCK_CLASS_NAME "Socket"
 static thread_local JSClassID tjs_sock_classid;
 
+#ifdef _WIN32
+typedef struct {
+    sock_fd_t sock;
+    int error;
+    bool owned;
+} tjs_sock_pin_t;
+#else
+typedef TJSPinnedFd tjs_sock_pin_t;
+#endif
+
 typedef struct {
     sock_fd_t  sock;
     bool       close_on_close;
@@ -68,7 +79,108 @@ typedef struct {
     JSValue    callback, this_obj;
     JSContext *jsctx;
     uv_poll_t  poll;
+    tjs_sock_pin_t poll_pin;
 } tjs_sock_t;
+
+static tjs_sock_pin_t tjs_sock_pin_init(sock_fd_t sock) {
+    return (tjs_sock_pin_t) { sock, 0, false };
+}
+
+static tjs_sock_pin_t tjs_sock_pin(sock_fd_t sock) {
+#ifdef _WIN32
+    tjs_sock_pin_t pin = tjs_sock_pin_init(sock);
+    WSAPROTOCOL_INFOW info;
+    if (WSADuplicateSocketW(sock, GetCurrentProcessId(), &info) != 0) {
+        pin.sock = SOCK_INVALID;
+        pin.error = WSAGetLastError();
+        return pin;
+    }
+
+    DWORD flags = WSA_FLAG_OVERLAPPED;
+# ifdef WSA_FLAG_NO_HANDLE_INHERIT
+    flags |= WSA_FLAG_NO_HANDLE_INHERIT;
+# endif
+    pin.sock = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                          FROM_PROTOCOL_INFO, &info, 0, flags);
+    if (!sock_valid(pin.sock)) {
+        pin.error = WSAGetLastError();
+        return pin;
+    }
+# ifndef WSA_FLAG_NO_HANDLE_INHERIT
+    if (!SetHandleInformation((HANDLE) pin.sock, HANDLE_FLAG_INHERIT, 0)) {
+        pin.error = WSAEINVAL;
+        closesocket(pin.sock);
+        pin.sock = SOCK_INVALID;
+        return pin;
+    }
+# endif
+    pin.owned = true;
+    return pin;
+#else
+    return TJS_PinFd(sock);
+#endif
+}
+
+static sock_fd_t tjs_sock_pin_socket(const tjs_sock_pin_t *pin) {
+#ifdef _WIN32
+    return pin->sock;
+#else
+    return pin->fd;
+#endif
+}
+
+static int tjs_sock_pin_error(const tjs_sock_pin_t *pin) {
+    return pin->error;
+}
+
+static bool tjs_sock_pin_owned(const tjs_sock_pin_t *pin) {
+    return pin->owned;
+}
+
+static TJSObjectHandleIdentity tjs_sock_pin_matches_socket(
+    const tjs_sock_pin_t *pin, sock_fd_t sock) {
+    if (!pin->owned)
+        return tjs_sock_pin_socket(pin) == sock
+            ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+            : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+#ifdef _WIN32
+    return TJS_CompareObjectHandles(
+        (void *) (uintptr_t) tjs_sock_pin_socket(pin),
+        (void *) (uintptr_t) sock);
+#else
+    struct stat pinned_stat;
+    struct stat raw_stat;
+    bool matches = fstat(tjs_sock_pin_socket(pin), &pinned_stat) == 0 &&
+                   fstat(sock, &raw_stat) == 0 &&
+                   pinned_stat.st_dev == raw_stat.st_dev &&
+                   pinned_stat.st_ino == raw_stat.st_ino &&
+                   (pinned_stat.st_mode & S_IFMT) ==
+                       (raw_stat.st_mode & S_IFMT);
+    return matches ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+                   : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+#endif
+}
+
+static void tjs_sock_unpin(tjs_sock_pin_t *pin) {
+#ifdef _WIN32
+    if (!pin || !pin->owned) return;
+    int saved_error = WSAGetLastError();
+    closesocket(pin->sock);
+    WSASetLastError(saved_error);
+    pin->sock = SOCK_INVALID;
+    pin->owned = false;
+#else
+    TJS_UnpinFd(pin);
+#endif
+}
+
+static JSValue tjs_sock_throw_pin_error(JSContext *ctx, int error) {
+#ifdef _WIN32
+    return JS_ThrowInternalError(ctx, "WSA error %d", error);
+#else
+    return tjs_throw_errno(ctx, uv_translate_sys_error(error));
+#endif
+}
 
 static bool tjs_sock_reget(JSContext *ctx, JSValueConst this_val,
                            tjs_sock_t **result) {
@@ -82,6 +194,24 @@ static bool tjs_sock_reget(JSContext *ctx, JSValueConst this_val,
         return false;
     }
     *result = s;
+    return true;
+}
+
+static bool tjs_sock_revalidate_pin(JSContext *ctx, JSValueConst this_val,
+                                    tjs_sock_t **state,
+                                    tjs_sock_pin_t *pin,
+                                    sock_fd_t *operation_sock) {
+    if (!tjs_sock_reget(ctx, this_val, state)) {
+        tjs_sock_unpin(pin);
+        return false;
+    }
+    int error = tjs_sock_pin_error(pin);
+    if (error) {
+        tjs_sock_unpin(pin);
+        tjs_sock_throw_pin_error(ctx, error);
+        return false;
+    }
+    *operation_sock = tjs_sock_pin_socket(pin);
     return true;
 }
 
@@ -138,6 +268,7 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd, bool close_on_
     s->callback       = JS_UNDEFINED;
     s->this_obj       = JS_UNDEFINED;
     s->jsctx          = ctx;
+    s->poll_pin       = tjs_sock_pin_init(fd);
     JS_SetOpaque(obj, s);
     return obj;
 }
@@ -145,6 +276,7 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd, bool close_on_
 static void tjs_sock_poll_close_cb(uv_handle_t *handle) {
     tjs_sock_t *s = uv_handle_get_data(handle);
     if (!s) return;
+    tjs_sock_unpin(&s->poll_pin);
     s->poll_closed = true;
     /* Only free once the JS wrapper has also been finalized; otherwise the
      * opaque pointer is still live and freeing here would be a use-after-free
@@ -209,31 +341,76 @@ static JSValue tjs_sock_from_fd(JSContext *ctx, JSValue this_val, int argc, JSVa
         return JS_EXCEPTION;
     bool close_on_close = false;
 
+    /* Property access and the capability hook can close fd and reuse its
+     * numeric slot. Duplicate before either re-entry boundary so this call
+     * keeps referring to the socket supplied by the caller. */
+    tjs_sock_pin_t pin = tjs_sock_pin(fd);
+
     if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        if (!JS_IsObject(argv[1]))
+        if (!JS_IsObject(argv[1])) {
+            tjs_sock_unpin(&pin);
             return JS_ThrowTypeError(ctx, "createFrom options must be an object");
+        }
         JSValue value = JS_GetPropertyStr(ctx, argv[1], "closeOnClose");
-        if (JS_IsException(value)) return JS_EXCEPTION;
+        if (JS_IsException(value)) {
+            tjs_sock_unpin(&pin);
+            return JS_EXCEPTION;
+        }
         if (!JS_IsUndefined(value)) {
             int close_value = JS_ToBool(ctx, value);
             JS_FreeValue(ctx, value);
-            if (close_value < 0) return JS_EXCEPTION;
+            if (close_value < 0) {
+                tjs_sock_unpin(&pin);
+                return JS_EXCEPTION;
+            }
             close_on_close = close_value != 0;
         } else {
             JS_FreeValue(ctx, value);
         }
     }
 
-    /* Gate before the SO_TYPE probe: a rejecting hook must not allow — or be
-     * preceded by — any syscall on the borrowed descriptor. */
-    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.createFrom", NULL), (void)0);
+    TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.createFrom", NULL), tjs_sock_unpin(&pin));
 
-    /* validate fd by probing socket type */
-    int dummy; socklen_t dlen = sizeof(dummy);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *) &dummy, &dlen) < 0)
+    if (tjs_sock_pin_error(&pin)) {
+        tjs_sock_unpin(&pin);
         return JS_ThrowTypeError(ctx, "not a valid socket descriptor");
+    }
 
-    return tjs_sock_new_from_fd(ctx, fd, close_on_close);
+    /* Validate the pinned socket, never a same-number replacement. */
+    int dummy; socklen_t dlen = sizeof(dummy);
+    if (getsockopt(tjs_sock_pin_socket(&pin), SOL_SOCKET, SO_TYPE,
+                   (char *) &dummy, &dlen) < 0) {
+        tjs_sock_unpin(&pin);
+        return JS_ThrowTypeError(ctx, "not a valid socket descriptor");
+    }
+
+    /* Build around the duplicate first. Allocation/GC may finalize another
+     * wrapper that owned fd; only switch back to fd after all allocations. */
+    sock_fd_t pinned_sock = tjs_sock_pin_socket(&pin);
+    pin.owned = false;
+    JSValue obj = tjs_sock_new_from_fd(ctx, pinned_sock, true);
+    if (JS_IsException(obj))
+        return obj;
+
+    tjs_sock_t *s = JS_GetOpaque(obj, tjs_sock_classid);
+    tjs_sock_pin_t owned_pin = tjs_sock_pin_init(pinned_sock);
+    owned_pin.owned = true;
+    TJSObjectHandleIdentity identity =
+        tjs_sock_pin_matches_socket(&owned_pin, fd);
+    if (identity == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {
+        /* The wrapper owns pinned_sock now, so freeing it releases only the
+         * duplicate and never the caller's socket. */
+        JS_FreeValue(ctx, obj);
+        return TJS_ThrowObjectHandleIdentityUnsupported(ctx);
+    }
+    if (identity == TJS_OBJECT_HANDLE_IDENTITY_SAME) {
+        tjs_sock_unpin(&owned_pin);
+        s->sock = fd;
+        s->close_on_close = close_on_close;
+        s->poll_pin = tjs_sock_pin_init(fd);
+    }
+
+    return obj;
 }
 
 static void close_sock(tjs_sock_t *s) {
@@ -319,8 +496,16 @@ static JSValue tjs_sock_bind(JSContext *ctx, JSValue this_val, int argc, JSValue
     struct sockaddr_storage addr;
     if (tjs_obj2addr(ctx, argv[0], &addr) != 0) return JS_EXCEPTION;
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.bind", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    RET_THROW_ERRNO(ctx, bind(s->sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr)) == 0);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.bind", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
+    int ret = bind(operation_sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr));
+    tjs_sock_unpin(&pin);
+    RET_THROW_ERRNO(ctx, ret == 0);
     return JS_UNDEFINED;
 }
 
@@ -330,8 +515,16 @@ static JSValue tjs_sock_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     struct sockaddr_storage addr;
     if (tjs_obj2addr(ctx, argv[0], &addr) != 0) return JS_EXCEPTION;
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "socket.connect", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    RET_THROW_ERRNO(ctx, connect(s->sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr)) == 0);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "socket.connect", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
+    int ret = connect(operation_sock, (struct sockaddr *) &addr, tjs_sock_addrlen(&addr));
+    tjs_sock_unpin(&pin);
+    RET_THROW_ERRNO(ctx, ret == 0);
     return JS_UNDEFINED;
 }
 
@@ -341,15 +534,30 @@ static JSValue tjs_sock_listen(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToUint32(ctx, &backlog, argv[0]))
         return JS_EXCEPTION;
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.listen", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    RET_THROW_ERRNO(ctx, listen(s->sock, backlog) == 0);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN, TJS_CAP_FLAG_REPLACEABLE, "socket.listen", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
+    int ret = listen(operation_sock, backlog);
+    tjs_sock_unpin(&pin);
+    RET_THROW_ERRNO(ctx, ret == 0);
     return JS_UNDEFINED;
 }
 
 static JSValue tjs_sock_accept(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     GET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.accept", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    sock_fd_t fd = accept(s->sock, NULL, NULL);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_LISTEN | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.accept", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
+    sock_fd_t fd = accept(operation_sock, NULL, NULL);
+    tjs_sock_unpin(&pin);
     RET_THROW_ERRNO(ctx, sock_valid(fd));
     return tjs_sock_new_from_fd(ctx, fd, true);
 }
@@ -360,8 +568,16 @@ static JSValue tjs_sock_shutdown(JSContext *ctx, JSValue this_val, int argc, JSV
     unsigned how;
     TJS_CHECK_ARG_RET(ctx, !JS_ToUint32(ctx, &how, argv[0]), 0, "uint");
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.shutdown", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    RET_THROW_ERRNO(ctx, shutdown(s->sock, how) == 0);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.shutdown", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
+    int ret = shutdown(operation_sock, how);
+    tjs_sock_unpin(&pin);
+    RET_THROW_ERRNO(ctx, ret == 0);
     return JS_UNDEFINED;
 }
 
@@ -376,11 +592,20 @@ static JSValue tjs_sock_recv(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
 
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recv", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recv", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
     uint8_t *buf = js_malloc(ctx, count);
-    if (!buf && count != 0)
+    if (!buf && count != 0) {
+        tjs_sock_unpin(&pin);
         return JS_ThrowOutOfMemory(ctx);
-    int ret = recv(s->sock, (char *) buf, count, (int) flags);
+    }
+    int ret = recv(operation_sock, (char *) buf, count, (int) flags);
+    tjs_sock_unpin(&pin);
     if (ret < 0)  { js_free(ctx, buf); return THROW_STRERROR(); }
     if (ret == 0) { js_free(ctx, buf); return JS_NULL; }
     return TJS_NewUint8Array(ctx, buf, ret);
@@ -401,8 +626,19 @@ static JSValue tjs_sock_send(JSContext *ctx, JSValue this_val, int argc, JSValue
     size_t sz;
     uint8_t *buf = JS_GetUint8Array(ctx, &sz, argv[0]);
     if (!buf) return JS_EXCEPTION;
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "socket.send", NULL), (void)0, do { REGET_SOCK(ctx, this_val, s); buf = JS_GetUint8Array(ctx, &sz, argv[0]); if (!buf) return JS_EXCEPTION; } while (0));
-    int ret = send(s->sock, (const char *) buf, sz, (int) flags);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "socket.send", NULL),
+        tjs_sock_unpin(&pin),
+        do {
+            if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION;
+            buf = JS_GetUint8Array(ctx, &sz, argv[0]);
+            if (!buf) { tjs_sock_unpin(&pin); return JS_EXCEPTION; }
+        } while (0));
+    int ret = send(operation_sock, (const char *) buf, sz, (int) flags);
+    tjs_sock_unpin(&pin);
     RET_THROW_ERRNO(ctx, ret >= 0);
     return JS_NewUint32(ctx, ret);
 }
@@ -417,8 +653,20 @@ static JSValue tjs_sock_setsockopt(JSContext *ctx, JSValue this_val, int argc, J
     size_t optlen;
     uint8_t *optval = JS_GetUint8Array(ctx, &optlen, argv[2]);
     if (!optval) return JS_EXCEPTION;
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.setopt", NULL), (void)0, do { REGET_SOCK(ctx, this_val, s); optval = JS_GetUint8Array(ctx, &optlen, argv[2]); if (!optval) return JS_EXCEPTION; } while (0));
-    RET_THROW_ERRNO(ctx, setsockopt(s->sock, level, optname, (const char *) optval, optlen) == 0);
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "socket.setopt", NULL),
+        tjs_sock_unpin(&pin),
+        do {
+            if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION;
+            optval = JS_GetUint8Array(ctx, &optlen, argv[2]);
+            if (!optval) { tjs_sock_unpin(&pin); return JS_EXCEPTION; }
+        } while (0));
+    int ret = setsockopt(operation_sock, level, optname, (const char *) optval, optlen);
+    tjs_sock_unpin(&pin);
+    RET_THROW_ERRNO(ctx, ret == 0);
     return JS_UNDEFINED;
 }
 
@@ -437,11 +685,20 @@ static JSValue tjs_sock_getsockopt(JSContext *ctx, JSValue this_val, int argc, J
     }
 
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.getopt", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.getopt", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
     void *optval = js_malloc(ctx, optlen);
-    if (!optval && optlen != 0)
+    if (!optval && optlen != 0) {
+        tjs_sock_unpin(&pin);
         return JS_ThrowOutOfMemory(ctx);
-    int ret = getsockopt(s->sock, level, optname, (char *) optval, &optlen);
+    }
+    int ret = getsockopt(operation_sock, level, optname, (char *) optval, &optlen);
+    tjs_sock_unpin(&pin);
     if (ret < 0) { js_free(ctx, optval); return THROW_STRERROR(); }
     return TJS_NewUint8Array(ctx, optval, optlen);
 }
@@ -460,19 +717,28 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     uint32_t ctrlsz = 0;
     if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToUint32(ctx, &ctrlsz, argv[1])) return JS_EXCEPTION;
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recvmsg", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "socket.recvmsg", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock)) return JS_EXCEPTION);
 
     struct msghdr msg = {0};
     msg.msg_namelen = sizeof(struct sockaddr_storage);
     msg.msg_name    = js_malloc(ctx, msg.msg_namelen);
-    if (!msg.msg_name)
+    if (!msg.msg_name) {
+        tjs_sock_unpin(&pin);
         return JS_ThrowOutOfMemory(ctx);
+    }
 
     if (ctrlsz > 0) {
         msg.msg_controllen = ctrlsz;
         msg.msg_control    = js_malloc(ctx, ctrlsz);
         if (!msg.msg_control) {
             js_free(ctx, msg.msg_name);
+            tjs_sock_unpin(&pin);
             return JS_ThrowOutOfMemory(ctx);
         }
     }
@@ -481,12 +747,14 @@ static JSValue tjs_sock_recvmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!iov.iov_base) {
         js_free(ctx, msg.msg_name);
         js_free(ctx, msg.msg_control);
+        tjs_sock_unpin(&pin);
         return JS_ThrowOutOfMemory(ctx);
     }
     msg.msg_iov    = &iov;
     msg.msg_iovlen = 1;
 
-    int ret = recvmsg(s->sock, &msg, 0);
+    int ret = recvmsg(operation_sock, &msg, 0);
+    tjs_sock_unpin(&pin);
     if (ret < 0) {
         /* clean up on error */
         js_free(ctx, msg.msg_name);
@@ -608,9 +876,23 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
         js_free(ctx, msg.msg_iov);
         return JS_EXCEPTION;
     }
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE | (msg.msg_name ? TJS_CAP_IO_CONNECT : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.sendmsg", NULL), js_free(ctx, msg.msg_iov), do { if (!tjs_sock_reget(ctx, this_val, &s) || tjs_sock_sendmsg_buffers(ctx, &msg, argv) < 0) { js_free(ctx, msg.msg_iov); return JS_EXCEPTION; } } while (0));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WRITE | (msg.msg_name ? TJS_CAP_IO_CONNECT : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.sendmsg", NULL),
+        (tjs_sock_unpin(&pin), js_free(ctx, msg.msg_iov)),
+        do {
+            if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin, &operation_sock) ||
+                tjs_sock_sendmsg_buffers(ctx, &msg, argv) < 0) {
+                tjs_sock_unpin(&pin);
+                js_free(ctx, msg.msg_iov);
+                return JS_EXCEPTION;
+            }
+        } while (0));
 
-    int ret = sendmsg(s->sock, &msg, flags);
+    int ret = sendmsg(operation_sock, &msg, flags);
+    tjs_sock_unpin(&pin);
     js_free(ctx, msg.msg_iov);
     RET_THROW_ERRNO(ctx, ret >= 0);
     return JS_NewUint32(ctx, ret);
@@ -637,11 +919,45 @@ static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue
     TJS_CHECK_ARG_RET(ctx, JS_IsFunction(ctx, argv[1]), 1, "function");
 
     REGET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WATCH | ((events & UV_READABLE) ? TJS_CAP_IO_READ : 0) | ((events & UV_WRITABLE) ? TJS_CAP_IO_WRITE : 0) | ((events & (UV_DISCONNECT | UV_PRIORITIZED)) ? TJS_CAP_IO_CONTROL : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.poll", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    TJS_CAPABILITY_GUARDED(
+        do { if (!s->poll_init) pin = tjs_sock_pin(s->sock); } while (0),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_WATCH | ((events & UV_READABLE) ? TJS_CAP_IO_READ : 0) | ((events & UV_WRITABLE) ? TJS_CAP_IO_WRITE : 0) | ((events & (UV_DISCONNECT | UV_PRIORITIZED)) ? TJS_CAP_IO_CONTROL : 0), TJS_CAP_FLAG_REPLACEABLE, "socket.poll", NULL),
+        tjs_sock_unpin(&pin),
+        do {
+            if (!tjs_sock_reget(ctx, this_val, &s)) {
+                tjs_sock_unpin(&pin);
+                return JS_EXCEPTION;
+            }
+            if (s->poll_init) {
+                tjs_sock_unpin(&pin);
+            } else if (tjs_sock_pin_error(&pin)) {
+                int error = tjs_sock_pin_error(&pin);
+                tjs_sock_unpin(&pin);
+                return tjs_sock_throw_pin_error(ctx, error);
+            }
+        } while (0));
 
     if (!s->poll_init) {
-        int ret = uv_poll_init_fd(tjs_get_loop(ctx), &s->poll, s->sock);
-        if (ret < 0) return tjs_throw_errno(ctx, ret);
+        /* uv_poll_t retains the descriptor after this function returns. Keep
+         * a duplicate for the handle's whole lifetime, including when no hook
+         * is installed yet (one may be installed before a later restart). */
+        if (!tjs_sock_pin_owned(&pin)) {
+            pin = tjs_sock_pin(s->sock);
+            if (tjs_sock_pin_error(&pin)) {
+                int error = tjs_sock_pin_error(&pin);
+                tjs_sock_unpin(&pin);
+                return tjs_sock_throw_pin_error(ctx, error);
+            }
+        }
+        int ret = uv_poll_init_fd(tjs_get_loop(ctx), &s->poll,
+                                  tjs_sock_pin_socket(&pin));
+        if (ret < 0) {
+            tjs_sock_unpin(&pin);
+            return tjs_throw_errno(ctx, ret);
+        }
+        s->poll_pin = pin;
+        pin = tjs_sock_pin_init(s->sock);
         uv_handle_set_data((uv_handle_t *) &s->poll, s);
         s->poll_init = true;
     }
@@ -686,22 +1002,55 @@ static JSValue tjs_sock_poll_stop(JSContext *ctx, JSValue this_val, int argc, JS
 
 static JSValue tjs_sock_get_fd(JSContext *ctx, JSValue this_val) {
     GET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.fileno", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    sock_fd_t fd = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.fileno", NULL),
+        tjs_sock_unpin(&pin),
+        do {
+            if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin,
+                                         &operation_sock))
+                return JS_EXCEPTION;
+            TJSObjectHandleIdentity identity =
+                tjs_sock_pin_matches_socket(&pin, s->sock);
+            if (identity == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {
+                tjs_sock_unpin(&pin);
+                return TJS_ThrowObjectHandleIdentityUnsupported(ctx);
+            }
+            if (identity != TJS_OBJECT_HANDLE_IDENTITY_SAME) {
+                tjs_sock_unpin(&pin);
+                return JS_ThrowTypeError(
+                    ctx, "Socket descriptor changed during capability check");
+            }
+            fd = s->sock;
+        } while (0));
+    tjs_sock_unpin(&pin);
 #ifdef _WIN32
-    return JS_NewBigUint64(ctx, (uint64_t) (uintptr_t) s->sock);
+    return JS_NewBigUint64(ctx, (uint64_t) (uintptr_t) fd);
 #else
-    return JS_NewInt32(ctx, s->sock);
+    return JS_NewInt32(ctx, fd);
 #endif
 }
 
 static JSValue tjs_sock_get_sockpeername(JSContext *ctx, JSValue this_val, int magic) {
     GET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "socket.sockname" : "socket.peername", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, magic == 0 ? "socket.sockname" : "socket.peername", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin,
+                                     &operation_sock))
+            return JS_EXCEPTION);
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
     int ret = magic == 0
-        ? getsockname(s->sock, (struct sockaddr *) &addr, &len)
-        : getpeername(s->sock, (struct sockaddr *) &addr, &len);
+        ? getsockname(operation_sock, (struct sockaddr *) &addr, &len)
+        : getpeername(operation_sock, (struct sockaddr *) &addr, &len);
+    tjs_sock_unpin(&pin);
     RET_THROW_ERRNO(ctx, ret == 0);
 
     JSValue result = JS_NewObjectProto(ctx, JS_NULL);
@@ -721,30 +1070,57 @@ static JSValue tjs_sock_get_polling(JSContext *ctx, JSValue this_val) {
 
 static JSValue tjs_sock_get_info(JSContext *ctx, JSValue this_val) {
     GET_SOCK(ctx, this_val, s);
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.info", NULL), (void)0, REGET_SOCK(ctx, this_val, s));
-    JSValue info = JS_NewObject(ctx);
-    if (JS_IsException(info)) return info;
+    tjs_sock_pin_t pin = tjs_sock_pin_init(s->sock);
+    sock_fd_t operation_sock = s->sock;
+    TJS_CAPABILITY_GUARDED(
+        pin = tjs_sock_pin(s->sock),
+        tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "socket.info", NULL),
+        tjs_sock_unpin(&pin),
+        if (!tjs_sock_revalidate_pin(ctx, this_val, &s, &pin,
+                                     &operation_sock))
+            return JS_EXCEPTION);
+
+    int type = 0;
+    int domain = 0;
+    int protocol = 0;
+    bool has_type = false;
+    bool has_domain = false;
+    bool has_protocol = false;
 
 #ifdef __APPLE__
     struct socket_fdinfo sfi;
-    if (proc_pidfdinfo(getpid(), s->sock, PROC_PIDFDSOCKETINFO, &sfi, sizeof sfi) > 0) {
-        JS_SetPropertyStr(ctx, info, "type",     JS_NewInt32(ctx, sfi.psi.soi_type));
-        JS_SetPropertyStr(ctx, info, "domain",   JS_NewInt32(ctx, sfi.psi.soi_family));
-        JS_SetPropertyStr(ctx, info, "protocol", JS_NewInt32(ctx, sfi.psi.soi_protocol));
+    if (proc_pidfdinfo(getpid(), operation_sock, PROC_PIDFDSOCKETINFO, &sfi,
+                       sizeof sfi) > 0) {
+        type = sfi.psi.soi_type;
+        domain = sfi.psi.soi_family;
+        protocol = sfi.psi.soi_protocol;
+        has_type = has_domain = has_protocol = true;
     }
 #else
-    int val; socklen_t vlen = sizeof(val);
-# define TRY_SOCKOPT(name, key) \
-    if (getsockopt(s->sock, SOL_SOCKET, name, (char*)&val, &vlen) == 0) { \
-        JS_SetPropertyStr(ctx, info, key, JS_NewInt32(ctx, val)); }
+    socklen_t vlen = sizeof(type);
+    has_type = getsockopt(operation_sock, SOL_SOCKET, SO_TYPE, (char *) &type,
+                          &vlen) == 0;
 
-    TRY_SOCKOPT(SO_TYPE, "type")
 # ifndef _WIN32
-    TRY_SOCKOPT(SO_DOMAIN,   "domain")
-    TRY_SOCKOPT(SO_PROTOCOL, "protocol")
+    vlen = sizeof(domain);
+    has_domain = getsockopt(operation_sock, SOL_SOCKET, SO_DOMAIN,
+                            (char *) &domain, &vlen) == 0;
+    vlen = sizeof(protocol);
+    has_protocol = getsockopt(operation_sock, SOL_SOCKET, SO_PROTOCOL,
+                              (char *) &protocol, &vlen) == 0;
 # endif
-# undef TRY_SOCKOPT
 #endif
+
+    tjs_sock_unpin(&pin);
+
+    JSValue info = JS_NewObject(ctx);
+    if (JS_IsException(info)) return info;
+    if (has_type)
+        JS_SetPropertyStr(ctx, info, "type", JS_NewInt32(ctx, type));
+    if (has_domain)
+        JS_SetPropertyStr(ctx, info, "domain", JS_NewInt32(ctx, domain));
+    if (has_protocol)
+        JS_SetPropertyStr(ctx, info, "protocol", JS_NewInt32(ctx, protocol));
     return info;
 }
 

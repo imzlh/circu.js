@@ -4,6 +4,12 @@
 #include <assert.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <errno.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 /* Keep this standalone target meaningful in Release builds too. */
 #undef assert
 #define assert(expr) CHECK(expr)
@@ -19,6 +25,7 @@ typedef enum HookMode {
     HOOK_REENTER,
     HOOK_REENTER_MACRO,
     HOOK_UNINSTALL,
+    HOOK_REUSE_FD,
 } HookMode;
 
 typedef struct HookState {
@@ -31,7 +38,62 @@ typedef struct HookState {
     uint32_t argc;
     TJSRuntime *runtime;
     JSValue callback;
+    const char *reuse_api;
+    int reuse_target_fd;
+    int reuse_source_fd;
+    bool reused_fd;
 } HookState;
+
+typedef struct HandleResolverState {
+    int resolve_calls;
+    int compare_calls;
+    bool available;
+} HandleResolverState;
+
+static HandleResolverState *handle_resolver_state;
+
+static int TJS_OBJECT_HANDLE_CALL mock_compare_object_handles(
+    void *first, void *second) {
+    handle_resolver_state->compare_calls++;
+    return first == second;
+}
+
+static TJSObjectHandleCompareFunction mock_resolve_compare_object_handles(
+    void *opaque) {
+    HandleResolverState *state = opaque;
+    state->resolve_calls++;
+    handle_resolver_state = state;
+    return state->available ? mock_compare_object_handles : NULL;
+}
+
+static void test_object_handle_compare_cache(void) {
+    HandleResolverState state = { .available = true };
+    TJSObjectHandleCompareCache cache = { 0 };
+    void *first = (void *) (uintptr_t) 1;
+    void *second = (void *) (uintptr_t) 2;
+
+    assert(TJS_CompareObjectHandlesCached(
+               &cache, mock_resolve_compare_object_handles, &state,
+               first, first) == TJS_OBJECT_HANDLE_IDENTITY_SAME);
+    assert(TJS_CompareObjectHandlesCached(
+               &cache, mock_resolve_compare_object_handles, &state,
+               first, second) == TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT);
+    assert(state.resolve_calls == 1);
+    assert(state.compare_calls == 2);
+
+    HandleResolverState unavailable = { 0 };
+    TJSObjectHandleCompareCache unavailable_cache = { 0 };
+    assert(TJS_CompareObjectHandlesCached(
+               &unavailable_cache, mock_resolve_compare_object_handles,
+               &unavailable, first, first) ==
+           TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED);
+    assert(TJS_CompareObjectHandlesCached(
+               &unavailable_cache, mock_resolve_compare_object_handles,
+               &unavailable, first, first) ==
+           TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED);
+    assert(unavailable.resolve_calls == 1);
+    assert(unavailable.compare_calls == 0);
+}
 
 static JSValue nested_macro_probe(JSContext *ctx,
                                   const TJSCapability *capability,
@@ -108,6 +170,17 @@ static JSValue capability_hook(JSContext *ctx,
         }
         case HOOK_UNINSTALL:
             TJS_SetCapabilityHook(state->runtime, NULL, NULL, 0);
+            return TJS_CAPABILITY_PASS;
+        case HOOK_REUSE_FD:
+#ifndef _WIN32
+            if (!state->reused_fd && state->reuse_api &&
+                strcmp(capability->api, state->reuse_api) == 0) {
+                assert(close(state->reuse_target_fd) == 0);
+                assert(dup2(state->reuse_source_fd, state->reuse_target_fd) ==
+                       state->reuse_target_fd);
+                state->reused_fd = true;
+            }
+#endif
             return TJS_CAPABILITY_PASS;
     }
     assert(0);
@@ -227,12 +300,16 @@ static void expect_hook_revalidation(JSContext *ctx,
 }
 
 int main(void) {
+    test_object_handle_compare_cache();
+
     TJSRuntime *runtime = TJS_NewRuntime();
     assert(runtime != NULL);
     JSContext *ctx = runtime->main_ctx;
     assert(ctx != NULL);
     assert(JS_AddIntrinsicEval(ctx) == 0);
+    set_global(ctx, "asyncfs", use_module(ctx, "asyncfs"));
     set_global(ctx, "sqlite3", use_module(ctx, "sqlite3"));
+    set_global(ctx, "socket", use_module(ctx, "socket"));
     set_global(ctx, "streams", use_module(ctx, "streams"));
 
     HookState state = {
@@ -565,6 +642,364 @@ int main(void) {
         "globalThis.run = () => pipe.open(0);\n"
         "globalThis.closeTarget = () => pipe.close();\n"
         "closeTarget");
+
+#ifndef _WIN32
+    /* asyncfs.createFrom is borrowed by construction: the returned owner must
+     * retain the pre-hook file description through its duplicate and never
+     * take ownership of either the original slot or its replacement. */
+    int original_pipe[2];
+    int replacement_pipe[2];
+    assert(pipe(original_pipe) == 0);
+    assert(pipe(replacement_pipe) == 0);
+    set_global(ctx, "fileFd", JS_NewInt32(ctx, original_pipe[0]));
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "asyncfs.createFrom";
+    state.reuse_target_fd = original_pipe[0];
+    state.reuse_source_fd = replacement_pipe[0];
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx,
+        "globalThis.pinnedFile = asyncfs.createFrom(fileFd)",
+        sizeof("globalThis.pinnedFile = asyncfs.createFrom(fileFd)") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+
+    result = eval_function(ctx, "pinnedFile.fileno()",
+                           sizeof("pinnedFile.fileno()") - 1);
+    assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT);
+    int pinned_file_fd = JS_VALUE_GET_INT(result);
+    JS_FreeValue(ctx, result);
+    unsigned char byte = 88;
+    assert(write(original_pipe[1], &byte, 1) == 1);
+    byte = 99;
+    assert(write(replacement_pipe[1], &byte, 1) == 1);
+    byte = 0;
+    assert(read(pinned_file_fd, &byte, 1) == 1);
+    assert(byte == 88);
+    assert(read(original_pipe[0], &byte, 1) == 1);
+    assert(byte == 99);
+    result = eval_function(ctx, "globalThis.pinnedFile = undefined",
+                           sizeof("globalThis.pinnedFile = undefined") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    JS_RunGC(JS_GetRuntime(ctx));
+    assert(fcntl(original_pipe[0], F_GETFD) != -1);
+    close(original_pipe[0]);
+    close(original_pipe[1]);
+    close(replacement_pipe[0]);
+    close(replacement_pipe[1]);
+
+    /* createFrom itself must pin before its capability hook. Otherwise a hook
+     * can replace the numeric slot and make the returned wrapper target the
+     * wrong socket. */
+    int original_pair[2];
+    int replacement_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, original_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, replacement_pair) == 0);
+    set_global(ctx, "socketFd", JS_NewInt32(ctx, original_pair[0]));
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "socket.createFrom";
+    state.reuse_target_fd = original_pair[0];
+    state.reuse_source_fd = replacement_pair[0];
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx,
+        "globalThis.pinnedSocket = socket.createFrom(socketFd)",
+        sizeof("globalThis.pinnedSocket = socket.createFrom(socketFd)") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+
+    result = eval_function(
+        ctx, "pinnedSocket.send(new Uint8Array([89]))",
+        sizeof("pinnedSocket.send(new Uint8Array([89]))") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    byte = 0;
+    assert(recv(original_pair[1], (char *) &byte, 1, MSG_DONTWAIT) == 1);
+    assert(byte == 89);
+    errno = 0;
+    assert(recv(replacement_pair[1], (char *) &byte, 1, MSG_DONTWAIT) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    result = eval_function(ctx, "pinnedSocket.close()",
+                           sizeof("pinnedSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    close(original_pair[0]);
+    close(original_pair[1]);
+    close(replacement_pair[0]);
+    close(replacement_pair[1]);
+
+    /* Explicit ownership closes the transferred descriptor on wrapper close. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, original_pair) == 0);
+    set_global(ctx, "socketFd", JS_NewInt32(ctx, original_pair[0]));
+    result = eval_function(
+        ctx,
+        "socket.createFrom(socketFd, { closeOnClose: true }).close()",
+        sizeof("socket.createFrom(socketFd, { closeOnClose: true }).close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    errno = 0;
+    assert(close(original_pair[0]) == -1);
+    assert(errno == EBADF);
+    close(original_pair[1]);
+
+    /* A conservative hook can close a numeric descriptor and reuse the slot
+     * without touching the JS wrapper. The authorized operation must stay on
+     * the pre-hook socket description, not the replacement in the same slot. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, original_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, replacement_pair) == 0);
+    set_global(ctx, "socketFd", JS_NewInt32(ctx, original_pair[0]));
+    result = eval_function(
+        ctx,
+        "globalThis.pinnedSocket = socket.createFrom(socketFd)",
+        sizeof("globalThis.pinnedSocket = socket.createFrom(socketFd)") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "socket.send";
+    state.reuse_target_fd = original_pair[0];
+    state.reuse_source_fd = replacement_pair[0];
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx, "pinnedSocket.send(new Uint8Array([90]))",
+        sizeof("pinnedSocket.send(new Uint8Array([90]))") - 1);
+    assert(!JS_IsException(result));
+    assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT &&
+           JS_VALUE_GET_INT(result) == 1);
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+
+    byte = 0;
+    assert(recv(original_pair[1], (char *) &byte, 1, MSG_DONTWAIT) == 1);
+    assert(byte == 90);
+    errno = 0;
+    assert(recv(replacement_pair[1], (char *) &byte, 1, MSG_DONTWAIT) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    result = eval_function(ctx, "pinnedSocket.close()",
+                           sizeof("pinnedSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    close(original_pair[0]);
+    close(original_pair[1]);
+    close(replacement_pair[0]);
+    close(replacement_pair[1]);
+
+    /* Address and metadata getters must query the pre-hook socket description,
+     * even when the hook replaces the wrapper's numeric descriptor. */
+    result = eval_function(
+        ctx,
+        "globalThis.originalSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "globalThis.replacementSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "originalSocket.bind({ ip: '127.0.0.1', port: 0 });\n"
+        "replacementSocket.bind({ ip: '127.0.0.1', port: 0 });\n"
+        "globalThis.expectedSocketPort = originalSocket.sockname.port",
+        sizeof(
+            "globalThis.originalSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "globalThis.replacementSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "originalSocket.bind({ ip: '127.0.0.1', port: 0 });\n"
+            "replacementSocket.bind({ ip: '127.0.0.1', port: 0 });\n"
+            "globalThis.expectedSocketPort = originalSocket.sockname.port") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "originalSocket.fileno",
+                           sizeof("originalSocket.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_target_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "replacementSocket.fileno",
+                           sizeof("replacementSocket.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_source_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "socket.sockname";
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx, "originalSocket.sockname.port === expectedSocketPort",
+        sizeof("originalSocket.sockname.port === expectedSocketPort") - 1);
+    assert(JS_IsBool(result) && JS_VALUE_GET_BOOL(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    result = eval_function(
+        ctx, "originalSocket.close(); replacementSocket.close()",
+        sizeof("originalSocket.close(); replacementSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+
+    result = eval_function(
+        ctx,
+        "globalThis.originalPeer = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "globalThis.replacementPeer = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "globalThis.originalDestination = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "globalThis.replacementDestination = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+        "originalDestination.bind({ ip: '127.0.0.1', port: 0 });\n"
+        "replacementDestination.bind({ ip: '127.0.0.1', port: 0 });\n"
+        "originalPeer.connect(originalDestination.sockname);\n"
+        "replacementPeer.connect(replacementDestination.sockname);\n"
+        "globalThis.expectedPeerPort = originalDestination.sockname.port",
+        sizeof(
+            "globalThis.originalPeer = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "globalThis.replacementPeer = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "globalThis.originalDestination = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "globalThis.replacementDestination = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM);\n"
+            "originalDestination.bind({ ip: '127.0.0.1', port: 0 });\n"
+            "replacementDestination.bind({ ip: '127.0.0.1', port: 0 });\n"
+            "originalPeer.connect(originalDestination.sockname);\n"
+            "replacementPeer.connect(replacementDestination.sockname);\n"
+            "globalThis.expectedPeerPort = originalDestination.sockname.port") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "originalPeer.fileno",
+                           sizeof("originalPeer.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_target_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "replacementPeer.fileno",
+                           sizeof("replacementPeer.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_source_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    state.reuse_api = "socket.peername";
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx, "originalPeer.peername.port === expectedPeerPort",
+        sizeof("originalPeer.peername.port === expectedPeerPort") - 1);
+    assert(JS_IsBool(result) && JS_VALUE_GET_BOOL(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    result = eval_function(
+        ctx,
+        "originalPeer.close(); replacementPeer.close();\n"
+        "originalDestination.close(); replacementDestination.close()",
+        sizeof(
+            "originalPeer.close(); replacementPeer.close();\n"
+            "originalDestination.close(); replacementDestination.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+
+    result = eval_function(
+        ctx,
+        "globalThis.originalInfoSocket = new socket.Socket(socket.AF_INET, socket.SOCK_STREAM);\n"
+        "globalThis.replacementInfoSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM)",
+        sizeof(
+            "globalThis.originalInfoSocket = new socket.Socket(socket.AF_INET, socket.SOCK_STREAM);\n"
+            "globalThis.replacementInfoSocket = new socket.Socket(socket.AF_INET, socket.SOCK_DGRAM)") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "originalInfoSocket.fileno",
+                           sizeof("originalInfoSocket.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_target_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "replacementInfoSocket.fileno",
+                           sizeof("replacementInfoSocket.fileno") - 1);
+    assert(JS_ToInt32(ctx, &state.reuse_source_fd, result) == 0);
+    JS_FreeValue(ctx, result);
+    state.reuse_api = "socket.info";
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx, "originalInfoSocket.info.type === socket.SOCK_STREAM",
+        sizeof("originalInfoSocket.info.type === socket.SOCK_STREAM") - 1);
+    assert(JS_IsBool(result) && JS_VALUE_GET_BOOL(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    result = eval_function(
+        ctx, "originalInfoSocket.close(); replacementInfoSocket.close()",
+        sizeof("originalInfoSocket.close(); replacementInfoSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+
+    /* fileno cannot expose its temporary duplicate. If same-slot reuse changes
+     * the identity, fail instead, and release the pin before propagating. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, original_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, replacement_pair) == 0);
+    set_global(ctx, "socketFd", JS_NewInt32(ctx, original_pair[0]));
+    result = eval_function(
+        ctx, "globalThis.pinnedSocket = socket.createFrom(socketFd)",
+        sizeof("globalThis.pinnedSocket = socket.createFrom(socketFd)") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    state.reuse_target_fd = original_pair[0];
+    state.reuse_source_fd = replacement_pair[0];
+    state.reuse_api = "socket.fileno";
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(ctx, "pinnedSocket.fileno",
+                           sizeof("pinnedSocket.fileno") - 1);
+    assert(JS_IsException(result));
+    clear_exception(ctx);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    assert(recv(original_pair[1], (char *) &byte, 1, MSG_DONTWAIT) == 0);
+    result = eval_function(ctx, "pinnedSocket.close()",
+                           sizeof("pinnedSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    close(original_pair[0]);
+    close(original_pair[1]);
+    close(replacement_pair[0]);
+    close(replacement_pair[1]);
+
+    /* uv_poll_t retains its descriptor after poll() returns. Its pinned copy
+     * must therefore remain alive until the handle's close callback, while
+     * still protecting initialization from same-slot reuse in the hook. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, original_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, replacement_pair) == 0);
+    set_global(ctx, "socketFd", JS_NewInt32(ctx, original_pair[0]));
+    result = eval_function(
+        ctx,
+        "globalThis.pinnedSocket = socket.createFrom(socketFd);\n"
+        "globalThis.pollCalls = 0",
+        sizeof("globalThis.pinnedSocket = socket.createFrom(socketFd);\n"
+               "globalThis.pollCalls = 0") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "socket.poll";
+    state.reuse_target_fd = original_pair[0];
+    state.reuse_source_fd = replacement_pair[0];
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx,
+        "pinnedSocket.poll(socket.READABLE, () => { pollCalls++ })",
+        sizeof("pinnedSocket.poll(socket.READABLE, () => { pollCalls++ })") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+
+    byte = 91;
+    assert(send(original_pair[1], (const char *) &byte, 1, 0) == 1);
+    assert(uv_run(&runtime->loop, UV_RUN_ONCE) != 0);
+    result = eval_function(ctx, "pollCalls",
+                           sizeof("pollCalls") - 1);
+    assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT &&
+           JS_VALUE_GET_INT(result) == 1);
+    JS_FreeValue(ctx, result);
+    result = eval_function(ctx, "pinnedSocket.stopPoll(); pinnedSocket.close()",
+                           sizeof("pinnedSocket.stopPoll(); pinnedSocket.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    uv_run(&runtime->loop, UV_RUN_NOWAIT);
+
+    close(original_pair[0]);
+    close(original_pair[1]);
+    close(replacement_pair[0]);
+    close(replacement_pair[1]);
+#endif
 
     /* Freeing a hooked runtime must retire its contribution to the negative
      * cache. The remaining runtime then takes the one-load zero-hook path. */
