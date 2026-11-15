@@ -203,6 +203,10 @@ TJSRuntime* TJS_GetRuntime(JSContext* ctx) {
     return JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
 }
 
+JSContext* TJS_GetMainContext(TJSRuntime* runtime) {
+    return runtime ? runtime->main_ctx : NULL;
+}
+
 JSValue tjs__get_args(JSContext* ctx) {
     JSValue args = JS_NewArray(ctx);
     for (int i = 0; i < tjs__argc; i++) {

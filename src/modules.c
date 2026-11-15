@@ -425,6 +425,22 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpat
         return -1;
     }
 
+#ifndef CJS__DISABLE_MODULE_USE
+    /* Source modules evaluated through TJS_EvalModule() need the same host
+     * metadata as the embedded bytecode entrypoint. Imported modules receive
+     * this here as well, without relying on a JS-side onModule bootstrap. */
+    JSValue use_func = JS_NewCFunctionData(
+        ctx, tjs__module_use, 1, 0, 1,
+        (JSValueConst[]) { trt->module.imod_ns });
+    JS_DefinePropertyValueStr(ctx, meta_obj, "use", use_func, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, meta_obj, "module",
+                              tjs__mod_list_init(ctx), JS_PROP_C_W_E);
+    JSValue reg_func =
+        JS_NewCFunction(ctx, tjs__module_register, "register", 2);
+    JS_DefinePropertyValueStr(ctx, meta_obj, "register", reg_func,
+                              JS_PROP_C_W_E);
+#endif
+
 	// try js resolver
 	if(!JS_IsUndefined(trt->module.metaloader)){
 		JSValueConst args[] = { JS_NewString(ctx, module_name), meta_obj };

@@ -25,6 +25,7 @@
 
 #include "mem.h"
 #include "capability.h"
+#include "message_clone.h"
 #include "private.h"
 #include "tjs.h"
 
@@ -67,7 +68,6 @@ typedef struct {
 } TJSMessagePipeFrameHeader;
 
 typedef struct TJSMessagePipeFrame TJSMessagePipeFrame;
-typedef struct TJSMessagePipeTransferOwner TJSMessagePipeTransferOwner;
 
 static void tjs_worker_count_init(void) {
     CHECK_EQ(uv_mutex_init(&tjs_worker_count_lock), 0);
@@ -132,15 +132,7 @@ typedef struct {
 
 struct TJSMessagePipeFrame {
     TJSMessagePipeFrameHeader header;
-    uint8_t *blob;
-    TJSMessagePipeTransferOwner *transfers;
-    int committed;
-};
-
-/* Allocated in neutral memory; refs held by the write request and the frame. */
-struct TJSMessagePipeTransferOwner {
-    _Atomic unsigned refs;
-    JSAutoTransferTab tab;
+    TJSMessageClone *clone;
 };
 
 enum {
@@ -148,10 +140,10 @@ enum {
     MSGPIPE_FRAME_VERSION = 1,
 };
 
-/* Each entry reserves one ref: claim moves it to the reader, cancel drops it. */
+/* Each entry owns one clone ref: claim moves it to the reader, cancel drops it. */
 typedef struct TJSMessagePipeTransferRegistryEntry {
     uint64_t token;
-    TJSMessagePipeTransferOwner *owner;
+    TJSMessageClone *clone;
     struct list_head link;
 } TJSMessagePipeTransferRegistryEntry;
 
@@ -168,33 +160,13 @@ static void msgpipe_transfer_registry_init(void) {
 
 typedef struct {
     uv_write_t req;
-    uint8_t *data;
-    // Track SABs that were dup'd for this write, so we can free them on close
-    void **sab_list;
-    size_t sab_count;
     TJSMessagePipeFrame frame;
-    TJSMessagePipeTransferOwner *transfer_owner;
+    TJSMessageClone *clone;
     uint64_t transfer_token;
 } TJSMessagePipeWriteReq;
 
-static void msgpipe_transfer_owner_release(TJSMessagePipeTransferOwner *owner) {
-    if (!owner) return;
-    if (atomic_fetch_sub_explicit(&owner->refs, 1, memory_order_acq_rel) == 1) {
-        JS_ReleaseAutoTransferTab(&owner->tab);
-        tjs__free(owner);
-    }
-}
-
-static void msgpipe_transfer_owner_release_unsent(TJSMessagePipeTransferOwner *owner) {
-    /* The receiver reference was reserved before uv_write. It is not
-     * published when uv_write fails, so both sides can be released here. */
-    if (!owner) return;
-    msgpipe_transfer_owner_release(owner);
-    msgpipe_transfer_owner_release(owner);
-}
-
 static bool msgpipe_transfer_registry_reserve(
-    TJSMessagePipeTransferOwner *owner,
+    TJSMessageClone *clone,
     TJSMessagePipeTransferRegistryEntry **entry_out) {
     TJSMessagePipeTransferRegistryEntry *entry;
     uint64_t token;
@@ -210,7 +182,7 @@ static bool msgpipe_transfer_registry_reserve(
         token = tjs_msgpipe_registry_next_token++;
     }
     entry->token = token;
-    entry->owner = owner;
+    entry->clone = tjs__message_clone_retain(clone);
     init_list_head(&entry->link);
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
     *entry_out = entry;
@@ -227,15 +199,16 @@ static void msgpipe_transfer_registry_publish(
 
 static void msgpipe_transfer_registry_discard_reserved(
     TJSMessagePipeTransferRegistryEntry *entry) {
+    tjs__message_clone_free(entry->clone);
     tjs__free(entry);
 }
 
 /* Remove an entry and return its reserved receiver reference.  The registry
  * lock makes removal and ownership transfer one operation. */
-static TJSMessagePipeTransferOwner *msgpipe_transfer_registry_claim(
+static TJSMessageClone *msgpipe_transfer_registry_claim(
     uint64_t token, uint64_t transfer_count) {
     struct list_head *el;
-    TJSMessagePipeTransferOwner *owner = NULL;
+    TJSMessageClone *clone = NULL;
 
     if (!token) return NULL;
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
@@ -244,8 +217,9 @@ static TJSMessagePipeTransferOwner *msgpipe_transfer_registry_claim(
         TJSMessagePipeTransferRegistryEntry *entry =
             list_entry(el, TJSMessagePipeTransferRegistryEntry, link);
         if (entry->token == token) {
-            if (entry->owner->tab.len == (size_t)transfer_count) {
-                owner = entry->owner;
+            if (tjs__message_clone_transfer_count(entry->clone) ==
+                (size_t)transfer_count) {
+                clone = entry->clone;
                 list_del(&entry->link);
                 tjs__free(entry);
             }
@@ -253,14 +227,14 @@ static TJSMessagePipeTransferOwner *msgpipe_transfer_registry_claim(
         }
     }
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
-    return owner;
+    return clone;
 }
 
 /* Cancel is used for a failed write and for a truncated frame.  It drops the
  * receiver reference; the write callback still drops its separate reference. */
 static bool msgpipe_transfer_registry_cancel(uint64_t token) {
     struct list_head *el, *tmp;
-    TJSMessagePipeTransferOwner *owner = NULL;
+    TJSMessageClone *clone = NULL;
 
     if (!token) return false;
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
@@ -269,78 +243,15 @@ static bool msgpipe_transfer_registry_cancel(uint64_t token) {
         TJSMessagePipeTransferRegistryEntry *entry =
             list_entry(el, TJSMessagePipeTransferRegistryEntry, link);
         if (entry->token == token) {
-            owner = entry->owner;
+            clone = entry->clone;
             list_del(&entry->link);
             tjs__free(entry);
             break;
         }
     }
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
-    if (owner) msgpipe_transfer_owner_release(owner);
-    return owner != NULL;
-}
-
-static TJSMessagePipeTransferOwner *msgpipe_parse_transfers(
-    JSContext *ctx, JSValueConst value) {
-    TJSMessagePipeTransferOwner *owner;
-    JSValue length_value;
-    uint64_t len64;
-    size_t size;
-
-    if (JS_IsUndefined(value) || JS_IsNull(value)) {
-        owner = tjs__mallocz(sizeof(*owner));
-        if (!owner) {
-            JS_ThrowOutOfMemory(ctx);
-            return NULL;
-        }
-        atomic_init(&owner->refs, 2);
-        return owner;
-    }
-    if (!JS_IsArray(value)) {
-        JS_ThrowTypeError(ctx, "transfer list must be an array");
-        return NULL;
-    }
-    length_value = JS_GetPropertyStr(ctx, value, "length");
-    if (JS_IsException(length_value))
-        return NULL;
-    if (JS_ToIndex(ctx, &len64, length_value)) {
-        JS_FreeValue(ctx, length_value);
-        return NULL;
-    }
-    JS_FreeValue(ctx, length_value);
-    if (len64 > UINT32_MAX ||
-        len64 > (SIZE_MAX - sizeof(*owner)) / sizeof(owner->tab.tab[0])) {
-        JS_ThrowRangeError(ctx, "transfer list is too large");
-        return NULL;
-    }
-    size = sizeof(*owner) + (size_t)len64 * sizeof(owner->tab.tab[0]);
-    owner = tjs__mallocz(size);
-    if (!owner) {
-        JS_ThrowOutOfMemory(ctx);
-        return NULL;
-    }
-    atomic_init(&owner->refs, 2);
-    owner->tab.tab = (JSAutoTransferEntry *)(owner + 1);
-    owner->tab.len = (size_t)len64;
-    for (size_t i = 0; i < owner->tab.len; i++) {
-        owner->tab.tab[i].value = JS_GetPropertyUint32(ctx, value, (uint32_t)i);
-        if (JS_IsException(owner->tab.tab[i].value)) {
-            for (size_t j = 0; j < i; j++)
-                JS_FreeValue(ctx, owner->tab.tab[j].value);
-            tjs__free(owner);
-            return NULL;
-        }
-    }
-    return owner;
-}
-
-static void msgpipe_free_transfer_values(
-    JSContext *ctx, TJSMessagePipeTransferOwner *owner) {
-    if (!owner) return;
-    for (size_t i = 0; i < owner->tab.len; i++) {
-        JS_FreeValue(ctx, owner->tab.tab[i].value);
-        owner->tab.tab[i].value = JS_UNDEFINED;
-    }
+    if (clone) tjs__message_clone_free(clone);
+    return clone != NULL;
 }
 
 static void uv__close_cb(uv_handle_t *handle);
@@ -371,12 +282,7 @@ static void msgpipe_unlink(TJSMessagePipe *p) {
 
 static void msgpipe_frame_clear(TJSMessagePipe *p) {
     if (!p->frame) return;
-    /* The read buffer is owned by p->reading and is released by the caller;
-     * frame->blob is only a view used while the frame is active. */
-    p->frame->blob = NULL;
-    if (p->frame->transfers) {
-        msgpipe_transfer_owner_release(p->frame->transfers);
-    }
+    tjs__message_clone_free(p->frame->clone);
     memset(p->frame, 0, sizeof(*p->frame));
 }
 
@@ -693,8 +599,6 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
                 emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, err, 0);
                 JS_FreeValue(ctx, err);
                 msgpipe_close_handle(p);
-            } else {
-                p->frame->blob = p->reading.data;
             }
             return;
         }
@@ -717,9 +621,12 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 
 deserialize_frame:
     /* Claim only after the complete header and blob have arrived. */
-    p->frame->transfers = msgpipe_transfer_registry_claim(
+    p->frame->clone = msgpipe_transfer_registry_claim(
         p->frame->header.transfer_token, p->frame->header.transfer_count);
-    if (!p->frame->transfers) {
+    if (!p->frame->clone ||
+        tjs__message_clone_size(p->frame->clone) != total_size ||
+        (total_size && memcmp(tjs__message_clone_data(p->frame->clone),
+                              p->reading.data, (size_t)total_size) != 0)) {
         msgpipe_transfer_registry_cancel(p->frame->header.transfer_token);
         JSValue err = tjs_new_error(ctx, UV_EPROTO);
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, err, 0);
@@ -730,11 +637,7 @@ deserialize_frame:
         msgpipe_close_handle(p);
         return;
     }
-    JSSABTab sab_tab = { .tab = NULL, .len = 0 };
-    int flags = JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE | JS_READ_OBJ_STRUCTURED_CLONE;
-    const uint8_t *blob = p->reading.data ? p->reading.data : (const uint8_t *)"";
-    JSValue obj = JS_ReadObject3(ctx, blob,
-        total_size, flags, &sab_tab, &p->frame->transfers->tab);
+    JSValue obj = tjs__message_clone_read(ctx, p->frame->clone);
     if (JS_IsException(obj)) {
         JSValue exc = JS_GetException(ctx);
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE_ERROR, exc, 0);
@@ -743,13 +646,6 @@ deserialize_frame:
         emit_msgpipe_event(p, MSGPIPE_EVENT_MESSAGE, obj, total_size);
     }
     JS_FreeValue(ctx, obj);
-
-    /* The sender transfers its SAB references with the serialized message.
-     * JS_ReadObject3() consumes ordinary ArrayBuffer wire refs as well. */
-    for (size_t i = 0; i < sab_tab.len; i++) {
-        tjs__sab_free(NULL, sab_tab.tab[i]);
-    }
-    js_free(ctx, sab_tab.tab);
 
     js_free(ctx, p->reading.data);
     memset(&p->reading, 0, sizeof(p->reading));
@@ -822,26 +718,12 @@ static void uv__write_cb(uv_write_t *req, int status) {
         JS_FreeValue(ctx, error);
     }
 
-    /* js_malloc/js_free use the same allocator as tjs__malloc/tjs__free,
-     * so tjs__free is safe here even after ctx/rt have been freed. */
-    tjs__free(wr->data);
-
-    /* A successful write transfers these references to the read side. A
-     * failed write has no receiver to consume them. */
-    if (status < 0) {
-        for (size_t i = 0; i < wr->sab_count; i++) {
-            tjs__sab_free(NULL, wr->sab_list[i]);
-        }
-    }
-    tjs__free(wr->sab_list);
     if (status < 0) {
         /* The token was published before uv_write, but no complete frame was
          * delivered. Cancel drops the receiver reference. */
         msgpipe_transfer_registry_cancel(wr->transfer_token);
-        msgpipe_transfer_owner_release(wr->transfer_owner);
-    } else {
-        msgpipe_transfer_owner_release(wr->transfer_owner);
     }
+    tjs__message_clone_free(wr->clone);
     tjs__free(wr);
 }
 
@@ -858,13 +740,8 @@ static int msgpipe_postmessage_revalidate(JSContext *ctx, JSValueConst this_val,
 }
 
 static void msgpipe_postmessage_discard(JSContext *ctx,
-                                        TJSMessagePipeWriteReq *wr,
-                                        JSSABTab *sab_tab,
-                                        TJSMessagePipeTransferOwner *owner) {
-    tjs__free(wr->data);
-    js_free(ctx, sab_tab->tab);
-    msgpipe_free_transfer_values(ctx, owner);
-    msgpipe_transfer_owner_release_unsent(owner);
+                                        TJSMessagePipeWriteReq *wr) {
+    tjs__message_clone_abort(ctx, wr->clone);
     tjs__free(wr);
 }
 
@@ -883,123 +760,54 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
     }
 
     JSValueConst transfer_list = argc >= 2 ? argv[1] : JS_UNDEFINED;
-    TJSMessagePipeTransferOwner *owner = msgpipe_parse_transfers(ctx, transfer_list);
-    if (!owner) {
-        tjs__free(wr);
-        return JS_EXCEPTION;
-    }
-
-    size_t len;
-    int flags = JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE |
-                JS_WRITE_OBJ_STRUCTURED_CLONE;
-    JSSABTab sab_tab = { .tab = NULL, .len = 0 };
-    JSAutoTransferTab *transfer_tab = &owner->tab;
-    uint8_t *buf = JS_WriteObject3(ctx, &len, argv[0], flags, &sab_tab,
-                                   transfer_tab);
-    if (!buf) {
-        msgpipe_free_transfer_values(ctx, owner);
-        msgpipe_transfer_owner_release_unsent(owner);
+    wr->clone = tjs__message_clone_prepare(ctx, argv[0], transfer_list);
+    if (!wr->clone) {
         tjs__free(wr);
         return JS_EXCEPTION;
     }
     if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) {
-        js_free(ctx, buf);
-        js_free(ctx, sab_tab.tab);
-        msgpipe_free_transfer_values(ctx, owner);
-        msgpipe_transfer_owner_release_unsent(owner);
-        tjs__free(wr);
+        msgpipe_postmessage_discard(ctx, wr);
         return JS_EXCEPTION;
     }
 
     wr->req.data = wr;
-    wr->transfer_owner = owner;
     wr->frame.header.magic = MSGPIPE_FRAME_MAGIC;
     wr->frame.header.version = MSGPIPE_FRAME_VERSION;
     wr->frame.header.reserved = 0;
-    wr->frame.header.blob_len = len;
-    wr->frame.header.transfer_count = owner->tab.len;
+    wr->frame.header.blob_len = tjs__message_clone_size(wr->clone);
+    wr->frame.header.transfer_count =
+        tjs__message_clone_transfer_count(wr->clone);
 
-    /* Copy to neutral memory: the uv_write cb can run after ctx is freed. */
-    wr->data = tjs__malloc(len ? len : 1);
-    if (!wr->data) {
-        js_free(ctx, buf);
-        js_free(ctx, sab_tab.tab);
-        msgpipe_free_transfer_values(ctx, owner);
-        msgpipe_transfer_owner_release_unsent(owner);
-        tjs__free(wr);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    if (len) memcpy(wr->data, buf, len);
-    js_free(ctx, buf);
-
-    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "worker.postMessage"), msgpipe_postmessage_discard(ctx, wr, &sab_tab, owner), do { if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) { msgpipe_postmessage_discard(ctx, wr, &sab_tab, owner); return (JS_EXCEPTION); } } while (0));
-
-    /* Keep SABs alive until the peer deserializes the message. The read side
-     * consumes these transferred references after cloning the objects. */
-    if (sab_tab.len > 0) {
-        wr->sab_list = tjs__malloc(sizeof(void*) * sab_tab.len);
-        if (!wr->sab_list) {
-            tjs__free(wr->data);
-            js_free(ctx, sab_tab.tab);
-            msgpipe_free_transfer_values(ctx, owner);
-            msgpipe_transfer_owner_release_unsent(owner);
-            tjs__free(wr);
-            return JS_ThrowOutOfMemory(ctx);
-        }
-        wr->sab_count = sab_tab.len;
-        for (size_t i = 0; i < sab_tab.len; i++) {
-            tjs__sab_dup(NULL, sab_tab.tab[i]);
-            wr->sab_list[i] = sab_tab.tab[i];
-        }
-    }
-    js_free(ctx, sab_tab.tab);
+    TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "worker.postMessage"), msgpipe_postmessage_discard(ctx, wr), do { if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) { msgpipe_postmessage_discard(ctx, wr); return (JS_EXCEPTION); } } while (0));
 
     /* Reserve neutral registry storage before commit.  Reservation is not
      * visible to readers; it makes the post-commit publish infallible. */
     TJSMessagePipeTransferRegistryEntry *registry_entry;
-    if (!msgpipe_transfer_registry_reserve(owner, &registry_entry)) {
-        tjs__free(wr->data);
-        for (size_t i = 0; i < wr->sab_count; i++) {
-            tjs__sab_free(NULL, wr->sab_list[i]);
-        }
-        tjs__free(wr->sab_list);
-        msgpipe_free_transfer_values(ctx, owner);
-        msgpipe_transfer_owner_release_unsent(owner);
-        tjs__free(wr);
+    if (!msgpipe_transfer_registry_reserve(wr->clone, &registry_entry)) {
+        msgpipe_postmessage_discard(ctx, wr);
         return JS_ThrowOutOfMemory(ctx);
     }
     wr->transfer_token = registry_entry->token;
 
     /* Detach sources before exposing the token to the peer.  If commit fails,
      * no registry entry or frame is published. */
-    if (JS_CommitArrayBufferTransfers(ctx, transfer_tab)) {
-        tjs__free(wr->data);
-        for (size_t i = 0; i < wr->sab_count; i++) {
-            tjs__sab_free(NULL, wr->sab_list[i]);
-        }
-        tjs__free(wr->sab_list);
+    if (tjs__message_clone_commit(ctx, wr->clone)) {
         msgpipe_transfer_registry_discard_reserved(registry_entry);
-        msgpipe_free_transfer_values(ctx, owner);
-        msgpipe_transfer_owner_release_unsent(owner);
+        tjs__message_clone_free(wr->clone);
         tjs__free(wr);
         return JS_EXCEPTION;
     }
-    msgpipe_free_transfer_values(ctx, owner);
 
     msgpipe_transfer_registry_publish(registry_entry);
     wr->frame.header.transfer_token = wr->transfer_token;
 
     uv_buf_t bufs[2] = { uv_buf_init((char *) &wr->frame.header, sizeof(wr->frame.header)),
-                         uv_buf_init((char *) wr->data, len) };
+                         uv_buf_init((char *) tjs__message_clone_data(wr->clone),
+                                     tjs__message_clone_size(wr->clone)) };
     int r = uv_write(&wr->req, &p->h.stream, bufs, 2, uv__write_cb);
     if (r != 0) {
-        tjs__free(wr->data);
-        for (size_t i = 0; i < wr->sab_count; i++) {
-            tjs__sab_free(NULL, wr->sab_list[i]);
-        }
-        tjs__free(wr->sab_list);
         msgpipe_transfer_registry_cancel(wr->transfer_token);
-        msgpipe_transfer_owner_release(owner);
+        tjs__message_clone_free(wr->clone);
         tjs__free(wr);
 
         return tjs_throw_errno(ctx, r);
@@ -1115,10 +923,7 @@ typedef struct {
     TJSRuntime *wrt;
     _Atomic int commit_error;
 
-	// something pass to worker
-	uint8_t* udata;
-	size_t udata_size;
-    TJSMessagePipeTransferOwner *transfer_owner;
+    TJSMessageClone *user_data;
     TJSCapabilityHook capability_hook;
     void *capability_userdata;
     uint32_t capability_hook_flags;
@@ -1227,10 +1032,8 @@ static void worker_entry(void *arg) {
     if (atomic_load_explicit(&wd->commit_error, memory_order_acquire)) {
         TJSWorker *owner = wd->worker;
 
-        msgpipe_transfer_owner_release(wd->transfer_owner);
-        wd->transfer_owner = NULL;
-        tjs__free(wd->udata);
-        wd->udata = NULL;
+        tjs__message_clone_free(wd->user_data);
+        wd->user_data = NULL;
 #ifndef _WIN32
         close(wd->channel_fd);
 #else
@@ -1258,12 +1061,9 @@ static void worker_entry(void *arg) {
 	reg_msgpipe(ctx);	// we should register class MessagePipe before creating
     JSValue message_pipe = tjs_new_msgpipe(ctx, wd->channel_fd);
     wrt->builtins.message_pipe = message_pipe;
-	if (wd->udata){
-		wrt->builtins.worker_udata = JS_ReadObject3(ctx, wd->udata,
-            wd->udata_size,
-            JS_READ_OBJ_REFERENCE | JS_READ_OBJ_SAB |
-                JS_READ_OBJ_STRUCTURED_CLONE,
-            NULL, wd->transfer_owner ? &wd->transfer_owner->tab : NULL);
+	if (wd->user_data){
+		wrt->builtins.worker_udata =
+            tjs__message_clone_read(ctx, wd->user_data);
 		if (JS_IsException(wrt->builtins.worker_udata)) {
 			JS_FreeValue(ctx, JS_GetException(ctx));
 			wrt->builtins.worker_udata = JS_UNDEFINED;
@@ -1271,9 +1071,8 @@ static void worker_entry(void *arg) {
 	} else {
 		wrt->builtins.worker_udata = JS_UNDEFINED;
 	}
-    msgpipe_transfer_owner_release(wd->transfer_owner);
-    tjs__free(wd->udata);
-    wd->udata = NULL;
+    tjs__message_clone_free(wd->user_data);
+    wd->user_data = NULL;
 
 	/* run core bootstrap code */
 	tjs__run_main(wrt);
@@ -1398,43 +1197,16 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 	/* serialize user_data */
     JSValue user_data = argc >= 1 ? argv[0] : JS_UNDEFINED;
 	JSValueConst transfer_list = argc >= 2 ? argv[1] : JS_UNDEFINED;
-	TJSMessagePipeTransferOwner *transfer_owner =
-        msgpipe_parse_transfers(ctx, transfer_list);
-	if (!transfer_owner)
+	TJSMessageClone *user_data_clone =
+        tjs__message_clone_prepare(ctx, user_data, transfer_list);
+	if (!user_data_clone)
         return JS_EXCEPTION;
-	size_t udata_size = 0;
-	uint8_t* udata = NULL;
-	{
-		udata = JS_WriteObject3(ctx, &udata_size, user_data,
-            JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_SAB |
-                JS_WRITE_OBJ_STRUCTURED_CLONE,
-            NULL, &transfer_owner->tab);
-		if (!udata) {
-			msgpipe_free_transfer_values(ctx, transfer_owner);
-			msgpipe_transfer_owner_release_unsent(transfer_owner);
-			return JS_EXCEPTION;
-		}
-	}
-	{
-		uint8_t *neutral_udata = tjs__malloc(udata_size ? udata_size : 1);
-		if (!neutral_udata) {
-			js_free(ctx, udata);
-			msgpipe_free_transfer_values(ctx, transfer_owner);
-			msgpipe_transfer_owner_release_unsent(transfer_owner);
-			return JS_ThrowOutOfMemory(ctx);
-		}
-		if (udata_size) memcpy(neutral_udata, udata, udata_size);
-		js_free(ctx, udata);
-		udata = neutral_udata;
-	}
-	TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "worker.create"), (tjs__free(udata), msgpipe_free_transfer_values(ctx, transfer_owner), msgpipe_transfer_owner_release_unsent(transfer_owner)));
+	TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "worker.create"), tjs__message_clone_abort(ctx, user_data_clone));
 
     uv_os_sock_t fds[2];
     int r = uv_socketpair(SOCK_STREAM, 0, fds, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE);
     if (r != 0) {
-		tjs__free(udata);
-        msgpipe_free_transfer_values(ctx, transfer_owner);
-        msgpipe_transfer_owner_release_unsent(transfer_owner);
+        tjs__message_clone_abort(ctx, user_data_clone);
         return tjs_throw_errno(ctx, r);
     }
 
@@ -1447,9 +1219,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         closesocket(fds[0]);
         closesocket(fds[1]);
 #endif
-		tjs__free(udata);
-        msgpipe_free_transfer_values(ctx, transfer_owner);
-        msgpipe_transfer_owner_release_unsent(transfer_owner);
+        tjs__message_clone_abort(ctx, user_data_clone);
         return JS_EXCEPTION;
     }
 
@@ -1472,18 +1242,14 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         closesocket(fds[1]);
 #endif
         worker_dispose_unstarted(ctx, obj, w);
-        tjs__free(udata);
-        msgpipe_free_transfer_values(ctx, transfer_owner);
-        msgpipe_transfer_owner_release_unsent(transfer_owner);
+        tjs__message_clone_abort(ctx, user_data_clone);
         return JS_ThrowOutOfMemory(ctx);
     }
     worker_data->channel_fd = fds[1];
     worker_data->start_sem = &start_sem;
     worker_data->ready_sem = &ready_sem;
     worker_data->worker = w;
-    worker_data->udata = udata;
-    worker_data->udata_size = udata_size;
-    worker_data->transfer_owner = transfer_owner;
+    worker_data->user_data = user_data_clone;
     worker_data->capability_hook = qrt->capability_hook;
     worker_data->capability_userdata = qrt->capability_userdata;
     worker_data->capability_hook_flags = qrt->capability_hook_flags;
@@ -1502,17 +1268,13 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 #endif
         tjs__free(worker_data);
         worker_dispose_unstarted(ctx, obj, w);
-        tjs__free(udata);
-        msgpipe_free_transfer_values(ctx, transfer_owner);
-        msgpipe_transfer_owner_release_unsent(transfer_owner);
+        tjs__message_clone_abort(ctx, user_data_clone);
         return tjs_throw_errno(ctx, r);
     }
 	/* Child blocks until commit; no half-detached workerData is exposed. */
-	int commit_error = JS_CommitArrayBufferTransfers(ctx, &transfer_owner->tab);
+	int commit_error = tjs__message_clone_commit(ctx, user_data_clone);
 	atomic_store_explicit(&worker_data->commit_error, commit_error,
         memory_order_release);
-	msgpipe_free_transfer_values(ctx, transfer_owner);
-	msgpipe_transfer_owner_release(transfer_owner);
 	uv_sem_post(&start_sem);
 
 	if (commit_error) {
@@ -1532,7 +1294,6 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     uv_sem_wait(&ready_sem);
     uv_sem_destroy(&ready_sem);
     uv_sem_destroy(&start_sem);
-	udata = NULL;
 
     uv_update_time(tjs_get_loop(ctx));
 

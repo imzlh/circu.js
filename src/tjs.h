@@ -37,6 +37,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct TJSRuntime TJSRuntime;
 typedef struct TJSApp App;
 
@@ -144,6 +148,16 @@ EXPORT bool TJS_SetCapabilityHook(TJSRuntime *runtime,
 EXPORT JSValue TJS_CheckCapability(JSContext *ctx,
                                    const TJSCapability *capability);
 
+/* Synchronously publish a borrowed payload to the runtime-local event bus.
+ * The namespace and event are non-NULL, NUL-terminated UTF-8 strings. The
+ * returned JSValue is owned by the caller: it is true when at least one
+ * listener was snapshotted, false otherwise, or JS_EXCEPTION when dispatch
+ * failed. This API must be called on the thread that owns ctx. */
+EXPORT JSValue TJS_EvBusEmit(JSContext *ctx,
+                             const char *namespace_name,
+                             const char *event_name,
+                             JSValueConst payload);
+
 
 typedef struct TJSModuleInfo {
     uint32_t abi_version;
@@ -174,6 +188,9 @@ EXPORT TJSRuntime *TJS_NewRuntimeOptions(TJSRunOptions *options);
 EXPORT App* TJS_NewApp(TJSRuntime* trt);
 EXPORT void TJS_FreeRuntime(TJSRuntime *qrt);
 EXPORT void TJS_Initialize(int argc, char **argv);
+/* Borrowed main context. It is owned by runtime and may only be used from the
+ * runtime's owner thread. */
+EXPORT JSContext *TJS_GetMainContext(TJSRuntime *runtime);
 EXPORT JSContext *TJS_GetJSContext(App *app);
 EXPORT TJSRuntime *TJS_GetRuntime(JSContext *ctx);
 EXPORT App *TJS_GetApp(JSContext *ctx);
@@ -192,7 +209,11 @@ EXPORT JSValue TJS_EvalModuleContent(JSContext *ctx,
                               const char *content,
                               size_t len);
 
-
 EXPORT void TJS_DumpValue(JSContext *ctx, FILE *f, JSValue val);
 EXPORT void TJS_DumpException(JSContext *ctx);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

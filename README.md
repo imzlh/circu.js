@@ -362,6 +362,12 @@ evbus.delete('example.app', 'state');
   values and promises are ignored. A listener added or unsubscribed during
   dispatch affects later emits, including nested emits, but not the current
   snapshot.
+- Native modules can publish through
+  `TJS_EvBusEmit(ctx, namespace, event, payload)` from `src/tjs.h`. The call is
+  synchronous and must run on the thread that owns `ctx`; its strings and
+  payload are borrowed, while the returned boolean or exception is owned by
+  the caller. It uses the same snapshot, cross-realm and exception semantics
+  as JavaScript `emit()`.
 - Namespace, key and event names must be strings (empty strings are allowed);
   a missing value for `set` or a non-callable listener throws `TypeError`.
   TypeScript payload and `get<T>` types are conventions between callers, not

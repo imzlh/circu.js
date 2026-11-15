@@ -554,24 +554,9 @@ static void evbus_cleanup_released_contexts(TJSEvBus *bus) {
     }
 }
 
-static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
-                               JSValueConst *argv, int magic, void *opaque) {
-    (void)this_val;
-    (void)magic;
-    (void)opaque;
-    JSAtom namespace_atom;
-    JSAtom event_atom;
-    if (evbus_pair_atoms(ctx, argc, argv, "emit", &namespace_atom, &event_atom) < 0) {
-        return JS_EXCEPTION;
-    }
-
-    TJSEvBus *bus = evbus_get(ctx, NULL);
-    if (!bus) {
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
-        return JS_EXCEPTION;
-    }
-
+static JSValue evbus_emit_atoms(JSContext *ctx, TJSEvBus *bus,
+                                JSAtom namespace_atom, JSAtom event_atom,
+                                JSValueConst payload) {
     size_t count = 0;
     struct list_head *pos;
     list_for_each(pos, &bus->listeners) {
@@ -581,20 +566,14 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
         }
     }
     if (count == 0) {
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
         return JS_FALSE;
     }
     if (count > SIZE_MAX / sizeof(TJSEvBusListener *)) {
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
         return JS_ThrowOutOfMemory(ctx);
     }
 
     TJSEvBusListener **snapshot = tjs__malloc(count * sizeof(*snapshot));
     if (!snapshot) {
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
         return JS_ThrowOutOfMemory(ctx);
     }
 
@@ -614,8 +593,6 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
         }
         evbus_dispatch_leave(bus);
         tjs__free(snapshot);
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
         return JS_EXCEPTION;
     }
     JSAtom runtime_event = JS_NewAtom(ctx, TJS_RUNTIME_EVENT_NAME);
@@ -626,8 +603,6 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
         }
         evbus_dispatch_leave(bus);
         tjs__free(snapshot);
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
         return JS_EXCEPTION;
     }
     if (namespace_atom == runtime_namespace && event_atom == runtime_event && count > 1) {
@@ -636,12 +611,12 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
     JS_FreeAtom(ctx, runtime_namespace);
     JS_FreeAtom(ctx, runtime_event);
 
-    JSValue payload = argc >= 3 ? argv[2] : JS_UNDEFINED;
     JSValue dispatch_result = JS_TRUE;
     for (size_t i = 0; i < count; i++) {
         TJSEvBusListener *listener = snapshot[i];
         JSContext *realm = listener->realm;
-        JSValue result = JS_Call(realm, listener->callback, JS_UNDEFINED, 1, &payload);
+        JSValue result = JS_Call(realm, listener->callback, JS_UNDEFINED, 1,
+                                 &payload);
         if (JS_IsException(result)) {
             dispatch_result = evbus_move_exception(realm, ctx);
             evbus_listener_release_dispatch(JS_GetRuntime(ctx), listener);
@@ -656,9 +631,62 @@ static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
 
     evbus_dispatch_leave(bus);
     tjs__free(snapshot);
+    return dispatch_result;
+}
+
+JSValue TJS_EvBusEmit(JSContext *ctx, const char *namespace_name,
+                      const char *event_name, JSValueConst payload) {
+    if (!namespace_name || !event_name) {
+        return JS_ThrowTypeError(
+            ctx, "TJS_EvBusEmit requires non-NULL namespace and event names");
+    }
+
+    TJSEvBus *bus = evbus_get(ctx, NULL);
+    if (!bus) {
+        return JS_EXCEPTION;
+    }
+
+    JSAtom namespace_atom = JS_NewAtom(ctx, namespace_name);
+    if (namespace_atom == JS_ATOM_NULL) {
+        return JS_EXCEPTION;
+    }
+    JSAtom event_atom = JS_NewAtom(ctx, event_name);
+    if (event_atom == JS_ATOM_NULL) {
+        JS_FreeAtom(ctx, namespace_atom);
+        return JS_EXCEPTION;
+    }
+
+    JSValue result = evbus_emit_atoms(ctx, bus, namespace_atom, event_atom,
+                                      payload);
     JS_FreeAtom(ctx, namespace_atom);
     JS_FreeAtom(ctx, event_atom);
-    return dispatch_result;
+    return result;
+}
+
+static JSValue tjs_evbus_emit(JSContext *ctx, JSValueConst this_val, int argc,
+                               JSValueConst *argv, int magic, void *opaque) {
+    (void)this_val;
+    (void)magic;
+    (void)opaque;
+    JSAtom namespace_atom;
+    JSAtom event_atom;
+    if (evbus_pair_atoms(ctx, argc, argv, "emit", &namespace_atom, &event_atom) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    TJSEvBus *bus = evbus_get(ctx, NULL);
+    if (!bus) {
+        JS_FreeAtom(ctx, namespace_atom);
+        JS_FreeAtom(ctx, event_atom);
+        return JS_EXCEPTION;
+    }
+
+    JSValue result = evbus_emit_atoms(
+        ctx, bus, namespace_atom, event_atom,
+        argc >= 3 ? argv[2] : JS_UNDEFINED);
+    JS_FreeAtom(ctx, namespace_atom);
+    JS_FreeAtom(ctx, event_atom);
+    return result;
 }
 
 static JSValue evbus_default_runtime_result(JSContext *ctx, int32_t event_name) {

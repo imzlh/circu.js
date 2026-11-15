@@ -276,6 +276,7 @@ add_library(libcjs STATIC
     src/utils.c
     src/version.c
     src/vm.c
+    src/message_clone.c
     src/mod_worker.c
     src/console.c
     src/evbus.c
@@ -483,6 +484,17 @@ if(BUILD_TESTING)
     target_link_libraries(capability_test PRIVATE libcjs uv_a)
     target_link_options(capability_test PRIVATE ${cjs_ldflags})
     add_test(NAME capability_test COMMAND capability_test)
+
+    add_executable(evbus_api_test tests/native/evbus_api.c)
+    target_link_libraries(evbus_api_test PRIVATE libcjs uv_a)
+    target_link_options(evbus_api_test PRIVATE ${cjs_ldflags})
+    add_test(NAME evbus_api_test COMMAND evbus_api_test)
+
+    add_executable(message_clone_test tests/native/message_clone.c)
+    target_link_libraries(message_clone_test PRIVATE libcjs uv_a)
+    target_link_options(message_clone_test PRIVATE ${cjs_ldflags})
+    target_include_directories(message_clone_test PRIVATE src deps/quickjs)
+    add_test(NAME message_clone_test COMMAND message_clone_test)
 
     # Manual, non-gating microbenchmark. Timings are deliberately not a test:
     # CI scheduling noise makes fixed performance thresholds misleading.
