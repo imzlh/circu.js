@@ -374,6 +374,19 @@ else()
     set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
     FetchContent_MakeAvailable(llhttp)
 
+    # llhttp's generated parser has a NEON path whose u8/u16 vector mixing
+    # relies on clang's default lax vector conversions. GCC rejects those
+    # implicit conversions, so enable its documented lax mode for GCC only.
+    # Bitwise u8/u16 vector ops compile to the same instructions.
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        if(TARGET llhttp_static)
+            target_compile_options(llhttp_static PRIVATE -flax-vector-conversions)
+        endif()
+        if(TARGET llhttp_shared)
+            target_compile_options(llhttp_shared PRIVATE -flax-vector-conversions)
+        endif()
+    endif()
+
     target_link_libraries(libcjs PRIVATE llhttp::llhttp)
 endif()
 
