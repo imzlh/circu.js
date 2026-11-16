@@ -652,7 +652,11 @@ static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
                 SSL_set_tlsext_host_name(pipe->ssl, hostname);
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
                 if (ssl_context->verify_hostname) {
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+                    SSL_set1_dnsname(pipe->ssl, hostname);
+#else
                     SSL_set1_host(pipe->ssl, hostname);
+#endif
                 }
 #endif
                 JS_FreeCString(ctx, hostname);
@@ -918,7 +922,11 @@ static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst th
             if (name->type == GEN_DNS) {
                 ASN1_STRING *dns = name->d.dNSName;
                 const char *dns_str = (const char *)ASN1_STRING_get0_data(dns);
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+                size_t dns_len = ASN1_STRING_get_length(dns);
+#else
                 int dns_len = ASN1_STRING_length(dns);
+#endif
                 // Use JS_NewStringLen to handle potential embedded NUL and avoid strlen overflow
                 JS_SetPropertyUint32(ctx, san_array, san_index, JS_NewStringLen(ctx, dns_str, dns_len));
                 san_index++;
@@ -1251,9 +1259,22 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
     X509_gmtime_adj(X509_get_notAfter(cert), 60L * 60L * 24L * days);
     X509_set_pubkey(cert, pkey);
     
-    X509_NAME *name = X509_get_subject_name(cert);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)cn, -1, -1, 0);
-    X509_set_issuer_name(cert, name);
+    X509_NAME *name = X509_NAME_new();
+    if (!name ||
+        !X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                    (unsigned char *)cn, -1, -1, 0) ||
+        !X509_set_subject_name(cert, name) ||
+        !X509_set_issuer_name(cert, name)) {
+        X509_NAME_free(name);
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        if (cn_owned) JS_FreeCString(ctx, cn);
+        JS_FreeValue(ctx, cn_val);
+        JS_FreeValue(ctx, days_val);
+        return JS_ThrowInternalError(ctx,
+                                     "failed to set certificate subject");
+    }
+    X509_NAME_free(name);
     
     /* Sign certificate */
     X509_sign(cert, pkey, EVP_sha256());
