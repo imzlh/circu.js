@@ -45,57 +45,143 @@ struct TJSModule {
 	const char *name;
 	void (*init)(JSContext *ctx, JSValue ns);
 	bool worker;
+	bool use;
+	bool esm;
 };
 
 static const struct TJSModule tjs_modules[] = {
-	// name init_fn allow_in_worker
-	{ "algorithm", tjs__mod_algorithm_init, true },
-	{ "asyncfs", tjs__mod_asyncfs_init, true },
-	{ "bjson", tjs__mod_bjson_init, true },
+	// name init_fn allow_in_worker allow_import_meta_use allow_standard_esm
+	{ "algorithm", tjs__mod_algorithm_init, true, true, false },
+	{ "asyncfs", tjs__mod_asyncfs_init, true, true, false },
+	{ "bjson", tjs__mod_bjson_init, true, true, false },
 #ifdef CJS_HAVE_BROTLI
-	{ "brotli", tjs__mod_brotli_init, true },
+	{ "brotli", tjs__mod_brotli_init, true, true, false },
 #endif
-	{ "curl", tjs__mod_curl_init, true },
-	{ "crypto", tjs__mod_crypto_init, true },
-	{ "console", tjs__mod_console_init, true },
-	{ "debug", tjs__mod_debug_init, true },
-	{ "dns", tjs__mod_dns_init, true },
-	{ "engine", tjs__mod_engine_init, true },
-	{ "evbus", tjs__mod_evbus_init, true },
-	{ "error", tjs__mod_error_init, true },
-	{ "ffi", tjs__mod_ffi_init, true },
-	{ "fs", tjs__mod_fs_init, true },
-	{ "fswatch", tjs__mod_fswatch_init, true },
-	{ "http", tjs__mod_http_init, true },
-	{ "nodeapi", tjs__mod_nodeapi_init, false },
-	{ "os", tjs__mod_os_init, true },
-	{ "process", tjs__mod_process_init, true },
+	{ "curl", tjs__mod_curl_init, true, true, false },
+	{ "crypto", tjs__mod_crypto_init, true, true, false },
+	{ "console", tjs__mod_console_init, true, true, false },
+	{ "debug", tjs__mod_debug_init, true, true, false },
+	{ "dns", tjs__mod_dns_init, true, true, false },
+	{ "engine", tjs__mod_engine_init, true, true, false },
+	{ "evbus", tjs__mod_evbus_init, true, true, false },
+	{ "error", tjs__mod_error_init, true, true, false },
+	{ "ffi", tjs__mod_ffi_init, true, true, false },
+	{ "fs", tjs__mod_fs_init, true, true, false },
+	{ "fswatch", tjs__mod_fswatch_init, true, true, false },
+	{ "http", tjs__mod_http_init, true, true, false },
+	{ "nodeapi", tjs__mod_nodeapi_init, false, true, false },
+	{ "os", tjs__mod_os_init, true, true, false },
+	{ "process", tjs__mod_process_init, true, true, false },
 	/* pty merged into process module */
-	{ "signals", tjs__mod_signals_init, true }, // workers can read the enum; signal() rejects there
-	{ "sourcemap", tjs__mod_sourcemap_init, true },
-	{ "sqlite3", tjs__mod_sqlite3_init, true },
-	{ "ssl", tjs__mod_ssl_init, true },
-	{ "streams", tjs__mod_streams_init, true },
+	{ "signals", tjs__mod_signals_init, true, true, false }, // workers can read the enum; signal() rejects there
+	{ "sourcemap", tjs__mod_sourcemap_init, true, true, false },
+	{ "sqlite3", tjs__mod_sqlite3_init, true, true, false },
+	{ "ssl", tjs__mod_ssl_init, true, true, false },
+	{ "streams", tjs__mod_streams_init, true, true, false },
 #ifdef CJS__HAS_ICONV
-	{ "text", tjs__mod_text_init, true },
+	{ "text", tjs__mod_text_init, true, true, false },
 #endif
-	{ "timers", tjs__mod_timers_init, true },
-	{ "udp", tjs__mod_udp_init, true },
+	{ "timers", tjs__mod_timers_init, true, true, false },
+	{ "udp", tjs__mod_udp_init, true, true, false },
 #ifdef CJS__HAS_WASM
-	{ "wasm", tjs__mod_wasm_init, true },
+	{ "wasm", tjs__mod_wasm_init, true, true, false },
 #endif
-	{ "worker", tjs__mod_worker_init, true },
-	{ "xml", tjs__mod_xml_init, true },
-	{ "zlib", tjs__mod_zlib_init, true },
-	{ "socket", tjs__mod_socket_init, true },
+	{ "worker", tjs__mod_worker_init, true, true, false },
+	{ "xml", tjs__mod_xml_init, true, true, false },
+	{ "zlib", tjs__mod_zlib_init, true, true, false },
+	{ "socket", tjs__mod_socket_init, true, true, false },
 #ifdef _WIN32
-    { "win32", tjs__mod_win32_init, true },
+    { "win32", tjs__mod_win32_init, true, true, false },
 #endif
 #ifdef CJS_HAS_EXTRA_MODULES
     /* Generated entries for host-injected static modules. */
 #include "extra_entries.h"
 #endif
 };
+
+static int tjs__static_esm_init(JSContext *ctx, JSModuleDef *m) {
+	JSValue module_obj = JS_GetModulePrivateValue(ctx, m);
+	if (JS_IsException(module_obj)) return -1;
+
+	JSPropertyEnum *properties = NULL;
+	uint32_t property_count = 0;
+	if (JS_GetOwnPropertyNames(ctx, &properties, &property_count, module_obj,
+	                           JS_GPN_STRING_MASK) < 0) {
+		JS_FreeValue(ctx, module_obj);
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < property_count; i++) {
+		const char *name = JS_AtomToCString(ctx, properties[i].atom);
+		if (!name) {
+			JS_FreePropertyEnum(ctx, properties, property_count);
+			JS_FreeValue(ctx, module_obj);
+			return -1;
+		}
+		JSValue value = JS_GetProperty(ctx, module_obj, properties[i].atom);
+		if (JS_IsException(value) ||
+		    JS_SetModuleExport(ctx, m, name, value) < 0) {
+			if (JS_IsException(value)) JS_FreeValue(ctx, value);
+			JS_FreeCString(ctx, name);
+			JS_FreePropertyEnum(ctx, properties, property_count);
+			JS_FreeValue(ctx, module_obj);
+			return -1;
+		}
+		JS_FreeCString(ctx, name);
+	}
+
+	JS_FreePropertyEnum(ctx, properties, property_count);
+	JS_FreeValue(ctx, module_obj);
+	return 0;
+}
+
+static JSModuleDef *tjs__load_static_esm(JSContext *ctx,
+	                                      const char *module_name,
+	                                      const struct TJSModule *mod) {
+	TJSRuntime *trt = TJS_GetRuntime(ctx);
+	if (!mod->worker && trt->is_worker) {
+		JS_ThrowReferenceError(ctx,
+		                       "native module '%s' is not available in workers",
+		                       module_name);
+		return NULL;
+	}
+
+	JSValue module_obj = JS_NewObjectProto(ctx, JS_NULL);
+	if (JS_IsException(module_obj)) return NULL;
+	mod->init(ctx, module_obj);
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, module_obj);
+		return NULL;
+	}
+
+	JSPropertyEnum *properties = NULL;
+	uint32_t property_count = 0;
+	if (JS_GetOwnPropertyNames(ctx, &properties, &property_count, module_obj,
+	                           JS_GPN_STRING_MASK) < 0) {
+		JS_FreeValue(ctx, module_obj);
+		return NULL;
+	}
+
+	JSModuleDef *m = JS_NewCModule(ctx, module_name, tjs__static_esm_init);
+	if (!m) {
+		JS_FreePropertyEnum(ctx, properties, property_count);
+		JS_FreeValue(ctx, module_obj);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < property_count; i++) {
+		const char *name = JS_AtomToCString(ctx, properties[i].atom);
+		if (!name || JS_AddModuleExport(ctx, m, name) < 0) {
+			if (name) JS_FreeCString(ctx, name);
+			JS_FreePropertyEnum(ctx, properties, property_count);
+			JS_FreeValue(ctx, module_obj);
+			return NULL;
+		}
+		JS_FreeCString(ctx, name);
+	}
+	JS_FreePropertyEnum(ctx, properties, property_count);
+	if (JS_SetModulePrivateValue(ctx, m, module_obj) < 0) return NULL;
+	return m;
+}
 
 /* Returns the namespace, JS_NULL when registered but not loadable here, or an
  * exception for errors. On success the uv_lib_t is freed by TJS_FreeRuntime. */
@@ -188,7 +274,7 @@ JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 	const struct TJSModule *mod = NULL;
 	for (int i = 0; i < countof(tjs_modules); i ++){
 		const struct TJSModule *m = &tjs_modules[i];
-		if (strcmp(m->name, name) == 0){
+		if (m->use && strcmp(m->name, name) == 0){
 			mod = m;
 			break;
 		}
@@ -272,11 +358,12 @@ JSValue tjs__module_register(JSContext *ctx, JSValueConst this_val, int argc, JS
 
 JSValue tjs__mod_list_init(JSContext* ctx){
 	JSValue obj = JS_NewArray(ctx);
+	uint32_t index = 0;
 	for (int i = 0; i < countof(tjs_modules); i ++){
 		const struct TJSModule *m = &tjs_modules[i];
-		JS_SetPropertyUint32(ctx, obj, i, JS_NewString(ctx, m->name));
+		if (!m->use) continue;
+		JS_SetPropertyUint32(ctx, obj, index++, JS_NewString(ctx, m->name));
 	}
-	JS_SetLength(ctx, obj, countof(tjs_modules));
 	return obj;
 }
 
@@ -305,6 +392,14 @@ JSModuleDef *tjs__module_loader(JSContext *ctx, const char *module_name, void *o
     int r, is_json;
     DynBuf dbuf;
 	TJSRuntime *trt = TJS_GetRuntime(ctx);
+
+	/* ESM-enabled static modules are not filesystem resources. Exact-name
+	 * matching keeps every other specifier behind the module.load check. */
+	for (int i = 0; i < countof(tjs_modules); i++) {
+		const struct TJSModule *mod = &tjs_modules[i];
+		if (mod->esm && strcmp(mod->name, module_name) == 0)
+			return tjs__load_static_esm(ctx, module_name, mod);
+	}
 
 	// try JS loader
 	if(!JS_IsUndefined(trt->module.loader)){

@@ -595,75 +595,111 @@ static JSClassDef js_sandbox_class = {
     .gc_mark = js_sandbox_mark,
 };
 
-int add_intrinsic(JSContext *ctx, const char *name, size_t len) {
-#pragma warning(push)
-#pragma warning(disable: 4232)
+enum {
+    SANDBOX_INTRINSIC_DATE         = 1u << 0,
+    SANDBOX_INTRINSIC_REGEXP       = 1u << 1,
+    SANDBOX_INTRINSIC_JSON         = 1u << 2,
+    SANDBOX_INTRINSIC_PROXY        = 1u << 3,
+    SANDBOX_INTRINSIC_MAP          = 1u << 4,
+    SANDBOX_INTRINSIC_TYPEDARRAYS  = 1u << 5,
+    SANDBOX_INTRINSIC_PROMISE      = 1u << 6,
+    SANDBOX_INTRINSIC_BIGINT       = 1u << 7,
+    SANDBOX_INTRINSIC_WEAKREF      = 1u << 8,
+    SANDBOX_INTRINSIC_ATOB         = 1u << 9,
+    SANDBOX_INTRINSIC_DOMEXCEPTION = 1u << 10,
+    SANDBOX_INTRINSIC_PERFORMANCE  = 1u << 11,
+    SANDBOX_INTRINSIC_ALL          = (1u << 12) - 1,
+};
+
+static uint32_t sandbox_intrinsic_flag(const char *name, size_t len) {
     static const struct {
         const char *name;
-        int (*add_func)(JSContext *);
+        uint32_t flag;
     } intrinsics[] = {
-        {"date",         JS_AddIntrinsicDate},
-        {"regexp",       JS_AddIntrinsicRegExp},
-        {"json",         JS_AddIntrinsicJSON},
-        {"proxy",        JS_AddIntrinsicProxy},
-        {"map",          JS_AddIntrinsicMapSet},
-        {"typedarrays",  JS_AddIntrinsicTypedArrays},
-        {"promise",      JS_AddIntrinsicPromise},
-        {"bigint",       JS_AddIntrinsicBigInt},
-        {"weakref",      JS_AddIntrinsicWeakRef},
-        {"atob",         JS_AddIntrinsicAToB},
-        {"domexception", JS_AddIntrinsicDOMException},
-        {"performance",  JS_AddPerformance},
+        {"date",         SANDBOX_INTRINSIC_DATE},
+        {"regexp",       SANDBOX_INTRINSIC_REGEXP},
+        {"json",         SANDBOX_INTRINSIC_JSON},
+        {"proxy",        SANDBOX_INTRINSIC_PROXY},
+        {"map",          SANDBOX_INTRINSIC_MAP},
+        {"typedarrays",  SANDBOX_INTRINSIC_TYPEDARRAYS},
+        {"promise",      SANDBOX_INTRINSIC_PROMISE},
+        {"bigint",       SANDBOX_INTRINSIC_BIGINT},
+        {"weakref",      SANDBOX_INTRINSIC_WEAKREF},
+        {"atob",         SANDBOX_INTRINSIC_ATOB},
+        {"domexception", SANDBOX_INTRINSIC_DOMEXCEPTION},
+        {"performance",  SANDBOX_INTRINSIC_PERFORMANCE},
     };
-#pragma warning(pop)
 
-        for (size_t i = 0; i < sizeof(intrinsics) / sizeof(intrinsics[0]); i++) {
-            if (strlen(intrinsics[i].name) == len && 
-                strncmp(name, intrinsics[i].name, len) == 0) {
-                return intrinsics[i].add_func(ctx);
-            }
+    for (size_t i = 0; i < countof(intrinsics); i++) {
+        if (strlen(intrinsics[i].name) == len &&
+            strncmp(name, intrinsics[i].name, len) == 0) {
+            return intrinsics[i].flag;
         }
-        return 0;
     }
+    return 0;
+}
+
+static int sandbox_add_intrinsics(JSContext *ctx, uint32_t flags) {
+    /* BaseObjects installs BigInt and the Sandbox constructor installs eval.
+     * Reinstalling either intrinsic corrupts an already initialized context. */
+    if ((flags & SANDBOX_INTRINSIC_DATE) && JS_AddIntrinsicDate(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_REGEXP) && JS_AddIntrinsicRegExp(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_JSON) && JS_AddIntrinsicJSON(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_PROXY) && JS_AddIntrinsicProxy(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_MAP) && JS_AddIntrinsicMapSet(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_TYPEDARRAYS) && JS_AddIntrinsicTypedArrays(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_PROMISE) && JS_AddIntrinsicPromise(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_WEAKREF) && JS_AddIntrinsicWeakRef(ctx)) return -1;
+
+    /* AToB requires a DOMException prototype in this context. The QuickJS
+     * helper only installs it when the runtime class is still unregistered,
+     * which is false after the main context has initialized. */
+    if ((flags & (SANDBOX_INTRINSIC_ATOB | SANDBOX_INTRINSIC_DOMEXCEPTION)) &&
+        JS_AddIntrinsicDOMException(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_ATOB) && JS_AddIntrinsicAToB(ctx)) return -1;
+    if ((flags & SANDBOX_INTRINSIC_PERFORMANCE) && JS_AddPerformance(ctx)) return -1;
+    return 0;
+}
+
+static JSValue sandbox_init_exception(JSContext *ctx, JSContext *sandbox_ctx) {
+    if (JS_HasException(sandbox_ctx)) {
+        return JS_Throw(ctx, JS_GetException(sandbox_ctx));
+    }
+    return JS_ThrowInternalError(ctx, "failed to initialize sandbox global");
+}
 
 static JSValue js_sandbox_init_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     TJSSandbox *sb = JS_GetOpaque2(ctx, this_val, js_sandbox_class_id);
     if (!sb) return JS_EXCEPTION;
     if (sb->g_inited) return JS_ThrowTypeError(ctx, "global already initialized");
 
+    /* Reading the feature array can run getters or string coercion. Mark the
+     * operation before any such callback so a reentrant call cannot install
+     * intrinsics twice. A failed initializer can leave a partially populated
+     * context, so retries would be unsafe too. */
+    sb->g_inited = true;
+    uint32_t flags = SANDBOX_INTRINSIC_ALL;
     if (argc != 0 && JS_IsArray(argv[0])) {
+        flags = 0;
         int64_t arrlen;
-        if (JS_GetLength(ctx, argv[0], &arrlen) != -1){
-            for (int64_t i = 0; i < arrlen; i++) {
-                JSValue obj = JS_GetPropertyUint32(ctx, argv[0], i);
-                const char* name = JS_ToCString(ctx, obj);
-                JS_FreeValue(ctx, obj);
-                if (!name)
-                    return JS_EXCEPTION;
-                int ret = add_intrinsic(ctx, name, strlen(name));
-                JS_FreeCString(ctx, name);
-                if (ret != 0)
-                    return JS_EXCEPTION;
-            }
-            return JS_UNDEFINED;
+        if (JS_GetLength(ctx, argv[0], &arrlen) < 0)
+            return JS_EXCEPTION;
+        for (int64_t i = 0; i < arrlen; i++) {
+            JSValue obj = JS_GetPropertyUint32(ctx, argv[0], i);
+            if (JS_IsException(obj))
+                return JS_EXCEPTION;
+            size_t len;
+            const char *name = JS_ToCStringLen(ctx, &len, obj);
+            JS_FreeValue(ctx, obj);
+            if (!name)
+                return JS_EXCEPTION;
+            flags |= sandbox_intrinsic_flag(name, len);
+            JS_FreeCString(ctx, name);
         }
     }
 
-    if (
-        JS_AddIntrinsicDate(ctx) ||
-        JS_AddIntrinsicEval(ctx) ||
-        JS_AddIntrinsicRegExp(ctx) ||
-        JS_AddIntrinsicJSON(ctx) ||
-        JS_AddIntrinsicProxy(ctx) ||
-        JS_AddIntrinsicMapSet(ctx) ||
-        JS_AddIntrinsicTypedArrays(ctx) ||
-        JS_AddIntrinsicPromise(ctx) ||
-        JS_AddIntrinsicWeakRef(ctx) ||
-        JS_AddIntrinsicAToB(ctx) ||
-        JS_AddPerformance(ctx)
-    ) {
-            return JS_EXCEPTION;
-    }
+    if (sandbox_add_intrinsics(sb->app->ctx, flags))
+        return sandbox_init_exception(ctx, sb->app->ctx);
 
     return JS_UNDEFINED;
 }

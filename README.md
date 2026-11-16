@@ -445,7 +445,15 @@ CJS_EXTRA_DEFINES
 CJS_EXTRA_MODULE_NAMES
 CJS_EXTRA_MODULE_INITS
 CJS_EXTRA_MODULE_WORKER_SAFE
+CJS_EXTRA_MODULE_USE
+CJS_EXTRA_MODULE_ESM
 ```
+
+The five `CJS_EXTRA_MODULE_*` lists are parallel. `WORKER_SAFE` controls
+availability in worker runtimes, `USE` exposes the module through
+`import.meta.use()`, and `ESM` exposes the exact registered name to native ES
+module imports. A host can register two names with the same init function when
+it wants separate low-level and ESM-facing names.
 
 `cno-cli` uses that path for optional HTTP/2 and QUIC static embedding.
 

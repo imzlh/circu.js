@@ -265,6 +265,18 @@ if(NOT _cjs_libuv_major MATCHES "UV_VERSION_MAJOR +1$")
 endif()
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
+set(_cjs_enable_static_esm_test OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND BUILD_TESTING)
+    set(_cjs_enable_static_esm_test ON)
+    list(APPEND CJS_EXTRA_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/static_esm_module.c")
+    list(APPEND CJS_EXTRA_MODULE_NAMES "cjs:test-native-esm")
+    list(APPEND CJS_EXTRA_MODULE_INITS "cjs_test_native_esm_init")
+    list(APPEND CJS_EXTRA_MODULE_WORKER_SAFE "true")
+    list(APPEND CJS_EXTRA_MODULE_USE "false")
+    list(APPEND CJS_EXTRA_MODULE_ESM "true")
+endif()
+
 add_library(libcjs STATIC
     src/binary.c
     src/capability.c
@@ -310,9 +322,13 @@ if(CJS_EXTRA_MODULE_NAMES)
     list(LENGTH CJS_EXTRA_MODULE_NAMES _cjs_extra_name_count)
     list(LENGTH CJS_EXTRA_MODULE_INITS _cjs_extra_init_count)
     list(LENGTH CJS_EXTRA_MODULE_WORKER_SAFE _cjs_extra_safe_count)
+    list(LENGTH CJS_EXTRA_MODULE_USE _cjs_extra_use_count)
+    list(LENGTH CJS_EXTRA_MODULE_ESM _cjs_extra_esm_count)
     if(NOT _cjs_extra_name_count EQUAL _cjs_extra_init_count OR
-       NOT _cjs_extra_name_count EQUAL _cjs_extra_safe_count)
-        message(FATAL_ERROR "CJS_EXTRA_MODULE_NAMES, CJS_EXTRA_MODULE_INITS, and CJS_EXTRA_MODULE_WORKER_SAFE must have the same length")
+       NOT _cjs_extra_name_count EQUAL _cjs_extra_safe_count OR
+       NOT _cjs_extra_name_count EQUAL _cjs_extra_use_count OR
+       NOT _cjs_extra_name_count EQUAL _cjs_extra_esm_count)
+        message(FATAL_ERROR "CJS_EXTRA_MODULE_NAMES, CJS_EXTRA_MODULE_INITS, CJS_EXTRA_MODULE_WORKER_SAFE, CJS_EXTRA_MODULE_USE, and CJS_EXTRA_MODULE_ESM must have the same length")
     endif()
 
     set(_cjs_extra_externs "")
@@ -322,8 +338,16 @@ if(CJS_EXTRA_MODULE_NAMES)
         list(GET CJS_EXTRA_MODULE_NAMES ${_i} _cjs_extra_name)
         list(GET CJS_EXTRA_MODULE_INITS ${_i} _cjs_extra_init)
         list(GET CJS_EXTRA_MODULE_WORKER_SAFE ${_i} _cjs_extra_safe)
+        list(GET CJS_EXTRA_MODULE_USE ${_i} _cjs_extra_use)
+        list(GET CJS_EXTRA_MODULE_ESM ${_i} _cjs_extra_esm)
+        foreach(_flag IN ITEMS _cjs_extra_safe _cjs_extra_use _cjs_extra_esm)
+            if(NOT "${${_flag}}" MATCHES "^(true|false)$")
+                message(FATAL_ERROR
+                    "${_flag} entry ${_i} must be the C literal true or false")
+            endif()
+        endforeach()
         string(APPEND _cjs_extra_externs "void ${_cjs_extra_init}(JSContext *ctx, JSValue ns);\n")
-        string(APPEND _cjs_extra_entries "    { \"${_cjs_extra_name}\", ${_cjs_extra_init}, ${_cjs_extra_safe} },\n")
+        string(APPEND _cjs_extra_entries "    { \"${_cjs_extra_name}\", ${_cjs_extra_init}, ${_cjs_extra_safe}, ${_cjs_extra_use}, ${_cjs_extra_esm} },\n")
     endforeach()
 
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extra_externs.h" "${_cjs_extra_externs}")
@@ -495,6 +519,13 @@ if(BUILD_TESTING)
     target_link_options(message_clone_test PRIVATE ${cjs_ldflags})
     target_include_directories(message_clone_test PRIVATE src deps/quickjs)
     add_test(NAME message_clone_test COMMAND message_clone_test)
+
+    if(_cjs_enable_static_esm_test)
+        add_executable(static_esm_test tests/native/static_esm.c)
+        target_link_libraries(static_esm_test PRIVATE libcjs uv_a)
+        target_link_options(static_esm_test PRIVATE ${cjs_ldflags})
+        add_test(NAME static_esm_test COMMAND static_esm_test)
+    endif()
 
     # Manual, non-gating microbenchmark. Timings are deliberately not a test:
     # CI scheduling noise makes fixed performance thresholds misleading.
