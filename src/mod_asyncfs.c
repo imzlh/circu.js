@@ -31,6 +31,11 @@
 #include <string.h>
 #include <uv.h>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 static thread_local JSClassID tjs_file_class_id;
 
 static void* tjs__buf_realloc_untracked(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
@@ -234,6 +239,33 @@ static TJSFile *tjs_file_get_open(JSContext *ctx, JSValue obj) {
         return NULL;
     }
     return f;
+}
+
+/* Whether two descriptors refer to the same open file description. A
+ * capability hook can close a numeric descriptor and reuse its slot, so the
+ * number alone says nothing. Windows compares kernel handles; POSIX uses the
+ * inode identity of a dup, which shares the open file description. */
+static TJSObjectHandleIdentity tjs_fs_fd_identity(int first, int second) {
+#ifdef _WIN32
+    HANDLE first_handle = uv_get_osfhandle(first);
+    HANDLE second_handle = uv_get_osfhandle(second);
+    if (first_handle == INVALID_HANDLE_VALUE ||
+        second_handle == INVALID_HANDLE_VALUE) {
+        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+    }
+    return TJS_CompareObjectHandles(first_handle, second_handle);
+#else
+    struct stat first_stat;
+    struct stat second_stat;
+    if (fstat(first, &first_stat) != 0 || fstat(second, &second_stat) != 0)
+        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+    bool same = first_stat.st_dev == second_stat.st_dev &&
+                first_stat.st_ino == second_stat.st_ino &&
+                (first_stat.st_mode & S_IFMT) ==
+                    (second_stat.st_mode & S_IFMT);
+    return same ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+                : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+#endif
 }
 
 static JSValue tjs_new_dir(JSContext *ctx, uv_dir_t *dir, const char *path) {
@@ -1253,19 +1285,46 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
 
+static int tjs_fs_create_file_from_fd_options(JSContext *ctx, JSValueConst value,
+                                              bool *close_on_close) {
+    if (JS_IsUndefined(value)) return 0;
+    if (!JS_IsObject(value))
+        return JS_ThrowTypeError(ctx, "createFrom options must be an object"), -1;
+
+    JSValue option = JS_GetPropertyStr(ctx, value, "closeOnClose");
+    if (JS_IsException(option)) return -1;
+    if (JS_IsUndefined(option)) {
+        JS_FreeValue(ctx, option);
+        return 0;
+    }
+    int enabled = JS_ToBool(ctx, option);
+    JS_FreeValue(ctx, option);
+    if (enabled < 0) return -1;
+    *close_on_close = enabled != 0;
+    return 0;
+}
+
 static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected file descriptor");
 
     const char *path = NULL;
     uv_file fd;
+    bool close_on_close = false;
 
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
 
-    /* Path conversion and the capability hook can re-enter and reuse fd's
-     * numeric slot. Keep the original file description alive throughout. */
+    /* Path/options conversion and the capability hook can re-enter and reuse
+     * fd's numeric slot. Pin so this call keeps referring to the file the
+     * caller named. */
     TJSPinnedFd pin = TJS_PinFd(fd);
     if (pin.error)
         return tjs_throw_errno(ctx, uv_translate_sys_error(pin.error));
+
+    if (argc > 2 &&
+        tjs_fs_create_file_from_fd_options(ctx, argv[2], &close_on_close) < 0) {
+        TJS_UnpinFd(&pin);
+        return JS_EXCEPTION;
+    }
 
     if (argc > 1 && !JS_IsUndefined(argv[1])) {
         path = JS_ToCString(ctx, argv[1]);
@@ -1286,10 +1345,9 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
         return tjs_throw_errno(ctx, r);
     }
 
-    /* The wrapper always owns the duplicate and never the caller's numeric
-     * descriptor. Besides making createFrom borrowed by construction, this
-     * avoids an unavoidable compare/use race if another thread closes and
-     * reuses fd after any attempted identity check. */
+    /* Build around the pin first: allocation/GC may finalize another wrapper
+     * that owned fd. Borrowed handles keep the duplicate, so closing them can
+     * never touch the caller's descriptor. */
     JSValue obj = tjs_new_file(ctx, pin.fd, path);
 
     if (path) JS_FreeCString(ctx, path);
@@ -1299,7 +1357,27 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
         return obj;
     }
 
-    pin.owned = false;
+    if (close_on_close) {
+        /* Transfer only when the numeric slot still names the file validated
+         * above. Otherwise the hook took the slot; keep the duplicate as the
+         * owned descriptor and leave the replacement alone. */
+        TJSObjectHandleIdentity identity = tjs_fs_fd_identity(pin.fd, fd);
+        if (identity == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {
+            pin.owned = false;
+            JS_FreeValue(ctx, obj);
+            return TJS_ThrowObjectHandleIdentityUnsupported(ctx);
+        }
+        if (identity == TJS_OBJECT_HANDLE_IDENTITY_SAME) {
+            TJSFile *f = tjs_file_get(ctx, obj);
+            CHECK_NOT_NULL(f);
+            f->fd = fd;
+            TJS_UnpinFd(&pin);
+        } else {
+            pin.owned = false;
+        }
+    } else {
+        pin.owned = false;
+    }
 
     return obj;
 }

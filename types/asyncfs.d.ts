@@ -1,6 +1,17 @@
 declare namespace CModuleAsyncFS {
     export type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
+    export interface CreateFromOptions {
+        /**
+         * Close the wrapped descriptor when the returned handle closes.
+         *
+         * Defaults to `false`; the caller keeps ownership unless this is set.
+         * With `false`, the handle operates on a duplicate so the caller's
+         * descriptor remains valid for its entire lifetime.
+         */
+        closeOnClose?: boolean;
+    }
+
     /**
      * File open mode shortcuts.
      *
@@ -276,17 +287,21 @@ declare namespace CModuleAsyncFS {
     /* ==================== Internal API (not recommended) ==================== */
 
     /**
-     * Create FileHandle from opened file descriptor (internal use)
-     * Ownership transfers to the FileHandle only after this function returns
-     * successfully. If construction throws, the caller still owns the fd.
+     * Create FileHandle from an opened file descriptor (internal use).
+     *
+     * By default the descriptor is borrowed: the handle wraps a duplicate and
+     * closing it never closes `fd`. Pass `{ closeOnClose: true }` to transfer
+     * ownership; the handle then wraps `fd` itself and closes it on close.
+     *
+     * When ownership transfers, it happens only after the handle is fully
+     * constructed. If construction throws, the caller still owns `fd`.
+     *
      * @internal
      * @param path - (Only used for FileHandle.path) mark up fd path
      */
-    /**
-     * Create a file handle from a duplicate of `fd`.
-     *
-     * The caller retains ownership of `fd`; closing the returned handle never
-     * closes the descriptor passed here.
-     */
-    export function createFrom(fd: number, path?: string): FileHandle;
+    export function createFrom(
+        fd: number,
+        path?: string,
+        options?: CreateFromOptions,
+    ): FileHandle;
 }

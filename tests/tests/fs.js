@@ -36,7 +36,34 @@ await test('asyncfs.createFrom accepts an omitted path', async () => {
     assertEquals(file.path, undefined);
     assert(file.fileno() !== fd, 'createFrom should wrap a duplicate descriptor');
     await file.close();
+    fs.fstat(fd);
+    fs.close(fd);
+});
+
+await test('asyncfs.createFrom transfers fd ownership on request', async () => {
+    const fd = fs.open(TEST_FILE, 'r');
+    const file = asyncfs.createFrom(fd, TEST_FILE, { closeOnClose: true });
+    assertEquals(file.fileno(), fd);
+    await file.close();
+    let closed = false;
     try {
+        fs.fstat(fd);
+    } catch {
+        closed = true;
+    }
+    assert(closed, 'closeOnClose must close the transferred descriptor');
+});
+
+await test('asyncfs.createFrom rejects invalid options', () => {
+    const fd = fs.open(TEST_FILE, 'r');
+    try {
+        let threw = false;
+        try {
+            asyncfs.createFrom(fd, TEST_FILE, 1);
+        } catch (error) {
+            threw = error instanceof TypeError;
+        }
+        assert(threw, 'non-object options must throw TypeError');
         fs.fstat(fd);
     } finally {
         fs.close(fd);

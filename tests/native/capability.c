@@ -644,9 +644,9 @@ int main(void) {
         "closeTarget");
 
 #ifndef _WIN32
-    /* asyncfs.createFrom is borrowed by construction: the returned owner must
-     * retain the pre-hook file description through its duplicate and never
-     * take ownership of either the original slot or its replacement. */
+    /* A borrowed asyncfs.createFrom must retain the pre-hook file description
+     * through its duplicate and never take ownership of either the original
+     * slot or its replacement. */
     int original_pipe[2];
     int replacement_pipe[2];
     assert(pipe(original_pipe) == 0);
@@ -691,6 +691,55 @@ int main(void) {
     close(original_pipe[1]);
     close(replacement_pipe[0]);
     close(replacement_pipe[1]);
+
+    /* Transferring ownership must still wrap the originally named file, not a
+     * same-numbered replacement installed by the hook. */
+    int owned_pipe[2];
+    int owned_replacement[2];
+    assert(pipe(owned_pipe) == 0);
+    assert(pipe(owned_replacement) == 0);
+    set_global(ctx, "fileFd", JS_NewInt32(ctx, owned_pipe[0]));
+    state.mode = HOOK_REUSE_FD;
+    state.reuse_api = "asyncfs.createFrom";
+    state.reuse_target_fd = owned_pipe[0];
+    state.reuse_source_fd = owned_replacement[0];
+    state.reused_fd = false;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    result = eval_function(
+        ctx,
+        "globalThis.ownedFile = asyncfs.createFrom(fileFd, undefined, { closeOnClose: true })",
+        sizeof("globalThis.ownedFile = asyncfs.createFrom(fileFd, undefined, { closeOnClose: true })") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(state.reused_fd);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    result = eval_function(ctx, "ownedFile.fileno()",
+                           sizeof("ownedFile.fileno()") - 1);
+    assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT);
+    int owned_file_fd = JS_VALUE_GET_INT(result);
+    JS_FreeValue(ctx, result);
+    byte = 88;
+    assert(write(owned_pipe[1], &byte, 1) == 1);
+    byte = 99;
+    assert(write(owned_replacement[1], &byte, 1) == 1);
+    byte = 0;
+    assert(read(owned_file_fd, &byte, 1) == 1);
+    assert(byte == 88);
+    byte = 0;
+    assert(read(owned_pipe[0], &byte, 1) == 1);
+    assert(byte == 99);
+    result = eval_function(ctx, "ownedFile.close()",
+                           sizeof("ownedFile.close()") - 1);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    errno = 0;
+    assert(fcntl(owned_file_fd, F_GETFD) == -1);
+    assert(errno == EBADF);
+    assert(fcntl(owned_pipe[0], F_GETFD) != -1);
+    close(owned_pipe[0]);
+    close(owned_pipe[1]);
+    close(owned_replacement[0]);
+    close(owned_replacement[1]);
 
     /* createFrom itself must pin before its capability hook. Otherwise a hook
      * can replace the numeric slot and make the returned wrapper target the
