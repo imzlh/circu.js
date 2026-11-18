@@ -732,6 +732,13 @@ int main(void) {
                            sizeof("ownedFile.close()") - 1);
     assert(!JS_IsException(result));
     JS_FreeValue(ctx, result);
+    /* close() hands the descriptor to the thread pool. Pump the loop until
+     * that close(2) has landed, otherwise the probe below races the worker
+     * and the descriptor still looks open. */
+    for (int spin = 0; spin < 1000 && fcntl(owned_file_fd, F_GETFD) != -1;
+         spin++) {
+        uv_run(&runtime->loop, UV_RUN_ONCE);
+    }
     errno = 0;
     assert(fcntl(owned_file_fd, F_GETFD) == -1);
     assert(errno == EBADF);
