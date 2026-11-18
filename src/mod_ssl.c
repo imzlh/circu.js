@@ -1242,7 +1242,7 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
         if (cn_owned) JS_FreeCString(ctx, cn);
         JS_FreeValue(ctx, cn_val);
         JS_FreeValue(ctx, days_val);
-        return JS_ThrowInternalError(ctx, "failed to generate RSA key for self-signed certificate");
+        return tjs_throw_plain_error(ctx, "failed to generate RSA key for self-signed certificate");
     }
 
     /* Create certificate */
@@ -1271,7 +1271,7 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
         if (cn_owned) JS_FreeCString(ctx, cn);
         JS_FreeValue(ctx, cn_val);
         JS_FreeValue(ctx, days_val);
-        return JS_ThrowInternalError(ctx,
+        return tjs_throw_plain_error(ctx,
                                      "failed to set certificate subject");
     }
     X509_NAME_free(name);

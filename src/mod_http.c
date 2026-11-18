@@ -360,7 +360,7 @@ static JSValue tjs_llhttp_execute(JSContext* ctx, JSValueConst this_val,
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
 	if (p->running) {
-		return JS_ThrowInternalError(ctx, "parser is already executing");
+		return tjs_throw_errno_msg(ctx, UV_EBUSY, "parser is already executing");
 	}
 	if (argc == 0) {
 		return JS_ThrowTypeError(ctx, "execute expects a buffer");
@@ -446,7 +446,7 @@ static JSValue tjs_llhttp_resume(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
-	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
+	if (p->running) return tjs_throw_errno_msg(ctx, UV_EBUSY, "parser is executing");
 	llhttp_resume(&p->parser);
 	return JS_UNDEFINED;
 }
@@ -455,7 +455,7 @@ static JSValue tjs_llhttp_reset(JSContext* ctx, JSValueConst this_val,
 	int argc, JSValueConst* argv) {
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
-	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
+	if (p->running) return tjs_throw_errno_msg(ctx, UV_EBUSY, "parser is executing");
 
 	int32_t type32 = p->type;
 	if (argc > 0 && !JS_IsUndefined(argv[0])) {
@@ -476,7 +476,7 @@ static JSValue tjs_llhttp_finish(JSContext* ctx, JSValueConst this_val,
 	(void) argc; (void) argv;
 	TJSLlhttpParser* p = tjs_llhttp_parser_get(ctx, this_val);
 	if (!p) return JS_EXCEPTION;
-	if (p->running) return JS_ThrowInternalError(ctx, "parser is executing");
+	if (p->running) return tjs_throw_errno_msg(ctx, UV_EBUSY, "parser is executing");
 
 	llhttp_errno_t err = llhttp_finish(&p->parser);
 

@@ -170,13 +170,13 @@ static void evbus_remove_listener(JSRuntime *rt, TJSEvBus *bus, uint64_t id) {
 static TJSEvBus *evbus_get(JSContext *ctx, App **app_out) {
     App *app = TJS_GetApp(ctx);
     if (!app || !app->trt) {
-        JS_ThrowInternalError(ctx, "evbus requires an application context");
+        tjs_throw_plain_error(ctx, "evbus requires an application context");
         return NULL;
     }
 
     TJSRuntime *trt = app->trt;
     if (trt->freeing) {
-        JS_ThrowInternalError(ctx, "evbus is unavailable while its runtime is shutting down");
+        tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "evbus is unavailable while its runtime is shutting down");
         return NULL;
     }
 
@@ -194,7 +194,7 @@ static TJSEvBus *evbus_get(JSContext *ctx, App **app_out) {
         trt->evbus = bus;
     }
     if (bus->disposed) {
-        JS_ThrowInternalError(ctx, "evbus is unavailable while its runtime is shutting down");
+        tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "evbus is unavailable while its runtime is shutting down");
         return NULL;
     }
     if (app_out && app->context_released) {

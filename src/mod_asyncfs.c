@@ -514,7 +514,7 @@ static void uv__fs_req_cb(uv_fs_t *req) {
                 size_t sz;
                 uint8_t *target = JS_GetUint8Array(ctx, &sz, fr->rw.tarray);
                 if (!target || sz < (size_t)fr->req.result) {
-                    arg = JS_NewInternalError(ctx, "fs read buffer became invalid");
+                    arg = tjs_new_plain_error(ctx, "fs read buffer became invalid");
                     is_reject = true;
                     break;
                 }

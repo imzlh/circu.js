@@ -155,7 +155,7 @@ static TJSUdp *tjs_udp_get_open(JSContext *ctx, JSValueConst obj) {
     TJSUdp *u = JS_GetOpaque2(ctx, obj, tjs_udp_class_id);
     if (!u) return NULL;
     if (u->closed || u->finalized || uv_is_closing((uv_handle_t *) &u->udp)) {
-        JS_ThrowInternalError(ctx, "UDP closed");
+        tjs_throw_errno_msg(ctx, UV_EBADF, "UDP closed");
         return NULL;
     }
     return u;
@@ -229,7 +229,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
         size_t sz;
         uint8_t *target = JS_GetUint8Array(ctx, &sz, u->read.b.tarray);
         if (!target || sz < (size_t)nread) {
-            arg = JS_NewInternalError(ctx, "recv buffer became invalid");
+            arg = tjs_new_plain_error(ctx, "recv buffer became invalid");
             is_reject = 1;
         } else {
             memcpy(target, u->read.b.data, (size_t)nread);
@@ -238,7 +238,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
             JS_DefinePropertyValueStr(ctx, arg, "partial", JS_NewBool(ctx, flags & UV_UDP_PARTIAL), JS_PROP_C_W_E);
             if (!addr) {
                 JS_FreeValue(ctx, arg);
-                arg = JS_NewInternalError(ctx, "recv callback did not provide an address");
+                arg = tjs_new_plain_error(ctx, "recv callback did not provide an address");
                 is_reject = 1;
             } else {
                 JSValue addrobj = JS_NewObjectProto(ctx, JS_NULL);
@@ -460,7 +460,7 @@ static JSValue tjs_new_udp(JSContext *ctx, int af) {
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(u);
-        return JS_ThrowInternalError(ctx, "couldn't initialize UDP handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     u->ctx = ctx;

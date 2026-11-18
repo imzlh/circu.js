@@ -768,7 +768,7 @@ static JSValue tjs_ipc_pipe(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
 static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowInternalError(ctx, "sendfd is not supported on Windows");
+    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "sendfd is not supported on Windows");
 #else
     int sock_fd, fd_to_send;
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
@@ -827,7 +827,7 @@ static JSValue tjs_send_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
 static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowInternalError(ctx, "recvfd is not supported on Windows");
+    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "recvfd is not supported on Windows");
 #else
     int sock_fd;
     if (JS_ToInt32(ctx, &sock_fd, argv[0])) return JS_EXCEPTION;
@@ -869,7 +869,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
     }
     if (msg.msg_flags & MSG_CTRUNC) {
         tjs_close_received_fds(&msg);
-        return JS_ThrowInternalError(ctx, "truncated control message");
+        return tjs_throw_plain_error(ctx, "truncated control message");
     }
 
     // Extract received fd from control message
@@ -879,7 +879,7 @@ static JSValue tjs_recv_fd(JSContext *ctx, JSValue this_val, int argc, JSValue *
         cmsg->cmsg_type != SCM_RIGHTS ||
         cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
         tjs_close_received_fds(&msg);
-        return JS_ThrowInternalError(ctx, "invalid control message");
+        return tjs_throw_plain_error(ctx, "invalid control message");
     }
 
     int received_fd = *((int *)CMSG_DATA(cmsg));

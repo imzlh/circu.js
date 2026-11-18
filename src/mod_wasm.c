@@ -1452,7 +1452,7 @@ static JSValue tjs__call_wasm_func_inst(JSContext *ctx,
             if (param_types[j] == WASM_EXTERNREF) {
                 uintptr_t key;
                 if (!tjs__externref_box_key(inst, ctx, argv[j], &key)) {
-                    return JS_ThrowInternalError(ctx, "failed to register externref");
+                    return tjs_throw_plain_error(ctx, "failed to register externref");
                 }
                 params[j].of.foreign = key;
             }
@@ -3184,7 +3184,7 @@ static JSValue tjs__wasm_memory_buffer(JSContext *ctx, TJSWasmInstance *i,
         return buf;
     if (JS_SetArrayBufferPinUnsupported(buf, true) < 0) {
         JS_FreeValue(ctx, buf);
-        return JS_ThrowInternalError(
+        return tjs_throw_plain_error(
             ctx, "cannot mark WebAssembly memory as unsafe to pin");
     }
     /* Keep our own tracking reference so we can detach it on grow. */
@@ -3347,7 +3347,7 @@ static JSValue tjs__wasm_global_set(JSContext *ctx,
         case WASM_EXTERNREF: {
             uint32_t index;
             if (!tjs__externref_box(owner, ctx, value, &index))
-                return JS_ThrowInternalError(ctx, "failed to register externref");
+                return tjs_throw_plain_error(ctx, "failed to register externref");
             memcpy(data, &index, sizeof(index));
             break;
         }
@@ -3444,7 +3444,7 @@ static int tjs__wasm_table_value(JSContext *ctx, TJSWasmInstance *owner,
     if (kind == WASM_EXTERNREF) {
         uint32_t index;
         if (!tjs__externref_box(owner, ctx, value, &index)) {
-            JS_ThrowInternalError(ctx, "failed to register externref");
+            tjs_throw_plain_error(ctx, "failed to register externref");
             return -1;
         }
         *result = (table_elem_type_t)index;
@@ -3514,7 +3514,7 @@ static JSValue tjs_wasm_tablegetat(JSContext *ctx, JSValue this_val,
             ? wasm_runtime_get_custom_data((wasm_module_inst_t)element_owner)
             : NULL;
         if (!native_owner)
-            return JS_ThrowInternalError(ctx,
+            return tjs_throw_plain_error(ctx,
                                          "funcref owner is not available");
         JSValue result = JS_NewObjectProto(ctx, JS_NULL);
         if (JS_IsException(result))
@@ -3526,7 +3526,7 @@ static JSValue tjs_wasm_tablegetat(JSContext *ctx, JSValue this_val,
         }
         if (JS_IsUndefined(owner_value)) {
             JS_FreeValue(ctx, result);
-            return JS_ThrowInternalError(ctx,
+            return tjs_throw_plain_error(ctx,
                                          "funcref owner is no longer alive");
         }
         JS_DefinePropertyValueStr(ctx, result, "index",
@@ -3561,7 +3561,7 @@ static JSValue tjs_wasm_tablesetat(JSContext *ctx, JSValue this_val,
         return JS_EXCEPTION;
     if (!wasm_table_set_elem((WASMModuleInstance *)owner->module_inst,
                              table, element_index, element))
-        return JS_ThrowInternalError(ctx, "failed to retain table element");
+        return tjs_throw_plain_error(ctx, "failed to retain table element");
     return JS_UNDEFINED;
 }
 
@@ -3717,7 +3717,7 @@ static JSValue tjs_wasm_setglobal(JSContext *ctx, JSValue this_val, int argc, JS
         case WASM_EXTERNREF: {
             uint32_t idx;
             if (!tjs__externref_box(global_owner, ctx, argv[2], &idx)) {
-                return JS_ThrowInternalError(ctx, "failed to register externref");
+                return tjs_throw_plain_error(ctx, "failed to register externref");
             }
             memcpy(global_inst.global_data, &idx, sizeof(idx));
             break;
@@ -3923,7 +3923,7 @@ static JSValue tjs_wasm_tableget(JSContext *ctx, JSValue this_val, int argc, JSV
             ? wasm_runtime_get_custom_data((wasm_module_inst_t)element_owner)
             : NULL;
         if (!native_owner)
-            return JS_ThrowInternalError(ctx,
+            return tjs_throw_plain_error(ctx,
                                          "funcref owner is not available");
         JSValue result = JS_NewObjectProto(ctx, JS_NULL);
         if (JS_IsException(result))
@@ -3935,7 +3935,7 @@ static JSValue tjs_wasm_tableget(JSContext *ctx, JSValue this_val, int argc, JSV
         }
         if (JS_IsUndefined(owner_value)) {
             JS_FreeValue(ctx, result);
-            return JS_ThrowInternalError(ctx,
+            return tjs_throw_plain_error(ctx,
                                          "funcref owner is no longer alive");
         }
         JS_DefinePropertyValueStr(ctx, result, "index",
@@ -4011,7 +4011,7 @@ static JSValue tjs_wasm_tableset(JSContext *ctx, JSValue this_val, int argc, JSV
         if (!JS_IsNull(val)) {
             uint32_t idx;
             if (!tjs__externref_box(table_owner, ctx, val, &idx)) {
-                return JS_ThrowInternalError(ctx, "failed to register externref");
+                return tjs_throw_plain_error(ctx, "failed to register externref");
             }
             elem = (table_elem_type_t)idx;
         }
@@ -4019,7 +4019,7 @@ static JSValue tjs_wasm_tableset(JSContext *ctx, JSValue this_val, int argc, JSV
 
     if (!wasm_table_set_elem((WASMModuleInstance *)table_owner->module_inst,
                              table, index, elem))
-        return JS_ThrowInternalError(ctx, "failed to retain table element");
+        return tjs_throw_plain_error(ctx, "failed to retain table element");
 
     return JS_UNDEFINED;
 }

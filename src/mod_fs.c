@@ -2860,7 +2860,7 @@ static JSValue tjs_syncfs_chown(JSContext* ctx, JSValueConst this_val, int argc,
 
 #ifdef _WIN32
     JS_FreeCString(ctx, path);
-    return JS_ThrowInternalError(ctx, "chown not supported on Windows");
+    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "chown not supported on Windows");
 #else
     int ret = chown(path, uid, gid);
 
@@ -2892,7 +2892,7 @@ static JSValue tjs_syncfs_fchown(JSContext* ctx, JSValueConst this_val, int argc
     TJSSyncFsFdPin pin = { fd, 0, false };
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_posix_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fchown", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 #ifdef _WIN32
-    return JS_ThrowInternalError(ctx, "fchown not supported on Windows");
+    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "fchown not supported on Windows");
 #else
     if (fchown(fd, uid, gid) < 0) {
         return tjs_syncfs_throw_pinned_errno(ctx, &pin);

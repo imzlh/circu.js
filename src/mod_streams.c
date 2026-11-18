@@ -266,11 +266,11 @@ static inline bool stream_has_fd(TJSStream *s) {
 static bool stream_revalidate_start_read(JSContext *ctx, TJSStream *s) {
     if (!stream_check_open(ctx, s)) return false;
     if (s->read_starting || s->read_req) {
-        JS_ThrowInternalError(ctx, "read already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
         return false;
     }
     if (s->streaming_read || s->read_buf) {
-        JS_ThrowInternalError(ctx, "startRead already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "startRead already in progress");
         return false;
     }
     return true;
@@ -283,7 +283,7 @@ static bool stream_revalidate_write_buffer(JSContext *ctx,
                                            JSValueConst value) {
     if (!stream_check_open(ctx, s)) return false;
     if (s->write_starting) {
-        JS_ThrowInternalError(ctx, "write already being started");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "write already being started");
         return false;
     }
     *buf = JS_GetAnyBuffer(ctx, size, value);
@@ -297,11 +297,11 @@ static bool stream_revalidate_read_buffer(JSContext *ctx,
                                           JSValueConst value) {
     if (!stream_check_open(ctx, s)) return false;
     if (s->read_starting || s->read_req) {
-        JS_ThrowInternalError(ctx, "read already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
         return false;
     }
     if (s->streaming_read) {
-        JS_ThrowInternalError(ctx, "startRead already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "startRead already in progress");
         return false;
     }
     *buf = JS_GetAnyBuffer(ctx, size, value);
@@ -320,7 +320,7 @@ static bool stream_revalidate_read_sync_buffer(JSContext *ctx,
                                                JSValueConst value) {
     if (!stream_check_open(ctx, s)) return false;
     if (s->read_starting) {
-        JS_ThrowInternalError(ctx, "read already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
         return false;
     }
     *buf = JS_GetAnyBuffer(ctx, size, value);
@@ -330,7 +330,7 @@ static bool stream_revalidate_read_sync_buffer(JSContext *ctx,
 static bool stream_revalidate_shutdown(JSContext *ctx, TJSStream *s) {
     if (!stream_check_open(ctx, s)) return false;
     if (s->shutdown_starting || !JS_IsUndefined(s->shutdown_promise.p)) {
-        JS_ThrowInternalError(ctx, "shutdown already in progress");
+        tjs_throw_errno_msg(ctx, UV_EALREADY, "shutdown already in progress");
         return false;
     }
     return true;
@@ -557,11 +557,11 @@ static JSValue tjs_stream_start_read(JSContext *ctx, JSValue this_val, int argc,
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->read_starting || s->read_req)
-        return JS_ThrowInternalError(ctx, "read already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
     if (s->streaming_read)
-        return JS_ThrowInternalError(ctx, "startRead already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "startRead already in progress");
     if (s->read_buf)
-        return JS_ThrowInternalError(ctx, "startRead already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "startRead already in progress");
 
     TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "stream.startRead", NULL), (void)0, if (!stream_revalidate_start_read(ctx, s)) return JS_EXCEPTION);
     bool started_foreground = s->h.handle.type == UV_TTY &&
@@ -650,7 +650,7 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->write_starting)
-        return JS_ThrowInternalError(ctx, "write already being started");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "write already being started");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
@@ -772,7 +772,7 @@ static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t 
         size_t sz;
         uint8_t *data = JS_GetAnyBuffer(ctx, &sz, rr->buf);
         if (!data || sz < (size_t)nread) {
-            arg = JS_NewInternalError(ctx, "read buffer became invalid");
+            arg = tjs_new_plain_error(ctx, "read buffer became invalid");
             rr->settled = 1;
             TJS_RejectPromise(ctx, &rr->result, 1, &arg);
             tjs_read_req_free(ctx, rr);
@@ -806,9 +806,9 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->read_starting || s->read_req)
-        return JS_ThrowInternalError(ctx, "read already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
     if (s->streaming_read)
-        return JS_ThrowInternalError(ctx, "startRead already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "startRead already in progress");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
@@ -849,7 +849,7 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
         TJS_FreePromise(ctx, &rr->result);
         JS_FreeValue(ctx, promise);
         tjs_read_req_free(ctx, rr);
-        return JS_ThrowInternalError(ctx, "read already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
     }
 
     s->read_req = rr;
@@ -900,7 +900,7 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->shutdown_starting || !JS_IsUndefined(s->shutdown_promise.p))
-        return JS_ThrowInternalError(ctx, "shutdown already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "shutdown already in progress");
 
     TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "stream.shutdown", NULL), (void)0, if (!stream_revalidate_shutdown(ctx, s)) return JS_EXCEPTION);
     uv_shutdown_t *req = tjs__malloc(sizeof(*req));
@@ -1084,7 +1084,7 @@ static JSValue tjs_stream_read_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->read_starting)
-        return JS_ThrowInternalError(ctx, "read already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
@@ -1113,7 +1113,7 @@ static JSValue tjs_stream_write_sync(JSContext *ctx, JSValue this_val, int argc,
     if (!s) return JS_EXCEPTION;
     if (!stream_check_open(ctx, s)) return JS_EXCEPTION;
     if (s->write_starting)
-        return JS_ThrowInternalError(ctx, "write already being started");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "write already being started");
 
     size_t sz;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &sz, argv[0]);
@@ -1290,6 +1290,43 @@ static TJSStream *tjs_tcp_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_tcp_class_id);
 }
 
+/* Forceful close: send RST instead of the graceful shutdown-and-drain that
+ * uv_close performs, so the peer observes ECONNRESET immediately. Mirrors
+ * tjs_stream_close, but routes the handle through uv_tcp_close_reset. */
+static JSValue tjs_tcp_reset(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSStream *s = tjs_tcp_get(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    if (uv_is_closing(&s->h.handle)) return JS_UNDEFINED;
+
+    TJSReadReq *rr = s->read_req;
+    if (rr) {
+        rr->canceled = 1;
+        uv_read_stop(&s->h.stream);
+    }
+    if (s->streaming_read)
+        uv_read_stop(&s->h.stream);
+
+    s->close_pinned = true;
+    stream_pin(ctx, s, this_val);
+    int r = uv_tcp_close_reset(&s->h.tcp, uv__close_cb);
+    if (r != 0) {
+        /* libuv refuses (shutdown in flight, or a never-connected handle) and
+         * has NOT scheduled uv__close_cb — release the close pin we took and
+         * report the failure; the handle is untouched and close() still works. */
+        s->close_pinned = false;
+        stream_unpin(s);
+        return tjs_throw_errno(ctx, r);
+    }
+
+    /* Publish closing state before a rejection hook can call reset() again. */
+    if (rr && !rr->settled) {
+        JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
+        rr->settled = 1;
+        TJS_RejectPromise(ctx, &rr->result, 1, &arg);
+    }
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_tcp_get_sockpeername(JSContext *ctx, JSValue this_val, int magic) {
     TJSStream *t = tjs_tcp_get(ctx, this_val);
     if (!t) return JS_EXCEPTION;
@@ -1312,13 +1349,13 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
 
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     char destination[96];
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "tcp.connect", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "tcp.connect", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress"); } while (0));
 
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) return JS_EXCEPTION;
@@ -1358,11 +1395,11 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
     /* Keep unconditional: without a hook the revalidate block below never
      * runs, and uv_tcp_open would fail with a bare EBUSY instead. */
     if (stream_has_fd(t))
-        return JS_ThrowInternalError(ctx, "socket already open");
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "socket already open");
 
     struct sockaddr_storage ss;
     if (tjs_obj2addr(ctx, argv[0], &ss) != 0) return JS_EXCEPTION;
@@ -1376,7 +1413,7 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
 
     char destination[96];
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "tcp.connectSync", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_has_fd(t)) return JS_ThrowInternalError(ctx, "socket already open"); } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "tcp.connectSync", tjs_stream_format_destination(&ss, destination, sizeof(destination))), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress"); if (stream_has_fd(t)) return tjs_throw_errno_msg(ctx, UV_EISCONN, "socket already open"); } while (0));
 
 #ifndef _WIN32
     int fd = socket(ss.ss_family, SOCK_STREAM, 0);
@@ -1415,7 +1452,7 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
     if (sel == 0) {
         close(fd);
-        return JS_ThrowInternalError(ctx, "Connection timeout");
+        return tjs_throw_errno_msg(ctx, UV_ETIMEDOUT, "Connection timeout");
     }
     if (sel < 0) {
         int e = errno; close(fd);
@@ -1478,7 +1515,7 @@ static JSValue tjs_tcp_connect_sync(JSContext *ctx, JSValue this_val, int argc, 
     int sel = select(0, NULL, &wfds, NULL, &tv);
     if (sel == 0) {
         closesocket(fd);
-        return JS_ThrowInternalError(ctx, "Connection timeout");
+        return tjs_throw_errno_msg(ctx, UV_ETIMEDOUT, "Connection timeout");
     }
     if (sel == SOCKET_ERROR) {
         int e = WSAGetLastError(); closesocket(fd);
@@ -1809,15 +1846,15 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
     if (stream_has_fd(t))
-        return JS_ThrowInternalError(ctx, "pipe already open");
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
     const char *name = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!name) return JS_EXCEPTION;
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "pipe.connect", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "pipe already open"); } } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "pipe.connect", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open"); } } while (0));
 
     uv_connect_t *req = tjs__malloc(sizeof(*req));
     if (!req) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
@@ -1842,7 +1879,7 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
         TJS_FreePromise(ctx, &t->connect_promise);
         JS_FreeValue(ctx, promise);
         tjs__free(req);
-        return JS_ThrowInternalError(ctx, "pipe already open");
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
     }
 
     stream_pin(ctx, t, this_val);
@@ -1870,9 +1907,9 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
     if (stream_has_fd(t))
-        return JS_ThrowInternalError(ctx, "pipe already open");
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
     if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "pipe name must be a string");
 
     size_t len;
@@ -1884,7 +1921,7 @@ static JSValue tjs_pipe_connect_sync(JSContext *ctx, JSValue this_val, int argc,
         return JS_ThrowTypeError(ctx, "pipe name too long");
     }
 
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "pipe.connectSync", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return JS_ThrowInternalError(ctx, "pipe already open"); } } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONNECT, TJS_CAP_FLAG_REPLACEABLE, "pipe.connectSync", name), JS_FreeCString(ctx, name), do { if (!stream_check_open(ctx, t)) { JS_FreeCString(ctx, name); return JS_EXCEPTION; } if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) { JS_FreeCString(ctx, name); return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress"); } if (stream_has_fd(t)) { JS_FreeCString(ctx, name); return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open"); } } while (0));
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1926,17 +1963,17 @@ static JSValue tjs_pipe_open(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (!t) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
     if (stream_has_fd(t))
-        return JS_ThrowInternalError(ctx, "pipe already open");
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
     int fd;
     if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
     if (!stream_check_open(ctx, t)) return JS_EXCEPTION;
     if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p))
-        return JS_ThrowInternalError(ctx, "connect already in progress");
+        return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress");
     if (stream_has_fd(t))
-        return JS_ThrowInternalError(ctx, "pipe already open");
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "pipe.open", NULL), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return JS_ThrowInternalError(ctx, "connect already in progress"); if (stream_has_fd(t)) return JS_ThrowInternalError(ctx, "pipe already open"); } while (0));
+        return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "pipe.open", NULL), (void)0, do { if (!stream_check_open(ctx, t)) return JS_EXCEPTION; if (t->connect_starting || !JS_IsUndefined(t->connect_promise.p)) return tjs_throw_errno_msg(ctx, UV_EALREADY, "connect already in progress"); if (stream_has_fd(t)) return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open"); } while (0));
     int r = uv_pipe_open(&t->h.pipe, fd);
     if (r != 0) return tjs_throw_errno(ctx, r);
     return JS_UNDEFINED;
@@ -1974,6 +2011,7 @@ static const JSCFunctionListEntry tjs_tcp_proto_funcs[] = {
     TJS_CFUNC_DEF("bind",         2, tjs_tcp_bind),
     TJS_CFUNC_DEF("setKeepAlive", 2, tjs_tcp_keepalive),
     TJS_CFUNC_DEF("setNoDelay",   1, tjs_tcp_nodelay),
+    TJS_CFUNC_DEF("reset",        0, tjs_tcp_reset),
 };
 
 static const JSCFunctionListEntry tjs_tty_proto_funcs[] = {

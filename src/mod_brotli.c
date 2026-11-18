@@ -208,7 +208,7 @@ static JSValue tjs_brotli_encode_all(JSContext *ctx, BrotliEncoderState *s, cons
         if (!ok) {
             js_free(ctx, out);
             BrotliEncoderDestroyInstance(s);
-            return JS_ThrowInternalError(ctx, "Brotli compression failed");
+            return tjs_throw_plain_error(ctx, "Brotli compression failed");
         }
 
         produced = out_size - avail_out;
@@ -220,7 +220,7 @@ static JSValue tjs_brotli_encode_all(JSContext *ctx, BrotliEncoderState *s, cons
             if (out_size > SIZE_MAX / 2) {
                 js_free(ctx, out);
                 BrotliEncoderDestroyInstance(s);
-                return JS_ThrowInternalError(ctx, "Brotli compressed output too large");
+                return tjs_throw_plain_error(ctx, "Brotli compressed output too large");
             }
             size_t new_size = out_size * 2;
             uint8_t *new_out = js_realloc(ctx, out, new_size);
@@ -268,7 +268,7 @@ static JSValue tjs_brotli_compress(JSContext *ctx, JSValueConst this_val, int ar
 
     BrotliEncoderState *s = tjs_brotli_make_encoder(&o, data_len);
     if (!s)
-        return JS_ThrowInternalError(ctx, "Failed to create Brotli encoder");
+        return tjs_throw_plain_error(ctx, "Failed to create Brotli encoder");
 
     return tjs_brotli_encode_all(ctx, s, data, data_len);
 }
@@ -296,7 +296,7 @@ static JSValue tjs_brotli_decompress(JSContext *ctx, JSValueConst this_val, int 
         return JS_EXCEPTION;
 
     if (data_len > SIZE_MAX / 4)
-        return JS_ThrowInternalError(ctx, "Brotli input too large");
+        return tjs_throw_plain_error(ctx, "Brotli input too large");
 
     size_t out_size = data_len * 4;
     if (out_size < 4096)
@@ -309,7 +309,7 @@ static JSValue tjs_brotli_decompress(JSContext *ctx, JSValueConst this_val, int 
     BrotliDecoderState *state = BrotliDecoderCreateInstance(NULL, NULL, NULL);
     if (!state) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Failed to create Brotli decoder");
+        return tjs_throw_plain_error(ctx, "Failed to create Brotli decoder");
     }
     if (large_window)
         BrotliDecoderSetParameter(state, BROTLI_DECODER_PARAM_LARGE_WINDOW, 1);
@@ -338,7 +338,7 @@ static JSValue tjs_brotli_decompress(JSContext *ctx, JSValueConst this_val, int 
             if (new_size < out_size) {
                 BrotliDecoderDestroyInstance(state);
                 js_free(ctx, out);
-                return JS_ThrowInternalError(ctx, "Brotli decompressed output too large");
+                return tjs_throw_plain_error(ctx, "Brotli decompressed output too large");
             }
             uint8_t *new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {
@@ -454,7 +454,7 @@ static JSValue tjs_brotli_create_compress(JSContext *ctx, JSValueConst this_val,
     c->state = tjs_brotli_make_encoder(&o, 0);
     if (!c->state) {
         js_free(ctx, c);
-        return JS_ThrowInternalError(ctx, "Failed to create Brotli encoder");
+        return tjs_throw_plain_error(ctx, "Failed to create Brotli encoder");
     }
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_brotli_compress_class_id);
@@ -487,7 +487,7 @@ static JSValue tjs_brotli_create_decompress(JSContext *ctx, JSValueConst this_va
     d->state = BrotliDecoderCreateInstance(NULL, NULL, NULL);
     if (!d->state) {
         js_free(ctx, d);
-        return JS_ThrowInternalError(ctx, "Failed to create Brotli decoder");
+        return tjs_throw_plain_error(ctx, "Failed to create Brotli decoder");
     }
     if (large_window)
         BrotliDecoderSetParameter(d->state, BROTLI_DECODER_PARAM_LARGE_WINDOW, 1);
@@ -539,7 +539,7 @@ static JSValue tjs_brotli_compress_process(JSContext *ctx, JSValueConst this_val
             c->state, op, &avail_in, &next_in, &avail_out, &next_out, NULL);
         if (!ok) {
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Brotli compress failed");
+            return tjs_throw_plain_error(ctx, "Brotli compress failed");
         }
 
         produced = out_size - avail_out;
@@ -551,7 +551,7 @@ static JSValue tjs_brotli_compress_process(JSContext *ctx, JSValueConst this_val
         if (produced == out_size) {
             if (out_size > SIZE_MAX / 2) {
                 js_free(ctx, out);
-                return JS_ThrowInternalError(ctx, "Brotli compressed output too large");
+                return tjs_throw_plain_error(ctx, "Brotli compressed output too large");
             }
             size_t new_size = out_size * 2;
             uint8_t *new_out = js_realloc(ctx, out, new_size);
@@ -631,7 +631,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
     }
 
     if (data_len > SIZE_MAX / 4)
-        return JS_ThrowInternalError(ctx, "Brotli input too large");
+        return tjs_throw_plain_error(ctx, "Brotli input too large");
 
     size_t out_size = data_len * 4;
     if (out_size < 4096)
@@ -676,7 +676,7 @@ static JSValue tjs_brotli_decompress_process(JSContext *ctx, JSValueConst this_v
             size_t new_size = out_size * 2;
             if (new_size < out_size) {
                 js_free(ctx, out);
-                return JS_ThrowInternalError(ctx, "Brotli decompressed output too large");
+                return tjs_throw_plain_error(ctx, "Brotli decompressed output too large");
             }
             uint8_t *new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {

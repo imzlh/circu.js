@@ -283,6 +283,12 @@ JSValue tjs_new_error_path(JSContext *ctx, int err, const char *path);
 JSValue tjs_throw_errno(JSContext *ctx, int err);
 JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path);
 
+/* Catchable operational errors; see mod_error.c. InternalError must not be
+ * used for conditions user code is expected to handle (it is uncatchable). */
+JSValue tjs_new_plain_error(JSContext *ctx, const char *fmt, ...) JS_PRINTF_FORMAT_ATTR(2, 3);
+JSValue tjs_throw_plain_error(JSContext *ctx, const char *fmt, ...) JS_PRINTF_FORMAT_ATTR(2, 3);
+JSValue tjs_throw_errno_msg(JSContext *ctx, int err, const char *fmt, ...) JS_PRINTF_FORMAT_ATTR(3, 4);
+
 JSValue tjs_new_pipe(JSContext *ctx);
 uv_stream_t *tjs_pipe_get_stream(JSContext *ctx, JSValue obj);
 uv_pipe_t *tjs_pipe_get_pipe(JSContext *ctx, JSValue obj);

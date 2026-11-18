@@ -121,7 +121,7 @@ static JSValue tjs_signal(JSContext *ctx, JSValue this_val, int argc, JSValue *a
     if (r != 0) {
         JS_FreeValue(ctx, obj);
         tjs__free(sh);
-        return JS_ThrowInternalError(ctx, "couldn't initialize Signal handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     sh->handle.data = sh;

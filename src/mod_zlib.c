@@ -148,7 +148,7 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
     int ret = deflateInit2(&strm, level, Z_DEFLATED, window_bits, mem_level, strategy);
     if (ret != Z_OK) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Failed to initialize compression");
+        return tjs_throw_plain_error(ctx, "Failed to initialize compression");
     }
     
     ret = deflate(&strm, Z_FINISH);
@@ -156,7 +156,7 @@ static JSValue tjs_zlib_compress(JSContext* ctx, JSValueConst this_val, int argc
     
     if (ret != Z_STREAM_END) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Compression failed");
+        return tjs_throw_plain_error(ctx, "Compression failed");
     }
     
     size_t out_len = strm.total_out;
@@ -194,7 +194,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
     
     /* Initial output buffer size (will grow if needed) */
     if (data_len > SIZE_MAX / 4) {
-        return JS_ThrowInternalError(ctx, "Decompressed output too large");
+        return tjs_throw_plain_error(ctx, "Decompressed output too large");
     }
     size_t out_size = data_len * 4;
     if (out_size < 4096) out_size = 4096;
@@ -213,7 +213,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
     int ret = inflateInit2(&strm, window_bits);
     if (ret != Z_OK) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Failed to initialize decompression");
+        return tjs_throw_plain_error(ctx, "Failed to initialize decompression");
     }
     
     /* Decompress with automatic buffer growth */
@@ -232,7 +232,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
             inflateEnd(&strm);
             js_free(ctx, out);
             if (ret == Z_STREAM_ERROR || ret == Z_MEM_ERROR)
-                return JS_ThrowInternalError(ctx, "Decompression failed");
+                return tjs_throw_plain_error(ctx, "Decompression failed");
             return JS_ThrowTypeError(ctx, "Decompression failed: %s", msg);
         }
 
@@ -248,7 +248,7 @@ static JSValue tjs_zlib_decompress(JSContext* ctx, JSValueConst this_val, int ar
             if (new_size < out_size) {  /* size_t overflow guard */
                 inflateEnd(&strm);
                 js_free(ctx, out);
-                return JS_ThrowInternalError(ctx, "Decompressed output too large");
+                return tjs_throw_plain_error(ctx, "Decompressed output too large");
             }
             uint8_t* new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {
@@ -432,7 +432,7 @@ static JSValue tjs_zlib_deflate_constructor(JSContext* ctx, JSValueConst new_tar
     int ret = deflateInit2(&d->strm, level, Z_DEFLATED, window_bits, mem_level, strategy);
     if (ret != Z_OK) {
         js_free(ctx, d);
-        return JS_ThrowInternalError(ctx, "Failed to initialize deflate");
+        return tjs_throw_plain_error(ctx, "Failed to initialize deflate");
     }
     
     d->initialized = 1;
@@ -470,7 +470,7 @@ static JSValue tjs_zlib_inflate_constructor(JSContext* ctx, JSValueConst new_tar
     int ret = inflateInit2(&i->strm, window_bits);
     if (ret != Z_OK) {
         js_free(ctx, i);
-        return JS_ThrowInternalError(ctx, "Failed to initialize inflate");
+        return tjs_throw_plain_error(ctx, "Failed to initialize inflate");
     }
     
     i->initialized = 1;
@@ -565,7 +565,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
             tjs_deflate_detach(&d->strm);
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Deflate failed");
+            return tjs_throw_plain_error(ctx, "Deflate failed");
         }
 
         produced = out_size - d->strm.avail_out;
@@ -582,7 +582,7 @@ static JSValue tjs_deflate_process(JSContext* ctx, JSValueConst this_val, int ar
         if (out_size > SIZE_MAX / 2) {
             tjs_deflate_detach(&d->strm);
             js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "Deflated output too large");
+            return tjs_throw_plain_error(ctx, "Deflated output too large");
         }
         size_t new_size = out_size * 2;
         uint8_t* new_out = js_realloc(ctx, out, new_size);
@@ -621,7 +621,7 @@ static JSValue tjs_deflate_reset(JSContext* ctx, JSValueConst this_val, int argc
     }
     
     if (deflateReset(&d->strm) != Z_OK) {
-        return JS_ThrowInternalError(ctx, "Deflate reset failed");
+        return tjs_throw_plain_error(ctx, "Deflate reset failed");
     }
     
     d->finished = 0;
@@ -685,7 +685,7 @@ static JSValue tjs_deflate_params(JSContext* ctx, JSValueConst this_val, int arg
 
     if (ret != Z_OK) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Failed to change deflate parameters");
+        return tjs_throw_plain_error(ctx, "Failed to change deflate parameters");
     }
 
     if (produced == 0) {
@@ -762,7 +762,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
     
     /* Allocate output buffer with room to grow */
     if (data_len > SIZE_MAX / 4) {
-        return JS_ThrowInternalError(ctx, "Inflated output too large");
+        return tjs_throw_plain_error(ctx, "Inflated output too large");
     }
     size_t out_size = data_len * 4;
     if (out_size < 4096) out_size = 4096;
@@ -790,7 +790,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
         if (ret != Z_OK && ret != Z_BUF_ERROR) {
             js_free(ctx, out);
             if (ret == Z_STREAM_ERROR) {
-                return JS_ThrowInternalError(ctx, "Inflate failed");
+                return tjs_throw_plain_error(ctx, "Inflate failed");
             }
             return JS_ThrowTypeError(ctx, "Inflate failed: %s",
                                       i->strm.msg ? i->strm.msg : "zlib error");
@@ -806,7 +806,7 @@ static JSValue tjs_inflate_process(JSContext* ctx, JSValueConst this_val, int ar
             size_t new_size = out_size * 2;
             if (new_size < out_size) {
                 js_free(ctx, out);
-                return JS_ThrowInternalError(ctx, "Inflated output too large");
+                return tjs_throw_plain_error(ctx, "Inflated output too large");
             }
             uint8_t* new_out = js_realloc(ctx, out, new_size);
             if (!new_out) {
@@ -853,7 +853,7 @@ static JSValue tjs_inflate_reset(JSContext* ctx, JSValueConst this_val, int argc
     }
     
     if (inflateReset(&i->strm) != Z_OK) {
-        return JS_ThrowInternalError(ctx, "Inflate reset failed");
+        return tjs_throw_plain_error(ctx, "Inflate reset failed");
     }
     
     i->finished = 0;

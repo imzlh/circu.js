@@ -286,7 +286,7 @@ static JSValue tjs_xml_parser_parse(JSContext *ctx, JSValueConst this_val,
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
     if (state->parsing) {
-        return JS_ThrowInternalError(ctx, "XML parser is already parsing");
+        return tjs_throw_errno_msg(ctx, UV_EBUSY, "XML parser is already parsing");
     }
     
     size_t len;
@@ -343,7 +343,7 @@ static JSValue tjs_xml_parser_reset(JSContext *ctx, JSValueConst this_val,
     TJSXMLParser *state = JS_GetOpaque2(ctx, this_val, tjs_xml_parser_class_id);
     if (!state) return JS_EXCEPTION;
     if (state->parsing) {
-        return JS_ThrowInternalError(ctx, "Cannot reset parser while parsing");
+        return tjs_throw_errno_msg(ctx, UV_EBUSY, "Cannot reset parser while parsing");
     }
     
     const char *encoding = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;

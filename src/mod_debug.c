@@ -657,7 +657,7 @@ static JSValue tjs_debug_start(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_ThrowTypeError(ctx, "startDebug requires a callback function");
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.start"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     JS_FreeValue(ctx, trt->debug.onBreak);
     trt->debug.onBreak = JS_DupValue(ctx, argv[0]);
     trt->debug.active  = true;
@@ -669,7 +669,7 @@ static JSValue tjs_debug_start(JSContext *ctx, JSValue this_val, int argc, JSVal
 static JSValue tjs_debug_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.stop"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     JS_SetDebugTraceHandler(ctx, NULL, NULL);
     JS_SetDebugThrowHook(ctx, NULL, NULL);
     JS_FreeValue(ctx, trt->debug.onBreak);
@@ -705,7 +705,7 @@ static JSValue tjs_debug_add_breakpoint(JSContext *ctx, JSValue this_val, int ar
         if (JS_ToInt32(ctx, &col, argv[2])) { JS_FreeCString(ctx, filename); return JS_EXCEPTION; }
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.addBreakpoint"), JS_FreeCString(ctx, filename));
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return JS_ThrowInternalError(ctx, "runtime is shutting down"); }
+    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down"); }
     JSAtom filename_atom = JS_NewAtom(ctx, filename);
     JS_FreeCString(ctx, filename);
     if (filename_atom == JS_ATOM_NULL) return JS_EXCEPTION;
@@ -748,7 +748,7 @@ static JSValue tjs_debug_remove_breakpoint(JSContext *ctx, JSValue this_val, int
     if (JS_ToInt32(ctx, &line, argv[1])) { JS_FreeCString(ctx, filename); return JS_EXCEPTION; }
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.removeBreakpoint"), JS_FreeCString(ctx, filename));
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return JS_ThrowInternalError(ctx, "runtime is shutting down"); }
+    if (!trt || trt->freeing) { JS_FreeCString(ctx, filename); return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down"); }
     JSAtom filename_atom = JS_NewAtom(ctx, filename);
     JS_FreeCString(ctx, filename);
     if (filename_atom == JS_ATOM_NULL) return JS_EXCEPTION;
@@ -763,7 +763,7 @@ static JSValue tjs_debug_remove_breakpoint(JSContext *ctx, JSValue this_val, int
 static JSValue tjs_debug_clear_breakpoints(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "debug.clearBreakpoints"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     TJSBreakpoint *bp, *tmp;
     HASH_ITER(hh, trt->debug.breakpoints, bp, tmp) {
         HASH_DEL(trt->debug.breakpoints, bp);
@@ -874,7 +874,7 @@ static JSValue tjs_debug_set_exception_breakpoint(JSContext *ctx, JSValue this_v
         return JS_EXCEPTION;
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.setExceptionBreakpoint"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     trt->debug.exception_break_mode = (int)mode;
     return JS_UNDEFINED;
 }
@@ -885,7 +885,7 @@ static JSValue tjs_debug_set_step_mode(JSContext *ctx, JSValue this_val, int arg
     if (JS_ToInt32(ctx, &mode, argv[0])) return JS_EXCEPTION;
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.step"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     trt->debug.step_mode  = (int)mode;
     trt->debug.step_depth = tjs__debug_current_pause_depth(trt, ctx);
     return JS_UNDEFINED;
@@ -1015,13 +1015,13 @@ static JSValue tjs_dc_main_wait_request(JSContext *ctx, JSValue this_val, int ar
         tjs_dc_active_stop_event = NULL;
 
         if (wr == WAIT_OBJECT_0 + 1 || !h->cb)
-            return JS_ThrowInternalError(ctx, "EAGAIN: debug channel stopped");
+            return tjs_throw_errno_msg(ctx, UV_EAGAIN, "EAGAIN: debug channel stopped");
         if (wr == WAIT_OBJECT_0)
             tjs_sem_trywait(&cb->main_sem);  /* keep sem count in sync */
 #else
         tjs_sem_wait(&cb->main_sem);
         if (!h->cb)
-            return JS_ThrowInternalError(ctx, "EAGAIN: debug channel stopped");
+            return tjs_throw_errno_msg(ctx, UV_EAGAIN, "EAGAIN: debug channel stopped");
 #endif
     }
 }
@@ -1075,7 +1075,7 @@ static const JSCFunctionListEntry tjs_dc_main_proto_funcs[] = {
 static JSValue tjs_debug_create_channel(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_DEBUG | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "debug.createDebugChannel"), (void)0);
     TJSRuntime *trt = TJS_GetRuntime(ctx);
-    if (!trt || trt->freeing) return JS_ThrowInternalError(ctx, "runtime is shutting down");
+    if (!trt || trt->freeing) return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
 
     /* Old channel (if any) stays owned by its existing handles; just drop the
      * weak pointer so the trace hook starts using the new one. */

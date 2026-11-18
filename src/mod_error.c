@@ -22,6 +22,8 @@
  * THE SOFTWARE.
  */
 
+#include <stdarg.h>
+
 #include "private.h"
 #include "utils.h"
 
@@ -116,6 +118,48 @@ JSValue tjs_throw_errno_path(JSContext *ctx, int err, const char *path) {
     if (JS_IsException(obj)) {
         return obj;
     }
+    return JS_Throw(ctx, obj);
+}
+
+/* Operational native failures must stay catchable JS errors. InternalError is
+ * engine-integrity only and is uncatchable by JS since quickjs #1814, so
+ * modules must never raise it for conditions user code is expected to handle.
+ * These helpers preserve the original message text and attach an errno code
+ * where the failure maps to one (name "IOError"), or throw a plain "Error"
+ * where it does not. */
+static JSValue tjs__new_operational(JSContext *ctx, int err, const char *fmt, va_list ap) {
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (err)
+        return tjs_new_coded_error(ctx, "IOError", JS_NewInt32(ctx, err), JS_NewString(ctx, buf));
+    return tjs_new_coded_error(ctx, "Error", JS_UNDEFINED, JS_NewString(ctx, buf));
+}
+
+JSValue tjs_new_plain_error(JSContext *ctx, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    JSValue obj = tjs__new_operational(ctx, 0, fmt, ap);
+    va_end(ap);
+    return obj;
+}
+
+JSValue tjs_throw_plain_error(JSContext *ctx, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    JSValue obj = tjs__new_operational(ctx, 0, fmt, ap);
+    va_end(ap);
+    if (JS_IsException(obj))
+        return obj;
+    return JS_Throw(ctx, obj);
+}
+
+JSValue tjs_throw_errno_msg(JSContext *ctx, int err, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    JSValue obj = tjs__new_operational(ctx, err, fmt, ap);
+    va_end(ap);
+    if (JS_IsException(obj))
+        return obj;
     return JS_Throw(ctx, obj);
 }
 

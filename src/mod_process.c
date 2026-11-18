@@ -417,7 +417,7 @@ static int materialize_spawn_stdio(JSContext *ctx, TJSProcess *p,
         if (!stream) {
             JS_FreeValue(ctx, pipe_obj);
             if (!JS_HasException(ctx))
-                JS_ThrowInternalError(ctx, "failed to create stdio pipe");
+                tjs_throw_plain_error(ctx, "failed to create stdio pipe");
             return -1;
         }
         options->stdio[fd].data.stream = stream;
@@ -428,7 +428,7 @@ static int materialize_spawn_stdio(JSContext *ctx, TJSProcess *p,
                 return -1;
         } else {
             JS_FreeValue(ctx, pipe_obj);
-            JS_ThrowInternalError(ctx, "extra stdio pipe has no owner");
+            tjs_throw_plain_error(ctx, "extra stdio pipe has no owner");
             return -1;
         }
     }
@@ -687,7 +687,7 @@ static void uv__pty_wait_cb(uv_timer_t *handle) {
 static JSValue make_fork_wait_error(TJSProcess *p, JSContext *ctx, int err) {
 #ifndef _WIN32
     if (p->fork_mode && p->fork_owner_pid != getpid()) {
-        JS_ThrowInternalError(ctx,
+        tjs_throw_plain_error(ctx,
                               "ECHILD: forked process handle belongs to another process");
         return JS_GetException(ctx);
     }
@@ -829,8 +829,10 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
     ws.ws_row = (unsigned short)rows;
 
     int master_fd = -1, slave_fd = -1;
-    if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) == -1)
-        return JS_ThrowInternalError(ctx, "openpty: %s", strerror(errno));
+    if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) == -1) {
+        int e = errno;
+        return tjs_throw_errno_msg(ctx, e, "openpty: %s", strerror(e));
+    }
 
     /* Make master non-blocking so libuv can poll it. */
     int fl = fcntl(master_fd, F_GETFL, 0);
@@ -840,7 +842,7 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
     if (pid < 0) {
         int e = errno;
         close(master_fd); close(slave_fd);
-        return JS_ThrowInternalError(ctx, "fork: %s", strerror(e));
+        return tjs_throw_errno_msg(ctx, e, "fork: %s", strerror(e));
     }
 
     if (pid == 0) {
@@ -886,7 +888,7 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
     if (!pp) {
         JS_FreeValue(ctx, pipe_obj);
         close(master_fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        return JS_ThrowInternalError(ctx, "failed to get pipe handle");
+        return tjs_throw_plain_error(ctx, "failed to get pipe handle");
     }
     int r = uv_pipe_open(pp, master_fd);
     if (r != 0) {
@@ -912,7 +914,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
                               char **env_arr, char **argv_arr, int argc_val,
                               int cols, int rows) {
     if (!load_conpty())
-        return JS_ThrowInternalError(ctx, "ConPTY not supported on this Windows version");
+        return tjs_throw_errno_msg(ctx, UV_ENOSYS, "ConPTY not supported on this Windows version");
 
     HANDLE hPipeIn  = INVALID_HANDLE_VALUE;
     HANDLE hPipeOut = INVALID_HANDLE_VALUE;
@@ -927,14 +929,14 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, true };
     if (!CreatePipe(&hConIn, &hPipeIn, &sa, 0) ||
         !CreatePipe(&hPipeOut, &hConOut, &sa, 0)) {
-        JS_ThrowInternalError(ctx, "CreatePipe failed: %lu", GetLastError());
+        tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreatePipe failed: %lu", GetLastError());
         goto cleanup;
     }
 
     COORD sz = { (SHORT)cols, (SHORT)rows };
     HRESULT hr = pCreatePseudoConsole(sz, hConIn, hConOut, 0, &hPC);
     if (FAILED(hr)) {
-        JS_ThrowInternalError(ctx, "CreatePseudoConsole failed: 0x%08lx", hr);
+        tjs_throw_plain_error(ctx, "CreatePseudoConsole failed: 0x%08lx", hr);
         goto cleanup;
     }
 
@@ -948,7 +950,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) ||
         !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                    hPC, sizeof(HPCON), NULL, NULL)) {
-        JS_ThrowInternalError(ctx, "ProcThreadAttribute setup failed");
+        tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "ProcThreadAttribute setup failed");
         goto cleanup;
     }
 
@@ -958,7 +960,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     if (!wapp) { JS_ThrowOutOfMemory(ctx); goto cleanup; }
     wexe = spawn_sync_resolve_win_app(ctx, wapp);
     if (!wexe) {
-        JS_ThrowInternalError(ctx, "SearchPath failed for PTY command: %s", cmd);
+        tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "SearchPath failed for PTY command: %s", cmd);
         goto cleanup;
     }
     char *default_argv[] = { (char *)cmd, NULL };
@@ -987,7 +989,7 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                         wenv, wcwd,
                         &siEx.StartupInfo, &pi)) {
-        JS_ThrowInternalError(ctx, "CreateProcess failed: %lu", GetLastError());
+        tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreateProcess failed: %lu", GetLastError());
         goto cleanup;
     }
     CloseHandle(pi.hThread);
@@ -1005,13 +1007,15 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     int wfd = _open_osfhandle((intptr_t)hPipeIn, 0);
     if (wfd < 0) {
         JS_FreeValue(ctx, write_obj);
-        JS_ThrowInternalError(ctx, "_open_osfhandle (write) failed: %s", strerror(errno));
+        int e = errno;
+        tjs_throw_errno_msg(ctx, e, "_open_osfhandle (write) failed: %s", strerror(e));
         goto cleanup;
     }
     hPipeIn = INVALID_HANDLE_VALUE; /* ownership transferred to the CRT fd */
-    if (uv_pipe_open(pw, wfd) != 0) {
+    int r = uv_pipe_open(pw, wfd);
+    if (r != 0) {
         _close(wfd); JS_FreeValue(ctx, write_obj);
-        JS_ThrowInternalError(ctx, "uv_pipe_open (write) failed");
+        tjs_throw_errno(ctx, r);
         goto cleanup;
     }
 
@@ -1024,13 +1028,15 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     if (rfd < 0) {
         JS_FreeValue(ctx, read_obj);
         JS_FreeValue(ctx, write_obj);
-        JS_ThrowInternalError(ctx, "_open_osfhandle (read) failed: %s", strerror(errno));
+        int e = errno;
+        tjs_throw_errno_msg(ctx, e, "_open_osfhandle (read) failed: %s", strerror(e));
         goto cleanup;
     }
     hPipeOut = INVALID_HANDLE_VALUE; /* ownership transferred to the CRT fd */
-    if (uv_pipe_open(pr, rfd) != 0) {
+    int rr = uv_pipe_open(pr, rfd);
+    if (rr != 0) {
         _close(rfd); JS_FreeValue(ctx, read_obj); JS_FreeValue(ctx, write_obj);
-        JS_ThrowInternalError(ctx, "uv_pipe_open (read) failed");
+        tjs_throw_errno(ctx, rr);
         goto cleanup;
     }
 
@@ -1161,9 +1167,27 @@ static int spawn_sync_stdio_mode(JSContext *ctx, JSValue opts, const char *name,
 static JSValue spawn_sync_make_result(JSContext *ctx, int pid, int64_t status, int signal,
                                       TJSSpawnSyncBuf *out, TJSSpawnSyncBuf *err,
                                       bool capture_out, bool capture_err,
-                                      const uv_rusage_t *usage) {
+                                      const uv_rusage_t *usage, int exec_errno) {
     JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
     if (JS_IsException(obj)) return obj;
+
+    /* exec/chdir never ran to completion: Node reports the failure through
+     * `error` with status null and empty output, never a 127 exit status. */
+    if (exec_errno != 0) {
+        JSValue err_obj = tjs_new_error(ctx, uv_translate_sys_error(exec_errno));
+        if (JS_IsException(err_obj)) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        JS_DefinePropertyValueStr(ctx, obj, "pid", JS_NewInt32(ctx, pid), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "status", JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "signal", JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "stdout", JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "stderr", JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "output", JS_NewArray(ctx), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "error", err_obj, JS_PROP_C_W_E);
+        return obj;
+    }
 
     JS_DefinePropertyValueStr(ctx, obj, "pid", JS_NewInt32(ctx, pid), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, obj, "status", signal ? JS_NULL : JS_NewInt64(ctx, status), JS_PROP_C_W_E);
@@ -1298,6 +1322,12 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     bool pipe_in = strcmp(stdin_mode, "pipe") == 0;
 
     int in_pipe[2] = { -1, -1 }, out_pipe[2] = { -1, -1 }, err_pipe[2] = { -1, -1 };
+    /* exec-fail report pipe, libuv's uv_spawn trick: the child writes the exec
+     * errno before _exit(127), the parent reads it after reaping. Without it a
+     * failed execvp is indistinguishable from a real exit-127 child, so the JS
+     * layer cannot report ENOENT for unresolvable commands. */
+    int exec_pipe[2] = { -1, -1 };
+    int exec_errno = 0;
     JSValue ret = JS_EXCEPTION;
     TJSSpawnSyncBuf out = { 0 }, err = { 0 };
     char **env_arr = NULL;
@@ -1333,11 +1363,13 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (pipe_in && pipe(in_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
     if (cap_out && pipe(out_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
     if (cap_err && pipe(err_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
+    if (pipe(exec_pipe) == -1) { ret = tjs_throw_errno(ctx, uv_translate_sys_error(errno)); goto cleanup; }
 
     for (int i = 0; i < 2; i++) {
         if (in_pipe[i] != -1) spawn_sync_set_cloexec(in_pipe[i]);
         if (out_pipe[i] != -1) spawn_sync_set_cloexec(out_pipe[i]);
         if (err_pipe[i] != -1) spawn_sync_set_cloexec(err_pipe[i]);
+        if (exec_pipe[i] != -1) spawn_sync_set_cloexec(exec_pipe[i]);
     }
 
     pid_t pid = fork();
@@ -1362,7 +1394,12 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         if (out_pipe[1] != -1) close(out_pipe[1]);
         if (err_pipe[0] != -1) close(err_pipe[0]);
         if (err_pipe[1] != -1) close(err_pipe[1]);
-        if (cwd && chdir(cwd) < 0) _exit(127);
+        if (exec_pipe[0] != -1) close(exec_pipe[0]);
+        if (cwd && chdir(cwd) < 0) {
+            int e = errno;
+            if (write(exec_pipe[1], &e, sizeof(e)) < 0) { /* parent already gone */ }
+            _exit(127);
+        }
         if (clear_env) environ = NULL;
         if (env_arr) {
             for (int i = 0; env_arr[i]; i++) {
@@ -1371,8 +1408,17 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
             }
         }
         execvp(args[0], args);
+        {
+            int e = errno;
+            if (write(exec_pipe[1], &e, sizeof(e)) < 0) { /* parent already gone */ }
+        }
         _exit(127);
     }
+
+    /* Parent holds the write end: close it so the post-wait read reaches EOF
+     * both when exec succeeded (CLOEXEC) and when the child died. */
+    close(exec_pipe[1]);
+    exec_pipe[1] = -1;
 
     if (in_pipe[0] != -1) { close(in_pipe[0]); in_pipe[0] = -1; }
     if (out_pipe[1] != -1) { close(out_pipe[1]); out_pipe[1] = -1; }
@@ -1462,8 +1508,18 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
 #if defined(__APPLE__)
     normalized_usage.ru_maxrss /= 1024;
 #endif
+
+    /* Child reported an exec/chdir failure? One int of errno, or EOF on exec
+     * success (CLOEXEC closed the write end) or on an empty-queue failure. */
+    if (exec_pipe[0] != -1) {
+        int e = 0;
+        ssize_t n = read(exec_pipe[0], &e, sizeof(e));
+        if (n == (ssize_t)sizeof(e) && e != 0)
+            exec_errno = e;
+    }
+
     ret = spawn_sync_make_result(ctx, (int)pid, es, ts, &out, &err, cap_out, cap_err,
-                                 &normalized_usage);
+                                 &normalized_usage, exec_errno);
 
 cleanup:
     if (in_pipe[0] != -1) close(in_pipe[0]);
@@ -1472,6 +1528,8 @@ cleanup:
     if (out_pipe[1] != -1) close(out_pipe[1]);
     if (err_pipe[0] != -1) close(err_pipe[0]);
     if (err_pipe[1] != -1) close(err_pipe[1]);
+    if (exec_pipe[0] != -1) close(exec_pipe[0]);
+    if (exec_pipe[1] != -1) close(exec_pipe[1]);
     spawn_sync_buf_free(&out);
     spawn_sync_buf_free(&err);
     spawn_sync_free_input(input);
@@ -1720,9 +1778,9 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
 
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "process.spawnSync"), (js_free(ctx, wcmd), js_free(ctx, wcwd), js_free(ctx, wenv), free_env(ctx, env_arr), spawn_sync_free_input(input), tjs__free_args(ctx, args)));
 
-    if (pipe_in && !CreatePipe(&in_r, &in_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdin) failed: %lu", GetLastError()); goto cleanup; }
-    if (cap_out && !CreatePipe(&out_r, &out_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stdout) failed: %lu", GetLastError()); goto cleanup; }
-    if (cap_err && !CreatePipe(&err_r, &err_w, &sa, 0)) { JS_ThrowInternalError(ctx, "CreatePipe(stderr) failed: %lu", GetLastError()); goto cleanup; }
+    if (pipe_in && !CreatePipe(&in_r, &in_w, &sa, 0)) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreatePipe(stdin) failed: %lu", GetLastError()); goto cleanup; }
+    if (cap_out && !CreatePipe(&out_r, &out_w, &sa, 0)) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreatePipe(stdout) failed: %lu", GetLastError()); goto cleanup; }
+    if (cap_err && !CreatePipe(&err_r, &err_w, &sa, 0)) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreatePipe(stderr) failed: %lu", GetLastError()); goto cleanup; }
     if (in_w != INVALID_HANDLE_VALUE) SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
     if (out_r != INVALID_HANDLE_VALUE) SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     if (err_r != INVALID_HANDLE_VALUE) SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
@@ -1734,7 +1792,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     si.hStdError = cap_err ? err_w : (!strcmp(stderr_mode, "ignore") ? INVALID_HANDLE_VALUE : GetStdHandle(STD_ERROR_HANDLE));
 
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, true, flags, wenv, wcwd, &si, &pi)) {
-        JS_ThrowInternalError(ctx, "CreateProcess failed: %lu", GetLastError());
+        tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreateProcess failed: %lu", GetLastError());
         goto cleanup;
     }
     spawned = true;
@@ -1747,17 +1805,17 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (cap_out) {
         out_arg.pipe = out_r; out_arg.buf = &out;
         out_thread = CreateThread(NULL, 0, spawn_sync_win_read_thread, &out_arg, 0, NULL);
-        if (!out_thread) { JS_ThrowInternalError(ctx, "CreateThread(stdout) failed: %lu", GetLastError()); goto cleanup; }
+        if (!out_thread) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreateThread(stdout) failed: %lu", GetLastError()); goto cleanup; }
     }
     if (cap_err) {
         err_arg.pipe = err_r; err_arg.buf = &err;
         err_thread = CreateThread(NULL, 0, spawn_sync_win_read_thread, &err_arg, 0, NULL);
-        if (!err_thread) { JS_ThrowInternalError(ctx, "CreateThread(stderr) failed: %lu", GetLastError()); goto cleanup; }
+        if (!err_thread) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreateThread(stderr) failed: %lu", GetLastError()); goto cleanup; }
     }
     if (pipe_in) {
         in_arg.pipe = in_w; in_arg.data = input; in_arg.len = input_len;
         in_thread = CreateThread(NULL, 0, spawn_sync_win_write_thread, &in_arg, 0, NULL);
-        if (!in_thread) { JS_ThrowInternalError(ctx, "CreateThread(stdin) failed: %lu", GetLastError()); goto cleanup; }
+        if (!in_thread) { tjs_throw_errno_msg(ctx, uv_translate_sys_error(GetLastError()), "CreateThread(stdin) failed: %lu", GetLastError()); goto cleanup; }
         in_w = INVALID_HANDLE_VALUE;
     }
 
@@ -1791,7 +1849,7 @@ static JSValue tjs_spawn_sync(JSContext *ctx, JSValue this_val, int argc, JSValu
         child_usage.ru_inblock = io_counters.ReadOperationCount;
     }
     ret = spawn_sync_make_result(ctx, (int)pi.dwProcessId, (int64_t)code, 0, &out, &err,
-                                 cap_out, cap_err, &child_usage);
+                                 cap_out, cap_err, &child_usage, 0);
 
 cleanup:
     if (spawned && JS_IsException(ret) && pi.hProcess) {
@@ -2255,7 +2313,7 @@ static bool fork_runtime_is_quiescent(TJSRuntime *qrt) {
 static int fork_check_allowed(JSContext *ctx, TJSRuntime **runtime_out) {
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     if (!qrt) {
-        JS_ThrowInternalError(ctx, "fork() requires an initialized runtime");
+        tjs_throw_plain_error(ctx, "fork() requires an initialized runtime");
         return -1;
     }
     if (qrt->is_worker) {
@@ -2426,7 +2484,7 @@ static JSValue tjs_process_kill_revalidate(JSContext *ctx, JSValue this_val,
     if (!p) return JS_EXCEPTION;
 #ifndef _WIN32
     if (fork_handle_is_foreign(p))
-        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+        return tjs_throw_errno_msg(ctx, UV_ESRCH, "forked process handle belongs to another process");
 #endif
     if (p->status.exited) return JS_UNDEFINED;
     if (p->status.lost)
@@ -2462,7 +2520,7 @@ static JSValue tjs_process_wait(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (!p) return JS_EXCEPTION;
 #ifndef _WIN32
     if (fork_handle_is_foreign(p))
-        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+        return tjs_throw_errno_msg(ctx, UV_ESRCH, "forked process handle belongs to another process");
 #endif
     if (p->status.exited) {
         JSValue obj = make_exit_obj(ctx, p->status.exit_status, p->status.term_signal);
@@ -2483,12 +2541,12 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
     if (!p) return JS_EXCEPTION;
 #ifndef _WIN32
     if (fork_handle_is_foreign(p))
-        return JS_ThrowInternalError(ctx, "forked process handle belongs to another process");
+        return tjs_throw_errno_msg(ctx, UV_ESRCH, "forked process handle belongs to another process");
 #else
     if (p->fork_mode)
-        return JS_ThrowInternalError(ctx, "fork process unavailable on Windows");
+        return tjs_throw_errno_msg(ctx, UV_ENOSYS, "fork process unavailable on Windows");
     if (p->pty_mode && !p->pty_proc_handle)
-        return JS_ThrowInternalError(ctx, "PTY process handle unavailable");
+        return tjs_throw_errno_msg(ctx, UV_ENOSYS, "PTY process handle unavailable");
 #endif
     if (p->status.exited)
         return make_exit_obj(ctx, p->status.exit_status, p->status.term_signal);
@@ -2499,7 +2557,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 
     if (p->fork_mode) {
 #ifdef _WIN32
-        return JS_ThrowInternalError(ctx, "fork process unavailable on Windows");
+        return tjs_throw_errno_msg(ctx, UV_ENOSYS, "fork process unavailable on Windows");
 #else
         int stat;
         pid_t result;
@@ -2517,7 +2575,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
     } else if (p->pty_mode) {
 #ifdef _WIN32
         if (WaitForSingleObject(p->pty_proc_handle, INFINITE) != WAIT_OBJECT_0)
-            return JS_ThrowInternalError(ctx, "WaitForSingleObject failed");
+            return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
         DWORD ws; GetExitCodeProcess(p->pty_proc_handle, &ws);
         es = (int64_t)ws; ts = 0;
 #else
@@ -2534,7 +2592,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
     } else {
 #ifdef _WIN32
         if (WaitForSingleObject(p->process.process_handle, INFINITE) != WAIT_OBJECT_0)
-            return JS_ThrowInternalError(ctx, "WaitForSingleObject failed");
+            return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
         DWORD ws; GetExitCodeProcess(p->process.process_handle, &ws);
         es = (int64_t)ws; ts = 0;
 #else
@@ -2561,7 +2619,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 static int tjs_process_pty_fd(JSContext *ctx, TJSProcess *p, int *fd_out) {
     uv_pipe_t *pipe = tjs_pipe_get_pipe(ctx, p->pty_readable);
     if (!pipe || uv_is_closing((uv_handle_t *)pipe)) {
-        JS_ThrowInternalError(ctx, "PTY closed");
+        tjs_throw_errno_msg(ctx, UV_EBADF, "PTY closed");
         return -1;
     }
     uv_os_fd_t fd;
@@ -2587,7 +2645,7 @@ static int tjs_process_resize_revalidate(JSContext *ctx, JSValue this_val,
 #ifdef _WIN32
     (void)pty_fd_out;
     if (!p->hpc && !p->status.exited) {
-        JS_ThrowInternalError(ctx, "ConPTY unavailable");
+        tjs_throw_plain_error(ctx, "ConPTY unavailable");
         return -1;
     }
 #else
@@ -2619,12 +2677,12 @@ static JSValue tjs_process_resize(JSContext *ctx, JSValue this_val, int argc, JS
     }
     COORD sz = { (SHORT)cols, (SHORT)rows };
     HRESULT hr = pResizePseudoConsole(p->hpc, sz);
-    if (FAILED(hr)) return JS_ThrowInternalError(ctx, "ResizePseudoConsole failed: 0x%08lx", hr);
+    if (FAILED(hr)) return tjs_throw_plain_error(ctx, "ResizePseudoConsole failed: 0x%08lx", hr);
 #else
     struct winsize ws; memset(&ws, 0, sizeof(ws));
     ws.ws_col = (unsigned short)cols; ws.ws_row = (unsigned short)rows;
     if (ioctl(pty_fd, TIOCSWINSZ, &ws) == -1)
-        return JS_ThrowInternalError(ctx, "TIOCSWINSZ: %s", strerror(errno));
+        { int e = errno; return tjs_throw_errno_msg(ctx, e, "TIOCSWINSZ: %s", strerror(e)); }
 #endif
     p->pty_cols = cols; p->pty_rows = rows;
     return JS_UNDEFINED;
@@ -2650,7 +2708,7 @@ static JSValue tjs_process_getwinsize(JSContext *ctx, JSValue this_val) {
     struct winsize ws; memset(&ws, 0, sizeof(ws));
     if (ioctl(pty_fd, TIOCGWINSZ, &ws) == -1) {
         JS_FreeValue(ctx, obj);
-        return JS_ThrowInternalError(ctx, "TIOCGWINSZ: %s", strerror(errno));
+        { int e = errno; return tjs_throw_errno_msg(ctx, e, "TIOCGWINSZ: %s", strerror(e)); }
     }
     JS_DefinePropertyValueStr(ctx, obj, "cols",   JS_NewInt32(ctx, ws.ws_col),    JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, obj, "rows",   JS_NewInt32(ctx, ws.ws_row),    JS_PROP_C_W_E);
@@ -2692,7 +2750,7 @@ static JSValue tjs_process_is_alive(JSContext *ctx, JSValue this_val, int argc, 
 
 static JSValue tjs_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
-    return JS_ThrowInternalError(ctx, "exec() not supported on Windows");
+    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "exec() not supported on Windows");
 #else
     if (argc == 0) return JS_ThrowTypeError(ctx, "exec(args)");
     char **args = NULL;

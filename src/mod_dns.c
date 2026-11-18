@@ -247,7 +247,7 @@ static JSValue tjs_dns_getaddrinfo(JSContext* ctx, JSValue this_val, int argc, J
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	if (!trt || trt->freeing) {
 		JS_FreeCString(ctx, node);
-		return JS_ThrowInternalError(ctx, "runtime is closing");
+		return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is closing");
 	}
 	TJSGetAddrInfoReq* gr = js_malloc(ctx, sizeof(*gr));
 	if (!gr) {
@@ -421,7 +421,7 @@ static JSValue tjs_dns_lookup_service(JSContext* ctx, JSValue this_val,
 	TJSRuntime* trt = TJS_GetRuntime(ctx);
 	if (!trt || trt->freeing) {
 		JS_FreeCString(ctx, address);
-		return JS_ThrowInternalError(ctx, "runtime is closing");
+		return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is closing");
 	}
 	TJSGetNameInfoReq* gr = js_malloc(ctx, sizeof(*gr));
 	if (!gr) {
@@ -1414,7 +1414,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	if (query_len < 0) {
 		JS_FreeCString(ctx, hostname);
 		if (server_is_js) JS_FreeCString(ctx, server);
-		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
+		return tjs_throw_plain_error(ctx, "Failed to build DNS query");
 	}
 	struct sockaddr_storage server_addr = {0};
 	struct sockaddr_in server_addr4;
@@ -1436,7 +1436,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 	if (!trt || trt->freeing) {
 		JS_FreeCString(ctx, hostname);
 		if (server_is_js) JS_FreeCString(ctx, server);
-		return JS_ThrowInternalError(ctx, "runtime is closing");
+		return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is closing");
 	}
 	dns_udp_ctx_t* req_ctx = malloc(sizeof(dns_udp_ctx_t));
 	if (!req_ctx) {
@@ -1462,7 +1462,7 @@ static JSValue tjs_dns_query(JSContext* ctx, JSValueConst this_val,
 		if (server_is_js) JS_FreeCString(ctx, server);
 		free(req_ctx->hostname);
 		free(req_ctx);
-		return JS_ThrowInternalError(ctx, "Failed to build DNS query");
+		return tjs_throw_plain_error(ctx, "Failed to build DNS query");
 	}
 	req_ctx->query_len = (unsigned int) query_len;
 	memcpy(&req_ctx->server_addr, &server_addr, sizeof(server_addr));

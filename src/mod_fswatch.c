@@ -265,7 +265,7 @@ static JSValue tjs_fs_watch(JSContext *ctx, JSValue this_val, int argc, JSValue 
         JS_FreeCString(ctx, path);
         JS_FreeValue(ctx, obj);
         tjs__free(fw);
-        return JS_ThrowInternalError(ctx, "couldn't initialize handle");
+        return tjs_throw_errno(ctx, r);
     }
 
     fw->ctx = ctx;

@@ -386,7 +386,7 @@ static JSValue tjs_crypto_bio_to_arraybuffer(JSContext* ctx, BIO* bio) {
     char* data = NULL;
     long len = BIO_get_mem_data(bio, &data);
     if (len < 0 || !data) {
-        return JS_ThrowInternalError(ctx, "Failed to read key data");
+        return tjs_throw_plain_error(ctx, "Failed to read key data");
     }
     return JS_NewArrayBufferCopy(ctx, (uint8_t*)data, (size_t)len);
 }
@@ -425,13 +425,13 @@ static JSValue tjs_crypto_get_key_type(JSContext* ctx, JSValueConst this_val, in
         ? tjs_crypto_load_private_key_auto(key_data, key_len)
         : tjs_crypto_load_public_key_auto(key_data, key_len);
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, magic == KEY_KIND_PRIVATE ? "Failed to parse private key" : "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, magic == KEY_KIND_PRIVATE ? "Failed to parse private key" : "Failed to parse public key");
     }
 
     type_name = tjs_crypto_key_type_name(pkey);
     if (!type_name) {
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Unsupported key type");
+        return tjs_throw_plain_error(ctx, "Unsupported key type");
     }
 
     result = JS_NewString(ctx, type_name);
@@ -463,7 +463,7 @@ static JSValue tjs_crypto_export_key(JSContext* ctx, JSValueConst this_val, int 
         pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
     }
     if (!pkey) {
-        return JS_ThrowInternalError(ctx,
+        return tjs_throw_plain_error(ctx,
             (magic == KEY_OP_EXPORT_PRIVATE_PEM || magic == KEY_OP_EXPORT_PRIVATE_DER ||
              magic == KEY_OP_DERIVE_PUBLIC_PEM || magic == KEY_OP_DERIVE_PUBLIC_DER)
                 ? "Failed to parse private key"
@@ -499,7 +499,7 @@ static JSValue tjs_crypto_export_key(JSContext* ctx, JSValueConst this_val, int 
     if (ok != 1) {
         BIO_free(bio);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Key export failed");
+        return tjs_throw_plain_error(ctx, "Key export failed");
     }
 
     result = tjs_crypto_bio_to_arraybuffer(ctx, bio);
@@ -513,7 +513,7 @@ static JSValue tjs_crypto_export_key(JSContext* ctx, JSValueConst this_val, int 
 static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     EC_GROUP* group = (EC_GROUP*)get_ec_group_from_magic(magic);
     if (!group) {
-        return JS_ThrowInternalError(ctx, "Invalid ECC curve");
+        return tjs_throw_plain_error(ctx, "Invalid ECC curve");
     }
 
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.generateEcKey"), EC_GROUP_free(group));
@@ -521,19 +521,19 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     EC_KEY* eckey = EC_KEY_new();
     if (!eckey) {
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(eckey, group) != 1) {
         EC_KEY_free(eckey);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY_set_group failed");
     }
     
     if (EC_KEY_generate_key(eckey) != 1) {
         EC_KEY_free(eckey);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "ECC key generation failed");
+        return tjs_throw_plain_error(ctx, "ECC key generation failed");
     }
     
     const BIGNUM* priv_bn = EC_KEY_get0_private_key(eckey);
@@ -542,7 +542,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     if (!priv_bn || !pub_point) {
         EC_KEY_free(eckey);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "Failed to get key components");
+        return tjs_throw_plain_error(ctx, "Failed to get key components");
     }
     
     size_t priv_len = (EC_GROUP_get_degree(group) + 7) / 8;
@@ -551,7 +551,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
     if (pub_len == 0) {
         EC_KEY_free(eckey);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "Failed to get public key length");
+        return tjs_throw_plain_error(ctx, "Failed to get public key length");
     }
     
     uint8_t* priv_buf = js_malloc(ctx, priv_len);
@@ -570,7 +570,7 @@ static JSValue tjs_crypto_generate_ec_key(JSContext* ctx, JSValueConst this_val,
         js_free(ctx, pub_buf);
         EC_KEY_free(eckey);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "Failed to encode private key");
+        return tjs_throw_plain_error(ctx, "Failed to encode private key");
     }
     EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED, pub_buf, pub_len, NULL);
     
@@ -642,7 +642,7 @@ static JSValue tjs_crypto_ec_public_from_private(JSContext* ctx, JSValueConst th
         BN_free(order);
         BN_free(scalar);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "Failed to derive EC public key");
+        return tjs_throw_plain_error(ctx, "Failed to derive EC public key");
     }
 
     BN_CTX_free(bn_ctx);
@@ -690,7 +690,7 @@ static JSValue tjs_crypto_ec_convert_public(JSContext* ctx, JSValueConst this_va
         BN_CTX_free(bn_ctx);
         EC_POINT_free(point);
         EC_GROUP_free(group);
-        return JS_ThrowInternalError(ctx, "Failed to convert EC public key");
+        return tjs_throw_plain_error(ctx, "Failed to convert EC public key");
     }
 
     BN_CTX_free(bn_ctx);
@@ -722,7 +722,7 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
         nid = NID_secp521r1;  // P-521
         md = EVP_sha512();
     } else {
-        return JS_ThrowInternalError(ctx, "Invalid ECDSA sign algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid ECDSA sign algorithm");
     }
     
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -738,19 +738,19 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
     // Import private key
     EC_KEY* eckey = EC_KEY_new_by_curve_name(nid);
     if (!eckey) {
-        return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY allocation failed");
     }
     
     BIGNUM* priv_bn = BN_bin2bn(key_data, key_len, NULL);
     if (!priv_bn) {
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Failed to convert private key");
+        return tjs_throw_plain_error(ctx, "Failed to convert private key");
     }
     
     if (EC_KEY_set_private_key(eckey, priv_bn) != 1) {
         BN_free(priv_bn);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Failed to set private key");
+        return tjs_throw_plain_error(ctx, "Failed to set private key");
     }
     
     // Hash the data
@@ -759,7 +759,7 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
     if (!EVP_Digest(data, data_len, hash, &hash_len, md, NULL)) {
         BN_free(priv_bn);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Hash computation failed");
+        return tjs_throw_plain_error(ctx, "Hash computation failed");
     }
 
     TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_OS | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "crypto.ecdsaSign"), (BN_free(priv_bn), EC_KEY_free(eckey)));
@@ -769,7 +769,7 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
     if (!sig) {
         BN_free(priv_bn);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "ECDSA sign failed");
+        return tjs_throw_plain_error(ctx, "ECDSA sign failed");
     }
     
     // Serialize to DER
@@ -778,7 +778,7 @@ static JSValue tjs_crypto_ecdsa_sign(JSContext* ctx, JSValueConst this_val, int 
         ECDSA_SIG_free(sig);
         BN_free(priv_bn);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Failed to encode signature");
+        return tjs_throw_plain_error(ctx, "Failed to encode signature");
     }
     
     uint8_t* sig_buf = js_malloc(ctx, sig_len);
@@ -824,7 +824,7 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
         nid = NID_secp521r1;  // P-521
         md = EVP_sha512();
     } else {
-        return JS_ThrowInternalError(ctx, "Invalid ECDSA verify algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid ECDSA verify algorithm");
     }
     
     pub_data = JS_GetAnyBuffer(ctx, &pub_len, argv[0]);
@@ -838,40 +838,40 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
     // Parse public key
     const EC_GROUP* group = EC_GROUP_new_by_curve_name(nid);
     if (!group) {
-        return JS_ThrowInternalError(ctx, "Failed to create EC_GROUP");
+        return tjs_throw_plain_error(ctx, "Failed to create EC_GROUP");
     }
     
     EC_KEY* eckey = EC_KEY_new();
     if (!eckey) {
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(eckey, group) != 1) {
         EC_KEY_free(eckey);
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY_set_group failed");
     }
     
     EC_POINT* pub_point = EC_POINT_new(group);
     if (!pub_point) {
         EC_KEY_free(eckey);
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "EC_POINT allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_POINT allocation failed");
     }
     
     if (EC_POINT_oct2point(group, pub_point, pub_data, pub_len, NULL) != 1) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, "Failed to parse public key");
     }
     
     if (EC_KEY_set_public_key(eckey, pub_point) != 1) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "Failed to set public key");
+        return tjs_throw_plain_error(ctx, "Failed to set public key");
     }
     
     EC_GROUP_free((EC_GROUP*)group);
@@ -882,7 +882,7 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
     if (!EVP_Digest(data, data_len, hash, &hash_len, md, NULL)) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Hash computation failed");
+        return tjs_throw_plain_error(ctx, "Hash computation failed");
     }
     
     // Parse signature
@@ -891,7 +891,7 @@ static JSValue tjs_crypto_ecdsa_verify(JSContext* ctx, JSValueConst this_val, in
     if (!sig) {
         EC_POINT_free(pub_point);
         EC_KEY_free(eckey);
-        return JS_ThrowInternalError(ctx, "Failed to parse signature");
+        return tjs_throw_plain_error(ctx, "Failed to parse signature");
     }
     
     // Verify
@@ -922,24 +922,24 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     
     int nid = get_ec_nid_from_magic(magic);
     if (nid == NID_undef) {
-        return JS_ThrowInternalError(ctx, "Invalid ECC curve");
+        return tjs_throw_plain_error(ctx, "Invalid ECC curve");
     }
     
     const EC_GROUP* group = EC_GROUP_new_by_curve_name(nid);
     if (!group) {
-        return JS_ThrowInternalError(ctx, "Failed to create EC_GROUP");
+        return tjs_throw_plain_error(ctx, "Failed to create EC_GROUP");
     }
     
     EC_KEY* priv_key = EC_KEY_new();
     if (!priv_key) {
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "EC_KEY allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY allocation failed");
     }
     
     if (EC_KEY_set_group(priv_key, group) != 1) {
         EC_KEY_free(priv_key);
         EC_GROUP_free((EC_GROUP*)group);
-        return JS_ThrowInternalError(ctx, "EC_KEY_set_group failed");
+        return tjs_throw_plain_error(ctx, "EC_KEY_set_group failed");
     }
     /* priv_key owns a copy now: free ours, borrow priv_key's to avoid leaks. */
     EC_GROUP_free((EC_GROUP*)group);
@@ -949,13 +949,13 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     BIGNUM* priv_bn = BN_bin2bn(priv_data, priv_len, NULL);
     if (!priv_bn) {
         EC_KEY_free(priv_key);
-        return JS_ThrowInternalError(ctx, "Failed to convert private key");
+        return tjs_throw_plain_error(ctx, "Failed to convert private key");
     }
     
     if (EC_KEY_set_private_key(priv_key, priv_bn) != 1) {
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
-        return JS_ThrowInternalError(ctx, "Failed to set private key");
+        return tjs_throw_plain_error(ctx, "Failed to set private key");
     }
     
     // Import public key
@@ -963,14 +963,14 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     if (!pub_point) {
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
-        return JS_ThrowInternalError(ctx, "EC_POINT allocation failed");
+        return tjs_throw_plain_error(ctx, "EC_POINT allocation failed");
     }
     
     if (EC_POINT_oct2point(group, pub_point, pub_data, pub_len, NULL) != 1) {
         EC_POINT_free(pub_point);
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
-        return JS_ThrowInternalError(ctx, "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, "Failed to parse public key");
     }
     
     // Compute shared secret
@@ -992,7 +992,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
         if (pkey) EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Failed to create EVP_PKEY");
+        return tjs_throw_plain_error(ctx, "Failed to create EVP_PKEY");
     }
     
     EC_KEY* peer_key = EC_KEY_new();
@@ -1004,7 +1004,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
         if (peer_key) EC_KEY_free(peer_key);
-        return JS_ThrowInternalError(ctx, "Failed to create peer key");
+        return tjs_throw_plain_error(ctx, "Failed to create peer key");
     }
     
     EVP_PKEY* peer_pkey = EVP_PKEY_new();
@@ -1016,7 +1016,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
         if (peer_pkey) EVP_PKEY_free(peer_pkey);
-        return JS_ThrowInternalError(ctx, "Failed to create peer EVP_PKEY");
+        return tjs_throw_plain_error(ctx, "Failed to create peer EVP_PKEY");
     }
     
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new(pkey, NULL);
@@ -1030,7 +1030,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
         EC_POINT_free(pub_point);
         BN_free(priv_bn);
         EC_KEY_free(priv_key);
-        return JS_ThrowInternalError(ctx, "ECDH derive init failed");
+        return tjs_throw_plain_error(ctx, "ECDH derive init failed");
     }
     
     size_t out_len = secret_len;
@@ -1052,7 +1052,7 @@ static JSValue tjs_crypto_ecdh_derive(JSContext* ctx, JSValueConst this_val, int
     
     if (derived <= 0 || out_len != secret_len) {
         js_free(ctx, secret);
-        return JS_ThrowInternalError(ctx, "ECDH derivation failed");
+        return tjs_throw_plain_error(ctx, "ECDH derivation failed");
     }
     
     JSValue result = js_fastab(ctx, secret, secret_len);
@@ -1111,7 +1111,7 @@ static JSValue tjs_crypto_derive_shared_secret(JSContext* ctx, JSValueConst this
         EVP_PKEY_free(peer);
         EVP_PKEY_free(pkey);
         ERR_clear_error();
-        return JS_ThrowInternalError(ctx, "Failed to determine shared secret length");
+        return tjs_throw_plain_error(ctx, "Failed to determine shared secret length");
     }
 
     uint8_t* secret = js_malloc(ctx, secret_len);
@@ -1132,7 +1132,7 @@ static JSValue tjs_crypto_derive_shared_secret(JSContext* ctx, JSValueConst this
     if (derived != 1) {
         js_free(ctx, secret);
         ERR_clear_error();
-        return JS_ThrowInternalError(ctx, "Key agreement failed");
+        return tjs_throw_plain_error(ctx, "Key agreement failed");
     }
 
     /* X25519/X448 report the maximum up front and the exact size after; trust
@@ -1164,14 +1164,14 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
     EVP_PKEY* pkey = tjs_crypto_load_public_key(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, "Failed to parse public key");
     }
     
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new(pkey, NULL);
     if (!pctx || EVP_PKEY_encrypt_init(pctx) != 1) {
         EVP_PKEY_CTX_free(pctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Failed to init encrypt");
+        return tjs_throw_plain_error(ctx, "Failed to init encrypt");
     }
     
     // Set OAEP padding and hash
@@ -1181,7 +1181,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
         EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) != 1) {
         EVP_PKEY_CTX_free(pctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Failed to configure RSA-OAEP");
+        return tjs_throw_plain_error(ctx, "Failed to configure RSA-OAEP");
     }
     
     if (label) {
@@ -1198,7 +1198,7 @@ static JSValue tjs_crypto_rsa_oaep_encrypt(JSContext* ctx, JSValueConst this_val
             OPENSSL_free(label_copy);
             EVP_PKEY_CTX_free(pctx);
             EVP_PKEY_free(pkey);
-            return JS_ThrowInternalError(ctx, "Failed to configure RSA-OAEP label");
+            return tjs_throw_plain_error(ctx, "Failed to configure RSA-OAEP label");
         }
     }
     
@@ -1257,13 +1257,13 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
     EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse private key");
+        return tjs_throw_plain_error(ctx, "Failed to parse private key");
     }
     
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new(pkey, NULL);
     if (!pctx || EVP_PKEY_decrypt_init(pctx) != 1) {
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Failed to init decrypt");
+        return tjs_throw_plain_error(ctx, "Failed to init decrypt");
     }
     
     // Set OAEP padding
@@ -1289,7 +1289,7 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
     if (EVP_PKEY_decrypt(pctx, NULL, &out_len, data, data_len) != 1) {
         EVP_PKEY_CTX_free(pctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Decrypt failed");
+        return tjs_throw_plain_error(ctx, "Decrypt failed");
     }
     
     uint8_t* out = js_malloc(ctx, out_len);
@@ -1306,7 +1306,7 @@ static JSValue tjs_crypto_rsa_oaep_decrypt(JSContext* ctx, JSValueConst this_val
     
     if (ret != 1) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Decrypt failed");
+        return tjs_throw_plain_error(ctx, "Decrypt failed");
     }
     
     JSValue result = js_fastab(ctx, out, out_len);
@@ -1342,7 +1342,7 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
     EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse private key");
+        return tjs_throw_plain_error(ctx, "Failed to parse private key");
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -1357,7 +1357,7 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
         EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, salt_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "PSS setup failed");
+        return tjs_throw_plain_error(ctx, "PSS setup failed");
     }
     
     /* Gate unconditionally: salt_len==0 is a valid PSS configuration, and the
@@ -1368,7 +1368,7 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
     if (EVP_DigestSign(mdctx, NULL, &sig_len, data, data_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Sign failed");
+        return tjs_throw_plain_error(ctx, "Sign failed");
     }
 
     uint8_t* sig = js_malloc(ctx, sig_len);
@@ -1385,7 +1385,7 @@ static JSValue tjs_crypto_rsa_pss_sign(JSContext* ctx, JSValueConst this_val, in
     
     if (ret != 1) {
         js_free(ctx, sig);
-        return JS_ThrowInternalError(ctx, "Sign failed");
+        return tjs_throw_plain_error(ctx, "Sign failed");
     }
     
     JSValue result = js_fastab(ctx, sig, sig_len);
@@ -1422,7 +1422,7 @@ static JSValue tjs_crypto_rsa_pss_verify(JSContext* ctx, JSValueConst this_val, 
     EVP_PKEY* pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, "Failed to parse public key");
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -1454,7 +1454,7 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
     
     if (magic == HASH_SHAKE128 || magic == HASH_SHAKE256) {
@@ -1480,13 +1480,13 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
     if (!mdctx) {
-        return JS_ThrowInternalError(ctx, "Failed to create hash context");
+        return tjs_throw_plain_error(ctx, "Failed to create hash context");
     }
     
     if (EVP_DigestInit_ex(mdctx, md, NULL) != 1 ||
         EVP_DigestUpdate(mdctx, data, data_len) != 1) {
         EVP_MD_CTX_free(mdctx);
-        return JS_ThrowInternalError(ctx, "Hash computation failed");
+        return tjs_throw_plain_error(ctx, "Hash computation failed");
     }
 
     if (magic == HASH_SHAKE128 || magic == HASH_SHAKE256) {
@@ -1501,7 +1501,7 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
             EVP_MD_CTX_free(mdctx);
             if (ok != 1) {
                 js_free(ctx, xof);
-                return JS_ThrowInternalError(ctx, "Hash computation failed");
+                return tjs_throw_plain_error(ctx, "Hash computation failed");
             }
             JSValue result = JS_NewArrayBufferCopy(ctx, xof, xof_len);
             js_free(ctx, xof);
@@ -1509,12 +1509,12 @@ static JSValue tjs_crypto_hash(JSContext* ctx, JSValueConst this_val, int argc, 
         }
         if (EVP_DigestFinalXOF(mdctx, hash, xof_len) != 1) {
             EVP_MD_CTX_free(mdctx);
-            return JS_ThrowInternalError(ctx, "Hash computation failed");
+            return tjs_throw_plain_error(ctx, "Hash computation failed");
         }
         hash_len = (unsigned int)xof_len;
     } else if (EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
         EVP_MD_CTX_free(mdctx);
-        return JS_ThrowInternalError(ctx, "Hash computation failed");
+        return tjs_throw_plain_error(ctx, "Hash computation failed");
     }
     
     EVP_MD_CTX_free(mdctx);
@@ -1533,7 +1533,7 @@ static JSValue tjs_crypto_hmac(JSContext* ctx, JSValueConst this_val, int argc, 
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid HMAC algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid HMAC algorithm");
     }
     
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -1550,7 +1550,7 @@ static JSValue tjs_crypto_hmac(JSContext* ctx, JSValueConst this_val, int argc, 
     unsigned int hmac_len;
     
     if (!HMAC(md, key, key_len, data, data_len, hmac, &hmac_len)) {
-        return JS_ThrowInternalError(ctx, "HMAC computation failed");
+        return tjs_throw_plain_error(ctx, "HMAC computation failed");
     }
     
     return JS_NewArrayBufferCopy(ctx, hmac, hmac_len);
@@ -1596,20 +1596,20 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
     
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     // OpenSSL 3.x: Use EVP_KDF
     EVP_KDF* kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
     if (!kdf) {
-        return JS_ThrowInternalError(ctx, "HKDF not available");
+        return tjs_throw_plain_error(ctx, "HKDF not available");
     }
     
     EVP_KDF_CTX* kctx = EVP_KDF_CTX_new(kdf);
     EVP_KDF_free(kdf);
     if (!kctx) {
-        return JS_ThrowInternalError(ctx, "HKDF context creation failed");
+        return tjs_throw_plain_error(ctx, "HKDF context creation failed");
     }
     
     OSSL_PARAM params[5], *p = params;
@@ -1632,7 +1632,7 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
     if (EVP_KDF_derive(kctx, out, keylen, params) != 1) {
         js_free(ctx, out);
         EVP_KDF_CTX_free(kctx);
-        return JS_ThrowInternalError(ctx, "HKDF derivation failed");
+        return tjs_throw_plain_error(ctx, "HKDF derivation failed");
     }
     
     EVP_KDF_CTX_free(kctx);
@@ -1641,30 +1641,30 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
     if (!pctx || EVP_PKEY_derive_init(pctx) != 1) {
         if (pctx) EVP_PKEY_CTX_free(pctx);
-        return JS_ThrowInternalError(ctx, "HKDF init failed");
+        return tjs_throw_plain_error(ctx, "HKDF init failed");
     }
     
     if (EVP_PKEY_CTX_set_hkdf_md(pctx, md) != 1) {
         EVP_PKEY_CTX_free(pctx);
-        return JS_ThrowInternalError(ctx, "HKDF set md failed");
+        return tjs_throw_plain_error(ctx, "HKDF set md failed");
     }
     
     if (salt && salt_len > 0) {
         if (EVP_PKEY_CTX_set1_hkdf_salt(pctx, salt, salt_len) != 1) {
             EVP_PKEY_CTX_free(pctx);
-            return JS_ThrowInternalError(ctx, "HKDF set salt failed");
+            return tjs_throw_plain_error(ctx, "HKDF set salt failed");
         }
     }
     
     if (EVP_PKEY_CTX_set1_hkdf_key(pctx, ikm, ikm_len) != 1) {
         EVP_PKEY_CTX_free(pctx);
-        return JS_ThrowInternalError(ctx, "HKDF set key failed");
+        return tjs_throw_plain_error(ctx, "HKDF set key failed");
     }
     
     if (info && info_len > 0) {
         if (EVP_PKEY_CTX_add1_hkdf_info(pctx, info, info_len) != 1) {
             EVP_PKEY_CTX_free(pctx);
-            return JS_ThrowInternalError(ctx, "HKDF set info failed");
+            return tjs_throw_plain_error(ctx, "HKDF set info failed");
         }
     }
     
@@ -1678,7 +1678,7 @@ static JSValue tjs_crypto_hkdf(JSContext* ctx, JSValueConst this_val, int argc, 
     if (EVP_PKEY_derive(pctx, out, &out_len) != 1) {
         js_free(ctx, out);
         EVP_PKEY_CTX_free(pctx);
-        return JS_ThrowInternalError(ctx, "HKDF derivation failed");
+        return tjs_throw_plain_error(ctx, "HKDF derivation failed");
     }
     
     EVP_PKEY_CTX_free(pctx);
@@ -1825,7 +1825,7 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
 
     const EVP_CIPHER* cipher = get_cipher_from_magic(cipher_magic);
     if (!cipher) {
-        return JS_ThrowInternalError(ctx, "Invalid cipher algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid cipher algorithm");
     }
 
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -1861,7 +1861,7 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
 
     EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
     if (!cctx) {
-        return JS_ThrowInternalError(ctx, "Failed to create cipher context");
+        return tjs_throw_plain_error(ctx, "Failed to create cipher context");
     }
 
     /* Bit 9 of magic: disable PKCS7 padding (raw/no-padding mode) */
@@ -1885,7 +1885,7 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
     if (EVP_CipherInit_ex(cctx, cipher, NULL, key, iv, encrypt) != 1) {
         js_free(ctx, out);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Cipher operation failed");
+        return tjs_throw_plain_error(ctx, "Cipher operation failed");
     }
     if (no_padding) {
         EVP_CIPHER_CTX_set_padding(cctx, 0);
@@ -1894,7 +1894,7 @@ static JSValue tjs_crypto_cipher(JSContext* ctx, JSValueConst this_val, int argc
         EVP_CipherFinal_ex(cctx, out + len, &final_len) != 1) {
         js_free(ctx, out);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Cipher operation failed");
+        return tjs_throw_plain_error(ctx, "Cipher operation failed");
     }
     
     EVP_CIPHER_CTX_free(cctx);
@@ -1960,7 +1960,7 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
         EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
         EVP_EncryptInit_ex(cctx, NULL, NULL, key, iv) != 1) {
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Failed to initialize GCM encryption");
+        return tjs_throw_plain_error(ctx, "Failed to initialize GCM encryption");
     }
     
     // Set AAD if provided
@@ -1968,7 +1968,7 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
     if (aad && aad_len > 0) {
         if (EVP_EncryptUpdate(cctx, NULL, &len, aad, aad_len) != 1) {
             EVP_CIPHER_CTX_free(cctx);
-            return JS_ThrowInternalError(ctx, "Failed to set AAD");
+            return tjs_throw_plain_error(ctx, "Failed to set AAD");
         }
     }
     
@@ -1984,7 +1984,7 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
     if (EVP_EncryptUpdate(cctx, ciphertext, &ciphertext_len, plaintext, plaintext_len) != 1) {
         js_free(ctx, ciphertext);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "GCM encryption failed");
+        return tjs_throw_plain_error(ctx, "GCM encryption failed");
     }
     
     // Finalize encryption
@@ -1992,7 +1992,7 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
     if (EVP_EncryptFinal_ex(cctx, ciphertext + ciphertext_len, &final_len) != 1) {
         js_free(ctx, ciphertext);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "GCM encryption finalization failed");
+        return tjs_throw_plain_error(ctx, "GCM encryption finalization failed");
     }
     ciphertext_len += final_len;
     
@@ -2002,7 +2002,7 @@ static JSValue tjs_crypto_gcm_encrypt(JSContext* ctx, JSValueConst this_val, int
         js_free(ctx, ciphertext);
         if (tag) js_free(ctx, tag);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Failed to get authentication tag");
+        return tjs_throw_plain_error(ctx, "Failed to get authentication tag");
     }
     
     EVP_CIPHER_CTX_free(cctx);
@@ -2061,7 +2061,7 @@ static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int
         EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1 ||
         EVP_DecryptInit_ex(cctx, NULL, NULL, key, iv) != 1) {
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Failed to initialize GCM decryption");
+        return tjs_throw_plain_error(ctx, "Failed to initialize GCM decryption");
     }
     
     // Set AAD if provided
@@ -2069,7 +2069,7 @@ static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int
     if (aad && aad_len > 0) {
         if (EVP_DecryptUpdate(cctx, NULL, &len, aad, aad_len) != 1) {
             EVP_CIPHER_CTX_free(cctx);
-            return JS_ThrowInternalError(ctx, "Failed to set AAD");
+            return tjs_throw_plain_error(ctx, "Failed to set AAD");
         }
     }
     
@@ -2085,14 +2085,14 @@ static JSValue tjs_crypto_gcm_decrypt(JSContext* ctx, JSValueConst this_val, int
     if (EVP_DecryptUpdate(cctx, plaintext, &plaintext_len, ciphertext, ciphertext_len) != 1) {
         js_free(ctx, plaintext);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "GCM decryption failed");
+        return tjs_throw_plain_error(ctx, "GCM decryption failed");
     }
     
     // Set expected tag for verification
     if (EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_TAG, tag_len, (void*)tag) != 1) {
         js_free(ctx, plaintext);
         EVP_CIPHER_CTX_free(cctx);
-        return JS_ThrowInternalError(ctx, "Failed to set authentication tag");
+        return tjs_throw_plain_error(ctx, "Failed to set authentication tag");
     }
     
     // Verify and finalize
@@ -2130,7 +2130,7 @@ static JSValue tjs_crypto_pbkdf2(JSContext* ctx, JSValueConst this_val, int argc
 
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
 
     /* Convert scalar parameters BEFORE buffer acquisition to prevent detach-UAF */
@@ -2164,7 +2164,7 @@ static JSValue tjs_crypto_pbkdf2(JSContext* ctx, JSValueConst this_val, int argc
     if (PKCS5_PBKDF2_HMAC((const char*)password, password_len, salt, salt_len, 
                           iterations, md, keylen, key) != 1) {
         js_free(ctx, key);
-        return JS_ThrowInternalError(ctx, "PBKDF2 failed");
+        return tjs_throw_plain_error(ctx, "PBKDF2 failed");
     }
     
     JSValue result = js_fastab(ctx, key, keylen);
@@ -2262,7 +2262,7 @@ static JSValue tjs_crypto_generate_rsa_key(JSContext* ctx, JSValueConst this_val
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
     
     if (!pctx) {
-        return JS_ThrowInternalError(ctx, "Failed to create RSA context");
+        return tjs_throw_plain_error(ctx, "Failed to create RSA context");
     }
     
     if (EVP_PKEY_keygen_init(pctx) != 1 ||
@@ -2270,7 +2270,7 @@ static JSValue tjs_crypto_generate_rsa_key(JSContext* ctx, JSValueConst this_val
         EVP_PKEY_keygen(pctx, &pkey) != 1) {
         if (pkey) EVP_PKEY_free(pkey);
         EVP_PKEY_CTX_free(pctx);
-        return JS_ThrowInternalError(ctx, "RSA key generation failed");
+        return tjs_throw_plain_error(ctx, "RSA key generation failed");
     }
     
     EVP_PKEY_CTX_free(pctx);
@@ -2308,7 +2308,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
     
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -2324,7 +2324,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
     EVP_PKEY* pkey = tjs_crypto_load_private_key_auto(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse private key");
+        return tjs_throw_plain_error(ctx, "Failed to parse private key");
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -2336,7 +2336,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
         EVP_DigestSignUpdate(mdctx, data, data_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Signature failed");
+        return tjs_throw_plain_error(ctx, "Signature failed");
     }
 
     int key_type = EVP_PKEY_base_id(pkey);
@@ -2349,7 +2349,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
     if (EVP_DigestSignFinal(mdctx, NULL, &sig_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Signature failed");
+        return tjs_throw_plain_error(ctx, "Signature failed");
     }
 
     uint8_t* sig = js_malloc(ctx, sig_len);
@@ -2363,7 +2363,7 @@ static JSValue tjs_crypto_sign(JSContext* ctx, JSValueConst this_val, int argc, 
         js_free(ctx, sig);
         EVP_MD_CTX_free(mdctx);
         EVP_PKEY_free(pkey);
-        return JS_ThrowInternalError(ctx, "Signature failed");
+        return tjs_throw_plain_error(ctx, "Signature failed");
     }
     
     EVP_MD_CTX_free(mdctx);
@@ -2384,7 +2384,7 @@ static JSValue tjs_crypto_verify(JSContext* ctx, JSValueConst this_val, int argc
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
     
     key_data = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -2405,7 +2405,7 @@ static JSValue tjs_crypto_verify(JSContext* ctx, JSValueConst this_val, int argc
     EVP_PKEY* pkey = tjs_crypto_load_public_key_auto(key_data, key_len);
     
     if (!pkey) {
-        return JS_ThrowInternalError(ctx, "Failed to parse public key");
+        return tjs_throw_plain_error(ctx, "Failed to parse public key");
     }
     
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
@@ -2519,7 +2519,7 @@ static JSValue tjs_gcm_constructor(JSContext *ctx, JSValueConst new_target,
         EVP_CIPHER_CTX_ctrl(gctx->ctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL) != 1) {
         EVP_CIPHER_CTX_free(gctx->ctx);
         js_free(ctx, gctx);
-        return JS_ThrowInternalError(ctx, "failed to initialize GCM");
+        return tjs_throw_plain_error(ctx, "failed to initialize GCM");
     }
     
     if (encrypting) {
@@ -2531,7 +2531,7 @@ static JSValue tjs_gcm_constructor(JSContext *ctx, JSValueConst new_target,
     if (ret != 1) {
         EVP_CIPHER_CTX_free(gctx->ctx);
         js_free(ctx, gctx);
-        return JS_ThrowInternalError(ctx, "failed to set key and IV");
+        return tjs_throw_plain_error(ctx, "failed to set key and IV");
     }
     
     gctx->encrypting = encrypting;
@@ -2608,7 +2608,7 @@ static JSValue tjs_gcm_update(JSContext *ctx, JSValueConst this_val,
     
     if (ret != 1) {
         js_free(ctx, out_data);
-        return JS_ThrowInternalError(ctx, "update failed");
+        return tjs_throw_plain_error(ctx, "update failed");
     }
     
     return js_fastab(ctx, out_data, out_len);
@@ -2632,14 +2632,14 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         // Encryption: finalize and get tag
         if (EVP_EncryptFinal_ex(gctx->ctx, out_data, &out_len) != 1) {
             JS_FreeValue(ctx, result);
-            return JS_ThrowInternalError(ctx, "encryption final failed");
+            return tjs_throw_plain_error(ctx, "encryption final failed");
         }
         
         // Get authentication tag (16 bytes)
         uint8_t tag[16];
         if (EVP_CIPHER_CTX_ctrl(gctx->ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) {
             JS_FreeValue(ctx, result);
-            return JS_ThrowInternalError(ctx, "failed to get tag");
+            return tjs_throw_plain_error(ctx, "failed to get tag");
         }
         
         gctx->finalized = 1;
@@ -2679,7 +2679,7 @@ static JSValue tjs_gcm_final(JSContext *ctx, JSValueConst this_val,
         // Set expected tag
         if (EVP_CIPHER_CTX_ctrl(gctx->ctx, EVP_CTRL_GCM_SET_TAG, tag_len, tag) != 1) {
             JS_FreeValue(ctx, result);
-            return JS_ThrowInternalError(ctx, "failed to set tag");
+            return tjs_throw_plain_error(ctx, "failed to set tag");
         }
         
         // Verify and finalize
@@ -2738,7 +2738,7 @@ static JSClassDef tjs_hash_class = {
 static JSValue tjs_crypto_create_hash(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int magic) {
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid hash algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid hash algorithm");
     }
     
     TJSHash* h = js_mallocz(ctx, sizeof(*h));
@@ -2751,7 +2751,7 @@ static JSValue tjs_crypto_create_hash(JSContext* ctx, JSValueConst this_val, int
     if (!h->ctx || EVP_DigestInit_ex(h->ctx, md, NULL) != 1) {
         if (h->ctx) EVP_MD_CTX_free(h->ctx);
         js_free(ctx, h);
-        return JS_ThrowInternalError(ctx, "Failed to initialize hash");
+        return tjs_throw_plain_error(ctx, "Failed to initialize hash");
     }
     
     JSValue obj = JS_NewObjectClass(ctx, tjs_hash_class_id);
@@ -2783,7 +2783,7 @@ static JSValue tjs_hash_update(JSContext* ctx, JSValueConst this_val, int argc, 
     }
     
     if (EVP_DigestUpdate(h->ctx, data, data_len) != 1) {
-        return JS_ThrowInternalError(ctx, "Hash update failed");
+        return tjs_throw_plain_error(ctx, "Hash update failed");
     }
     
     return JS_DupValue(ctx, this_val);
@@ -2800,7 +2800,7 @@ static JSValue tjs_hash_digest(JSContext* ctx, JSValueConst this_val, int argc, 
     unsigned int hash_len;
     
     if (EVP_DigestFinal_ex(h->ctx, hash, &hash_len) != 1) {
-        return JS_ThrowInternalError(ctx, "Hash finalization failed");
+        return tjs_throw_plain_error(ctx, "Hash finalization failed");
     }
     
     // Reinitialize for potential reuse
@@ -2826,7 +2826,7 @@ static JSValue tjs_hash_copy(JSContext* ctx, JSValueConst this_val, int argc, JS
     if (!copy->ctx || EVP_MD_CTX_copy_ex(copy->ctx, source->ctx) != 1) {
         if (copy->ctx) EVP_MD_CTX_free(copy->ctx);
         js_free(ctx, copy);
-        return JS_ThrowInternalError(ctx, "Failed to copy hash state");
+        return tjs_throw_plain_error(ctx, "Failed to copy hash state");
     }
 
     JSValue obj = JS_NewObjectClass(ctx, tjs_hash_class_id);
@@ -2878,7 +2878,7 @@ static JSValue tjs_crypto_create_hmac(JSContext* ctx, JSValueConst this_val, int
     
     const EVP_MD* md = get_md_from_magic(magic);
     if (!md) {
-        return JS_ThrowInternalError(ctx, "Invalid HMAC algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid HMAC algorithm");
     }
     
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -2899,7 +2899,7 @@ static JSValue tjs_crypto_create_hmac(JSContext* ctx, JSValueConst this_val, int
         if (h->ctx) EVP_MD_CTX_free(h->ctx);
         if (h->pkey) EVP_PKEY_free(h->pkey);
         js_free(ctx, h);
-        return JS_ThrowInternalError(ctx, "Failed to initialize HMAC");
+        return tjs_throw_plain_error(ctx, "Failed to initialize HMAC");
     }
     
     JSValue obj = JS_NewObjectClass(ctx, tjs_hmac_class_id);
@@ -2932,7 +2932,7 @@ static JSValue tjs_hmac_update(JSContext* ctx, JSValueConst this_val, int argc, 
     }
     
     if (EVP_DigestSignUpdate(h->ctx, data, data_len) != 1) {
-        return JS_ThrowInternalError(ctx, "HMAC update failed");
+        return tjs_throw_plain_error(ctx, "HMAC update failed");
     }
     
     return JS_DupValue(ctx, this_val);
@@ -2947,7 +2947,7 @@ static JSValue tjs_hmac_digest(JSContext* ctx, JSValueConst this_val, int argc, 
     
     size_t hmac_len;
     if (EVP_DigestSignFinal(h->ctx, NULL, &hmac_len) != 1) {
-        return JS_ThrowInternalError(ctx, "HMAC finalization failed");
+        return tjs_throw_plain_error(ctx, "HMAC finalization failed");
     }
     
     uint8_t* hmac = js_malloc(ctx, hmac_len);
@@ -2957,7 +2957,7 @@ static JSValue tjs_hmac_digest(JSContext* ctx, JSValueConst this_val, int argc, 
     
     if (EVP_DigestSignFinal(h->ctx, hmac, &hmac_len) != 1) {
         js_free(ctx, hmac);
-        return JS_ThrowInternalError(ctx, "HMAC finalization failed");
+        return tjs_throw_plain_error(ctx, "HMAC finalization failed");
     }
     
     // Reinitialize for potential reuse
@@ -3004,7 +3004,7 @@ static JSValue tjs_crypto_create_cipher(JSContext* ctx, JSValueConst this_val, i
     
     const EVP_CIPHER* cipher = get_cipher_from_magic(cipher_magic);
     if (!cipher) {
-        return JS_ThrowInternalError(ctx, "Invalid cipher algorithm");
+        return tjs_throw_plain_error(ctx, "Invalid cipher algorithm");
     }
     
     key = JS_GetAnyBuffer(ctx, &key_len, argv[0]);
@@ -3031,7 +3031,7 @@ static JSValue tjs_crypto_create_cipher(JSContext* ctx, JSValueConst this_val, i
     if (!c->ctx || EVP_CipherInit_ex(c->ctx, cipher, NULL, key, iv, encrypt) != 1) {
         if (c->ctx) EVP_CIPHER_CTX_free(c->ctx);
         js_free(ctx, c);
-        return JS_ThrowInternalError(ctx, "Failed to initialize cipher");
+        return tjs_throw_plain_error(ctx, "Failed to initialize cipher");
     }
     if (no_padding) {
         EVP_CIPHER_CTX_set_padding(c->ctx, 0);
@@ -3075,7 +3075,7 @@ static JSValue tjs_cipher_update(JSContext* ctx, JSValueConst this_val, int argc
     
     if (EVP_CipherUpdate(c->ctx, out, &out_len, data, data_len) != 1) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Cipher update failed");
+        return tjs_throw_plain_error(ctx, "Cipher update failed");
     }
     
     JSValue result = js_fastab(ctx, out, out_len);
@@ -3097,7 +3097,7 @@ static JSValue tjs_cipher_final(JSContext* ctx, JSValueConst this_val, int argc,
     
     if (EVP_CipherFinal_ex(c->ctx, out, &out_len) != 1) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "Cipher finalization failed");
+        return tjs_throw_plain_error(ctx, "Cipher finalization failed");
     }
     
     JSValue result = js_fastab(ctx, out, out_len);
@@ -3161,7 +3161,7 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     EVP_ENCODE_CTX* ectx = EVP_ENCODE_CTX_new();
     if (!ectx) {
         JS_FreeCString(ctx, str);
-        return JS_ThrowInternalError(ctx, "Base64 decode failed: out of memory");
+        return tjs_throw_plain_error(ctx, "Base64 decode failed: out of memory");
     }
     EVP_DecodeInit(ectx);
 
@@ -3181,13 +3181,13 @@ static JSValue tjs_crypto_base64_decode(JSContext* ctx, JSValueConst this_val, i
     if (rc < 0) {
         js_free(ctx, out);
         EVP_ENCODE_CTX_free(ectx);
-        return JS_ThrowInternalError(ctx, "Base64 decode failed");
+        return tjs_throw_plain_error(ctx, "Base64 decode failed");
     }
 
     if (EVP_DecodeFinal(ectx, out + out_len, &final_len) < 0) {
         js_free(ctx, out);
         EVP_ENCODE_CTX_free(ectx);
-        return JS_ThrowInternalError(ctx, "Base64 decode failed: invalid padding");
+        return tjs_throw_plain_error(ctx, "Base64 decode failed: invalid padding");
     }
     EVP_ENCODE_CTX_free(ectx);
 

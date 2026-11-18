@@ -647,7 +647,7 @@ static JSValue read_value(JSContext *ctx, FfiType *type, const uint8_t *source,
             return array;
         }
     }
-    return JS_ThrowInternalError(ctx, "unknown FFI type");
+    return tjs_throw_plain_error(ctx, "unknown FFI type");
 }
 
 static JSValue type_pack(JSContext*ctx,JSValueConst self,int argc,JSValueConst*argv){

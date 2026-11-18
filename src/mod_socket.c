@@ -35,7 +35,7 @@
 # define SOCK_INVALID        INVALID_SOCKET
 # define sock_close(fd)      closesocket(fd)
 # define sock_valid(fd)      ((fd) != INVALID_SOCKET)
-# define THROW_STRERROR()    JS_ThrowInternalError(ctx, "WSA error %d", WSAGetLastError())
+# define THROW_STRERROR()    tjs_throw_errno(ctx, uv_translate_sys_error(WSAGetLastError()))
 # define uv_poll_init_fd     uv_poll_init_socket
 #else
 # include <net/if.h>
@@ -47,7 +47,7 @@
 # define SOCK_INVALID        (-1)
 # define sock_close(fd)      close(fd)
 # define sock_valid(fd)      ((fd) >= 0)
-# define THROW_STRERROR()    JS_ThrowInternalError(ctx, "%s (%d)", strerror(errno), errno)
+# define THROW_STRERROR()    tjs_throw_errno(ctx, errno)
 # define uv_poll_init_fd     uv_poll_init
 #endif
 
@@ -176,7 +176,7 @@ static void tjs_sock_unpin(tjs_sock_pin_t *pin) {
 
 static JSValue tjs_sock_throw_pin_error(JSContext *ctx, int error) {
 #ifdef _WIN32
-    return JS_ThrowInternalError(ctx, "WSA error %d", error);
+    return tjs_throw_errno(ctx, uv_translate_sys_error(error));
 #else
     return tjs_throw_errno(ctx, uv_translate_sys_error(error));
 #endif
@@ -190,7 +190,7 @@ static bool tjs_sock_reget(JSContext *ctx, JSValueConst this_val,
         return false;
     }
     if (s->closed) {
-        JS_ThrowInternalError(ctx, "Socket closed");
+        tjs_throw_errno_msg(ctx, UV_EBADF, "Socket closed");
         return false;
     }
     *result = s;
@@ -226,7 +226,7 @@ static bool tjs_sock_revalidate_pin(JSContext *ctx, JSValueConst this_val,
 #define GET_SOCK(ctx, this_val, s)                                           \
     tjs_sock_t *s = JS_GetOpaque(this_val, tjs_sock_classid);               \
     if (!s) return JS_ThrowTypeError(ctx, "expected " TJS_SOCK_CLASS_NAME);  \
-    if (s->closed) return JS_ThrowInternalError(ctx, "Socket closed")
+    if (s->closed) return tjs_throw_errno_msg(ctx, UV_EBADF, "Socket closed")
 
 /* Argument conversion and capability hooks can synchronously close or
  * otherwise re-enter this wrapper. Never use an opaque pointer or descriptor
@@ -479,8 +479,8 @@ static socklen_t tjs_sock_addrlen(const struct sockaddr_storage *addr) {
 
 static JSValue tjs_sock_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     DECL_SOCK(ctx, this_val, s);
-    if (s->closed)  return JS_ThrowInternalError(ctx, "Socket already closed");
-    if (s->in_cb)   return JS_ThrowInternalError(ctx, "Cannot close during poll callback");
+    if (s->closed)  return tjs_throw_errno_msg(ctx, UV_EBADF, "Socket already closed");
+    if (s->in_cb)   return tjs_throw_errno_msg(ctx, UV_EBUSY, "Cannot close during poll callback");
     close_sock(s);
     if (!JS_IsUndefined(s->this_obj)) {
         JSValue obj = s->this_obj;
@@ -981,9 +981,9 @@ static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue
 
 static JSValue tjs_sock_poll_stop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     DECL_SOCK(ctx, this_val, s);
-    if (s->in_cb)    return JS_ThrowInternalError(ctx, "Cannot stop poll during callback");
+    if (s->in_cb)    return tjs_throw_errno_msg(ctx, UV_EBUSY, "Cannot stop poll during callback");
     if (!s->poll_init || uv_is_closing((uv_handle_t *) &s->poll))
-        return JS_ThrowInternalError(ctx, "Poll not active");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Poll not active");
     int ret = uv_poll_stop(&s->poll);
     if (ret < 0) return tjs_throw_errno(ctx, ret);
     if (!JS_IsUndefined(s->callback)) {

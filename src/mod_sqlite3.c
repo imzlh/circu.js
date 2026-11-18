@@ -86,7 +86,7 @@ static TJSSqlite3Handle *tjs_sqlite3_get_open(JSContext *ctx, JSValue obj) {
         return NULL;
     }
     if (!h->handle) {
-        JS_ThrowInternalError(ctx, "database closed");
+        tjs_throw_errno_msg(ctx, UV_EBADF, "database closed");
         return NULL;
     }
     return h;
@@ -1671,7 +1671,7 @@ static JSValue tjs_sqlite3_stmt_bind(JSContext *ctx, JSValue this_val, int argc,
     }
 
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     int r = sqlite3_reset(h->stmt);
@@ -1698,7 +1698,7 @@ static JSValue tjs_sqlite3_stmt_reset(JSContext *ctx, JSValue this_val, int argc
     }
 
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     int r = sqlite3_reset(h->stmt);
@@ -1714,7 +1714,7 @@ static JSValue tjs_sqlite3_stmt_set_read_big_ints(JSContext *ctx, JSValue this_v
     if (!h)
         return JS_EXCEPTION;
     if (!h->stmt)
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     h->read_big_ints = argc > 0 && JS_ToBool(ctx, argv[0]);
     return JS_UNDEFINED;
 }
@@ -1729,7 +1729,7 @@ static JSValue tjs_sqlite3_stmt_column_names(JSContext *ctx, JSValue this_val, i
         return JS_EXCEPTION;
     }
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     int count = sqlite3_column_count(h->stmt);
@@ -1792,7 +1792,7 @@ static JSValue tjs_sqlite3_stmt_column_metadata(JSContext *ctx, JSValue this_val
         return JS_EXCEPTION;
     }
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     int count = sqlite3_column_count(h->stmt);
@@ -1855,12 +1855,12 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
     }
 
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     TJSCapabilityMask mask = TJS_CAP_IO | TJS_CAP_IO_READ;
     if (!sqlite3_stmt_readonly(h->stmt)) mask |= TJS_CAP_IO_WRITE;
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.all", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized"); } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.all", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized"); } while (0));
 
     int r = sqlite3_reset(h->stmt);
     if (r != SQLITE_OK) {
@@ -1877,7 +1877,7 @@ static JSValue tjs_sqlite3_stmt_all(JSContext *ctx, JSValue this_val, int argc, 
 
     h = tjs_sqlite3_stmt_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
-    if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    if (!h->stmt) return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
 
     JSValue result = JS_NewArray(ctx);
     if (JS_IsException(result)) {
@@ -1914,12 +1914,12 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
     }
 
     if (!h->stmt) {
-        return JS_ThrowInternalError(ctx, "Statement has been finalized");
+        return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
     }
 
     TJSCapabilityMask mask = TJS_CAP_IO | TJS_CAP_IO_READ;
     if (!sqlite3_stmt_readonly(h->stmt)) mask |= TJS_CAP_IO_WRITE;
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.run", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized"); } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, mask, TJS_CAP_FLAG_REPLACEABLE, "sqlite3.statement.run", NULL), (void)0, do { h = tjs_sqlite3_stmt_get(ctx, this_val); if (!h) return JS_EXCEPTION; if (!h->stmt) return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized"); } while (0));
 
     int r = sqlite3_reset(h->stmt);
     if (r != SQLITE_OK) {
@@ -1936,7 +1936,7 @@ static JSValue tjs_sqlite3_stmt_run(JSContext *ctx, JSValue this_val, int argc, 
 
     h = tjs_sqlite3_stmt_get(ctx, this_val);
     if (!h) return JS_EXCEPTION;
-    if (!h->stmt) return JS_ThrowInternalError(ctx, "Statement has been finalized");
+    if (!h->stmt) return tjs_throw_errno_msg(ctx, UV_EBADF, "Statement has been finalized");
 
     r = sqlite3_step(h->stmt);
     if (r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) {
