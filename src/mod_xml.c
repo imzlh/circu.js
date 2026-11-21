@@ -56,16 +56,25 @@ typedef struct {
 
 /* Macro for invoking JS handler */
 #define INVOKE_HANDLER(state, handler_name, argc, ...) do { \
-    JSValue handler = JS_GetPropertyStr((state)->ctx, (state)->handlers, handler_name); \
     JSValue args[] = { __VA_ARGS__ }; \
-    if (JS_IsFunction((state)->ctx, handler)) { \
+    JSValue handler = JS_UNDEFINED; \
+    bool failed = false; \
+    for (int i = 0; i < argc; i++) { \
+        if (JS_IsException(args[i])) failed = true; \
+    } \
+    if (!failed) { \
+        handler = JS_GetPropertyStr((state)->ctx, (state)->handlers, handler_name); \
+        failed = JS_IsException(handler); \
+    } \
+    if (!failed && JS_IsFunction((state)->ctx, handler)) { \
         JSValue ret = JS_Call((state)->ctx, handler, JS_UNDEFINED, argc, args); \
-        if (JS_IsException(ret)) { \
-            (state)->stopped = true; \
-            (state)->exception = true; \
-            if ((state)->parser) XML_StopParser((state)->parser, 0); \
-        } \
+        failed = JS_IsException(ret); \
         JS_FreeValue((state)->ctx, ret); \
+    } \
+    if (failed) { \
+        (state)->stopped = true; \
+        (state)->exception = true; \
+        if ((state)->parser) XML_StopParser((state)->parser, 0); \
     } \
     for (int i = 0; i < argc; i++) JS_FreeValue((state)->ctx, args[i]); \
     JS_FreeValue((state)->ctx, handler); \
@@ -74,9 +83,16 @@ typedef struct {
 /* Helper: Convert attributes array to JS object */
 static JSValue xml_attrs_to_obj(JSContext *ctx, const XML_Char **attrs) {
     JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj)) return obj;
     if (attrs) {
         for (int i = 0; attrs[i]; i += 2) {
-            JS_SetPropertyStr(ctx, obj, attrs[i], JS_NewString(ctx, attrs[i + 1]));
+            JSValue value = JS_NewString(ctx, attrs[i + 1]);
+            if (JS_IsException(value) ||
+                JS_DefinePropertyValueStr(ctx, obj, attrs[i], value,
+                                          JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(ctx, obj);
+                return JS_EXCEPTION;
+            }
         }
     }
     return obj;
@@ -135,6 +151,34 @@ XML_CALLBACK(processing_instruction, const XML_Char *target, const XML_Char *dat
     JSValue target_val = JS_NewString(state->ctx, target);
     JSValue data_val = JS_NewString(state->ctx, data ? data : "");
     INVOKE_HANDLER(state, "processingInstruction", 2, target_val, data_val);
+}
+
+XML_CALLBACK(doctype_start, const XML_Char *name, const XML_Char *system_id,
+             const XML_Char *public_id, int has_internal_subset) {
+    TJSXMLParser *state = (TJSXMLParser *)userData;
+    if (state->stopped) return;
+
+    JSValue name_val = JS_NewString(state->ctx, name);
+    JSValue system_val = system_id ? JS_NewString(state->ctx, system_id) : JS_NULL;
+    JSValue public_val = public_id ? JS_NewString(state->ctx, public_id) : JS_NULL;
+    INVOKE_HANDLER(state, "startDoctype", 4, name_val, system_val, public_val,
+                   JS_NewBool(state->ctx, has_internal_subset));
+}
+
+XML_CALLBACK(entity_declaration, const XML_Char *name, int is_parameter,
+             const XML_Char *value, int value_length, const XML_Char *base,
+             const XML_Char *system_id, const XML_Char *public_id,
+             const XML_Char *notation_name) {
+    TJSXMLParser *state = (TJSXMLParser *)userData;
+    if (state->stopped) return;
+
+    JSValue name_val = JS_NewString(state->ctx, name);
+    JSValue value_val = value ? JS_NewStringLen(state->ctx, value, value_length) : JS_NULL;
+    JSValue system_val = system_id ? JS_NewString(state->ctx, system_id) : JS_NULL;
+    JSValue public_val = public_id ? JS_NewString(state->ctx, public_id) : JS_NULL;
+    INVOKE_HANDLER(state, "entityDeclaration", 5, name_val,
+                   JS_NewBool(state->ctx, is_parameter), value_val,
+                   system_val, public_val);
 }
 
 XML_CALLBACK(namespace_start, const XML_Char *prefix, const XML_Char *uri) {
@@ -253,12 +297,15 @@ static JSValue tjs_xml_parser_constructor(JSContext *ctx, JSValueConst new_targe
     }
     
     /* Setup callbacks */
+    XML_SetParamEntityParsing(state->parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
     XML_SetUserData(state->parser, state);
     XML_SetElementHandler(state->parser, xml_element_start_cb, xml_element_end_cb);
     XML_SetCharacterDataHandler(state->parser, xml_character_data_cb);
     XML_SetCommentHandler(state->parser, xml_comment_cb);
     XML_SetCdataSectionHandler(state->parser, xml_start_cdata_cb, xml_end_cdata_cb);
     XML_SetProcessingInstructionHandler(state->parser, xml_processing_instruction_cb);
+    XML_SetStartDoctypeDeclHandler(state->parser, xml_doctype_start_cb);
+    XML_SetEntityDeclHandler(state->parser, xml_entity_declaration_cb);
     XML_SetNamespaceDeclHandler(state->parser, xml_namespace_start_cb, xml_namespace_end_cb);
     
     JS_SetOpaque(obj, state);

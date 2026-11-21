@@ -92,6 +92,15 @@ declare namespace CModuleXML {
         /** Called when a processing instruction is encountered */
         processingInstruction?: (target: string, data: string) => void;
 
+        /** Called at the start of a document type declaration */
+        startDoctype?: (name: string, systemId: string | null,
+            publicId: string | null, hasInternalSubset: boolean) => void;
+
+        /** Called for entity declarations, including parameter-entity expansion */
+        entityDeclaration?: (name: string, parameter: boolean,
+            value: string | null, systemId: string | null,
+            publicId: string | null) => void;
+
         /** Called when a namespace declaration starts */
         startNamespace?: (prefix: string | null, uri: string) => void;
 
