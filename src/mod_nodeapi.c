@@ -39,6 +39,120 @@
 
 /* Internal structures */
 
+static struct list_head napi_deferred_dynlibs;
+typedef struct napi_dynlib_state {
+    struct list_head link;
+    TJSDynLib *lib;
+} napi_dynlib_state;
+
+static struct list_head napi_dynlib_states;
+static uv_mutex_t napi_deferred_dynlibs_mutex;
+static uv_once_t napi_deferred_dynlibs_once = UV_ONCE_INIT;
+
+static void napi_dynlib_cleanup_at_exit(void);
+
+static void napi_init_deferred_dynlibs(void) {
+    init_list_head(&napi_deferred_dynlibs);
+    init_list_head(&napi_dynlib_states);
+    CHECK_EQ(uv_mutex_init(&napi_deferred_dynlibs_mutex), 0);
+    (void) atexit(napi_dynlib_cleanup_at_exit);
+}
+
+static void napi_dynlib_init(void) {
+    uv_once(&napi_deferred_dynlibs_once, napi_init_deferred_dynlibs);
+}
+
+static napi_dynlib_state *napi_dynlib_state_find_locked(TJSDynLib *lib) {
+    struct list_head *el;
+    list_for_each(el, &napi_dynlib_states) {
+        napi_dynlib_state *state = list_entry(el, napi_dynlib_state, link);
+        if (state->lib == lib) return state;
+    }
+    return NULL;
+}
+
+static bool napi_dynlib_pin(TJSDynLib *lib) {
+    if (!lib) return true;
+    napi_dynlib_init();
+    uv_mutex_lock(&napi_deferred_dynlibs_mutex);
+    napi_dynlib_state *state = napi_dynlib_state_find_locked(lib);
+    if (!state) {
+        state = calloc(1, sizeof(*state));
+        if (!state) {
+            uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+            return false;
+        }
+        init_list_head(&state->link);
+        state->lib = lib;
+        list_add_tail(&state->link, &napi_dynlib_states);
+    }
+    if (lib->nodeapi_deferred) {
+        uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+        return false;
+    }
+    lib->nodeapi_pins++;
+    uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+    return true;
+}
+
+static void napi_dynlib_cleanup_at_exit(void) {
+    napi_dynlib_init();
+    uv_mutex_lock(&napi_deferred_dynlibs_mutex);
+    struct list_head *el, *tmp;
+    list_for_each_safe(el, tmp, &napi_deferred_dynlibs) {
+        TJSDynLib *lib = list_entry(el, TJSDynLib, link);
+        if (lib->nodeapi_pins != 0) continue;
+        napi_dynlib_state *state = napi_dynlib_state_find_locked(lib);
+        list_del(&lib->link);
+        lib->nodeapi_deferred = false;
+        if (state) {
+            list_del(&state->link);
+            free(state);
+        }
+        uv_dlclose(&lib->lib);
+        free(lib);
+    }
+    uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+}
+
+static void napi_dynlib_unpin(TJSDynLib *lib) {
+    if (!lib) return;
+    napi_dynlib_init();
+    napi_dynlib_state *free_state = NULL;
+    uv_mutex_lock(&napi_deferred_dynlibs_mutex);
+    CHECK_GT(lib->nodeapi_pins, 0);
+    lib->nodeapi_pins--;
+    napi_dynlib_state *state = napi_dynlib_state_find_locked(lib);
+    if (lib->nodeapi_pins == 0 && state) {
+        if (!lib->nodeapi_deferred) {
+            list_del(&state->link);
+            free_state = state;
+        }
+    }
+    uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+    free(free_state);
+    /* Deferred images are intentionally retained until process exit. The
+     * final unpin may happen after TJS_FreeRuntime() closed its loop, and it
+     * may still be returning through addon code, so no continuation or
+     * synchronous dlclose is safe here. */
+}
+
+bool tjs__nodeapi_defer_dynlib(TJSDynLib *lib) {
+    if (!lib) return false;
+    bool deferred = false;
+    napi_dynlib_init();
+    uv_mutex_lock(&napi_deferred_dynlibs_mutex);
+    if (lib->nodeapi_pins != 0 && !lib->nodeapi_deferred) {
+        napi_dynlib_state *state = napi_dynlib_state_find_locked(lib);
+        CHECK_NOT_NULL(state);
+        list_add_tail(&lib->link, &napi_deferred_dynlibs);
+        lib->nodeapi_deferred = true;
+        deferred = true;
+    }
+    uv_mutex_unlock(&napi_deferred_dynlibs_mutex);
+    return deferred;
+}
+
 #define NAPI_HS_BLOCK 64
 
 typedef struct napi_hs_block {
@@ -65,9 +179,12 @@ struct napi_env__ {
     napi_hs_block *orphan_handles;    /* handles created with no open scope */
     int api_version;                  /* from node_api_module_get_api_version_v1 */
     char *filename;                   /* module path, for node_api_get_module_file_name */
+    TJSDynLib *dynlib;                /* owning Node-API image */
     int refcount;                     /* keepalive (async work, tsfn, refs) */
     bool registered_finalizer;
     bool cleanup_done;
+    bool cleanup_lock_initialized;
+    bool linked;
     void *instance_data;
     napi_finalize instance_finalize_cb;
     void *instance_finalize_hint;
@@ -75,6 +192,11 @@ struct napi_env__ {
     struct list_head tsfns;           /* live napi_threadsafe_function values */
     struct list_head cleanup_hooks;   /* napi_cleanup_hook entries */
     struct list_head async_cleanup_hooks;
+    struct list_head async_works;
+    uv_mutex_t cleanup_mutex;
+    uv_async_t *cleanup_wakeup;        /* loop-thread teardown waiter, mutex protected */
+    size_t async_cleanup_running;
+    size_t async_work_callbacks;
     int callback_depth;
     napi_hs_block *deferred_handles;
     struct list_head link;            /* all envs, for runtime shutdown */
@@ -120,13 +242,15 @@ struct napi_ref__ {
 };
 
 static void napi_ref_clear_values(napi_env env, napi_ref ref) {
-    if (!JS_IsUninitialized(ref->value)) {
-        JS_FreeValue(env->ctx, ref->value);
-        ref->value = JS_UNINITIALIZED;
+    JSValue value = ref->value;
+    JSValue weakref = ref->weakref;
+    ref->value = JS_UNINITIALIZED;
+    ref->weakref = JS_UNINITIALIZED;
+    if (!JS_IsUninitialized(value)) {
+        JS_FreeValue(env->ctx, value);
     }
-    if (!JS_IsUninitialized(ref->weakref)) {
-        JS_FreeValue(env->ctx, ref->weakref);
-        ref->weakref = JS_UNINITIALIZED;
+    if (!JS_IsUninitialized(weakref)) {
+        JS_FreeValue(env->ctx, weakref);
     }
 }
 
@@ -152,9 +276,14 @@ struct napi_async_work__ {
     napi_async_execute_callback execute;
     napi_async_complete_callback complete;
     void *data;
-    bool queued;
-    bool done;
+    enum {
+        NAPI_ASYNC_WORK_CREATED,
+        NAPI_ASYNC_WORK_QUEUED,
+        NAPI_ASYNC_WORK_COMPLETED,
+    } state;
     bool cancelled;
+    bool linked;
+    struct list_head link;
 };
 
 typedef struct napi_tsfn_item {
@@ -164,6 +293,8 @@ typedef struct napi_tsfn_item {
 
 struct napi_threadsafe_function__ {
     napi_env env;
+    napi_env owner_env;
+    TJSDynLib *dynlib;
     JSValue func;
     void *context;
     void *finalize_data;
@@ -177,8 +308,10 @@ struct napi_threadsafe_function__ {
     size_t max_queue_size;            /* 0 means unbounded */
     size_t thread_count;
     bool closing;
-    bool aborted;
     bool close_started;
+    bool retired;                    /* runtime resources are detached */
+    bool reap_claimed;               /* control block free is single-owner */
+    size_t api_inflight;             /* any-thread API calls using this block */
     struct list_head link;
 };
 
@@ -194,6 +327,9 @@ typedef struct napi_async_cleanup_hook_handle__ {
     napi_async_cleanup_hook hook;
     void *data;
     struct list_head link;
+    bool called;
+    bool linked;
+    bool running;
 } napi_async_cleanup_entry;
 
 typedef struct {
@@ -233,6 +369,80 @@ static JSValue napi_fn_call(JSContext *ctx, JSValueConst func_obj,
 static JSValue napi_fn_cfunc(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int magic);
 static void napi_tsfn_close_cb(uv_handle_t *handle);
+static void napi_tsfn_create_fail_close_cb(uv_handle_t *handle);
+static void napi_env_signal(napi_env env);
+
+static bool napi_tsfn_begin_api(napi_threadsafe_function tsfn) {
+    uv_mutex_lock(&tsfn->mutex);
+    if (tsfn->reap_claimed || (tsfn->retired && tsfn->thread_count == 0)) {
+        uv_mutex_unlock(&tsfn->mutex);
+        return false;
+    }
+    tsfn->api_inflight++;
+    uv_mutex_unlock(&tsfn->mutex);
+    return true;
+}
+
+static bool napi_tsfn_claim_reap_locked(napi_threadsafe_function tsfn) {
+    if (!tsfn->retired || tsfn->thread_count != 0 ||
+        tsfn->api_inflight != 0 || tsfn->reap_claimed)
+        return false;
+    tsfn->reap_claimed = true;
+    return true;
+}
+
+static void napi_tsfn_dispose(napi_threadsafe_function tsfn) {
+    napi_env owner_env = tsfn->owner_env;
+    TJSDynLib *dynlib = tsfn->dynlib;
+    if (owner_env) {
+        uv_mutex_lock(&owner_env->cleanup_mutex);
+        if (tsfn->link.prev && tsfn->link.next)
+            list_del(&tsfn->link);
+        uv_mutex_unlock(&owner_env->cleanup_mutex);
+        napi_env_signal(owner_env);
+    }
+    uv_mutex_destroy(&tsfn->mutex);
+    uv_cond_destroy(&tsfn->cond);
+    free(tsfn);
+    napi_dynlib_unpin(dynlib);
+}
+
+static void napi_tsfn_end_api(napi_threadsafe_function tsfn) {
+    bool reap;
+    uv_mutex_lock(&tsfn->mutex);
+    if (tsfn->api_inflight > 0)
+        tsfn->api_inflight--;
+    reap = napi_tsfn_claim_reap_locked(tsfn);
+    uv_mutex_unlock(&tsfn->mutex);
+    if (reap)
+        napi_tsfn_dispose(tsfn);
+}
+
+static void napi_env_signal(napi_env env) {
+    if (!env || !env->cleanup_lock_initialized) return;
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (env->cleanup_wakeup)
+        uv_async_send(env->cleanup_wakeup);
+    uv_mutex_unlock(&env->cleanup_mutex);
+}
+
+static void napi_async_work_unlink_locked(napi_async_work work) {
+    if (!work->linked) return;
+    list_del(&work->link);
+    work->linked = false;
+}
+
+static bool napi_env_has_pending(napi_env env) {
+    bool pending;
+    uv_mutex_lock(&env->cleanup_mutex);
+    pending = !list_empty(&env->async_cleanup_hooks) ||
+              !list_empty(&env->async_works) ||
+              !list_empty(&env->tsfns) ||
+              env->async_cleanup_running != 0 ||
+              env->async_work_callbacks != 0;
+    uv_mutex_unlock(&env->cleanup_mutex);
+    return pending;
+}
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_reference(napi_env env, napi_value value, uint32_t initial_refcount,
                       napi_ref *result);
@@ -324,6 +534,7 @@ static napi_status napi_set_error(napi_env env, napi_status status) {
 /* check args; on failure return invalid_arg */
 #define NAPI_CHECK_ARG(env, a)  do { if ((a) == NULL) return NAPI_RET((env), napi_invalid_arg); } while (0)
 #define NAPI_CHECK_ENV(env)     do { if ((env) == NULL) return napi_invalid_arg; } while (0)
+#define NAPI_CHECK_JS(env)      do { if ((env)->cleanup_done || (env)->trt->freeing) return NAPI_RET((env), napi_cannot_run_js); } while (0)
 
 /* If a QuickJS call raised, fold it into the pending exception and return
  * napi_pending_exception. */
@@ -396,7 +607,8 @@ static JSValue napi_make_ext(napi_env env, void *data,
 
 static void napi_run_runtime_finalizer(JSRuntime *rt, void *arg);
 
-static napi_env napi_env_new(JSContext *ctx, const char *filename, int api_version) {
+static napi_env napi_env_new(JSContext *ctx, const char *filename, int api_version,
+                             TJSDynLib *dynlib) {
     if (!napi_envs_inited) { init_list_head(&napi_envs); napi_envs_inited = true; }
     napi_ensure_classes(ctx);
 
@@ -409,69 +621,116 @@ static napi_env napi_env_new(JSContext *ctx, const char *filename, int api_versi
     env->open_scope = NULL;
     env->api_version = api_version;
     env->filename = filename ? strdup(filename) : NULL;
+    env->dynlib = dynlib;
     env->refcount = 1;
     init_list_head(&env->refs);
     init_list_head(&env->tsfns);
     init_list_head(&env->cleanup_hooks);
     init_list_head(&env->async_cleanup_hooks);
+    init_list_head(&env->async_works);
+    if (uv_mutex_init(&env->cleanup_mutex) != 0) {
+        free(env->filename);
+        free(env);
+        return NULL;
+    }
+    env->cleanup_lock_initialized = true;
     list_add_tail(&env->link, &napi_envs);
+    env->linked = true;
 
     JS_AddRuntimeFinalizer(JS_GetRuntime(ctx), napi_run_runtime_finalizer, env);
     return env;
 }
 
 static void napi_env_cleanup(napi_env env) {
-    struct list_head *el, *tmp;
+    struct list_head *el;
+    bool run_cleanup = false;
 
+    uv_mutex_lock(&env->cleanup_mutex);
     if (!env->cleanup_done) {
         env->cleanup_done = true;
+        run_cleanup = true;
+    }
+    uv_mutex_unlock(&env->cleanup_mutex);
 
-        /* run cleanup hooks LIFO */
-        list_for_each_prev_safe(el, tmp, &env->async_cleanup_hooks) {
-            napi_async_cleanup_entry *e = list_entry(el, napi_async_cleanup_entry, link);
-            list_del(&e->link);
-            if (e->hook) e->hook(e, e->data);
-            free(e);
+    if (run_cleanup) {
+
+        /* Close TSFNs before invoking async cleanup hooks. A hook commonly
+         * wakes producer threads; those calls must observe napi_closing
+         * instead of racing a late transition below. */
+        uv_mutex_lock(&env->cleanup_mutex);
+        list_for_each(el, &env->tsfns) {
+            napi_threadsafe_function tsfn = list_entry(el, struct napi_threadsafe_function__, link);
+            uv_mutex_lock(&tsfn->mutex);
+            tsfn->closing = true;
+            uv_cond_broadcast(&tsfn->cond);
+            /* A producer may have unref'd the TSFN. Its closing notification
+             * must still be delivered while runtime teardown waits. */
+            if (!tsfn->close_started) {
+                uv_ref((uv_handle_t *)&tsfn->async);
+                uv_async_send(&tsfn->async);
+            }
+            uv_mutex_unlock(&tsfn->mutex);
         }
-        list_for_each_prev_safe(el, tmp, &env->cleanup_hooks) {
-            napi_cleanup_entry *e = list_entry(el, napi_cleanup_entry, link);
+        uv_mutex_unlock(&env->cleanup_mutex);
+
+        /* Start each hook once, in LIFO order. Returning from the callback is
+         * not completion: only napi_remove_async_cleanup_hook ends its wait. */
+        for (;;) {
+            napi_async_cleanup_entry *e = NULL;
+            napi_async_cleanup_hook hook = NULL;
+            void *data = NULL;
+
+            uv_mutex_lock(&env->cleanup_mutex);
+            list_for_each_prev(el, &env->async_cleanup_hooks) {
+                napi_async_cleanup_entry *candidate =
+                    list_entry(el, napi_async_cleanup_entry, link);
+                if (!candidate->called) {
+                    candidate->called = true;
+                    candidate->running = true;
+                    env->async_cleanup_running++;
+                    e = candidate;
+                    hook = candidate->hook;
+                    data = candidate->data;
+                    break;
+                }
+            }
+            uv_mutex_unlock(&env->cleanup_mutex);
+
+            if (!e) break;
+            if (hook) hook(e, data);
+
+            uv_mutex_lock(&env->cleanup_mutex);
+            e->running = false;
+            if (env->async_cleanup_running > 0)
+                env->async_cleanup_running--;
+            if (!e->linked)
+                free(e);
+            uv_mutex_unlock(&env->cleanup_mutex);
+            napi_env_signal(env);
+        }
+        while (!list_empty(&env->cleanup_hooks)) {
+            napi_cleanup_entry *e = list_entry(env->cleanup_hooks.prev, napi_cleanup_entry, link);
             list_del(&e->link);
             if (e->fn) e->fn(e->arg);
             free(e);
         }
     }
 
+}
+
+/* Keep references and handle scopes alive through native completion/cleanup
+ * callbacks. They may still delete references or release addon-owned data. */
+static void napi_env_release_values(napi_env env) {
     if (!JS_IsUninitialized(env->pending_exception))
         JS_FreeValue(env->ctx, env->pending_exception);
     env->pending_exception = JS_UNINITIALIZED;
 
-    list_for_each_safe(el, tmp, &env->refs) {
-        napi_ref ref = list_entry(el, struct napi_ref__, link);
+    while (!list_empty(&env->refs)) {
+        napi_ref ref = list_entry(env->refs.next, struct napi_ref__, link);
         list_del(&ref->link);
         napi_ref_clear_values(env, ref);
         /* NOT freed here: addon finalizers run after env cleanup and may still
          * call napi_delete_reference(); freeing here is a double free. */
-    }
-
-    list_for_each_safe(el, tmp, &env->tsfns) {
-        napi_threadsafe_function tsfn = list_entry(el, struct napi_threadsafe_function__, link);
-        uv_mutex_lock(&tsfn->mutex);
-        while (!list_empty(&tsfn->queue)) {
-            struct list_head *item_el = tsfn->queue.next;
-            list_del(item_el);
-            napi_tsfn_item *item = list_entry(item_el, napi_tsfn_item, link);
-            free(item);
-        }
-        tsfn->queue_size = 0;
-        tsfn->closing = true;
-        tsfn->aborted = true;
-        tsfn->thread_count = 0;
-        bool should_close = !tsfn->close_started;
-        if (should_close) tsfn->close_started = true;
-        uv_mutex_unlock(&tsfn->mutex);
-        if (should_close && !uv_is_closing((uv_handle_t *) &tsfn->async)) {
-            uv_close((uv_handle_t *) &tsfn->async, napi_tsfn_close_cb);
-        }
     }
 
     napi_hs_block *b = env->orphan_handles;
@@ -497,11 +756,36 @@ static void napi_env_cleanup(napi_env env) {
     }
 }
 
+static void napi_cancel_env_async_work(napi_env env) {
+    struct list_head *el;
+    uv_mutex_lock(&env->cleanup_mutex);
+    list_for_each(el, &env->async_works) {
+        napi_async_work work = list_entry(el, struct napi_async_work__, link);
+        if (uv_cancel((uv_req_t *)&work->req) == 0)
+            work->cancelled = true;
+    }
+    uv_mutex_unlock(&env->cleanup_mutex);
+}
+
 static void napi_env_free(napi_env env) {
     napi_env_cleanup(env);
+    /* tjs__nodeapi_cleanup_runtime waits for all asynchronous cleanup work
+     * before JS_FreeRuntime reaches this finalizer. Keep this guard for a
+     * defensive late-finalizer path: freeing the env while an addon can still
+     * remove an async cleanup hook is a use-after-free. */
+    if (napi_env_has_pending(env))
+        return;
+    if (env->linked) {
+        list_del(&env->link);
+        env->linked = false;
+    }
+    napi_env_release_values(env);
     if (env->instance_finalize_cb) {
         env->instance_finalize_cb(env, env->instance_data, env->instance_finalize_hint);
         env->instance_finalize_cb = NULL;
+    }
+    if (env->cleanup_lock_initialized) {
+        uv_mutex_destroy(&env->cleanup_mutex);
     }
     free(env->filename);
     free(env);
@@ -509,18 +793,87 @@ static void napi_env_free(napi_env env) {
 
 static void napi_run_runtime_finalizer(JSRuntime *rt, void *arg) {
     napi_env env = arg;
-    /* Detach from list defensively; the ctx is going away. */
-    if (env->link.prev && env->link.next) list_del(&env->link);
+    /* Keep a pending env linked until the normal runtime cleanup pass has
+     * drained it. The finalizer cannot safely free it while addon callbacks
+     * may still remove hooks or finish work. */
     napi_env_free(env);
+}
+
+static void napi_cleanup_wakeup(uv_async_t *handle) {
+    (void)handle;
+}
+
+static void napi_cleanup_wakeup_closed(uv_handle_t *handle) {
+    bool *closed = handle->data;
+    *closed = true;
 }
 
 void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt) {
     if (!napi_envs_inited) return;
     struct list_head *el, *tmp;
+    bool found = false;
+    list_for_each(el, &napi_envs) {
+        napi_env env = list_entry(el, struct napi_env__, link);
+        if (env->trt == trt) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return;
+
+    /* An async hook can complete on a native thread with no libuv request.
+     * Keep a referenced wakeup so UV_RUN_ONCE waits without spinning and a
+     * thread-side removal can wake it even when all addon handles are unref'd. */
+    uv_async_t wakeup;
+    bool wakeup_closed = false;
+    CHECK_EQ(uv_async_init(&trt->loop, &wakeup, napi_cleanup_wakeup), 0);
+    wakeup.data = &wakeup_closed;
     list_for_each_safe(el, tmp, &napi_envs) {
         napi_env env = list_entry(el, struct napi_env__, link);
-        if (env->trt == trt) napi_env_cleanup(env);
+        if (env->trt == trt) {
+            uv_mutex_lock(&env->cleanup_mutex);
+            env->cleanup_wakeup = &wakeup;
+            uv_mutex_unlock(&env->cleanup_mutex);
+            napi_env_cleanup(env);
+            napi_cancel_env_async_work(env);
+        }
     }
+
+    /* Do not unload a Node-API addon while its execute/complete pair, TSFN
+     * close callback, or async cleanup hook can still call into addon code. */
+    for (;;) {
+        bool pending = false;
+        list_for_each(el, &napi_envs) {
+            napi_env env = list_entry(el, struct napi_env__, link);
+            if (env->trt == trt && napi_env_has_pending(env)) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) break;
+        uv_run(&trt->loop, UV_RUN_ONCE);
+    }
+
+    list_for_each(el, &napi_envs) {
+        napi_env env = list_entry(el, struct napi_env__, link);
+        if (env->trt == trt) {
+            uv_mutex_lock(&env->cleanup_mutex);
+            env->cleanup_wakeup = NULL;
+            uv_mutex_unlock(&env->cleanup_mutex);
+            napi_env_release_values(env);
+        }
+    }
+    uv_close((uv_handle_t *)&wakeup, napi_cleanup_wakeup_closed);
+    while (!wakeup_closed)
+        uv_run(&trt->loop, UV_RUN_NOWAIT);
+}
+
+/* Registration can fail after an addon has created native state. Complete the
+ * cleanup protocol now, but keep the image runtime-owned until QuickJS has run
+ * the env finalizer and any remaining addon-owned JS finalizers. */
+static void napi_env_cleanup_after_failed_registration(napi_env env) {
+    napi_env_cleanup(env);
+    napi_cancel_env_async_work(env);
 }
 
 /* Handle scopes */
@@ -614,6 +967,7 @@ napi_escape_handle(napi_env env, napi_escapable_handle_scope scope,
     NAPI_CHECK_ARG(env, scope);
     NAPI_CHECK_ARG(env, escapee);
     NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_handle_scope s = (napi_handle_scope) scope;
     if (!s->escapable) return NAPI_RET(env, napi_invalid_arg);
     if (s->escape_called) return NAPI_RET(env, napi_escape_called_twice);
@@ -642,6 +996,7 @@ napi_get_last_error_info(node_api_basic_env basic_env,
 NAPI_EXTERN napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error) {
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, error);
+    NAPI_CHECK_JS(env);
     if (NAPI_PENDING(env)) return NAPI_RET(env, napi_pending_exception);
     env->pending_exception = JS_DupValue(env->ctx, v(error));
     return NAPI_OK(env);
@@ -649,6 +1004,7 @@ NAPI_EXTERN napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error) {
 
 static napi_status napi_throw_named(napi_env env, const char *error_type,
                                     const char *code, const char *msg) {
+    NAPI_CHECK_JS(env);
     JSValue err = JS_NewError(env->ctx);
     if (msg) JS_SetPropertyStr(env->ctx, err, "message", JS_NewString(env->ctx, msg));
     if (error_type)
@@ -686,6 +1042,7 @@ static napi_status napi_create_error_named(napi_env env, const char *name,
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, msg);
     NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue err = JS_NewError(env->ctx);
     JS_SetPropertyStr(env->ctx, err, "message", JS_DupValue(env->ctx, v(msg)));
     if (name) JS_SetPropertyStr(env->ctx, err, "name", JS_NewString(env->ctx, name));
@@ -716,6 +1073,7 @@ napi_is_error(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, value);
     NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = JS_IsError(v(value));
     return NAPI_OK(env);
 }
@@ -732,6 +1090,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_and_clear_last_exception(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!NAPI_PENDING(env)) {
         JSValue undef = JS_UNDEFINED;
         *result = napi_add_handle(env, undef);
@@ -756,6 +1115,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_fatal_exception(napi_env env, napi_value err) {
     NAPI_CHECK_ENV(env);
     NAPI_CHECK_ARG(env, err);
+    NAPI_CHECK_JS(env);
     /* Surface as an uncaught exception. */
     JS_Throw(env->ctx, JS_DupValue(env->ctx, v(err)));
     TJS_DumpException(env->ctx);
@@ -767,24 +1127,28 @@ napi_fatal_exception(napi_env env, napi_value err) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_undefined(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_UNDEFINED; *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_null(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NULL; *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_global(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = napi_add_handle(env, JS_GetGlobalObject(env->ctx));
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_boolean(napi_env env, bool value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewBool(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
@@ -792,18 +1156,21 @@ napi_get_boolean(napi_env env, bool value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_object(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = napi_add_handle(env, JS_NewObject(env->ctx));
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_array(napi_env env, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = napi_add_handle(env, JS_NewArray(env->ctx));
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_array_with_length(napi_env env, size_t length, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue arr = JS_NewArray(env->ctx);
     JS_SetLength(env->ctx, arr, (int64_t) length);
     *result = napi_add_handle(env, arr);
@@ -813,36 +1180,42 @@ napi_create_array_with_length(napi_env env, size_t length, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_double(napi_env env, double value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewFloat64(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_int32(napi_env env, int32_t value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewInt32(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_uint32(napi_env env, uint32_t value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewUint32(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_int64(napi_env env, int64_t value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewInt64(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_bigint_int64(napi_env env, int64_t value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewBigInt64(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_bigint_uint64(napi_env env, uint64_t value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue x = JS_NewBigUint64(env->ctx, value); *result = napi_add_handle(env, x);
     return NAPI_OK(env);
 }
@@ -850,6 +1223,7 @@ napi_create_bigint_uint64(napi_env env, uint64_t value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_string_utf8(napi_env env, const char *str, size_t length, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len = (length == NAPI_AUTO_LENGTH) ? strlen(str) : length;
     *result = napi_add_handle(env, JS_NewStringLen(env->ctx, str, len));
     return NAPI_OK(env);
@@ -857,6 +1231,7 @@ napi_create_string_utf8(napi_env env, const char *str, size_t length, napi_value
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_string_latin1(napi_env env, const char *str, size_t length, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len = (length == NAPI_AUTO_LENGTH) ? strlen(str) : length;
     /* latin1 -> utf16 -> string */
     if (len > SIZE_MAX / sizeof(uint16_t)) return napi_generic_failure;
@@ -871,6 +1246,7 @@ napi_create_string_latin1(napi_env env, const char *str, size_t length, napi_val
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_string_utf16(napi_env env, const char16_t *str, size_t length, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len = length;
     if (length == NAPI_AUTO_LENGTH) { len = 0; while (str[len]) len++; }
     JSValue s = JS_NewStringUTF16(env->ctx, (const uint16_t *) str, len);
@@ -881,6 +1257,7 @@ napi_create_string_utf16(napi_env env, const char16_t *str, size_t length, napi_
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_symbol(napi_env env, napi_value description, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     const char *desc = NULL;
     if (description) desc = JS_ToCString(env->ctx, v(description));
     JSValue sym = JS_NewSymbol(env->ctx, desc ? desc : "", false);
@@ -908,6 +1285,7 @@ static napi_valuetype napi_typeof_value(JSContext *ctx, JSValue val) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_typeof(napi_env env, napi_value value, napi_valuetype *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = napi_typeof_value(env->ctx, v(value));
     return NAPI_OK(env);
 }
@@ -915,6 +1293,7 @@ napi_typeof(napi_env env, napi_value value, napi_valuetype *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_double(napi_env env, napi_value value, double *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsNumber(v(value))) return NAPI_RET(env, napi_number_expected);
     if (JS_ToFloat64(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_number_expected); }
     return NAPI_OK(env);
@@ -922,6 +1301,7 @@ napi_get_value_double(napi_env env, napi_value value, double *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_int32(napi_env env, napi_value value, int32_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsNumber(v(value))) return NAPI_RET(env, napi_number_expected);
     if (JS_ToInt32(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_number_expected); }
     return NAPI_OK(env);
@@ -929,6 +1309,7 @@ napi_get_value_int32(napi_env env, napi_value value, int32_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_uint32(napi_env env, napi_value value, uint32_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsNumber(v(value))) return NAPI_RET(env, napi_number_expected);
     if (JS_ToUint32(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_number_expected); }
     return NAPI_OK(env);
@@ -936,6 +1317,7 @@ napi_get_value_uint32(napi_env env, napi_value value, uint32_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_int64(napi_env env, napi_value value, int64_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsNumber(v(value))) return NAPI_RET(env, napi_number_expected);
     if (JS_ToInt64(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_number_expected); }
     return NAPI_OK(env);
@@ -943,6 +1325,7 @@ napi_get_value_int64(napi_env env, napi_value value, int64_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_bool(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsBool(v(value))) return NAPI_RET(env, napi_boolean_expected);
     *result = JS_ToBool(env->ctx, v(value)) ? true : false;
     return NAPI_OK(env);
@@ -951,6 +1334,7 @@ napi_get_value_bool(napi_env env, napi_value value, bool *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_bigint_int64(napi_env env, napi_value value, int64_t *result, bool *lossless) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsBigInt(v(value))) return NAPI_RET(env, napi_bigint_expected);
     if (JS_ToBigInt64(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_bigint_expected); }
     if (lossless) *lossless = true; /* best-effort */
@@ -959,6 +1343,7 @@ napi_get_value_bigint_int64(napi_env env, napi_value value, int64_t *result, boo
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_bigint_uint64(napi_env env, napi_value value, uint64_t *result, bool *lossless) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsBigInt(v(value))) return NAPI_RET(env, napi_bigint_expected);
     if (JS_ToBigUint64(env->ctx, result, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_bigint_expected); }
     if (lossless) *lossless = true;
@@ -970,6 +1355,7 @@ napi_get_value_bigint_uint64(napi_env env, napi_value value, uint64_t *result, b
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_string_utf8(napi_env env, napi_value value, char *buf, size_t bufsize, size_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     if (!JS_IsString(v(value))) return NAPI_RET(env, napi_string_expected);
     size_t len = 0;
     const char *s = JS_ToCStringLen(env->ctx, &len, v(value));
@@ -994,6 +1380,7 @@ napi_get_value_string_utf8(napi_env env, napi_value value, char *buf, size_t buf
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_string_latin1(napi_env env, napi_value value, char *buf, size_t bufsize, size_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     if (!JS_IsString(v(value))) return NAPI_RET(env, napi_string_expected);
     size_t len = 0;
     const uint16_t *s = JS_ToCStringLenUTF16(env->ctx, &len, v(value));
@@ -1014,6 +1401,7 @@ napi_get_value_string_latin1(napi_env env, napi_value value, char *buf, size_t b
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_string_utf16(napi_env env, napi_value value, char16_t *buf, size_t bufsize, size_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     if (!JS_IsString(v(value))) return NAPI_RET(env, napi_string_expected);
     size_t len = 0;
     const uint16_t *s = JS_ToCStringLenUTF16(env->ctx, &len, v(value));
@@ -1035,6 +1423,7 @@ napi_get_value_string_utf16(napi_env env, napi_value value, char16_t *buf, size_
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_coerce_to_bool(napi_env env, napi_value value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     int b = JS_ToBool(env->ctx, v(value));
     if (b < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = napi_add_handle(env, JS_NewBool(env->ctx, b));
@@ -1043,6 +1432,7 @@ napi_coerce_to_bool(napi_env env, napi_value value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_coerce_to_number(napi_env env, napi_value value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     double d;
     if (JS_ToFloat64(env->ctx, &d, v(value)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = napi_add_handle(env, JS_NewFloat64(env->ctx, d));
@@ -1051,6 +1441,7 @@ napi_coerce_to_number(napi_env env, napi_value value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_coerce_to_string(napi_env env, napi_value value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len; const char *s = JS_ToCStringLen(env->ctx, &len, v(value));
     if (!s) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     JSValue str = JS_NewStringLen(env->ctx, s, len);
@@ -1061,6 +1452,7 @@ napi_coerce_to_string(napi_env env, napi_value value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_coerce_to_object(napi_env env, napi_value value, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     /* Object(value) via global Object() call */
     JSValue global = JS_GetGlobalObject(env->ctx);
     JSValue objctor = JS_GetPropertyStr(env->ctx, global, "Object");
@@ -1078,6 +1470,7 @@ napi_coerce_to_object(napi_env env, napi_value value, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_set_property(napi_env env, napi_value object, napi_value key, napi_value value) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, key); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_ValueToAtom(env->ctx, v(key));
     if (atom == JS_ATOM_NULL) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     int r = JS_SetProperty(env->ctx, v(object), atom, JS_DupValue(env->ctx, v(value)));
@@ -1088,6 +1481,7 @@ napi_set_property(napi_env env, napi_value object, napi_value key, napi_value va
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_property(napi_env env, napi_value object, napi_value key, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, key); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_ValueToAtom(env->ctx, v(key));
     if (atom == JS_ATOM_NULL) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     JSValue r = JS_GetProperty(env->ctx, v(object), atom);
@@ -1099,6 +1493,7 @@ napi_get_property(napi_env env, napi_value object, napi_value key, napi_value *r
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_has_property(napi_env env, napi_value object, napi_value key, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, key); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_ValueToAtom(env->ctx, v(key));
     if (atom == JS_ATOM_NULL) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     int r = JS_HasProperty(env->ctx, v(object), atom);
@@ -1110,6 +1505,7 @@ napi_has_property(napi_env env, napi_value object, napi_value key, bool *result)
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_delete_property(napi_env env, napi_value object, napi_value key, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, key);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_ValueToAtom(env->ctx, v(key));
     if (atom == JS_ATOM_NULL) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     int r = JS_DeleteProperty(env->ctx, v(object), atom, 0);
@@ -1121,6 +1517,7 @@ napi_delete_property(napi_env env, napi_value object, napi_value key, bool *resu
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_has_own_property(napi_env env, napi_value object, napi_value key, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, key); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     /* use Object.prototype.hasOwnProperty */
     JSValue global = JS_GetGlobalObject(env->ctx);
     JSValue objc = JS_GetPropertyStr(env->ctx, global, "Object");
@@ -1139,6 +1536,7 @@ napi_has_own_property(napi_env env, napi_value object, napi_value key, bool *res
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_set_named_property(napi_env env, napi_value object, const char *utf8name, napi_value value) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     int r = JS_SetPropertyStr(env->ctx, v(object), utf8name, JS_DupValue(env->ctx, v(value)));
     if (r < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     return NAPI_OK(env);
@@ -1146,6 +1544,7 @@ napi_set_named_property(napi_env env, napi_value object, const char *utf8name, n
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_named_property(napi_env env, napi_value object, const char *utf8name, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue r = JS_GetPropertyStr(env->ctx, v(object), utf8name);
     if (JS_IsException(r)) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = napi_add_handle(env, r);
@@ -1154,6 +1553,7 @@ napi_get_named_property(napi_env env, napi_value object, const char *utf8name, n
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_has_named_property(napi_env env, napi_value object, const char *utf8name, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_NewAtom(env->ctx, utf8name);
     int r = JS_HasProperty(env->ctx, v(object), atom);
     JS_FreeAtom(env->ctx, atom);
@@ -1165,6 +1565,7 @@ napi_has_named_property(napi_env env, napi_value object, const char *utf8name, b
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_set_element(napi_env env, napi_value object, uint32_t index, napi_value value) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     int r = JS_SetPropertyUint32(env->ctx, v(object), index, JS_DupValue(env->ctx, v(value)));
     if (r < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     return NAPI_OK(env);
@@ -1172,6 +1573,7 @@ napi_set_element(napi_env env, napi_value object, uint32_t index, napi_value val
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_element(napi_env env, napi_value object, uint32_t index, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue r = JS_GetPropertyUint32(env->ctx, v(object), index);
     if (JS_IsException(r)) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = napi_add_handle(env, r);
@@ -1180,6 +1582,7 @@ napi_get_element(napi_env env, napi_value object, uint32_t index, napi_value *re
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_has_element(napi_env env, napi_value object, uint32_t index, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_NewAtomUInt32(env->ctx, index);
     int r = JS_HasProperty(env->ctx, v(object), atom);
     JS_FreeAtom(env->ctx, atom);
@@ -1190,6 +1593,7 @@ napi_has_element(napi_env env, napi_value object, uint32_t index, bool *result) 
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_delete_element(napi_env env, napi_value object, uint32_t index, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object);
+    NAPI_CHECK_JS(env);
     JSAtom atom = JS_NewAtomUInt32(env->ctx, index);
     int r = JS_DeleteProperty(env->ctx, v(object), atom, 0);
     JS_FreeAtom(env->ctx, atom);
@@ -1201,6 +1605,7 @@ napi_delete_element(napi_env env, napi_value object, uint32_t index, bool *resul
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_prototype(napi_env env, napi_value object, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue proto = JS_GetPrototype(env->ctx, v(object));
     if (JS_IsException(proto)) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = napi_add_handle(env, proto);
@@ -1210,6 +1615,7 @@ napi_get_prototype(napi_env env, napi_value object, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_property_names(napi_env env, napi_value object, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSPropertyEnum *tab = NULL; uint32_t len = 0;
     if (JS_GetOwnPropertyNames(env->ctx, &tab, &len, v(object),
                                JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
@@ -1231,6 +1637,7 @@ napi_get_all_property_names(napi_env env, napi_value object,
                             napi_key_conversion key_conversion,
                             napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     int flags = 0;
     if (key_filter & napi_key_skip_strings) ; else flags |= JS_GPN_STRING_MASK;
     if (!(key_filter & napi_key_skip_symbols)) flags |= JS_GPN_SYMBOL_MASK;
@@ -1252,12 +1659,14 @@ napi_get_all_property_names(napi_env env, napi_value object,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_array(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = JS_IsArray(v(value));
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_array_length(napi_env env, napi_value value, uint32_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     int64_t len = 0;
     if (JS_GetLength(env->ctx, v(value), &len) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = (uint32_t) len;
@@ -1267,6 +1676,7 @@ napi_get_array_length(napi_env env, napi_value value, uint32_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_strict_equals(napi_env env, napi_value lhs, napi_value rhs, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, lhs); NAPI_CHECK_ARG(env, rhs); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     /* Implement via a small JS helper to avoid needing internal API. */
     JSValueConst args[2] = { v(lhs), v(rhs) };
     JSValue global = JS_GetGlobalObject(env->ctx);
@@ -1283,6 +1693,7 @@ napi_strict_equals(napi_env env, napi_value lhs, napi_value rhs, bool *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_instanceof(napi_env env, napi_value object, napi_value constructor, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, constructor); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     int r = JS_IsInstanceOf(env->ctx, v(object), v(constructor));
     if (r < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     *result = r ? true : false;
@@ -1292,12 +1703,14 @@ napi_instanceof(napi_env env, napi_value object, napi_value constructor, bool *r
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_object_freeze(napi_env env, napi_value object) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object);
+    NAPI_CHECK_JS(env);
     if (JS_FreezeObject(env->ctx, v(object)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     return NAPI_OK(env);
 }
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_object_seal(napi_env env, napi_value object) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object);
+    NAPI_CHECK_JS(env);
     if (JS_SealObject(env->ctx, v(object)) < 0) { napi_capture_exception(env); return NAPI_RET(env, napi_pending_exception); }
     return NAPI_OK(env);
 }
@@ -1428,6 +1841,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_function(napi_env env, const char *utf8name, size_t length,
                      napi_callback cb, void *data, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, cb); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue fn = napi_make_function(env, cb, data, utf8name, length, false);
     if (JS_IsException(fn)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
     *result = napi_add_handle(env, fn);
@@ -1438,6 +1852,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_cb_info(napi_env env, napi_callback_info cbinfo, size_t *argc,
                  napi_value *argv, napi_value *this_arg, void **data) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, cbinfo);
+    NAPI_CHECK_JS(env);
     struct napi_callback_info__ *info = cbinfo;
     if (argv != NULL && argc != NULL) {
         size_t want = *argc;
@@ -1459,6 +1874,7 @@ napi_get_cb_info(napi_env env, napi_callback_info cbinfo, size_t *argc,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_new_target(napi_env env, napi_callback_info cbinfo, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, cbinfo); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     struct napi_callback_info__ *info = cbinfo;
     if (JS_IsUndefined(info->new_target)) {
         *result = NULL;
@@ -1472,6 +1888,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_call_function(napi_env env, napi_value recv, napi_value func,
                    size_t argc, const napi_value *argv, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, func);
+    NAPI_CHECK_JS(env);
     JSValueConst *args = NULL;
     if (argc > 0) {
         args = malloc(sizeof(JSValueConst) * argc);
@@ -1491,6 +1908,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_new_instance(napi_env env, napi_value constructor, size_t argc,
                   const napi_value *argv, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, constructor); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValueConst *args = NULL;
     if (argc > 0) {
         args = malloc(sizeof(JSValueConst) * argc);
@@ -1546,6 +1964,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_define_properties(napi_env env, napi_value object, size_t property_count,
                        const napi_property_descriptor *properties) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object);
+    NAPI_CHECK_JS(env);
     for (size_t i = 0; i < property_count; i++) {
         napi_status s = napi_apply_descriptor(env, v(object), &properties[i]);
         if (s != napi_ok) return NAPI_RET(env, s);
@@ -1559,6 +1978,7 @@ napi_define_class(napi_env env, const char *utf8name, size_t length,
                   size_t property_count, const napi_property_descriptor *properties,
                   napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, constructor); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
 
     JSValue ctor = napi_make_function(env, constructor, data, utf8name, length, true);
     if (JS_IsException(ctor)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
@@ -1597,6 +2017,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_wrap(napi_env env, napi_value js_object, void *native_object,
           napi_finalize finalize_cb, void *finalize_hint, napi_ref *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object);
+    NAPI_CHECK_JS(env);
     JSValue carrier = napi_make_ext(env, native_object, finalize_cb, finalize_hint);
     if (JS_IsException(carrier)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
     /* attach as a non-enumerable hidden property */
@@ -1667,6 +2088,7 @@ static napi_ext_payload *napi_get_wrap_payload(napi_env env, napi_value js_objec
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_unwrap(napi_env env, napi_value js_object, void **result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_ext_payload *p = napi_get_wrap_payload(env, js_object);
     /* Test `wrapped`, not just `p`: the non-deletable carrier outlives the
      * wrap, and unwrap-after-remove must not hand back a dangling pointer. */
@@ -1678,6 +2100,7 @@ napi_unwrap(napi_env env, napi_value js_object, void **result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_remove_wrap(napi_env env, napi_value js_object, void **result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object);
+    NAPI_CHECK_JS(env);
     napi_ext_payload *p = napi_get_wrap_payload(env, js_object);
     if (!p || !p->wrapped) return NAPI_RET(env, napi_invalid_arg);
     p->finalize_cb = NULL;
@@ -1692,6 +2115,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_external(napi_env env, void *data, napi_finalize finalize_cb,
                      void *finalize_hint, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue ext = napi_make_ext(env, data, finalize_cb, finalize_hint);
     if (JS_IsException(ext)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
     *result = napi_add_handle(env, ext);
@@ -1710,6 +2134,7 @@ napi_get_value_external(napi_env env, napi_value value, void **result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_type_tag_object(napi_env env, napi_value object, const napi_type_tag *type_tag) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, type_tag);
+    NAPI_CHECK_JS(env);
     /* store tag inside a dedicated carrier hidden property */
     JSValue carrier = napi_make_ext(env, NULL, NULL, NULL);
     if (JS_IsException(carrier)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
@@ -1726,8 +2151,10 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_check_object_type_tag(napi_env env, napi_value object,
                            const napi_type_tag *type_tag, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, object); NAPI_CHECK_ARG(env, type_tag); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue carrier = JS_GetPropertyStr(env->ctx, v(object), "\xff""napi_tag");
-    napi_ext_payload *p = JS_IsException(carrier) ? NULL : JS_GetOpaque(carrier, napi_ext_class_id);
+    napi_ext_payload *p = JS_IsException(carrier) ? NULL :
+        JS_GetOpaque(carrier, napi_ext_class_id);
     *result = (p && p->has_tag && p->tag.lower == type_tag->lower && p->tag.upper == type_tag->upper);
     JS_FreeValue(env->ctx, carrier);
     return NAPI_OK(env);
@@ -1737,6 +2164,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_add_finalizer(napi_env env, napi_value js_object, void *finalize_data,
                    napi_finalize finalize_cb, void *finalize_hint, napi_ref *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, js_object); NAPI_CHECK_ARG(env, finalize_cb);
+    NAPI_CHECK_JS(env);
     JSValue carrier = napi_make_ext(env, finalize_data, finalize_cb, finalize_hint);
     if (JS_IsException(carrier)) { napi_capture_exception(env); return NAPI_RET(env, napi_generic_failure); }
     /* attach under a unique-ish key so multiple finalizers can coexist */
@@ -1821,6 +2249,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_reference(napi_env env, napi_value value, uint32_t initial_refcount,
                       napi_ref *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_ref ref = calloc(1, sizeof(*ref));
     if (!ref) return NAPI_RET(env, napi_generic_failure);
     ref->env = env;
@@ -1861,6 +2290,7 @@ napi_delete_reference(napi_env env, napi_ref ref) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_reference_ref(napi_env env, napi_ref ref, uint32_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, ref);
+    NAPI_CHECK_JS(env);
     if (ref->count == 0) {
         napi_status st = napi_ref_make_strong(ref);
         if (st != napi_ok) return st;
@@ -1872,6 +2302,7 @@ napi_reference_ref(napi_env env, napi_ref ref, uint32_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_reference_unref(napi_env env, napi_ref ref, uint32_t *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, ref);
+    NAPI_CHECK_JS(env);
     if (ref->count == 0) return NAPI_RET(env, napi_invalid_arg);
     if (ref->count == 1) {
         napi_status st = napi_ref_make_weak(ref);
@@ -1886,6 +2317,7 @@ napi_reference_unref(napi_env env, napi_ref ref, uint32_t *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_reference_value(napi_env env, napi_ref ref, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, ref); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsUninitialized(ref->value)) {
         *result = napi_add_handle(env, JS_DupValue(env->ctx, ref->value));
         return NAPI_OK(env);
@@ -1928,6 +2360,7 @@ static void *napi_external_ab_free(JSRuntime *rt, void *opaque, void *ptr, size_
 }
 
 static napi_status napi_get_buffer_ctor(napi_env env, JSValue *ctor) {
+    NAPI_CHECK_JS(env);
     JSValue global = JS_GetGlobalObject(env->ctx);
     JSValue buffer = JS_GetPropertyStr(env->ctx, global, "Buffer");
     JS_FreeValue(env->ctx, global);
@@ -1993,6 +2426,7 @@ static napi_status napi_make_owned_arraybuffer(napi_env env, size_t byte_length,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_arraybuffer(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = JS_IsArrayBuffer(v(value));
     return NAPI_OK(env);
 }
@@ -2001,6 +2435,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_arraybuffer(napi_env env, size_t byte_length, void **data,
                         napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     return napi_make_owned_arraybuffer(env, byte_length, data, result);
 }
 
@@ -2011,6 +2446,7 @@ napi_create_external_arraybuffer(napi_env env, void *external_data,
                                  void *finalize_hint,
                                  napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_ab_payload *p = calloc(1, sizeof(*p));
     if (!p) return NAPI_RET(env, napi_generic_failure);
     p->env = env;
@@ -2032,6 +2468,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_arraybuffer_info(napi_env env, napi_value arraybuffer, void **data,
                           size_t *byte_length) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, arraybuffer);
+    NAPI_CHECK_JS(env);
     if (!JS_IsArrayBuffer(v(arraybuffer))) return NAPI_RET(env, napi_arraybuffer_expected);
     size_t len = 0;
     uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, v(arraybuffer));
@@ -2081,6 +2518,7 @@ static napi_typedarray_type napi_from_qjs_typedarray(int type) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_typedarray(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = JS_GetTypedArrayType(v(value)) >= 0;
     return NAPI_OK(env);
 }
@@ -2090,6 +2528,7 @@ napi_create_typedarray(napi_env env, napi_typedarray_type type, size_t length,
                        napi_value arraybuffer, size_t byte_offset,
                        napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, arraybuffer); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     int qtype = napi_to_qjs_typedarray(type);
     if (qtype < 0) return NAPI_RET(env, napi_invalid_arg);
     JSValue offv = JS_NewUint32(env->ctx, (uint32_t) byte_offset);
@@ -2116,6 +2555,7 @@ napi_get_typedarray_info(napi_env env, napi_value typedarray,
                          void **data, napi_value *arraybuffer,
                          size_t *byte_offset) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, typedarray);
+    NAPI_CHECK_JS(env);
     int qtype = JS_GetTypedArrayType(v(typedarray));
     if (qtype < 0) return NAPI_RET(env, napi_invalid_arg);
     size_t off = 0, blen = 0, bpe = 0;
@@ -2151,6 +2591,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_dataview(napi_env env, size_t length, napi_value arraybuffer,
                      size_t byte_offset, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, arraybuffer); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue ctor = napi_get_global_ctor(env->ctx, "DataView");
     JSValue args[3] = {
         v(arraybuffer),
@@ -2172,6 +2613,7 @@ napi_create_dataview(napi_env env, size_t length, napi_value arraybuffer,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_dataview(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     *result = JS_IsDataView(v(value));
     return NAPI_OK(env);
 }
@@ -2181,6 +2623,7 @@ napi_get_dataview_info(napi_env env, napi_value dataview, size_t *bytelength,
                        void **data, napi_value *arraybuffer,
                        size_t *byte_offset) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, dataview);
+    NAPI_CHECK_JS(env);
     if (!JS_IsDataView(v(dataview))) return NAPI_RET(env, napi_invalid_arg);
     size_t off = 0, len = 0;
     JSValue ab = JS_GetDataViewBuffer(env->ctx, v(dataview), &off, &len);
@@ -2206,6 +2649,7 @@ napi_get_dataview_info(napi_env env, napi_value dataview, size_t *bytelength,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_buffer(napi_env env, size_t length, void **data, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     uint8_t *buf = length ? malloc(length) : NULL;
     if (length && !buf) return NAPI_RET(env, napi_generic_failure);
     JSValue ab = JS_NewArrayBuffer(env->ctx, buf, length, 0, napi_raw_ab_free, NULL, false);
@@ -2235,6 +2679,7 @@ napi_create_external_buffer(napi_env env, size_t length, void *data,
                             napi_finalize finalize_cb, void *finalize_hint,
                             napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_ab_payload *p = calloc(1, sizeof(*p));
     if (!p) return NAPI_RET(env, napi_generic_failure);
     p->env = env;
@@ -2277,6 +2722,7 @@ napi_is_buffer(napi_env env, napi_value value, bool *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_buffer_info(napi_env env, napi_value value, void **data, size_t *length) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value);
+    NAPI_CHECK_JS(env);
     if (JS_GetTypedArrayType(v(value)) != JS_TYPED_ARRAY_UINT8) {
         return NAPI_RET(env, napi_invalid_arg);
     }
@@ -2286,6 +2732,7 @@ napi_get_buffer_info(napi_env env, napi_value value, void **data, size_t *length
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, arraybuffer);
+    NAPI_CHECK_JS(env);
     if (!JS_IsArrayBuffer(v(arraybuffer))) return NAPI_RET(env, napi_arraybuffer_expected);
     if (JS_DetachArrayBuffer(env->ctx, v(arraybuffer)) < 0) {
         /* N-API reports non-detachable buffers as a status, not as a pending
@@ -2300,6 +2747,7 @@ napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_detached_arraybuffer(napi_env env, napi_value value, bool *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsArrayBuffer(v(value))) return NAPI_RET(env, napi_arraybuffer_expected);
     size_t len = 0;
     uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, v(value));
@@ -2321,6 +2769,7 @@ napi_is_detached_arraybuffer(napi_env env, napi_value value, bool *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_promise(napi_env env, napi_deferred *deferred, napi_value *promise) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, deferred); NAPI_CHECK_ARG(env, promise);
+    NAPI_CHECK_JS(env);
     JSValue funcs[2];
     JSValue p = JS_NewPromiseCapability(env->ctx, funcs);
     if (JS_IsException(p)) {
@@ -2343,6 +2792,12 @@ napi_create_promise(napi_env env, napi_deferred *deferred, napi_value *promise) 
 static napi_status napi_settle_deferred(napi_env env, napi_deferred deferred,
                                         napi_value value, bool reject) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, deferred); NAPI_CHECK_ARG(env, value);
+    if (env->cleanup_done || env->trt->freeing) {
+        JS_FreeValue(env->ctx, deferred->resolve);
+        JS_FreeValue(env->ctx, deferred->reject);
+        free(deferred);
+        return NAPI_RET(env, napi_cannot_run_js);
+    }
     JSValue fn = reject ? deferred->reject : deferred->resolve;
     JSValueConst arg = v(value);
     JSValue r = JS_Call(env->ctx, fn, JS_UNDEFINED, 1, &arg);
@@ -2370,6 +2825,7 @@ napi_reject_deferred(napi_env env, napi_deferred deferred, napi_value rejection)
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_promise(napi_env env, napi_value value, bool *is_promise) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, is_promise);
+    NAPI_CHECK_JS(env);
     *is_promise = JS_IsPromise(v(value));
     return NAPI_OK(env);
 }
@@ -2377,6 +2833,7 @@ napi_is_promise(napi_env env, napi_value value, bool *is_promise) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_date(napi_env env, double time, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     JSValue d = JS_NewDate(env->ctx, time);
     if (JS_IsException(d)) {
         napi_capture_exception(env);
@@ -2389,6 +2846,7 @@ napi_create_date(napi_env env, double time, napi_value *result) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_is_date(napi_env env, napi_value value, bool *is_date) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, is_date);
+    NAPI_CHECK_JS(env);
     *is_date = JS_IsDate(v(value));
     return NAPI_OK(env);
 }
@@ -2396,6 +2854,7 @@ napi_is_date(napi_env env, napi_value value, bool *is_date) {
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_date_value(napi_env env, napi_value value, double *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (!JS_IsDate(v(value))) return NAPI_RET(env, napi_date_expected);
     JSValue fn = JS_GetPropertyStr(env->ctx, v(value), "getTime");
     JSValue r = JS_Call(env->ctx, fn, v(value), 0, NULL);
@@ -2417,6 +2876,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_create_bigint_words(napi_env env, int sign_bit, size_t word_count,
                          const uint64_t *words, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     if (sign_bit != 0 && sign_bit != 1) return NAPI_RET(env, napi_invalid_arg);
     if (word_count > 0 && words == NULL) return NAPI_RET(env, napi_invalid_arg);
     JSValue bi = JS_NewBigIntWords(env->ctx, sign_bit, word_count, words);
@@ -2432,6 +2892,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_value_bigint_words(napi_env env, napi_value value, int *sign_bit,
                             size_t *word_count, uint64_t *words) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, value); NAPI_CHECK_ARG(env, word_count);
+    NAPI_CHECK_JS(env);
     if (!JS_IsBigInt(v(value))) return NAPI_RET(env, napi_bigint_expected);
     size_t count = words ? *word_count : 0;
     if (JS_GetBigIntWords(env->ctx, v(value), sign_bit, &count, words) < 0) {
@@ -2446,6 +2907,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 node_api_symbol_for(napi_env env, const char *utf8description, size_t length,
                     napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, utf8description); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len = length == NAPI_AUTO_LENGTH ? strlen(utf8description) : length;
     char *desc = malloc(len + 1);
     if (!desc) return NAPI_RET(env, napi_generic_failure);
@@ -2460,6 +2922,7 @@ node_api_symbol_for(napi_env env, const char *utf8description, size_t length,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_run_script(napi_env env, napi_value script, napi_value *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, script); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     size_t len = 0;
     const char *src = JS_ToCStringLen(env->ctx, &len, v(script));
     if (!src) {
@@ -2544,6 +3007,7 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_async_init(napi_env env, napi_value async_resource,
                 napi_value async_resource_name, napi_async_context *result) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    NAPI_CHECK_JS(env);
     napi_async_context c = calloc(1, sizeof(*c));
     if (!c) return NAPI_RET(env, napi_generic_failure);
     c->env = env;
@@ -2634,7 +3098,17 @@ napi_add_async_cleanup_hook(node_api_basic_env basic_env,
     e->env = env;
     e->hook = hook;
     e->data = arg;
+    e->called = false;
+    e->linked = true;
+    e->running = false;
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (env->cleanup_done) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        free(e);
+        return NAPI_RET(env, napi_invalid_arg);
+    }
     list_add_tail(&e->link, &env->async_cleanup_hooks);
+    uv_mutex_unlock(&env->cleanup_mutex);
     if (remove_handle) *remove_handle = e;
     return NAPI_OK(env);
 }
@@ -2643,28 +3117,65 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_remove_async_cleanup_hook(napi_async_cleanup_hook_handle remove_handle) {
     if (!remove_handle) return napi_invalid_arg;
     napi_env env = remove_handle->env;
+    if (!env) return napi_invalid_arg;
+
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (remove_handle->env != env || !remove_handle->linked) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return napi_invalid_arg;
+    }
     list_del(&remove_handle->link);
-    free(remove_handle);
-    return NAPI_OK(env);
+    remove_handle->linked = false;
+    if (!remove_handle->running)
+        free(remove_handle);
+    if (env->cleanup_wakeup)
+        uv_async_send(env->cleanup_wakeup);
+    uv_mutex_unlock(&env->cleanup_mutex);
+    /* Removal is also used by native cleanup threads. Do not touch env after
+     * dropping the lock: the runtime waiter can now finish and free it. */
+    return napi_ok;
 }
 
 static void napi_async_work_execute(uv_work_t *req) {
     napi_async_work w = req->data;
-    if (!w->cancelled && w->execute) w->execute(w->env, w->data);
+    /* libuv owns cancellation/start arbitration. Runtime flags are loop-thread
+     * state and must not be read unsynchronized from this pool thread. */
+    if (w->execute)
+        w->execute(w->env, w->data);
 }
 
 static void napi_async_work_complete(uv_work_t *req, int status) {
     napi_async_work w = req->data;
-    w->done = true;
+    napi_env env = w->env;
+    napi_async_complete_callback complete;
+    void *data;
+    bool cancelled;
+
+    uv_mutex_lock(&env->cleanup_mutex);
+    napi_async_work_unlink_locked(w);
+    CHECK_EQ(w->state, NAPI_ASYNC_WORK_QUEUED);
+    w->state = NAPI_ASYNC_WORK_COMPLETED;
     if (status == UV_ECANCELED) w->cancelled = true;
-    if (w->complete) {
-        napi_env env = w->env;
-        napi_status work_status = w->cancelled ? napi_cancelled : napi_ok;
-        void *data = w->data;
+    complete = w->complete;
+    data = w->data;
+    cancelled = w->cancelled;
+    env->async_work_callbacks++;
+    uv_mutex_unlock(&env->cleanup_mutex);
+
+    /* complete is native addon code, including payload/reference cleanup.
+     * Deliver it even during teardown; the addon still owns/deletes work. */
+    if (complete) {
+        napi_status work_status = cancelled ? napi_cancelled : napi_ok;
         napi_handle_scope scope = napi_scope_open(env, false);
-        w->complete(env, work_status, data);
+        complete(env, work_status, data);
         napi_scope_close(env, scope);
     }
+
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (env->async_work_callbacks > 0)
+        env->async_work_callbacks--;
+    uv_mutex_unlock(&env->cleanup_mutex);
+    napi_env_signal(env);
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
@@ -2682,6 +3193,7 @@ napi_create_async_work(napi_env env, napi_value async_resource,
     w->complete = complete;
     w->data = data;
     w->req.data = w;
+    init_list_head(&w->link);
     *result = w;
     return NAPI_OK(env);
 }
@@ -2690,14 +3202,27 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_queue_async_work(node_api_basic_env basic_env, napi_async_work work) {
     napi_env env = (napi_env) basic_env;
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, work);
-    if (work->queued) return NAPI_RET(env, napi_invalid_arg);
-    work->queued = true;
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (env->cleanup_done || env->trt->freeing) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return NAPI_RET(env, napi_closing);
+    }
+    if (work->state != NAPI_ASYNC_WORK_CREATED) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return NAPI_RET(env, napi_invalid_arg);
+    }
+    work->state = NAPI_ASYNC_WORK_QUEUED;
+    work->cancelled = false;
     int r = uv_queue_work(env->loop, &work->req, napi_async_work_execute,
                           napi_async_work_complete);
     if (r != 0) {
-        work->queued = false;
+        work->state = NAPI_ASYNC_WORK_CREATED;
+        uv_mutex_unlock(&env->cleanup_mutex);
         return NAPI_RET(env, napi_generic_failure);
     }
+    list_add_tail(&work->link, &env->async_works);
+    work->linked = true;
+    uv_mutex_unlock(&env->cleanup_mutex);
     return NAPI_OK(env);
 }
 
@@ -2705,42 +3230,84 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_cancel_async_work(node_api_basic_env basic_env, napi_async_work work) {
     napi_env env = (napi_env) basic_env;
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, work);
-    work->cancelled = true;
+    uv_mutex_lock(&env->cleanup_mutex);
     int r = uv_cancel((uv_req_t *) &work->req);
-    return r == 0 || r == UV_EBUSY ? NAPI_OK(env) : NAPI_RET(env, napi_generic_failure);
+    if (r != 0) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return NAPI_RET(env, napi_generic_failure);
+    }
+    work->cancelled = true;
+    uv_mutex_unlock(&env->cleanup_mutex);
+    return NAPI_OK(env);
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_delete_async_work(napi_env env, napi_async_work work) {
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, work);
-    if (work->queued && !work->done) return NAPI_RET(env, napi_invalid_arg);
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (work->state == NAPI_ASYNC_WORK_QUEUED) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return NAPI_RET(env, napi_invalid_arg);
+    }
+    napi_async_work_unlink_locked(work);
+    uv_mutex_unlock(&env->cleanup_mutex);
     free(work);
     return NAPI_OK(env);
 }
 
 /* Thread-safe function */
 
-static void napi_tsfn_maybe_close(napi_threadsafe_function tsfn);
-
 static void napi_tsfn_close_cb(uv_handle_t *handle) {
     napi_threadsafe_function tsfn = handle->data;
-    if (tsfn->link.prev && tsfn->link.next) list_del(&tsfn->link);
+    CHECK(napi_tsfn_begin_api(tsfn));
+
+    napi_env env = tsfn->env;
+    JSValue func;
+    napi_finalize finalize_cb;
+    void *finalize_data;
+
+    /* Publish retirement before running any cleanup callback. External owners
+     * must see a closed, runtime-independent control block while the finalizer
+     * is still allowed to finish its addon-owned cleanup. */
+    uv_mutex_lock(&tsfn->mutex);
+    env = tsfn->env;
+    func = tsfn->func;
+    finalize_cb = tsfn->finalize_cb;
+    finalize_data = tsfn->finalize_data;
+    tsfn->env = NULL;
+    tsfn->func = JS_UNDEFINED;
+    tsfn->context = NULL;
+    tsfn->finalize_data = NULL;
+    tsfn->finalize_cb = NULL;
+    tsfn->call_js_cb = NULL;
+    tsfn->retired = true;
+    uv_mutex_unlock(&tsfn->mutex);
+
+    JS_FreeValueRT(env->trt->rt, func);
+    if (finalize_cb)
+        finalize_cb(env, finalize_data, NULL);
+    napi_tsfn_end_api(tsfn);
+}
+
+static void napi_tsfn_create_fail_close_cb(uv_handle_t *handle) {
+    napi_threadsafe_function tsfn = handle->data;
+    napi_env env = tsfn->env;
+    JSValue func = tsfn->func;
     uv_mutex_destroy(&tsfn->mutex);
     uv_cond_destroy(&tsfn->cond);
-    JS_FreeValue(tsfn->env->ctx, tsfn->func);
-    if (tsfn->finalize_cb) {
-        tsfn->finalize_cb(tsfn->env, tsfn->finalize_data, NULL);
-    }
+    JS_FreeValueRT(env->trt->rt, func);
     free(tsfn);
 }
 
 static void napi_tsfn_async_cb(uv_async_t *handle) {
     napi_threadsafe_function tsfn = handle->data;
+    napi_env env = tsfn->env;
     for (;;) {
         uv_mutex_lock(&tsfn->mutex);
         if (list_empty(&tsfn->queue)) {
             uv_cond_broadcast(&tsfn->cond);
-            bool should_close = tsfn->closing && tsfn->thread_count == 0 && !tsfn->close_started;
+            bool should_close = tsfn->closing && tsfn->thread_count == 0 &&
+                !tsfn->close_started;
             if (should_close) {
                 tsfn->close_started = true;
                 uv_mutex_unlock(&tsfn->mutex);
@@ -2757,25 +3324,24 @@ static void napi_tsfn_async_cb(uv_async_t *handle) {
         uv_mutex_unlock(&tsfn->mutex);
 
         napi_tsfn_item *item = list_entry(el, napi_tsfn_item, link);
-        napi_handle_scope scope = napi_scope_open(tsfn->env, false);
-        napi_value js_cb = napi_add_handle(tsfn->env, JS_DupValue(tsfn->env->ctx, tsfn->func));
-        if (tsfn->call_js_cb) {
-            tsfn->call_js_cb(tsfn->env, js_cb, tsfn->context, item->data);
+        if (env->trt->freeing || env->cleanup_done) {
+            /* The payload belongs to the addon, not napi_tsfn_item. Let the
+             * native callback release it even though JS calls are forbidden. */
+            if (tsfn->call_js_cb)
+                tsfn->call_js_cb(NULL, NULL, tsfn->context, item->data);
         } else {
-            napi_call_function(tsfn->env, NULL, js_cb, 0, NULL, NULL);
+            napi_handle_scope scope = napi_scope_open(env, false);
+            napi_value js_cb = NULL;
+            if (!JS_IsUndefined(tsfn->func))
+                js_cb = napi_add_handle(env, JS_DupValue(env->ctx, tsfn->func));
+            if (tsfn->call_js_cb) {
+                tsfn->call_js_cb(env, js_cb, tsfn->context, item->data);
+            } else if (js_cb) {
+                napi_call_function(env, NULL, js_cb, 0, NULL, NULL);
+            }
+            napi_scope_close(env, scope);
         }
-        napi_scope_close(tsfn->env, scope);
         free(item);
-        napi_tsfn_maybe_close(tsfn);
-    }
-}
-
-static void napi_tsfn_maybe_close(napi_threadsafe_function tsfn) {
-    uv_mutex_lock(&tsfn->mutex);
-    bool should_send = tsfn->closing && tsfn->thread_count == 0;
-    uv_mutex_unlock(&tsfn->mutex);
-    if (should_send && !uv_is_closing((uv_handle_t *) &tsfn->async)) {
-        uv_async_send(&tsfn->async);
     }
 }
 
@@ -2792,10 +3358,13 @@ napi_create_threadsafe_function(napi_env env, napi_value func,
                                 napi_threadsafe_function *result) {
     (void) async_resource; (void) async_resource_name;
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, result);
+    if (initial_thread_count == 0) return NAPI_RET(env, napi_invalid_arg);
     if (!func && !call_js_cb) return NAPI_RET(env, napi_invalid_arg);
     napi_threadsafe_function tsfn = calloc(1, sizeof(*tsfn));
     if (!tsfn) return NAPI_RET(env, napi_generic_failure);
     tsfn->env = env;
+    tsfn->owner_env = env;
+    tsfn->dynlib = env->dynlib;
     tsfn->func = func ? JS_DupValue(env->ctx, v(func)) : JS_UNDEFINED;
     tsfn->context = context;
     tsfn->finalize_data = thread_finalize_data;
@@ -2805,9 +3374,28 @@ napi_create_threadsafe_function(napi_env env, napi_value func,
     tsfn->thread_count = initial_thread_count;
     init_list_head(&tsfn->queue);
     init_list_head(&tsfn->link);
-    uv_mutex_init(&tsfn->mutex);
-    uv_cond_init(&tsfn->cond);
+    if (uv_mutex_init(&tsfn->mutex) != 0) {
+        JS_FreeValue(env->ctx, tsfn->func);
+        free(tsfn);
+        return NAPI_RET(env, napi_generic_failure);
+    }
+    if (uv_cond_init(&tsfn->cond) != 0) {
+        uv_mutex_destroy(&tsfn->mutex);
+        JS_FreeValue(env->ctx, tsfn->func);
+        free(tsfn);
+        return NAPI_RET(env, napi_generic_failure);
+    }
+    uv_mutex_lock(&env->cleanup_mutex);
+    if (env->cleanup_done || env->trt->freeing) {
+        uv_mutex_unlock(&env->cleanup_mutex);
+        uv_mutex_destroy(&tsfn->mutex);
+        uv_cond_destroy(&tsfn->cond);
+        JS_FreeValue(env->ctx, tsfn->func);
+        free(tsfn);
+        return NAPI_RET(env, napi_closing);
+    }
     if (uv_async_init(env->loop, &tsfn->async, napi_tsfn_async_cb) != 0) {
+        uv_mutex_unlock(&env->cleanup_mutex);
         uv_mutex_destroy(&tsfn->mutex);
         uv_cond_destroy(&tsfn->cond);
         JS_FreeValue(env->ctx, tsfn->func);
@@ -2815,7 +3403,13 @@ napi_create_threadsafe_function(napi_env env, napi_value func,
         return NAPI_RET(env, napi_generic_failure);
     }
     tsfn->async.data = tsfn;
+    if (!napi_dynlib_pin(tsfn->dynlib)) {
+        uv_close((uv_handle_t *) &tsfn->async, napi_tsfn_create_fail_close_cb);
+        uv_mutex_unlock(&env->cleanup_mutex);
+        return NAPI_RET(env, napi_generic_failure);
+    }
     list_add_tail(&tsfn->link, &env->tsfns);
+    uv_mutex_unlock(&env->cleanup_mutex);
     *result = tsfn;
     return NAPI_OK(env);
 }
@@ -2825,50 +3419,68 @@ napi_create_threadsafe_function(napi_env env, napi_value func,
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_get_threadsafe_function_context(napi_threadsafe_function func, void **result) {
     if (!func || !result) return napi_invalid_arg;
-    *result = func->context;
-    return napi_ok;
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
+    uv_mutex_lock(&func->mutex);
+    napi_status status = func->retired ? napi_closing : napi_ok;
+    *result = func->retired ? NULL : func->context;
+    uv_mutex_unlock(&func->mutex);
+    napi_tsfn_end_api(func);
+    return status;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_call_threadsafe_function(napi_threadsafe_function func, void *data,
                               napi_threadsafe_function_call_mode is_blocking) {
     if (!func) return napi_invalid_arg;
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
     uv_mutex_lock(&func->mutex);
     while (!func->closing && func->max_queue_size > 0 &&
            func->queue_size >= func->max_queue_size) {
         if (is_blocking == napi_tsfn_nonblocking) {
             uv_mutex_unlock(&func->mutex);
+            napi_tsfn_end_api(func);
             return napi_queue_full;
         }
         uv_cond_wait(&func->cond, &func->mutex);
     }
     if (func->closing) {
+        /* Node-API treats napi_closing as this thread's final use. The
+         * producer must not call another TSFN API after it receives it. */
+        if (func->thread_count > 0) func->thread_count--;
+        if (!func->retired && func->thread_count == 0 && !func->close_started)
+            uv_async_send(&func->async);
         uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
         return napi_closing;
     }
     napi_tsfn_item *item = calloc(1, sizeof(*item));
     if (!item) {
         uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
         return napi_generic_failure;
     }
     item->data = data;
     list_add_tail(&item->link, &func->queue);
     func->queue_size++;
-    uv_mutex_unlock(&func->mutex);
     uv_async_send(&func->async);
+    uv_mutex_unlock(&func->mutex);
+    napi_tsfn_end_api(func);
     return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
 napi_acquire_threadsafe_function(napi_threadsafe_function func) {
     if (!func) return napi_invalid_arg;
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
     uv_mutex_lock(&func->mutex);
     if (func->closing) {
         uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
         return napi_closing;
     }
     func->thread_count++;
     uv_mutex_unlock(&func->mutex);
+    napi_tsfn_end_api(func);
     return napi_ok;
 }
 
@@ -2876,18 +3488,24 @@ NAPI_EXTERN napi_status NAPI_CDECL
 napi_release_threadsafe_function(napi_threadsafe_function func,
                                  napi_threadsafe_function_release_mode mode) {
     if (!func) return napi_invalid_arg;
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
     uv_mutex_lock(&func->mutex);
+    if (func->thread_count == 0) {
+        uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
+        return napi_invalid_arg;
+    }
     if (func->thread_count > 0) func->thread_count--;
     if (mode == napi_tsfn_abort || func->thread_count == 0) {
         func->closing = true;
-        if (mode == napi_tsfn_abort) func->aborted = true;
+        uv_cond_broadcast(&func->cond);
     }
+    /* Publish while holding the same mutex that protects close_started. The
+     * loop thread cannot free func between the decision and uv_async_send. */
+    if (func->closing && !func->retired && !func->close_started)
+        uv_async_send(&func->async);
     uv_mutex_unlock(&func->mutex);
-    /* maybe_close() is uv_is_closing-guarded; an unconditional uv_async_send
-     * can touch a handle the async callback already closed and freed. */
-    napi_tsfn_maybe_close(func);
-    /* Bare status: any-thread entry point, and `func` may be torn down from
-     * here on -- see the block comment above napi_get_threadsafe_function_context. */
+    napi_tsfn_end_api(func);
     return napi_ok;
 }
 
@@ -2896,8 +3514,17 @@ napi_unref_threadsafe_function(node_api_basic_env basic_env,
                                napi_threadsafe_function func) {
     napi_env env = (napi_env) basic_env;
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, func);
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
+    uv_mutex_lock(&func->mutex);
+    if (func->retired || func->close_started) {
+        uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
+        return napi_closing;
+    }
     uv_unref((uv_handle_t *) &func->async);
-    return NAPI_OK(env);
+    uv_mutex_unlock(&func->mutex);
+    napi_tsfn_end_api(func);
+    return napi_ok;
 }
 
 NAPI_EXTERN napi_status NAPI_CDECL
@@ -2905,8 +3532,17 @@ napi_ref_threadsafe_function(node_api_basic_env basic_env,
                              napi_threadsafe_function func) {
     napi_env env = (napi_env) basic_env;
     NAPI_CHECK_ENV(env); NAPI_CHECK_ARG(env, func);
+    if (!napi_tsfn_begin_api(func)) return napi_closing;
+    uv_mutex_lock(&func->mutex);
+    if (func->retired || func->close_started) {
+        uv_mutex_unlock(&func->mutex);
+        napi_tsfn_end_api(func);
+        return napi_closing;
+    }
     uv_ref((uv_handle_t *) &func->async);
-    return NAPI_OK(env);
+    uv_mutex_unlock(&func->mutex);
+    napi_tsfn_end_api(func);
+    return napi_ok;
 }
 
 /* Node-API addon loading */
@@ -2943,6 +3579,7 @@ static JSValue tjs__napi_dlopen(JSContext *ctx, JSValueConst this_val,
     }
     napi_pending_module = NULL;
     legacy_node_module_pending = false;
+    node->nodeapi = true;
     if (uv_dlopen(path, &node->lib) != 0) {
         JSValue err = napi_throw_dlerror(ctx, &node->lib, path);
         uv_dlclose(&node->lib);
@@ -2981,7 +3618,7 @@ static JSValue tjs__napi_dlopen(JSContext *ctx, JSValueConst this_val,
         return err;
     }
 
-    napi_env env = napi_env_new(ctx, path, api_version);
+    napi_env env = napi_env_new(ctx, path, api_version, node);
     if (!env) {
         uv_dlclose(&node->lib);
         free(node);
@@ -3000,8 +3637,11 @@ static JSValue tjs__napi_dlopen(JSContext *ctx, JSValueConst this_val,
         JSValue exc = env->pending_exception;
         env->pending_exception = JS_UNINITIALIZED;
         JS_FreeValue(ctx, result);
-        uv_dlclose(&node->lib);
-        free(node);
+        TJSRuntime *qrt = TJS_GetRuntime(ctx);
+        (void) napi_env_cleanup_after_failed_registration(env);
+        /* Keep the image loaded through JS_FreeRuntime: its env finalizer and
+         * any remaining JS finalizers may still call addon code. */
+        list_add_tail(&node->link, &qrt->module.dyn_libs);
         JS_FreeCString(ctx, path);
         return JS_Throw(ctx, exc);
     }
