@@ -71,16 +71,31 @@ typedef TJSPinnedFd tjs_sock_pin_t;
 #endif
 
 typedef struct {
+    TJSRuntime *trt;
     sock_fd_t  sock;
     bool       close_on_close;
     bool       closed, poll_init, in_cb, finalized;
     bool       poll_closing;  /* uv_close on poll handle initiated */
     bool       poll_closed;   /* poll close_cb has fired */
+    struct list_head runtime_link;
+    bool       runtime_linked;
     JSValue    callback, this_obj;
     JSContext *jsctx;
     uv_poll_t  poll;
     tjs_sock_pin_t poll_pin;
 } tjs_sock_t;
+
+static void tjs_sock_list_add(tjs_sock_t *s) {
+    init_list_head(&s->runtime_link);
+    list_add(&s->runtime_link, &s->trt->sockets);
+    s->runtime_linked = true;
+}
+
+static void tjs_sock_list_remove(tjs_sock_t *s) {
+    if (!s->runtime_linked) return;
+    list_del(&s->runtime_link);
+    s->runtime_linked = false;
+}
 
 static tjs_sock_pin_t tjs_sock_pin_init(sock_fd_t sock) {
     return (tjs_sock_pin_t) { sock, 0, false };
@@ -264,11 +279,13 @@ static JSValue tjs_sock_new_from_fd(JSContext *ctx, sock_fd_t fd, bool close_on_
         return JS_ThrowOutOfMemory(ctx);
     }
     s->sock           = fd;
+    s->trt            = TJS_GetRuntime(ctx);
     s->close_on_close = close_on_close;
     s->callback       = JS_UNDEFINED;
     s->this_obj       = JS_UNDEFINED;
     s->jsctx          = ctx;
     s->poll_pin       = tjs_sock_pin_init(fd);
+    tjs_sock_list_add(s);
     JS_SetOpaque(obj, s);
     return obj;
 }
@@ -281,8 +298,10 @@ static void tjs_sock_poll_close_cb(uv_handle_t *handle) {
     /* Only free once the JS wrapper has also been finalized; otherwise the
      * opaque pointer is still live and freeing here would be a use-after-free
      * on the next method call / finalizer. JSValues freed in finalizer. */
-    if (s->finalized)
+    if (s->finalized) {
+        tjs_sock_list_remove(s);
         tjs__free(s);
+    }
 }
 
 static JSValue tjs_sock_create(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -414,39 +433,50 @@ static JSValue tjs_sock_from_fd(JSContext *ctx, JSValue this_val, int argc, JSVa
 }
 
 static void close_sock(tjs_sock_t *s) {
-    if (s->closed) return;
-    if (s->poll_init) {
-        if (uv_is_active((uv_handle_t *) &s->poll))
+    if (!s->closed) {
+        s->closed = true;
+        if (s->poll_init && uv_is_active((uv_handle_t *) &s->poll))
             uv_poll_stop(&s->poll);
+        if (s->close_on_close && sock_valid(s->sock))
+            sock_close(s->sock);
+        s->sock = SOCK_INVALID;
+    }
+    /* A nested loop must not complete the close while libuv's poll callback
+     * still owns the handle (Windows also reads it after our callback). */
+    if (s->poll_init && !s->in_cb) {
         if (!uv_is_closing((uv_handle_t *) &s->poll)) {
             s->poll_closing = true;
             uv_close((uv_handle_t *) &s->poll, tjs_sock_poll_close_cb);
         }
-        if (!JS_IsUndefined(s->callback)) {
-            JS_FreeValue(s->jsctx, s->callback);
-            s->callback  = JS_UNDEFINED;
-        }
         s->poll_init = false;
     }
-    if (s->close_on_close)
-        sock_close(s->sock);
-    s->closed = true;
+}
+
+static void tjs_sock_clear_poll_refs(JSRuntime *rt, tjs_sock_t *s) {
+    JSValue callback = s->callback;
+    s->callback = JS_UNDEFINED;
+    JSValue this_obj = s->this_obj;
+    s->this_obj = JS_UNDEFINED;
+    /* Either release can reenter; leave no shared refs or later accesses to s. */
+    JS_FreeValueRT(rt, callback);
+    JS_FreeValueRT(rt, this_obj);
 }
 
 static void tjs_sock_finalizer(JSRuntime *rt, JSValue val) {
     tjs_sock_t *s = JS_GetOpaque(val, tjs_sock_classid);
     if (s) {
-        s->finalized = true;
-        JS_FreeValueRT(rt, s->callback);
-        s->callback = JS_UNDEFINED;
         /* this_obj is only set while polling and keeps the wrapper alive until
          * stopPoll() or close() releases the native strong reference. */
         s->this_obj = JS_UNDEFINED;
         close_sock(s);
+        tjs_sock_clear_poll_refs(rt, s);
+        /* A callback finalizer may pump the poll close callback above. */
+        s->finalized = true;
         /* Free now only if the poll close_cb will not run later. If a close
          * is in flight and its cb has not fired yet, defer freeing to the cb
          * (which now checks s->finalized). */
-        if (!s->poll_closing || s->poll_closed) {
+        if (!s->in_cb && (!s->poll_closing || s->poll_closed)) {
+            tjs_sock_list_remove(s);
             tjs__free(s);
         }
     }
@@ -482,11 +512,7 @@ static JSValue tjs_sock_close(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (s->closed)  return tjs_throw_errno_msg(ctx, UV_EBADF, "Socket already closed");
     if (s->in_cb)   return tjs_throw_errno_msg(ctx, UV_EBUSY, "Cannot close during poll callback");
     close_sock(s);
-    if (!JS_IsUndefined(s->this_obj)) {
-        JSValue obj = s->this_obj;
-        s->this_obj = JS_UNDEFINED;
-        JS_FreeValue(ctx, obj);
-    }
+    tjs_sock_clear_poll_refs(JS_GetRuntime(ctx), s);
     return JS_UNDEFINED;
 }
 
@@ -904,11 +930,36 @@ static JSValue tjs_sock_sendmsg(JSContext *ctx, JSValue this_val, int argc, JSVa
 
 static void tjs_sock_uv_poll_cb(uv_poll_t *handle, int status, int events) {
     tjs_sock_t *s = uv_handle_get_data((uv_handle_t *) handle);
-    JSValue args[] = { JS_NewInt32(s->jsctx, status), JS_NewInt32(s->jsctx, events) };
+    if (!s || !s->trt || s->trt->freeing) {
+        if (s) close_sock(s);
+        return;
+    }
+    if (s->closed || s->in_cb || JS_IsUndefined(s->callback)) return;
+    JSContext *ctx = s->jsctx;
+    /* poll() can replace its callback; cleanup can drop both shared roots. */
+    JSValue callback = JS_DupValue(ctx, s->callback);
+    JSValue this_obj = JS_DupValue(ctx, s->this_obj);
+    JSValue args[] = { JS_NewInt32(ctx, status), JS_NewInt32(ctx, events) };
     s->in_cb = true;
-    JSValue ret = JS_Call(s->jsctx, s->callback, s->this_obj, countof(args), args);
+    JSValue ret = JS_Call(ctx, callback, this_obj, countof(args), args);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, callback);
+    JS_FreeValue(ctx, this_obj);
     s->in_cb = false;
-    JS_FreeValue(s->jsctx, ret);
+    if (s->closed) close_sock(s);
+}
+
+void tjs__mod_socket_cleanup_runtime(TJSRuntime *trt) {
+    while (!list_empty(&trt->sockets)) {
+        tjs_sock_t *s = list_entry(trt->sockets.next, tjs_sock_t, runtime_link);
+        /* JS roots may own other sockets, whose finalizers can remove any
+         * remaining node. Never retain a successor across JS_FreeValueRT. */
+        tjs_sock_list_remove(s);
+        close_sock(s);
+        tjs_sock_clear_poll_refs(trt->rt, s);
+    }
 }
 
 static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -973,9 +1024,9 @@ static JSValue tjs_sock_poll(JSContext *ctx, JSValue this_val, int argc, JSValue
         s->callback = old_callback;
         return tjs_throw_errno(ctx, ret);
     }
-    JS_FreeValue(ctx, old_callback);
     if (JS_IsUndefined(s->this_obj))
         s->this_obj = JS_DupValue(ctx, this_val);
+    JS_FreeValue(ctx, old_callback);
     return JS_UNDEFINED;
 }
 
@@ -986,15 +1037,7 @@ static JSValue tjs_sock_poll_stop(JSContext *ctx, JSValue this_val, int argc, JS
         return tjs_throw_errno_msg(ctx, UV_EBADF, "Poll not active");
     int ret = uv_poll_stop(&s->poll);
     if (ret < 0) return tjs_throw_errno(ctx, ret);
-    if (!JS_IsUndefined(s->callback)) {
-        JS_FreeValue(ctx, s->callback);
-        s->callback = JS_UNDEFINED;
-    }
-    if (!JS_IsUndefined(s->this_obj)) {
-        JSValue obj = s->this_obj;
-        s->this_obj = JS_UNDEFINED;
-        JS_FreeValue(ctx, obj);
-    }
+    tjs_sock_clear_poll_refs(JS_GetRuntime(ctx), s);
     return JS_UNDEFINED;
 }
 
