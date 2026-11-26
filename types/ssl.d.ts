@@ -42,8 +42,8 @@ declare namespace CModuleSSL {
         /** Maximum TLS version */
         maxVersion?: "TLSv1.0" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3";
 
-        /** Certificate PEM data */
-        cert?: string;
+        /** Certificate PEM data, or a parsed Certificate */
+        cert?: string | Certificate;
 
         /** Private key PEM data */
         key?: string;
@@ -125,11 +125,85 @@ declare namespace CModuleSSL {
         /** Valid to date */
         validTo: string;
 
-        /** Subject alternative names */
-        subjectAltNames?: string[];
+        /** Valid from as Unix epoch milliseconds */
+        validFromMs: number;
 
-        /** SHA-256 fingerprint */
-        fingerprint256: string;
+        /** Valid to as Unix epoch milliseconds */
+        validToMs: number;
+
+        /** Is this a CA certificate */
+        ca: boolean;
+
+        /** Subject alternative names (comma-separated, typed) */
+        subjectAltName?: string;
+
+        /** Authority information access entries */
+        infoAccess?: string;
+
+        /** Extended key usage OIDs */
+        keyUsage?: string[];
+
+        /** Signature algorithm long name */
+        signatureAlgorithm?: string;
+
+        /** Signature algorithm OID */
+        signatureAlgorithmOid?: string;
+    }
+
+    /**
+     * Certificate - X.509 certificate wrapper
+     *
+     * Owns a parsed certificate. Instances come from `new Certificate(data)`,
+     * `loadPEM(data, 'certificate')` or `pipe.certificate`.
+     */
+    export class Certificate {
+        /** Parse a certificate from PEM or DER data */
+        constructor(data: ArrayBuffer | ArrayBufferView);
+
+        /** Structured certificate metadata */
+        get info(): CertificateInfo;
+
+        /** DER encoding */
+        readonly raw: ArrayBuffer;
+
+        /** Subject public key, SPKI DER */
+        readonly publicKey: ArrayBuffer;
+
+        /** PEM encoding */
+        readonly pem: string;
+
+        /** SHA-1 fingerprint (colon-separated hex) */
+        readonly fingerprint: string;
+
+        /** SHA-256 fingerprint (colon-separated hex) */
+        readonly fingerprint256: string;
+
+        /** SHA-512 fingerprint (colon-separated hex) */
+        readonly fingerprint512: string;
+
+        /** Check the certificate against a hostname; returns the matched name */
+        checkHost(name: string, options?: {
+            subject?: 'default' | 'always' | 'never';
+            wildcards?: boolean;
+            partialWildcards?: boolean;
+            multiLabelWildcards?: boolean;
+            singleLabelSubdomains?: boolean;
+        }): string | undefined;
+
+        /** Check the certificate against an email address */
+        checkEmail(email: string, options?: { subject?: 'default' | 'always' | 'never' }): string | undefined;
+
+        /** Check the certificate against an IP address */
+        checkIP(ip: string): string | undefined;
+
+        /** Whether this certificate was issued by |issuer| */
+        checkIssued(issuer: Certificate): boolean;
+
+        /** Whether the certificate signature verifies with |publicKey| (SPKI DER) */
+        verify(publicKey: ArrayBuffer | ArrayBufferView): boolean;
+
+        /** Whether |privateKey| (DER) matches the certificate's public key */
+        checkPrivateKey(privateKey: ArrayBuffer | ArrayBufferView): boolean;
     }
 
     /**
@@ -214,10 +288,10 @@ declare namespace CModuleSSL {
         shutdown(): number;
 
         /**
-         * Get peer certificate information
-         * @returns Certificate info or null if not available
+         * Get the peer certificate
+         * @returns Certificate instance, or null if not available
          */
-        readonly certificate: CertificateInfo | null;
+        readonly certificate: Certificate | null;
 
         /**
          * Get negotiated SSL/TLS version
@@ -251,11 +325,13 @@ declare namespace CModuleSSL {
     }
 
     /**
-     * PEM Data Info
+     * Private key summary returned by `loadPEM(data, 'key')`.
      */
-    export interface PEMInfo {
-        subject?: string;
+    export interface KeyInfo {
+        /** Key algorithm name ("RSA", "EC", "Ed25519" or "unknown") */
         type?: string;
+
+        /** Key size in bits */
         bits?: number;
     }
 
@@ -296,7 +372,8 @@ declare namespace CModuleSSL {
      * @param data PEM-encoded data
      * @param type Type: "certificate" or "key"
      */
-    export function loadPEM(data: string, type?: "certificate" | "key"): PEMInfo | null;
+    export function loadPEM(data: string, type?: "certificate"): Certificate | null;
+    export function loadPEM(data: string, type: "key"): KeyInfo | null;
 
     /**
      * Create a self-signed certificate

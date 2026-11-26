@@ -30,6 +30,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -85,6 +86,12 @@ typedef enum {
     TJS_SSL_HANDSHAKE_ERROR
 } TJSSSLHandshakeState;
 
+/* Defined in the Certificate region below; the SSLContext constructor accepts
+ * a Certificate in place of a PEM string. */
+typedef struct TJSSSLCertificate TJSSSLCertificate;
+static TJSSSLCertificate *tjs_ssl_certificate_probe(JSValueConst value);
+static JSValue tjs_ssl_certificate_to_pem(JSContext *ctx, JSValueConst this_val);
+
 #pragma region SSLContext
 typedef struct {
     JSContext *ctx;
@@ -103,7 +110,7 @@ typedef struct {
     size_t alpn_list_len;
 } TJSSSLContext;
 
-static thread_local JSClassID tjs_ssl_context_class_id;
+static JSClassID tjs_ssl_context_class_id;
 
 static void tjs_ssl_context_finalizer(JSRuntime *rt, JSValue val) {
     TJSSSLContext *ssl_ctx = JS_GetOpaque(val, tjs_ssl_context_class_id);
@@ -325,12 +332,28 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
     JS_FreeValue(ctx, min_ver_val);
     JS_FreeValue(ctx, max_ver_val);
     
-    /* Certificate and key */
+    /* Certificate and key. `cert` may be a PEM string or a Certificate. */
     JSValue cert_val = JS_GetPropertyStr(ctx, options, "cert");
     JSValue key_val = JS_GetPropertyStr(ctx, options, "key");
     const char *cert = cstr(ctx, cert_val);
     const char *key = cstr(ctx, key_val);
-    
+    JSValue cert_pem_val = JS_UNDEFINED;
+    if (!cert && tjs_ssl_certificate_probe(cert_val)) {
+        cert_pem_val = tjs_ssl_certificate_to_pem(ctx, cert_val);
+        if (!JS_IsException(cert_pem_val))
+            cert = JS_ToCString(ctx, cert_pem_val);
+        if (!cert) {
+            JS_FreeValue(ctx, cert_val);
+            JS_FreeValue(ctx, key_val);
+            JS_FreeValue(ctx, cert_pem_val);
+            if (key) JS_FreeCString(ctx, key);
+            SSL_CTX_free(ssl_ctx->ssl_ctx);
+            js_free(ctx, ssl_ctx);
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+    }
+
     if (cert) {
         ssl_ctx->cert_pem = js_strdup(ctx, cert);
         int ret = ssl_ctx_use_certificate_chain_pem(ssl_ctx->ssl_ctx, cert);
@@ -338,6 +361,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
         if (ret != 1) {
             JS_FreeValue(ctx, cert_val);
             JS_FreeValue(ctx, key_val);
+            JS_FreeValue(ctx, cert_pem_val);
             if (key) JS_FreeCString(ctx, key);
             if (ssl_ctx->cert_pem) js_free(ctx, ssl_ctx->cert_pem);
             SSL_CTX_free(ssl_ctx->ssl_ctx);
@@ -346,6 +370,7 @@ static JSValue tjs_ssl_context_constructor(JSContext *ctx, JSValueConst new_targ
             SSL_THROW_ERROR(ctx, "SSL_CTX_use_certificate_chain_pem");
         }
     }
+    JS_FreeValue(ctx, cert_pem_val);
     JS_FreeValue(ctx, cert_val);
 
     if (key) {
@@ -544,6 +569,575 @@ SSL_CTX* tjs__sslctx_get(JSContext *ctx, JSValueConst obj){
 	return ssl_ctx->ssl_ctx;
 }
 
+#pragma region Certificate
+/* An X.509 certificate wrapper. Owns the X509 and backs both the `ssl.Certificate`
+ * constructor and `pipe.certificate`, so peer certs and parsed PEM share one
+ * implementation. */
+struct TJSSSLCertificate {
+    X509 *x509;
+};
+
+static JSClassID tjs_ssl_certificate_class_id;
+
+static void tjs_ssl_certificate_finalizer(JSRuntime *rt, JSValue val) {
+    TJSSSLCertificate *cert = JS_GetOpaque(val, tjs_ssl_certificate_class_id);
+    if (cert) {
+        X509_free(cert->x509);
+        js_free_rt(rt, cert);
+    }
+}
+
+static JSClassDef tjs_ssl_certificate_class = {
+    "Certificate",
+    .finalizer = tjs_ssl_certificate_finalizer,
+};
+
+static JSValue tjs_ssl_certificate_error(JSContext *ctx, const char *message) {
+    ERR_clear_error();
+    return JS_ThrowTypeError(ctx, "%s", message);
+}
+
+static JSValue tjs_ssl_certificate_name_error(JSContext *ctx, const char *message) {
+    tjs_ssl_certificate_error(ctx, message);
+    JSValue error = JS_GetException(ctx);
+    if (JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, "ERR_INVALID_ARG_VALUE")) < 0) {
+        JS_FreeValue(ctx, error);
+        return JS_EXCEPTION;
+    }
+    return JS_Throw(ctx, error);
+}
+
+static TJSSSLCertificate *tjs_ssl_certificate_get(JSContext *ctx, JSValueConst value) {
+    if (tjs_ssl_certificate_class_id == JS_INVALID_CLASS_ID)
+        return NULL;
+    TJSSSLCertificate *cert = JS_GetOpaque2(ctx, value, tjs_ssl_certificate_class_id);
+    return cert;
+}
+
+/* Non-throwing probe for callers that accept several input types. */
+static TJSSSLCertificate *tjs_ssl_certificate_probe(JSValueConst value) {
+    if (tjs_ssl_certificate_class_id == JS_INVALID_CLASS_ID) return NULL;
+    return JS_GetOpaque(value, tjs_ssl_certificate_class_id);
+}
+
+/* Attach an X509 to a new instance, taking ownership. |prototype| is used for
+ * the constructor path; NULL uses the class prototype. */
+static JSValue tjs_ssl_certificate_new(JSContext *ctx, X509 *x509, JSValueConst prototype) {
+    if (!x509) return JS_NULL;
+    if (tjs_ssl_certificate_class_id == JS_INVALID_CLASS_ID) {
+        X509_free(x509);
+        return JS_ThrowInternalError(ctx, "Certificate is not initialized");
+    }
+    TJSSSLCertificate *cert = js_mallocz(ctx, sizeof(*cert));
+    if (!cert) {
+        X509_free(x509);
+        return JS_EXCEPTION;
+    }
+    cert->x509 = x509;
+
+    JSValue obj = JS_IsNull(prototype)
+        ? JS_NewObjectClass(ctx, tjs_ssl_certificate_class_id)
+        : JS_NewObjectProtoClass(ctx, prototype, tjs_ssl_certificate_class_id);
+    if (JS_IsException(obj)) {
+        X509_free(x509);
+        js_free(ctx, cert);
+        return obj;
+    }
+    JS_SetOpaque(obj, cert);
+    return obj;
+}
+
+/* Wrap an X509 from C, taking ownership. */
+static JSValue tjs_ssl_certificate_wrap(JSContext *ctx, X509 *x509) {
+    return tjs_ssl_certificate_new(ctx, x509, JS_NULL);
+}
+
+/* Parse PEM or DER certificate data into a new X509. */
+static X509 *tjs_ssl_certificate_parse(const unsigned char *data, size_t length) {
+    BIO *input = BIO_new_mem_buf(data, (int)length);
+    if (!input) return NULL;
+    ERR_clear_error();
+    X509 *certificate = PEM_read_bio_X509(input, NULL, NULL, NULL);
+    BIO_free(input);
+    if (certificate) return certificate;
+    ERR_clear_error();
+    const unsigned char *cursor = data;
+    return d2i_X509(NULL, &cursor, (long)length);
+}
+
+static JSValue tjs_ssl_certificate_constructor(JSContext *ctx, JSValueConst new_target,
+                                               int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "certificate data is required");
+    size_t length;
+    const unsigned char *data = JS_GetAnyBuffer(ctx, &length, argv[0]);
+    if (!data)
+        return JS_HasException(ctx) ? JS_EXCEPTION : tjs_ssl_certificate_error(ctx, "invalid certificate data");
+    if (length == 0 || length > INT_MAX)
+        return tjs_ssl_certificate_error(ctx, "invalid certificate data");
+
+    X509 *certificate = tjs_ssl_certificate_parse(data, length);
+    if (!certificate) return tjs_ssl_certificate_error(ctx, "invalid X.509 certificate");
+
+    JSValue prototype = JS_GetPropertyStr(ctx, new_target, "prototype");
+    if (JS_IsException(prototype)) {
+        X509_free(certificate);
+        return JS_EXCEPTION;
+    }
+    JSValue result = tjs_ssl_certificate_new(ctx, certificate, prototype);
+    JS_FreeValue(ctx, prototype);
+    return result;
+}
+
+static JSValue tjs_ssl_certificate_bio_string(JSContext *ctx, BIO *output) {
+    char *data;
+    long length = BIO_get_mem_data(output, &data);
+    return JS_NewStringLen(ctx, data, length > 0 ? (size_t)length : 0);
+}
+
+static int tjs_ssl_certificate_set_name(JSContext *ctx, JSValue target, const char *key,
+                                        X509_NAME *name, BIO *output) {
+    BIO_reset(output);
+    if (X509_NAME_print_ex(output, name, 0,
+            ASN1_STRFLGS_ESC_2253 | ASN1_STRFLGS_ESC_CTRL | ASN1_STRFLGS_UTF8_CONVERT |
+            XN_FLAG_SEP_MULTILINE | XN_FLAG_FN_SN) < 0) {
+        tjs_ssl_certificate_error(ctx, "cannot format certificate name");
+        return -1;
+    }
+    return JS_SetPropertyStr(ctx, target, key, tjs_ssl_certificate_bio_string(ctx, output));
+}
+
+static int tjs_ssl_certificate_print_alt_name(BIO *output, const unsigned char *data,
+                                               size_t length, bool utf8) {
+    if ((!data && length) || length > INT_MAX) return 0;
+    bool quote = false;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = data[index];
+        if (byte < 32 || byte == 127 || (!utf8 && byte > 126) ||
+            byte == ',' || byte == '"' || byte == '\\' || byte == '\'') {
+            quote = true;
+            break;
+        }
+    }
+    if (!quote) return length == 0 || BIO_write(output, data, (int)length) == (int)length;
+    if (BIO_puts(output, "\"") <= 0) return 0;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = data[index];
+        if (byte == '"' || byte == '\\') {
+            if (BIO_printf(output, "\\%c", byte) <= 0) return 0;
+        } else if (byte < 32 || byte == 127 || (!utf8 && byte > 126) || byte == ',') {
+            if (BIO_printf(output, "\\u%04x", byte) <= 0) return 0;
+        } else if (BIO_write(output, data + index, 1) != 1) {
+            return 0;
+        }
+    }
+    return BIO_puts(output, "\"") > 0;
+}
+
+static const unsigned char *tjs_ssl_certificate_asn1_bytes(const ASN1_STRING *value, size_t *length) {
+    if (!value) return NULL;
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+    *length = ASN1_STRING_get_length(value);
+#else
+    int size = ASN1_STRING_length(value);
+    if (size < 0) return NULL;
+    *length = (size_t)size;
+#endif
+    return ASN1_STRING_get0_data(value);
+}
+
+static int tjs_ssl_certificate_print_name(BIO *output, const GENERAL_NAME *name) {
+    if (!name) return 0;
+    const ASN1_STRING *value = NULL;
+    const char *prefix = NULL;
+    switch (name->type) {
+        case GEN_DNS: value = name->d.dNSName; prefix = "DNS:"; break;
+        case GEN_EMAIL: value = name->d.rfc822Name; prefix = "email:"; break;
+        case GEN_URI: value = name->d.uniformResourceIdentifier; prefix = "URI:"; break;
+        case GEN_DIRNAME: {
+            if (!name->d.dirn || BIO_puts(output, "DirName:") <= 0) return 0;
+            BIO *directory = BIO_new(BIO_s_mem());
+            if (!directory) return 0;
+            int status = X509_NAME_print_ex(directory, name->d.dirn, 0,
+                XN_FLAG_RFC2253 & ~ASN1_STRFLGS_ESC_MSB & ~ASN1_STRFLGS_ESC_CTRL);
+            char *data;
+            long length = BIO_get_mem_data(directory, &data);
+            int result = status >= 0 && length >= 0 && length <= INT_MAX &&
+                tjs_ssl_certificate_print_alt_name(output, (const unsigned char *)data, (size_t)length, true);
+            BIO_free(directory);
+            return result;
+        }
+        case GEN_IPADD: {
+            size_t length;
+            const unsigned char *address = tjs_ssl_certificate_asn1_bytes(name->d.iPAddress, &length);
+            if (!address || (length != 4 && length != 16)) return 0;
+            if (BIO_puts(output, "IP Address:") <= 0) return 0;
+            for (size_t index = 0; index < length; index += length == 4 ? 1 : 2) {
+                int status = length == 4
+                    ? BIO_printf(output, index ? ".%u" : "%u", address[index])
+                    : BIO_printf(output, index ? ":%X" : "%X", address[index] * 256 + address[index + 1]);
+                if (status <= 0) return 0;
+            }
+            return 1;
+        }
+        case GEN_RID: {
+            char oid[128];
+            int length = OBJ_obj2txt(oid, sizeof(oid), name->d.registeredID, 1);
+            return length > 0 && (size_t)length < sizeof(oid) &&
+                BIO_puts(output, "Registered ID:") > 0 && BIO_write(output, oid, length) == length;
+        }
+        case GEN_OTHERNAME: return BIO_puts(output, "othername:<unsupported>") > 0;
+        case GEN_X400: return BIO_puts(output, "X400Name:<unsupported>") > 0;
+        case GEN_EDIPARTY: return BIO_puts(output, "EdiPartyName:<unsupported>") > 0;
+        default: return 0;
+    }
+    if (!value || BIO_puts(output, prefix) <= 0) return 0;
+    size_t length;
+    const unsigned char *data = tjs_ssl_certificate_asn1_bytes(value, &length);
+    return data && tjs_ssl_certificate_print_alt_name(output, data, length, false);
+}
+
+static int tjs_ssl_certificate_set_extension(JSContext *ctx, JSValue target, const char *key,
+                                             X509 *certificate, int nid, BIO *output) {
+    if (X509_get_ext_by_NID(certificate, nid, -1) < 0) return 0;
+    BIO_reset(output);
+    bool valid = true;
+    if (nid == NID_subject_alt_name) {
+        GENERAL_NAMES *names = X509_get_ext_d2i(certificate, nid, NULL, NULL);
+        int count = names ? sk_GENERAL_NAME_num(names) : 0;
+        valid = count > 0;
+        for (int index = 0; valid && index < count; index++) {
+            valid = (!index || BIO_puts(output, ", ") > 0) &&
+                tjs_ssl_certificate_print_name(output, sk_GENERAL_NAME_value(names, index));
+        }
+        GENERAL_NAMES_free(names);
+    } else {
+        AUTHORITY_INFO_ACCESS *entries = X509_get_ext_d2i(certificate, nid, NULL, NULL);
+        int count = entries ? sk_ACCESS_DESCRIPTION_num(entries) : 0;
+        valid = count > 0;
+        for (int index = 0; valid && index < count; index++) {
+            ACCESS_DESCRIPTION *entry = sk_ACCESS_DESCRIPTION_value(entries, index);
+            if (!entry || !entry->method || !entry->location) {
+                valid = false;
+                break;
+            }
+            char method[128];
+            int length = OBJ_obj2txt(method, sizeof(method), entry->method, 0);
+            valid = length > 0 && (size_t)length < sizeof(method) &&
+                (!index || BIO_puts(output, "\n") > 0) &&
+                BIO_write(output, method, length) == length &&
+                BIO_puts(output, " - ") > 0 && tjs_ssl_certificate_print_name(output, entry->location);
+        }
+        AUTHORITY_INFO_ACCESS_free(entries);
+    }
+    if (!valid) {
+        tjs_ssl_certificate_error(ctx, "invalid or unsupported certificate name extension");
+        return -1;
+    }
+    return JS_SetPropertyStr(ctx, target, key, tjs_ssl_certificate_bio_string(ctx, output));
+}
+
+static JSValue tjs_ssl_certificate_build_info(JSContext *ctx, X509 *certificate) {
+    BIO *output = BIO_new(BIO_s_mem());
+    if (!output) return JS_ThrowOutOfMemory(ctx);
+    JSValue result = JS_NewObject(ctx);
+    if (JS_IsException(result)) goto fail;
+
+    if (tjs_ssl_certificate_set_name(ctx, result, "subject", X509_get_subject_name(certificate), output) < 0 ||
+        tjs_ssl_certificate_set_name(ctx, result, "issuer", X509_get_issuer_name(certificate), output) < 0 ||
+        tjs_ssl_certificate_set_extension(ctx, result, "subjectAltName", certificate, NID_subject_alt_name, output) < 0 ||
+        tjs_ssl_certificate_set_extension(ctx, result, "infoAccess", certificate, NID_info_access, output) < 0 ||
+        JS_SetPropertyStr(ctx, result, "ca", JS_NewBool(ctx, X509_check_ca(certificate) == 1)) < 0)
+        goto fail;
+
+    const ASN1_TIME *times[] = { X509_get0_notBefore(certificate), X509_get0_notAfter(certificate) };
+    const char *time_names[] = { "validFrom", "validTo" };
+    const char *millis_names[] = { "validFromMs", "validToMs" };
+    ASN1_TIME *epoch = ASN1_TIME_set(NULL, 0);
+    if (!epoch) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+    for (int index = 0; index < 2; index++) {
+        int days, seconds;
+        BIO_reset(output);
+        if (!ASN1_TIME_print(output, times[index]) ||
+            !ASN1_TIME_diff(&days, &seconds, epoch, times[index])) {
+            ASN1_TIME_free(epoch);
+            tjs_ssl_certificate_error(ctx, "invalid certificate validity time");
+            goto fail;
+        }
+        if (JS_SetPropertyStr(ctx, result, time_names[index], tjs_ssl_certificate_bio_string(ctx, output)) < 0 ||
+            JS_SetPropertyStr(ctx, result, millis_names[index],
+                JS_NewFloat64(ctx, ((double)days * 86400 + seconds) * 1000)) < 0) {
+            ASN1_TIME_free(epoch);
+            goto fail;
+        }
+    }
+    ASN1_TIME_free(epoch);
+
+    BIGNUM *serial = ASN1_INTEGER_to_BN(X509_get_serialNumber(certificate), NULL);
+    char *serial_text = serial ? BN_bn2hex(serial) : NULL;
+    BN_free(serial);
+    if (!serial_text) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+    int status = JS_SetPropertyStr(ctx, result, "serialNumber", JS_NewString(ctx, serial_text));
+    OPENSSL_free(serial_text);
+    if (status < 0) goto fail;
+
+    EXTENDED_KEY_USAGE *usage = X509_get_ext_d2i(certificate, NID_ext_key_usage, NULL, NULL);
+    if (usage) {
+        JSValue values = JS_NewArray(ctx);
+        if (JS_IsException(values)) {
+            EXTENDED_KEY_USAGE_free(usage);
+            goto fail;
+        }
+        for (int index = 0; index < sk_ASN1_OBJECT_num(usage); index++) {
+            char oid[128];
+            int length = OBJ_obj2txt(oid, sizeof(oid), sk_ASN1_OBJECT_value(usage, index), 1);
+            if (length <= 0 || (size_t)length >= sizeof(oid) ||
+                JS_SetPropertyUint32(ctx, values, index, JS_NewStringLen(ctx, oid, length)) < 0) {
+                EXTENDED_KEY_USAGE_free(usage);
+                JS_FreeValue(ctx, values);
+                if (!JS_HasException(ctx)) tjs_ssl_certificate_error(ctx, "invalid certificate key usage");
+                goto fail;
+            }
+        }
+        EXTENDED_KEY_USAGE_free(usage);
+        if (JS_SetPropertyStr(ctx, result, "keyUsage", values) < 0) goto fail;
+    }
+    const ASN1_OBJECT *signature;
+    X509_ALGOR_get0(&signature, NULL, NULL, X509_get0_tbs_sigalg(certificate));
+    char oid[128];
+    int length = OBJ_obj2txt(oid, sizeof(oid), signature, 1);
+    if (length > 0 && (size_t)length < sizeof(oid) &&
+        JS_SetPropertyStr(ctx, result, "signatureAlgorithmOid", JS_NewStringLen(ctx, oid, length)) < 0)
+        goto fail;
+    const char *signature_name = OBJ_nid2ln(OBJ_obj2nid(signature));
+    if (signature_name && JS_SetPropertyStr(ctx, result, "signatureAlgorithm", JS_NewString(ctx, signature_name)) < 0)
+        goto fail;
+
+    BIO_free(output);
+    return result;
+fail:
+    BIO_free(output);
+    JS_FreeValue(ctx, result);
+    return JS_EXCEPTION;
+}
+
+/* `info` is rebuilt on each access so a caller can mutate the returned object
+ * and arrays without affecting later reads. */
+static JSValue tjs_ssl_certificate_info(JSContext *ctx, JSValueConst this_val) {
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) return JS_EXCEPTION;
+    return tjs_ssl_certificate_build_info(ctx, cert->x509);
+}
+
+/* PEM encoding; also used to accept a Certificate where a PEM string is
+ * expected (see the SSLContext constructor). */
+static JSValue tjs_ssl_certificate_to_pem(JSContext *ctx, JSValueConst this_val) {
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) return JS_EXCEPTION;
+    BIO *output = BIO_new(BIO_s_mem());
+    if (!output) return JS_ThrowOutOfMemory(ctx);
+    if (!PEM_write_bio_X509(output, cert->x509)) {
+        BIO_free(output);
+        return tjs_ssl_certificate_error(ctx, "cannot encode certificate");
+    }
+    JSValue result = tjs_ssl_certificate_bio_string(ctx, output);
+    BIO_free(output);
+    return result;
+}
+
+/* `raw` (DER) and `publicKey` (SPKI DER) as ArrayBuffers. */
+static JSValue tjs_ssl_certificate_encode(JSContext *ctx, JSValueConst this_val, int magic) {
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) return JS_EXCEPTION;
+    X509 *certificate = cert->x509;
+    unsigned char *data = NULL;
+    int length;
+    bool public_key = magic == 1;
+    if (public_key) {
+        EVP_PKEY *key = X509_get_pubkey(certificate);
+        if (!key) return tjs_ssl_certificate_error(ctx, "invalid certificate public key");
+        length = i2d_PUBKEY(key, &data);
+        EVP_PKEY_free(key);
+    } else {
+        length = i2d_X509(certificate, &data);
+    }
+    if (length <= 0) {
+        OPENSSL_free(data);
+        return tjs_ssl_certificate_error(ctx, public_key
+            ? "cannot encode certificate public key" : "cannot encode certificate");
+    }
+    JSValue result = JS_NewArrayBufferCopy(ctx, data, length);
+    OPENSSL_free(data);
+    return result;
+}
+
+/* Digest getters: Node exposes fingerprint / fingerprint256 / fingerprint512
+ * as properties, not a fingerprint(algorithm) method. */
+static JSValue tjs_ssl_certificate_fingerprint(JSContext *ctx, JSValueConst this_val, int magic) {
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) return JS_EXCEPTION;
+    const EVP_MD *digest = magic == 0 ? EVP_sha1() : magic == 1 ? EVP_sha256() : EVP_sha512();
+    unsigned char bytes[EVP_MAX_MD_SIZE];
+    unsigned int length;
+    if (!X509_digest(cert->x509, digest, bytes, &length))
+        return tjs_ssl_certificate_error(ctx, "cannot digest certificate");
+    char result[EVP_MAX_MD_SIZE * 3];
+    static const char hex[] = "0123456789ABCDEF";
+    for (unsigned int index = 0; index < length; index++) {
+        result[index * 3] = hex[bytes[index] >> 4];
+        result[index * 3 + 1] = hex[bytes[index] & 15];
+        result[index * 3 + 2] = ':';
+    }
+    return JS_NewStringLen(ctx, result, length ? length * 3 - 1 : 0);
+}
+
+static int tjs_ssl_certificate_check_flags(JSContext *ctx, JSValueConst options, bool host,
+                                           unsigned int *flags) {
+    *flags = 0;
+    if (JS_IsUndefined(options)) return 0;
+    if (!JS_IsObject(options)) {
+        JS_ThrowTypeError(ctx, "certificate check options must be an object");
+        return -1;
+    }
+    JSValue subject = JS_GetPropertyStr(ctx, options, "subject");
+    if (JS_IsException(subject)) return -1;
+    if (!JS_IsUndefined(subject)) {
+        if (!JS_IsString(subject)) {
+            JS_FreeValue(ctx, subject);
+            JS_ThrowTypeError(ctx, "certificate subject option must be a string");
+            return -1;
+        }
+        const char *mode = JS_ToCString(ctx, subject);
+        JS_FreeValue(ctx, subject);
+        if (!mode) return -1;
+        if (strcmp(mode, "always") == 0) *flags |= X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT;
+        else if (strcmp(mode, "never") == 0) *flags |= X509_CHECK_FLAG_NEVER_CHECK_SUBJECT;
+        else if (strcmp(mode, "default") != 0) {
+            JS_FreeCString(ctx, mode);
+            JS_ThrowTypeError(ctx, "invalid certificate subject option");
+            return -1;
+        }
+        JS_FreeCString(ctx, mode);
+    } else {
+        JS_FreeValue(ctx, subject);
+    }
+    if (!host) return 0;
+    const char *names[] = { "wildcards", "partialWildcards", "multiLabelWildcards", "singleLabelSubdomains" };
+    const unsigned int masks[] = { X509_CHECK_FLAG_NO_WILDCARDS, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,
+        X509_CHECK_FLAG_MULTI_LABEL_WILDCARDS, X509_CHECK_FLAG_SINGLE_LABEL_SUBDOMAINS };
+    for (int index = 0; index < 4; index++) {
+        JSValue value = JS_GetPropertyStr(ctx, options, names[index]);
+        if (JS_IsException(value)) return -1;
+        if (!JS_IsUndefined(value)) {
+            if (!JS_IsBool(value)) {
+                JS_FreeValue(ctx, value);
+                JS_ThrowTypeError(ctx, "%s must be a boolean", names[index]);
+                return -1;
+            }
+            if ((JS_ToBool(ctx, value) != 0) == (index >= 2)) *flags |= masks[index];
+        }
+        JS_FreeValue(ctx, value);
+    }
+    return 0;
+}
+
+static JSValue tjs_ssl_certificate_check_name(JSContext *ctx, JSValueConst this_val,
+                                              int argc, JSValueConst *argv, int magic) {
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "certificate name must be a string");
+    unsigned int flags = 0;
+    if (magic != 2 && tjs_ssl_certificate_check_flags(ctx, argc > 1 ? argv[1] : JS_UNDEFINED, magic == 0, &flags) < 0)
+        return JS_EXCEPTION;
+    size_t length;
+    const char *name = JS_ToCStringLen(ctx, &length, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    if (memchr(name, 0, length)) {
+        JS_FreeCString(ctx, name);
+        return tjs_ssl_certificate_name_error(ctx, "certificate name contains a null byte");
+    }
+    unsigned char address[16];
+    size_t address_length = 0;
+    if (magic == 2) {
+        if (uv_inet_pton(AF_INET, name, address) == 0) address_length = 4;
+        else if (uv_inet_pton(AF_INET6, name, address) == 0) address_length = 16;
+        else {
+            JS_FreeCString(ctx, name);
+            return tjs_ssl_certificate_name_error(ctx, "invalid certificate IP address");
+        }
+    }
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    char *matched = NULL;
+    int status = magic == 0 ? X509_check_host(cert->x509, name, length, flags, &matched) :
+        magic == 1 ? X509_check_email(cert->x509, name, length, flags) :
+        X509_check_ip(cert->x509, address, address_length, 0);
+    JSValue result = status == 1 ? JS_NewString(ctx, matched ? matched : name) : JS_UNDEFINED;
+    OPENSSL_free(matched);
+    JS_FreeCString(ctx, name);
+    if (status < 0) return tjs_ssl_certificate_name_error(ctx, "invalid certificate name");
+    return result;
+}
+
+static JSValue tjs_ssl_certificate_check_issued(JSContext *ctx, JSValueConst this_val,
+                                                 int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "issuer certificate is required");
+    TJSSSLCertificate *issuer = tjs_ssl_certificate_get(ctx, argv[0]);
+    if (!issuer) return JS_EXCEPTION;
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) return JS_EXCEPTION;
+    return JS_NewBool(ctx, X509_check_issued(issuer->x509, cert->x509) == X509_V_OK);
+}
+
+static JSValue tjs_ssl_certificate_check_key(JSContext *ctx, JSValueConst this_val,
+                                             int argc, JSValueConst *argv, int private_key) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "key data is required");
+    size_t length;
+    const unsigned char *data = JS_GetAnyBuffer(ctx, &length, argv[0]);
+    if (!data)
+        return JS_HasException(ctx) ? JS_EXCEPTION : tjs_ssl_certificate_error(ctx, "invalid key data");
+    if (length == 0 || length > LONG_MAX) return tjs_ssl_certificate_error(ctx, "invalid key data");
+    const unsigned char *cursor = data;
+    ERR_clear_error();
+    EVP_PKEY *key = private_key ? d2i_AutoPrivateKey(NULL, &cursor, (long)length) :
+        d2i_PUBKEY(NULL, &cursor, (long)length);
+    if (!key) return tjs_ssl_certificate_error(ctx, "invalid DER key data");
+    TJSSSLCertificate *cert = tjs_ssl_certificate_get(ctx, this_val);
+    if (!cert) {
+        EVP_PKEY_free(key);
+        return JS_EXCEPTION;
+    }
+    int status = private_key ? X509_check_private_key(cert->x509, key) : X509_verify(cert->x509, key);
+    EVP_PKEY_free(key);
+    ERR_clear_error();
+    return JS_NewBool(ctx, status == 1);
+}
+
+static const JSCFunctionListEntry tjs_ssl_certificate_proto_funcs[] = {
+    JS_CGETSET_DEF("info", tjs_ssl_certificate_info, NULL),
+    JS_CGETSET_MAGIC_DEF("raw", tjs_ssl_certificate_encode, NULL, 0),
+    JS_CGETSET_MAGIC_DEF("publicKey", tjs_ssl_certificate_encode, NULL, 1),
+    JS_CGETSET_DEF("pem", tjs_ssl_certificate_to_pem, NULL),
+    JS_CGETSET_MAGIC_DEF("fingerprint", tjs_ssl_certificate_fingerprint, NULL, 0),
+    JS_CGETSET_MAGIC_DEF("fingerprint256", tjs_ssl_certificate_fingerprint, NULL, 1),
+    JS_CGETSET_MAGIC_DEF("fingerprint512", tjs_ssl_certificate_fingerprint, NULL, 2),
+    JS_CFUNC_MAGIC_DEF("checkHost", 2, tjs_ssl_certificate_check_name, 0),
+    JS_CFUNC_MAGIC_DEF("checkEmail", 2, tjs_ssl_certificate_check_name, 1),
+    JS_CFUNC_MAGIC_DEF("checkIP", 1, tjs_ssl_certificate_check_name, 2),
+    JS_CFUNC_DEF("checkIssued", 1, tjs_ssl_certificate_check_issued),
+    JS_CFUNC_MAGIC_DEF("verify", 1, tjs_ssl_certificate_check_key, 0),
+    JS_CFUNC_MAGIC_DEF("checkPrivateKey", 1, tjs_ssl_certificate_check_key, 1),
+};
+
+#pragma endregion Certificate
+
 #pragma region SSLPipe
 typedef struct {
     JSContext *ctx;
@@ -559,7 +1153,7 @@ typedef struct {
     char *hostname;
 } TJSSSLPipe;
 
-static thread_local JSClassID tjs_ssl_pipe_class_id;
+static JSClassID tjs_ssl_pipe_class_id;
 
 static void tjs_ssl_pipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSSSLPipe *pipe = JS_GetOpaque(val, tjs_ssl_pipe_class_id);
@@ -593,6 +1187,9 @@ static JSClassDef tjs_ssl_pipe_class = {
 /* new SSLPipe(sslContext, options) */
 static JSValue tjs_ssl_pipe_constructor(JSContext *ctx, JSValueConst new_target,
                                          int argc, JSValueConst *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "SSLContext is required");
+    }
     TJSSSLContext *ssl_context = JS_GetOpaque2(ctx, argv[0], tjs_ssl_context_class_id);
     if (!ssl_context) {
         return JS_ThrowTypeError(ctx, "First argument must be SSLContext");
@@ -674,6 +1271,7 @@ static JSValue tjs_ssl_pipe_feed(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "encrypted data is required");
     
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
@@ -758,6 +1356,7 @@ static JSValue tjs_ssl_pipe_write(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "plaintext data is required");
     
     size_t size;
     uint8_t *buf = JS_GetAnyBuffer(ctx, &size, argv[0]);
@@ -842,115 +1441,11 @@ static JSValue tjs_ssl_pipe_shutdown(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
-/* pipe.certificate() - Get peer certificate info */
+/* pipe.certificate() - Get the peer certificate as a Certificate instance */
 static JSValue tjs_ssl_pipe_get_peer_certificate(JSContext *ctx, JSValueConst this_val) {
     TJSSSLPipe *pipe = JS_GetOpaque2(ctx, this_val, tjs_ssl_pipe_class_id);
     if (!pipe) return JS_EXCEPTION;
-    
-    X509 *cert = SSL_get_peer_certificate(pipe->ssl);
-    if (!cert) {
-        return JS_NULL;
-    }
-    
-    JSValue cert_obj = JS_NewObject(ctx);
-    
-    /* Subject */
-    char *subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
-    if (subj) {
-        JS_SetPropertyStr(ctx, cert_obj, "subject", JS_NewString(ctx, subj));
-        OPENSSL_free(subj);
-    }
-    
-    /* Issuer */
-    char *issuer = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
-    if (issuer) {
-        JS_SetPropertyStr(ctx, cert_obj, "issuer", JS_NewString(ctx, issuer));
-        OPENSSL_free(issuer);
-    }
-    
-    /* Serial number */
-    ASN1_INTEGER *serial = X509_get_serialNumber(cert);
-    if (serial) {
-        BIGNUM *bn = ASN1_INTEGER_to_BN(serial, NULL);
-        if (bn) {
-            char *serial_str = BN_bn2hex(bn);
-            if (serial_str) {
-                JS_SetPropertyStr(ctx, cert_obj, "serialNumber", JS_NewString(ctx, serial_str));
-                OPENSSL_free(serial_str);
-            }
-            BN_free(bn);
-        }
-    }
-    
-    /* Valid from/to */
-    const ASN1_TIME *not_before = X509_get0_notBefore(cert);
-    const ASN1_TIME *not_after = X509_get0_notAfter(cert);
-    
-    if (not_before) {
-        BIO *bio = BIO_new(BIO_s_mem());
-        ASN1_TIME_print(bio, not_before);
-        char buf[64];
-        int len = BIO_read(bio, buf, sizeof(buf) - 1);
-        if (len > 0) {
-            buf[len] = '\0';
-            JS_SetPropertyStr(ctx, cert_obj, "validFrom", JS_NewString(ctx, buf));
-        }
-        BIO_free(bio);
-    }
-    
-    if (not_after) {
-        BIO *bio = BIO_new(BIO_s_mem());
-        ASN1_TIME_print(bio, not_after);
-        char buf[64];
-        int len = BIO_read(bio, buf, sizeof(buf) - 1);
-        if (len > 0) {
-            buf[len] = '\0';
-            JS_SetPropertyStr(ctx, cert_obj, "validTo", JS_NewString(ctx, buf));
-        }
-        BIO_free(bio);
-    }
-    
-    /* Subject Alternative Names */
-    STACK_OF(GENERAL_NAME) *san_names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
-    if (san_names) {
-        JSValue san_array = JS_NewArray(ctx);
-        int san_count = sk_GENERAL_NAME_num(san_names);
-        int san_index = 0;  // Track actual SAN entries (non-DNS skipped)
-
-        for (int i = 0; i < san_count; i++) {
-            GENERAL_NAME *name = sk_GENERAL_NAME_value(san_names, i);
-            if (name->type == GEN_DNS) {
-                ASN1_STRING *dns = name->d.dNSName;
-                const char *dns_str = (const char *)ASN1_STRING_get0_data(dns);
-#if OPENSSL_VERSION_NUMBER >= 0x40100000L
-                size_t dns_len = ASN1_STRING_get_length(dns);
-#else
-                int dns_len = ASN1_STRING_length(dns);
-#endif
-                // Use JS_NewStringLen to handle potential embedded NUL and avoid strlen overflow
-                JS_SetPropertyUint32(ctx, san_array, san_index, JS_NewStringLen(ctx, dns_str, dns_len));
-                san_index++;
-            }
-        }
-
-        JS_SetPropertyStr(ctx, cert_obj, "subjectAltNames", san_array);
-        sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
-    }
-    
-    /* Fingerprint */
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int md_len;
-    if (X509_digest(cert, EVP_sha256(), md, &md_len)) {
-        char fingerprint[EVP_MAX_MD_SIZE * 3];
-        for (unsigned int i = 0; i < md_len; i++) {
-            sprintf(fingerprint + i * 3, "%02X:", md[i]);
-        }
-        fingerprint[md_len * 3 - 1] = '\0';
-        JS_SetPropertyStr(ctx, cert_obj, "fingerprint256", JS_NewString(ctx, fingerprint));
-    }
-    
-    X509_free(cert);
-    return cert_obj;
+    return tjs_ssl_certificate_wrap(ctx, SSL_get_peer_certificate(pipe->ssl));
 }
 
 /* pipe.version() - Get SSL/TLS version */
@@ -1061,12 +1556,12 @@ static const JSCFunctionListEntry tjs_ssl_pipe_proto_funcs[] = {
 
 #pragma region Utility Functions
 /* getOpenSSLVersion() */
-static int tjs__ssl_openssl_version(JSContext *ctx, JSValueConst ns) {
+static int tjs_ssl_static_version(JSContext *ctx, JSValueConst ns) {
     return JS_SetPropertyStr(ctx, ns, "version", JS_NewString(ctx, OpenSSL_version(OPENSSL_VERSION)));
 }
 
 /* cipherList() */
-static int tjs__ssl_cipher_list(JSContext *ctx, JSValueConst ns) {
+static int tjs_ssl_static_ciphers(JSContext *ctx, JSValueConst ns) {
     SSL_CTX *tmp_ctx = SSL_CTX_new(TLS_method());
     if (!tmp_ctx) {
         return JS_SetPropertyStr(ctx, ns, "ciphers", JS_NewArray(ctx));
@@ -1095,10 +1590,11 @@ static int tjs__ssl_cipher_list(JSContext *ctx, JSValueConst ns) {
 }
 
 /* loadPEM(data, type) - Load certificate or key from PEM */
-static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
+static JSValue tjs_ssl_static_load_pem(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "PEM data is required");
     const char *data = cstr(ctx, argv[0]);
-    if (!data) return JS_EXCEPTION;
+    if (!data) return JS_ThrowTypeError(ctx, "PEM data must be a string");
 
     const char *type = argc > 1 ? cstr(ctx, argv[1]) : "certificate";
     if (argc > 1 && !type) {
@@ -1107,9 +1603,9 @@ static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
     }
 
     BIO *bio = BIO_new_mem_buf(data, -1);
-    JS_FreeCString(ctx, data);
 
     if (!bio) {
+        JS_FreeCString(ctx, data);
         if (type != NULL && argc > 1) JS_FreeCString(ctx, type);
         return JS_ThrowOutOfMemory(ctx);
     }
@@ -1118,20 +1614,7 @@ static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
 
     if (strcmp(type, "certificate") == 0) {
         X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-        if (cert) {
-            /* Return basic certificate info */
-            result = JS_NewObject(ctx);
-            
-            char *subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
-            if (subj) {
-                JS_SetPropertyStr(ctx, result, "subject", JS_NewString(ctx, subj));
-                OPENSSL_free(subj);
-            }
-            
-            X509_free(cert);
-        } else {
-            result = JS_NULL;
-        }
+        result = cert ? tjs_ssl_certificate_wrap(ctx, cert) : JS_NULL;
     } else if (strcmp(type, "key") == 0) {
         EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
         if (pkey) {
@@ -1157,12 +1640,13 @@ static JSValue tjs_ssl_load_pem(JSContext *ctx, JSValueConst this_val,
     
     if (argc > 1) JS_FreeCString(ctx, type);
     BIO_free(bio);
+    JS_FreeCString(ctx, data);
     
     return result;
 }
 
 /* createSelfSignedCert(options) - Create self-signed certificate */
-static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this_val,
+static JSValue tjs_ssl_static_create_self_signed_cert(JSContext *ctx, JSValueConst this_val,
                                                  int argc, JSValueConst *argv) {
     JSValue options = argc > 0 ? argv[0] : JS_UNDEFINED;
 
@@ -1308,16 +1792,25 @@ static JSValue tjs_ssl_create_self_signed_cert(JSContext *ctx, JSValueConst this
     return result;
 }
 
-static const JSCFunctionListEntry tjs_ssl_funcs[] = {
-    JS_CFUNC_DEF("loadPEM", 2, tjs_ssl_load_pem),
-    JS_CFUNC_DEF("createSelfSignedCert", 1, tjs_ssl_create_self_signed_cert),
+static const JSCFunctionListEntry tjs_ssl_static_funcs[] = {
+    JS_CFUNC_DEF("loadPEM", 2, tjs_ssl_static_load_pem),
+    JS_CFUNC_DEF("createSelfSignedCert", 1, tjs_ssl_static_create_self_signed_cert),
 };
 
 #pragma region Module Initialization
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+
     /* Register SSLContext */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_ssl_context_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_ssl_context_class_id, &tjs_ssl_context_class);
+    if (JS_NewClassID(rt, &tjs_ssl_context_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate SSLContext class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_ssl_context_class_id) &&
+        JS_NewClass(rt, tjs_ssl_context_class_id, &tjs_ssl_context_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register SSLContext class");
+        return;
+    }
     
     JSValue context_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, context_proto, tjs_ssl_context_proto_funcs,
@@ -1329,10 +1822,39 @@ void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
                                            JS_CFUNC_constructor, 0);
 	JS_SetConstructor(ctx, context_ctor, context_proto);
     JS_SetPropertyStr(ctx, ns, "Context", context_ctor);
-    
+
+    /* Register Certificate */
+    if (JS_NewClassID(rt, &tjs_ssl_certificate_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Certificate class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_ssl_certificate_class_id) &&
+        JS_NewClass(rt, tjs_ssl_certificate_class_id, &tjs_ssl_certificate_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Certificate class");
+        return;
+    }
+
+    JSValue certificate_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, certificate_proto, tjs_ssl_certificate_proto_funcs,
+                              countof(tjs_ssl_certificate_proto_funcs));
+    JS_SetClassProto(ctx, tjs_ssl_certificate_class_id, certificate_proto);
+
+    JSValue certificate_ctor = JS_NewCFunction2(ctx, tjs_ssl_certificate_constructor,
+                                               "Certificate", 1,
+                                               JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, certificate_ctor, certificate_proto);
+    JS_SetPropertyStr(ctx, ns, "Certificate", certificate_ctor);
+
     /* Register SSLPipe */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_ssl_pipe_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_ssl_pipe_class_id, &tjs_ssl_pipe_class);
+    if (JS_NewClassID(rt, &tjs_ssl_pipe_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate SSLPipe class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_ssl_pipe_class_id) &&
+        JS_NewClass(rt, tjs_ssl_pipe_class_id, &tjs_ssl_pipe_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register SSLPipe class");
+        return;
+    }
     
     JSValue pipe_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, pipe_proto, tjs_ssl_pipe_proto_funcs,
@@ -1346,9 +1868,9 @@ void tjs__mod_ssl_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyStr(ctx, ns, "Pipe", pipe_ctor);
     
     /* Register utility functions */
-    JS_SetPropertyFunctionList(ctx, ns, tjs_ssl_funcs, countof(tjs_ssl_funcs));
+    JS_SetPropertyFunctionList(ctx, ns, tjs_ssl_static_funcs, countof(tjs_ssl_static_funcs));
 
 	/* OpenSSL version and config */
-	tjs__ssl_openssl_version(ctx, ns);
-	tjs__ssl_cipher_list(ctx, ns);
+	tjs_ssl_static_version(ctx, ns);
+	tjs_ssl_static_ciphers(ctx, ns);
 }
