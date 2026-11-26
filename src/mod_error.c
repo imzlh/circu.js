@@ -96,7 +96,9 @@ JSValue tjs_new_error_path(JSContext *ctx, int err, const char *path) {
     return tjs_new_coded_error(ctx, "IOError", JS_NewInt32(ctx, err), JS_NewString(ctx, buf));
 }
 
-static JSValue tjs_error_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
+static JSValue tjs_error_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "Error requires an error code");
     int err;
     if (JS_ToInt32(ctx, &err, argv[0])) {
         return JS_EXCEPTION;
@@ -187,9 +189,24 @@ JSValue tjs__error_strerr(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 	return JS_NewStringLen(ctx, buf, len);
 }
 
-/* strerror only — Error is registered as a real constructor below. */
+static JSValue tjs_error_lookup(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int name_only) {
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "%s requires an error code",
+                                 name_only ? "getErrorName" : "getErrorMessage");
+    int32_t err;
+    if (JS_ToInt32(ctx, &err, argv[0])) return JS_EXCEPTION;
+    char result[128];
+    if (name_only) uv_err_name_r(err, result, sizeof(result));
+    else uv_strerror_r(err, result, sizeof(result));
+    return JS_NewString(ctx, result);
+}
+
+/* Error is registered as a real constructor below. */
 static JSCFunctionListEntry tjs__error_funcs[] = {
-	JS_CFUNC_DEF("strerror", 0, tjs__error_strerr)
+    JS_CFUNC_DEF("strerror", 0, tjs__error_strerr),
+    JS_CFUNC_MAGIC_DEF("getErrorMessage", 1, tjs_error_lookup, 0),
+    JS_CFUNC_MAGIC_DEF("getErrorName", 1, tjs_error_lookup, 1),
 };
 
 void tjs__mod_error_init(JSContext *ctx, JSValue ns) {
