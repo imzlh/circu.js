@@ -46,7 +46,8 @@ enum {
     MSGPIPE_EVENT_MAX,
 };
 
-static thread_local JSClassID tjs_msgpipe_class_id;
+static JSClassID tjs_msgpipe_class_id;
+static JSClassID tjs_worker_class_id;
 
 /* Messages arriving before onmessage is installed stay pending; never cap
  * this queue -- delivery semantics forbid silently dropping a burst. */
@@ -67,6 +68,8 @@ typedef struct {
     uint64_t transfer_token;
 } TJSMessagePipeFrameHeader;
 
+typedef struct TJSMessagePipe TJSMessagePipe;
+typedef struct TJSMessagePipeChannel TJSMessagePipeChannel;
 typedef struct TJSMessagePipeFrame TJSMessagePipeFrame;
 
 static void tjs_worker_count_init(void) {
@@ -97,15 +100,20 @@ size_t tjs__active_worker_count(void) {
     return count;
 }
 
-typedef struct {
+struct TJSMessagePipe {
     JSContext *ctx;
     TJSRuntime *trt;
+    TJSMessagePipeChannel *channel;
+    unsigned side;
     int closed;
     int finalized;
     int closing_for_runtime;
+    bool clearing_js;
     bool peer_eof;
     bool peer_closed_cleanly;
     bool close_dispatched;
+    /* Peer closed while frames were still queued: emit close after they drain. */
+    bool close_after_drain;
     struct list_head link;
     union {
         uv_handle_t handle;
@@ -121,6 +129,8 @@ typedef struct {
     } reading;
     /* Borrowed from the JS wrapper. A queued drain job owns its own duplicate. */
     JSValue self;
+    /* Writes in flight keep the native pipe alive until their callbacks run. */
+    unsigned writes_pending;
     JSValue events[MSGPIPE_EVENT_MAX];
     JSValue *pending;
     size_t pending_count;
@@ -128,7 +138,38 @@ typedef struct {
     size_t pending_bytes;
     bool pending_drain_queued;
     TJSMessagePipeFrame *frame;
-} TJSMessagePipe;
+};
+
+struct TJSMessagePipeChannel {
+    _Atomic unsigned refs;
+    /* Protected by tjs_msgpipe_registry_lock. */
+    unsigned closed_sides;
+};
+
+enum {
+    MSGPIPE_SIDE_PARENT = 0,
+    MSGPIPE_SIDE_WORKER = 1,
+};
+
+static TJSMessagePipeChannel *msgpipe_channel_new(void) {
+    TJSMessagePipeChannel *channel = tjs__mallocz(sizeof(*channel));
+    if (channel)
+        atomic_init(&channel->refs, 1);
+    return channel;
+}
+
+static TJSMessagePipeChannel *msgpipe_channel_retain(
+    TJSMessagePipeChannel *channel) {
+    if (channel)
+        atomic_fetch_add_explicit(&channel->refs, 1, memory_order_relaxed);
+    return channel;
+}
+
+static void msgpipe_channel_release(TJSMessagePipeChannel *channel) {
+    if (!channel) return;
+    if (atomic_fetch_sub_explicit(&channel->refs, 1, memory_order_acq_rel) == 1)
+        tjs__free(channel);
+}
 
 struct TJSMessagePipeFrame {
     TJSMessagePipeFrameHeader header;
@@ -143,6 +184,8 @@ enum {
 /* Each entry owns one clone ref: claim moves it to the reader, cancel drops it. */
 typedef struct TJSMessagePipeTransferRegistryEntry {
     uint64_t token;
+    TJSMessagePipeChannel *channel;
+    unsigned receiver_side;
     TJSMessageClone *clone;
     struct list_head link;
 } TJSMessagePipeTransferRegistryEntry;
@@ -165,41 +208,101 @@ typedef struct {
     uint64_t transfer_token;
 } TJSMessagePipeWriteReq;
 
-static bool msgpipe_transfer_registry_reserve(
+static int msgpipe_transfer_registry_reserve(
+    TJSMessagePipeChannel *channel,
+    unsigned receiver_side,
     TJSMessageClone *clone,
     TJSMessagePipeTransferRegistryEntry **entry_out) {
     TJSMessagePipeTransferRegistryEntry *entry;
     uint64_t token;
 
     entry = tjs__mallocz(sizeof(*entry));
-    if (!entry) return false;
+    if (!entry) return -1;
 
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
     uv_mutex_lock(&tjs_msgpipe_registry_lock);
+    if (channel->closed_sides & (1u << receiver_side)) {
+        uv_mutex_unlock(&tjs_msgpipe_registry_lock);
+        tjs__free(entry);
+        return 0;
+    }
     token = tjs_msgpipe_registry_next_token++;
     if (token == 0) {
         /* Do not ever put zero in a frame: it is reserved as an invalid token. */
         token = tjs_msgpipe_registry_next_token++;
     }
     entry->token = token;
+    entry->channel = msgpipe_channel_retain(channel);
+    entry->receiver_side = receiver_side;
     entry->clone = tjs__message_clone_retain(clone);
     init_list_head(&entry->link);
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
     *entry_out = entry;
-    return true;
+    return 1;
 }
 
-static void msgpipe_transfer_registry_publish(
-    TJSMessagePipeTransferRegistryEntry *entry) {
+static void msgpipe_transfer_registry_cancel_receiver(
+    TJSMessagePipeChannel *channel, unsigned receiver_side) {
+    struct list_head removed, *el, *tmp;
+
+    if (!channel) return;
+    init_list_head(&removed);
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
     uv_mutex_lock(&tjs_msgpipe_registry_lock);
-    list_add_tail(&entry->link, &tjs_msgpipe_registry);
+    channel->closed_sides |= 1u << receiver_side;
+    list_for_each_safe(el, tmp, &tjs_msgpipe_registry) {
+        TJSMessagePipeTransferRegistryEntry *entry =
+            list_entry(el, TJSMessagePipeTransferRegistryEntry, link);
+        if (entry->channel == channel &&
+            entry->receiver_side == receiver_side) {
+            list_del(&entry->link);
+            list_add_tail(&entry->link, &removed);
+        }
+    }
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
+
+    list_for_each_safe(el, tmp, &removed) {
+        TJSMessagePipeTransferRegistryEntry *entry =
+            list_entry(el, TJSMessagePipeTransferRegistryEntry, link);
+        list_del(&entry->link);
+        /* Releasing a clone may take its own locks; keep it outside the
+         * registry critical section. This cleanup path cannot fail on OOM. */
+        tjs__message_clone_free(entry->clone);
+        msgpipe_channel_release(entry->channel);
+        tjs__free(entry);
+    }
+}
+
+/* Commit and publish under one registry lock.  Closing the receiver must win
+ * before commit, or the sender must win with a published transfer; there is
+ * no valid state in which the source is detached but the token is rejected. */
+static int msgpipe_transfer_registry_commit_and_publish(
+    JSContext *ctx, TJSMessagePipeTransferRegistryEntry *entry) {
+    int result = 0;
+    uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
+    uv_mutex_lock(&tjs_msgpipe_registry_lock);
+    if (entry->channel->closed_sides & (1u << entry->receiver_side)) {
+        result = 1;
+    } else if (tjs__message_clone_commit(ctx, entry->clone) != 0) {
+        result = -1;
+    } else {
+        list_add_tail(&entry->link, &tjs_msgpipe_registry);
+    }
+    uv_mutex_unlock(&tjs_msgpipe_registry_lock);
+    return result;
 }
 
 static void msgpipe_transfer_registry_discard_reserved(
     TJSMessagePipeTransferRegistryEntry *entry) {
     tjs__message_clone_free(entry->clone);
+    msgpipe_channel_release(entry->channel);
+    tjs__free(entry);
+}
+
+static void msgpipe_transfer_registry_abort_reserved(
+    JSContext *ctx, TJSMessagePipeTransferRegistryEntry *entry) {
+    tjs__message_clone_abort(ctx, entry->clone);
+    msgpipe_channel_release(entry->channel);
     tjs__free(entry);
 }
 
@@ -209,6 +312,7 @@ static TJSMessageClone *msgpipe_transfer_registry_claim(
     uint64_t token, uint64_t transfer_count) {
     struct list_head *el;
     TJSMessageClone *clone = NULL;
+    TJSMessagePipeChannel *channel = NULL;
 
     if (!token) return NULL;
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
@@ -220,6 +324,7 @@ static TJSMessageClone *msgpipe_transfer_registry_claim(
             if (tjs__message_clone_transfer_count(entry->clone) ==
                 (size_t)transfer_count) {
                 clone = entry->clone;
+                channel = entry->channel;
                 list_del(&entry->link);
                 tjs__free(entry);
             }
@@ -227,6 +332,7 @@ static TJSMessageClone *msgpipe_transfer_registry_claim(
         }
     }
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
+    msgpipe_channel_release(channel);
     return clone;
 }
 
@@ -235,6 +341,7 @@ static TJSMessageClone *msgpipe_transfer_registry_claim(
 static bool msgpipe_transfer_registry_cancel(uint64_t token) {
     struct list_head *el, *tmp;
     TJSMessageClone *clone = NULL;
+    TJSMessagePipeChannel *channel = NULL;
 
     if (!token) return false;
     uv_once(&tjs_msgpipe_registry_once, msgpipe_transfer_registry_init);
@@ -244,6 +351,7 @@ static bool msgpipe_transfer_registry_cancel(uint64_t token) {
             list_entry(el, TJSMessagePipeTransferRegistryEntry, link);
         if (entry->token == token) {
             clone = entry->clone;
+            channel = entry->channel;
             list_del(&entry->link);
             tjs__free(entry);
             break;
@@ -251,6 +359,7 @@ static bool msgpipe_transfer_registry_cancel(uint64_t token) {
     }
     uv_mutex_unlock(&tjs_msgpipe_registry_lock);
     if (clone) tjs__message_clone_free(clone);
+    msgpipe_channel_release(channel);
     return clone != NULL;
 }
 
@@ -307,32 +416,38 @@ static void msgpipe_clear_js_rt(JSRuntime *rt, TJSMessagePipe *p) {
     p->pending_bytes = 0;
 }
 
-static void msgpipe_clear_js(TJSMessagePipe *p) {
-    for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
-        JSValue event = p->events[i];
-        p->events[i] = JS_UNDEFINED;
-        JS_FreeValue(p->ctx, event);
-    }
-    uint8_t *data = p->reading.data;
-    msgpipe_cancel_reading_token(p);
-    memset(&p->reading, 0, sizeof(p->reading));
-    js_free(p->ctx, data);
-    msgpipe_frame_clear(p);
-    for (size_t i = 0; i < p->pending_count; i++) {
-        JS_FreeValue(p->ctx, p->pending[i]);
-    }
-    p->pending_count = 0;
-    js_free(p->ctx, p->pending);
-    p->pending = NULL;
-    p->pending_cap = 0;
-    p->pending_bytes = 0;
-}
-
 static void msgpipe_close_handle(TJSMessagePipe *p) {
+    /* Entries addressed to this endpoint no longer have a receiver. Keep
+     * sender-side entries alive until their write callback or the peer claims
+     * them, so closing one direction does not drop already-written data. */
+    msgpipe_transfer_registry_cancel_receiver(p->channel, p->side);
     if (!uv_is_closing(&p->h.handle)) {
         uv_read_stop(&p->h.stream);
         uv_close(&p->h.handle, uv__close_cb);
     }
+}
+
+static void msgpipe_free_if_ready(TJSMessagePipe *p) {
+    if (!p->finalized || !p->closed || p->writes_pending > 0 || p->clearing_js)
+        return;
+    msgpipe_unlink(p);
+    msgpipe_frame_destroy(p);
+    msgpipe_channel_release(p->channel);
+    p->channel = NULL;
+    tjs__free(p);
+}
+
+static void msgpipe_cleanup(JSRuntime *rt, TJSMessagePipe *p) {
+    if (p->clearing_js) return;
+    /* Releasing a handler can finalize this wrapper, another pipe, or reenter
+     * runtime cleanup. Unlink before any release, and pin the native record
+     * until all releases finish, even if its close callback has already run. */
+    p->clearing_js = true;
+    msgpipe_unlink(p);
+    msgpipe_close_handle(p);
+    msgpipe_clear_js_rt(rt, p);
+    p->clearing_js = false;
+    msgpipe_free_if_ready(p);
 }
 
 
@@ -340,30 +455,14 @@ static void uv__close_cb(uv_handle_t *handle) {
     TJSMessagePipe *p = handle->data;
     CHECK_NOT_NULL(p);
     p->closed = 1;
-    if (p->finalized) {
-        msgpipe_frame_destroy(p);
-        tjs__free(p);
-    }
+    msgpipe_free_if_ready(p);
 }
 
 static void tjs_msgpipe_finalizer(JSRuntime *rt, JSValue val) {
     TJSMessagePipe *p = JS_GetOpaque(val, tjs_msgpipe_class_id);
     if (p) {
-        msgpipe_unlink(p);
-        /* Free JS resources now while rt is still alive. */
-        msgpipe_clear_js_rt(rt, p);
-
         p->finalized = 1;
-        if (!uv_is_closing(&p->h.handle)) {
-            msgpipe_close_handle(p);
-            return;
-        }
-        if (!p->closed) {
-            /* uv_close already in flight, close_cb will free p */
-            return;
-        }
-        msgpipe_frame_destroy(p);
-        tjs__free(p);
+        msgpipe_cleanup(rt, p);
     }
 }
 
@@ -414,15 +513,33 @@ static JSValue emit_event(JSContext *ctx, int argc, JSValue *argv) {
     return JS_UNDEFINED;
 }
 
+static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg, size_t message_bytes);
+
+static void dispatch_msgpipe_close(TJSMessagePipe *p) {
+    if (p->close_dispatched ||
+        !JS_IsFunction(p->ctx, p->events[MSGPIPE_EVENT_CLOSE]))
+        return;
+
+    p->close_after_drain = false;
+    p->close_dispatched = true;
+    emit_msgpipe_event(p, MSGPIPE_EVENT_CLOSE, JS_UNDEFINED, 0);
+}
+
 static JSValue drain_msgpipe_messages(JSContext *ctx, int argc, JSValue *argv) {
     CHECK_EQ(argc, 1);
 
     TJSMessagePipe *p = JS_GetOpaque(argv[0], tjs_msgpipe_class_id);
+    /* Runtime teardown has already released the handler and pending values.
+     * Never call into JS after freeing starts; the queued job's arguments are
+     * still released by QuickJS when the runtime is destroyed. */
     if (!p || p->finalized || p->closing_for_runtime) return JS_UNDEFINED;
 
     JSValue event_func = p->events[MSGPIPE_EVENT_MESSAGE];
     if (!JS_IsFunction(ctx, event_func) || p->pending_count == 0) {
         p->pending_drain_queued = false;
+        if (p->close_after_drain) {
+            dispatch_msgpipe_close(p);
+        }
         return JS_UNDEFINED;
     }
 
@@ -449,16 +566,26 @@ static JSValue drain_msgpipe_messages(JSContext *ctx, int argc, JSValue *argv) {
         JSValueConst pipe_obj = p->self;
         if (JS_EnqueueJob(ctx, drain_msgpipe_messages, 1, &pipe_obj))
             msgpipe_oom(p);
-        else
+        else {
             p->pending_drain_queued = true;
+            tjs__notify_work(TJS_GetRuntime(ctx));
+        }
+        return JS_UNDEFINED;
+    }
+
+    /* The peer closed while this batch was still queued; close follows the
+     * messages so the owner sees every frame before teardown. */
+    if (p->close_after_drain) {
+        dispatch_msgpipe_close(p);
     }
     return JS_UNDEFINED;
 }
 
 static void schedule_msgpipe_drain(TJSMessagePipe *p) {
     if (p->pending_drain_queued || p->pending_count == 0 ||
-        !JS_IsFunction(p->ctx, p->events[MSGPIPE_EVENT_MESSAGE]))
+        !JS_IsFunction(p->ctx, p->events[MSGPIPE_EVENT_MESSAGE])) {
         return;
+    }
 
     JSValueConst pipe_obj = p->self;
     if (JS_EnqueueJob(p->ctx, drain_msgpipe_messages, 1, &pipe_obj)) {
@@ -466,6 +593,11 @@ static void schedule_msgpipe_drain(TJSMessagePipe *p) {
         return;
     }
     p->pending_drain_queued = true;
+    /* The job runs at the NEXT checkpoint, but this pass's check callback may
+     * have already run uv__maybe_idle() and stopped the idle handle: with no
+     * ref'd handle left the loop exits and the queued frames are lost. Wake
+     * the loop now (idle twin ref'd) so the drain is guaranteed to run. */
+    tjs__notify_work(TJS_GetRuntime(p->ctx));
 }
 
 static void emit_msgpipe_event(TJSMessagePipe *p, int event, JSValue arg, size_t message_bytes) {
@@ -553,8 +685,15 @@ static void uv__read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
         msgpipe_frame_clear(p);
         if (!p->closing_for_runtime && p->peer_closed_cleanly && !p->close_dispatched
             && JS_IsFunction(ctx, p->events[MSGPIPE_EVENT_CLOSE])) {
-            p->close_dispatched = true;
-            emit_msgpipe_event(p, MSGPIPE_EVENT_CLOSE, JS_UNDEFINED, 0);
+            /* Same ordering rule as the setter: queued frames first, then close,
+             * so the owner cannot tear the port down with output still pending. */
+            if (p->pending_count > 0 &&
+                JS_IsFunction(ctx, p->events[MSGPIPE_EVENT_MESSAGE])) {
+                p->close_after_drain = true;
+                schedule_msgpipe_drain(p);
+            } else {
+                dispatch_msgpipe_close(p);
+            }
         } else if (!p->closing_for_runtime && (!peer_eof || !at_message_boundary)) {
             /* EOF is clean only after a complete frame; a partial frame is corrupt. */
             JSValue error = tjs_new_error(ctx, nread);
@@ -652,7 +791,14 @@ deserialize_frame:
     msgpipe_frame_clear(p);
 }
 
-static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
+/* Internal factory, also used by the standalone native lifetime regression. */
+TJS__HIDDEN JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd,
+                                   TJSMessagePipeChannel *channel,
+                                   unsigned side) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
+
     JSValue obj = JS_NewObjectClass(ctx, tjs_msgpipe_class_id);
     if (JS_IsException(obj)) {
         return obj;
@@ -672,6 +818,8 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
 
     p->ctx = ctx;
     p->trt = TJS_GetRuntime(ctx);
+    p->channel = msgpipe_channel_retain(channel);
+    p->side = side;
     p->self = obj;
     for (int i = 0; i < MSGPIPE_EVENT_MAX; i++) {
         p->events[i] = JS_UNDEFINED;
@@ -695,12 +843,14 @@ static JSValue tjs_new_msgpipe(JSContext *ctx, uv_os_sock_t fd) {
 }
 
 void tjs__close_all_msgpipes(TJSRuntime *qrt) {
-    struct list_head *el, *tmp;
-    list_for_each_safe(el, tmp, &qrt->msgpipes) {
-        TJSMessagePipe *p = list_entry(el, TJSMessagePipe, link);
+    while (!list_empty(&qrt->msgpipes)) {
+        TJSMessagePipe *p = list_entry(qrt->msgpipes.next, TJSMessagePipe, link);
         p->closing_for_runtime = 1;
-        msgpipe_clear_js(p);
-        msgpipe_close_handle(p);
+        /* Closing cancels any write that has not completed. The write
+         * callback still owns the request and releases the native pipe after
+         * libuv reports cancellation; do not pump the whole loop here because
+         * unrelated handles may otherwise call into JS during teardown. */
+        msgpipe_cleanup(qrt->rt, p);
     }
 }
 
@@ -725,6 +875,10 @@ static void uv__write_cb(uv_write_t *req, int status) {
     }
     tjs__message_clone_free(wr->clone);
     tjs__free(wr);
+
+    if (p->writes_pending > 0)
+        p->writes_pending--;
+    msgpipe_free_if_ready(p);
 }
 
 static int msgpipe_postmessage_revalidate(JSContext *ctx, JSValueConst this_val,
@@ -746,11 +900,17 @@ static void msgpipe_postmessage_discard(JSContext *ctx,
 }
 
 static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "postMessage requires a value");
+    }
     TJSMessagePipe *p = tjs_msgpipe_get(ctx, this_val);
     if (!p) {
         return JS_EXCEPTION;
     }
     if (p->peer_eof || uv_is_closing(&p->h.handle)) {
+        return tjs_throw_errno(ctx, UV_EPIPE);
+    }
+    if (!p->channel) {
         return tjs_throw_errno(ctx, UV_EPIPE);
     }
 
@@ -780,32 +940,45 @@ static JSValue tjs_msgpipe_postmessage(JSContext *ctx, JSValue this_val, int arg
 
     TJS_CAPABILITY_REVALIDATE(tjs__capability(ctx, TJS_CAP_WORKER | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "worker.postMessage"), msgpipe_postmessage_discard(ctx, wr), do { if (msgpipe_postmessage_revalidate(ctx, this_val, &p) < 0) { msgpipe_postmessage_discard(ctx, wr); return (JS_EXCEPTION); } } while (0));
 
-    /* Reserve neutral registry storage before commit.  Reservation is not
-     * visible to readers; it makes the post-commit publish infallible. */
+    /* Reserve neutral registry storage before commit. The reservation is not
+     * visible to readers; the commit-and-publish step below orders it with
+     * receiver shutdown. */
     TJSMessagePipeTransferRegistryEntry *registry_entry;
-    if (!msgpipe_transfer_registry_reserve(wr->clone, &registry_entry)) {
+    int reserve_result = msgpipe_transfer_registry_reserve(
+        p->channel, p->side ^ 1, wr->clone, &registry_entry);
+    if (reserve_result <= 0) {
         msgpipe_postmessage_discard(ctx, wr);
-        return JS_ThrowOutOfMemory(ctx);
+        return reserve_result == 0 ? tjs_throw_errno(ctx, UV_EPIPE)
+                                   : JS_ThrowOutOfMemory(ctx);
     }
     wr->transfer_token = registry_entry->token;
 
-    /* Detach sources before exposing the token to the peer.  If commit fails,
-     * no registry entry or frame is published. */
-    if (tjs__message_clone_commit(ctx, wr->clone)) {
-        msgpipe_transfer_registry_discard_reserved(registry_entry);
+    /* The registry lock makes receiver close and source detachment one
+     * operation: a rejected publish can no longer follow a successful commit. */
+    int commit_result = msgpipe_transfer_registry_commit_and_publish(
+        ctx, registry_entry);
+    if (commit_result != 0) {
+        if (commit_result > 0)
+            msgpipe_transfer_registry_abort_reserved(ctx, registry_entry);
+        else
+            msgpipe_transfer_registry_discard_reserved(registry_entry);
         tjs__message_clone_free(wr->clone);
         tjs__free(wr);
-        return JS_EXCEPTION;
+        return commit_result < 0 ? JS_EXCEPTION : tjs_throw_errno(ctx, UV_EPIPE);
     }
-
-    msgpipe_transfer_registry_publish(registry_entry);
     wr->frame.header.transfer_token = wr->transfer_token;
 
     uv_buf_t bufs[2] = { uv_buf_init((char *) &wr->frame.header, sizeof(wr->frame.header)),
                          uv_buf_init((char *) tjs__message_clone_data(wr->clone),
                                      tjs__message_clone_size(wr->clone)) };
+    /* Keep the native pipe alive until the write callback releases its
+     * request. This does not change the handle's user-visible ref state:
+     * unref() must still allow an otherwise idle worker to exit. */
+    p->writes_pending++;
     int r = uv_write(&wr->req, &p->h.stream, bufs, 2, uv__write_cb);
     if (r != 0) {
+        if (p->writes_pending > 0)
+            p->writes_pending--;
         msgpipe_transfer_registry_cancel(wr->transfer_token);
         tjs__message_clone_free(wr->clone);
         tjs__free(wr);
@@ -834,9 +1007,6 @@ static JSValue tjs_msgpipe_unref(JSContext *ctx, JSValue this_val, int argc, JSV
     }
     if (!uv_is_closing(&p->h.handle)) {
         uv_unref(&p->h.handle);
-        if (p->trt->is_worker && (JS_IsJobPending(p->trt->rt) || p->trt->jobs.ticks_pending)) {
-            uv_stop(tjs_get_loop(ctx));
-        }
     }
     return JS_UNDEFINED;
 }
@@ -864,8 +1034,17 @@ static JSValue tjs_msgpipe_event_set(JSContext *ctx, JSValue this_val, JSValue v
         }
         if (magic == MSGPIPE_EVENT_CLOSE && p->peer_closed_cleanly && !p->close_dispatched
             && JS_IsFunction(ctx, value)) {
-            p->close_dispatched = true;
-            emit_msgpipe_event(p, MSGPIPE_EVENT_CLOSE, JS_UNDEFINED, 0);
+            /* Frames decoded before EOF are still queued. Delivering close now
+             * would let the owner tear the port down while they are pending,
+             * which loses a short-lived worker's last output; the drain defers
+             * close until the queue is empty. */
+            if (p->pending_count > 0 &&
+                JS_IsFunction(ctx, p->events[MSGPIPE_EVENT_MESSAGE])) {
+                p->close_after_drain = true;
+                schedule_msgpipe_drain(p);
+            } else {
+                dispatch_msgpipe_close(p);
+            }
         }
     }
     return JS_UNDEFINED;
@@ -901,26 +1080,44 @@ static const JSCFunctionListEntry tjs_msgpipe_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("onclose", tjs_msgpipe_event_get, tjs_msgpipe_event_set, MSGPIPE_EVENT_CLOSE),
 };
 
-static void reg_msgpipe(JSContext* ctx) {
-	JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_NewClassID(rt, &tjs_msgpipe_class_id);
-    JS_NewClass(rt, tjs_msgpipe_class_id, &tjs_msgpipe_class);
-    JSValue proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_msgpipe_proto_funcs, countof(tjs_msgpipe_proto_funcs));
-    JS_SetClassProto(ctx, tjs_msgpipe_class_id, proto);
+static int reg_msgpipe(JSContext *ctx) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSClassID id = JS_NewClassID(rt, &tjs_msgpipe_class_id);
+    if (id == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate MessagePipe class ID");
+        return -1;
+    }
+    if (!JS_IsRegisteredClass(rt, id) &&
+        JS_NewClass(rt, id, &tjs_msgpipe_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register MessagePipe class");
+        return -1;
+    }
+    JSValue proto = JS_GetClassProto(ctx, id);
+    if (!JS_IsNull(proto)) {
+        JS_FreeValue(ctx, proto);
+        return 0;
+    }
+    proto = JS_NewObject(ctx);
+    if (JS_IsException(proto)) return -1;
+    if (JS_SetPropertyFunctionList(ctx, proto, tjs_msgpipe_proto_funcs,
+                                   countof(tjs_msgpipe_proto_funcs)) < 0) {
+        JS_FreeValue(ctx, proto);
+        return -1;
+    }
+    JS_SetClassProto(ctx, id, proto);
+    return 0;
 }
 
-static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd);
-
-static thread_local JSClassID tjs_worker_class_id;
+static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd,
+                              TJSMessagePipeChannel *channel);
 
 /* Worker thread data passed to worker_entry */
 typedef struct {
     uv_os_sock_t channel_fd;
+    TJSMessagePipeChannel *channel;
     uv_sem_t *start_sem;
     uv_sem_t *ready_sem;
     TJSWorker *worker;
-    TJSRuntime *wrt;
     _Atomic int commit_error;
 
     TJSMessageClone *user_data;
@@ -941,132 +1138,174 @@ static void worker_detach_self(TJSWorker *w) {
     w->self_obj = JS_UNDEFINED;
 }
 
-/* The runtime is stopping, but the worker thread still owns `w` until it
- * finishes TJS_FreeRuntime() and the final ownership check below. */
+/* Clearing wrt under the lock prevents stop requests during runtime teardown. */
 static void worker_mark_runtime_stopped(TJSWorker *w) {
     uv_mutex_lock(&w->lock);
-    w->terminated = true;
     w->wrt = NULL;
     uv_mutex_unlock(&w->lock);
 }
 
-static void worker_mark_started(TJSWorker *w, TJSRuntime *wrt) {
+static void worker_mark_init_failed(TJSWorker *w, int error) {
     uv_mutex_lock(&w->lock);
-    w->exited = false;
-    w->wrt = wrt;
+    w->init_error = error;
+    w->wrt = NULL;
     uv_mutex_unlock(&w->lock);
 }
 
-static TJSRuntime *worker_get_runtime(TJSWorker *w) {
-    TJSRuntime *wrt;
+static int worker_get_init_error(TJSWorker *w) {
+    int error;
     uv_mutex_lock(&w->lock);
-    wrt = w->wrt;
+    error = w->init_error;
     uv_mutex_unlock(&w->lock);
-    return wrt;
+    return error;
+}
+
+static void worker_mark_started(TJSWorker *w, TJSRuntime *wrt) {
+    uv_mutex_lock(&w->lock);
+    w->wrt = wrt;
+    uv_mutex_unlock(&w->lock);
 }
 
 /* Stop and deliver under the lock: TJS_Stop on a pointer that escaped it is
  * a use-after-free once worker_mark_runtime_stopped() clears w->wrt. */
 static void worker_stop_locked(TJSWorker *w) {
     uv_mutex_lock(&w->lock);
-    if (!w->terminated) {
-        w->terminated = true;
+    if (!w->stop_requested) {
+        w->stop_requested = true;
         if (w->wrt) TJS_Stop(w->wrt);
     }
     uv_mutex_unlock(&w->lock);
 }
 
-static bool worker_should_join(TJSWorker *w) {
-    bool should_join;
+/* Claim the only parent-side join. This also protects against a second
+ * teardown path invoking uv_thread_join on the same joinable thread. */
+static bool worker_claim_join(TJSWorker *w) {
+    bool claim = false;
     uv_mutex_lock(&w->lock);
-    should_join = !w->joined;
+    if (w->state == TJS_WORKER_JOINABLE) {
+        w->state = TJS_WORKER_JOINING;
+        claim = true;
+    }
     uv_mutex_unlock(&w->lock);
-    return should_join;
+    return claim;
+}
+
+bool tjs__worker_is_joined(TJSWorker *w) {
+    bool joined;
+    uv_mutex_lock(&w->lock);
+    joined = w->state == TJS_WORKER_RELEASING || w->state == TJS_WORKER_JOINED;
+    uv_mutex_unlock(&w->lock);
+    return joined;
 }
 
 static void worker_mark_joined(TJSWorker *w) {
     uv_mutex_lock(&w->lock);
-    w->joined = true;
+    CHECK_EQ(w->state, TJS_WORKER_JOINING);
+    w->state = TJS_WORKER_RELEASING;
     w->wrt = NULL;
     uv_mutex_unlock(&w->lock);
 }
 
-/* Decide under the lock who frees: the finalizer only if the thread has
- * already returned, else the thread (it observes finalized_by_gc). */
+/* A GC finalizer may only free a record after the parent has joined it. A
+ * thread that merely returned is still joinable and must remain in the
+ * runtime's worker list. */
 static bool worker_gc_claim_free(TJSWorker *w) {
     bool free_now;
     uv_mutex_lock(&w->lock);
     w->finalized_by_gc = true;
-    free_now = w->joined || w->exited;
+    free_now = w->state == TJS_WORKER_JOINED;
     uv_mutex_unlock(&w->lock);
     return free_now;
 }
 
-/* Decide under the lock whether the thread frees (GC finalizer deferred). */
-static bool worker_thread_claim_free(TJSWorker *w) {
+/* Complete the parent join and claim the record only when GC has already
+ * released the wrapper. */
+static bool worker_finish_join(TJSWorker *w) {
     bool free_now;
     uv_mutex_lock(&w->lock);
-    w->exited = true;
+    CHECK_EQ(w->state, TJS_WORKER_RELEASING);
+    w->state = TJS_WORKER_JOINED;
     free_now = w->finalized_by_gc;
     uv_mutex_unlock(&w->lock);
     return free_now;
 }
 
+static void worker_destroy_record(TJSWorker *w) {
+    if (!list_empty(&w->link)) {
+        list_del(&w->link);
+    }
+    uv_mutex_destroy(&w->lock);
+    tjs__free(w);
+}
+
 void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w) {
     worker_stop_locked(w);
 
-    if (worker_should_join(w)) {
+    if (worker_claim_join(w)) {
         CHECK_EQ(uv_thread_join(&w->tid), 0);
         worker_mark_joined(w);
         uv_update_time(tjs_get_loop(ctx));
         worker_release_self(ctx, w);
+        if (worker_finish_join(w))
+            worker_destroy_record(w);
     }
 }
 
 /* This is what the worker runs */
 static void worker_entry(void *arg) {
     worker_data_t *wd = arg;
+    TJSWorker *owner = wd->worker;
+    TJSRuntime *wrt = NULL;
+    JSContext *ctx = NULL;
+    JSValue message_pipe = JS_UNDEFINED;
+    bool channel_owned = true;
+    int init_error = 0;
 
     /* Wait for the parent's transfer commit before touching workerData. */
     uv_sem_wait(wd->start_sem);
     if (atomic_load_explicit(&wd->commit_error, memory_order_acquire)) {
-        TJSWorker *owner = wd->worker;
-
-        tjs__message_clone_free(wd->user_data);
-        wd->user_data = NULL;
-#ifndef _WIN32
-        close(wd->channel_fd);
-#else
-        closesocket(wd->channel_fd);
-#endif
-        if (owner) worker_mark_runtime_stopped(owner);
-        /* Wake the constructor so it can join and dispose of the owner. */
-        uv_sem_post(wd->ready_sem);
-        tjs__free(wd);
-        if (owner && worker_thread_claim_free(owner)) {
-            uv_mutex_destroy(&owner->lock);
-            tjs__free(owner);
-        }
-        tjs_worker_count_remove();
-        return;
+        init_error = UV_ECANCELED;
+        goto init_failed;
     }
 
-    TJSRuntime *wrt = TJS_NewRuntimeWorker();
-    CHECK_NOT_NULL(wrt);
+    wrt = TJS_NewRuntimeWorker();
+    if (!wrt) {
+        init_error = UV_ENOMEM;
+        goto init_failed;
+    }
     TJS_SetCapabilityHook(wrt, wd->capability_hook, wd->capability_userdata,
                           wd->capability_hook_flags);
-    JSContext *ctx = wrt->main_ctx;
+    ctx = wrt->main_ctx;
 
     /* Bootstrap the worker scope. */
-	reg_msgpipe(ctx);	// we should register class MessagePipe before creating
-    JSValue message_pipe = tjs_new_msgpipe(ctx, wd->channel_fd);
+    if (reg_msgpipe(ctx) < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        init_error = UV_ENOMEM;
+        goto init_failed;
+    }
+    message_pipe = tjs_new_msgpipe(ctx, wd->channel_fd, wd->channel,
+                                   MSGPIPE_SIDE_WORKER);
+    msgpipe_channel_release(wd->channel);
+    wd->channel = NULL;
+    if (JS_IsException(message_pipe)) {
+        JSValue exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, exception);
+        message_pipe = JS_UNDEFINED;
+        init_error = UV_ENOMEM;
+        goto init_failed;
+    }
+    channel_owned = false;
     wrt->builtins.message_pipe = message_pipe;
+	message_pipe = JS_UNDEFINED;
 	if (wd->user_data){
 		wrt->builtins.worker_udata =
             tjs__message_clone_read(ctx, wd->user_data);
 		if (JS_IsException(wrt->builtins.worker_udata)) {
-			JS_FreeValue(ctx, JS_GetException(ctx));
+			JSValue exception = JS_GetException(ctx);
+			JS_FreeValue(ctx, exception);
 			wrt->builtins.worker_udata = JS_UNDEFINED;
+			init_error = UV_EINVAL;
+			goto init_failed;
 		}
 	} else {
 		wrt->builtins.worker_udata = JS_UNDEFINED;
@@ -1074,11 +1313,15 @@ static void worker_entry(void *arg) {
     tjs__message_clone_free(wd->user_data);
     wd->user_data = NULL;
 
-	/* run core bootstrap code */
-	tjs__run_main(wrt);
+	/* Run core bootstrap code. A worker must report bootstrap failure to its
+	 * constructor instead of terminating the host process or leaving the
+	 * parent blocked forever on ready_sem. */
+	if (tjs__run_main(wrt) < 0) {
+        init_error = UV_EINVAL;
+        goto init_failed;
+    }
 
     /* Notify the caller we are setup. */
-    TJSWorker *owner = wd->worker;
     if (owner) worker_mark_started(owner, wrt);
     uv_sem_post(wd->ready_sem);
     tjs__free(wd);
@@ -1090,14 +1333,38 @@ static void worker_entry(void *arg) {
 
     TJS_FreeRuntime(wrt);
 
-    /* Free the struct only if the finalizer deferred to us; exited is set
-     * here, after all worker-thread access to the owner is complete. */
-    if (owner && worker_thread_claim_free(owner)) {
-        uv_mutex_destroy(&owner->lock);
-        tjs__free(owner);
+    /* The worker thread never frees the parent-side record. The parent must
+     * join first. Keep the fork guard active through native runtime teardown. */
+    tjs_worker_count_remove();
+    return;
+
+init_failed:
+    if (wd->user_data) {
+        /* A failed parent-side commit leaves the clone PREPARED and owned by
+         * the parent. Only release clones after the commit handoff. */
+        if (!atomic_load_explicit(&wd->commit_error, memory_order_acquire))
+            tjs__message_clone_free(wd->user_data);
+        wd->user_data = NULL;
     }
-    /* Keep the fork guard active until every access to the parent-side worker
-     * record has completed, not merely until the worker JS runtime is gone. */
+    if (!JS_IsUndefined(message_pipe))
+        JS_FreeValue(ctx, message_pipe);
+    msgpipe_channel_release(wd->channel);
+    wd->channel = NULL;
+    if (wrt)
+        TJS_FreeRuntime(wrt);
+    if (channel_owned) {
+#ifndef _WIN32
+        close(wd->channel_fd);
+#else
+        closesocket(wd->channel_fd);
+#endif
+    }
+    if (owner)
+        worker_mark_init_failed(owner, init_error ? init_error : UV_EINVAL);
+    /* Wake the constructor on every bootstrap failure before releasing the
+     * worker_data that contains its stack semaphore pointers. */
+    uv_sem_post(wd->ready_sem);
+    tjs__free(wd);
     tjs_worker_count_remove();
 }
 
@@ -1108,8 +1375,7 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     /* Detach self first: freeing it here would recurse on the same JSObject. */
     worker_detach_self(w);
 
-    /* Signal stop but never block or join in a finalizer: a stuck worker
-     * thread would hang the GC. The thread cleans up when it exits. */
+    /* Signal stop without blocking GC. The parent runtime joins the thread. */
     worker_stop_locked(w);
 
     /* Drop the msgpipe ref: its finalizer closes the parent-side handle,
@@ -1118,14 +1384,11 @@ static void tjs_worker_finalizer(JSRuntime *rt, JSValue val) {
     w->message_pipe = JS_UNDEFINED;
     JS_FreeValueRT(rt, message_pipe);
 
-    if (w->link.next) list_del(&w->link);
-
-    /* Free now only if the thread returned; else it frees on exit. */
+    /* A joinable Worker remains linked and alive. Only the parent-side join
+     * can make this record freeable. */
     if (worker_gc_claim_free(w)) {
-        uv_mutex_destroy(&w->lock);
-        tjs__free(w);
+        worker_destroy_record(w);
     }
-    // Otherwise, the thread cleanup will free w when it exits
 }
 
 static void tjs_worker_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
@@ -1145,7 +1408,12 @@ static TJSWorker *tjs_worker_get(JSContext *ctx, JSValue obj) {
     return JS_GetOpaque2(ctx, obj, tjs_worker_class_id);
 }
 
-static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
+static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd,
+                              TJSMessagePipeChannel *channel) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
+
     JSValue obj = JS_NewObjectClass(ctx, tjs_worker_class_id);
     if (JS_IsException(obj)) {
         return obj;
@@ -1158,12 +1426,12 @@ static JSValue tjs_new_worker(JSContext *ctx, uv_os_sock_t channel_fd) {
     }
 
     w->ctx = ctx;
-    w->terminated = false;
-    w->exited = false;
-    w->joined = false;
+    w->state = TJS_WORKER_UNSTARTED;
+    init_list_head(&w->link);
     CHECK_EQ(uv_mutex_init(&w->lock), 0);
     w->self_obj = JS_UNDEFINED;
-    w->message_pipe = tjs_new_msgpipe(ctx, channel_fd);
+    w->message_pipe = tjs_new_msgpipe(ctx, channel_fd, channel,
+                                      MSGPIPE_SIDE_PARENT);
 
     if (JS_IsException(w->message_pipe)) {
         JS_FreeValue(ctx, obj);
@@ -1187,12 +1455,31 @@ static void worker_dispose_unstarted(JSContext *ctx, JSValue obj, TJSWorker *w) 
     JS_FreeValue(ctx, message_pipe);
     worker_release_self(ctx, w);
     JS_FreeValue(ctx, obj);
-    uv_mutex_destroy(&w->lock);
-    tjs__free(w);
+    worker_destroy_record(w);
+}
+
+/* The wrapper was never returned to JS. Its thread has already been joined,
+ * so this constructor-owned failure path can clear the opaque pointer before
+ * releasing the temporary JS references and claiming the record as finalized. */
+static void worker_dispose_joined_failure(JSContext *ctx, JSValue obj, TJSWorker *w) {
+    JSValue message_pipe;
+
+    JS_SetOpaque(obj, NULL);
+    message_pipe = w->message_pipe;
+    w->message_pipe = JS_UNDEFINED;
+    JS_FreeValue(ctx, message_pipe);
+    worker_release_self(ctx, w);
+    JS_FreeValue(ctx, obj);
+
+    CHECK_EQ(w->state, TJS_WORKER_RELEASING);
+    worker_destroy_record(w);
 }
 
 static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
 	TJSRuntime *qrt = TJS_GetRuntime(ctx);
+
+	if (!qrt || qrt->freeing)
+		return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
 
 	/* serialize user_data */
     JSValue user_data = argc >= 1 ? argv[0] : JS_UNDEFINED;
@@ -1210,8 +1497,22 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         return tjs_throw_errno(ctx, r);
     }
 
-    JSValue obj = tjs_new_worker(ctx, fds[0]);
+    TJSMessagePipeChannel *channel = msgpipe_channel_new();
+    if (!channel) {
+#ifndef _WIN32
+        close(fds[0]);
+        close(fds[1]);
+#else
+        closesocket(fds[0]);
+        closesocket(fds[1]);
+#endif
+        tjs__message_clone_abort(ctx, user_data_clone);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    JSValue obj = tjs_new_worker(ctx, fds[0], channel);
     if (JS_IsException(obj)) {
+        msgpipe_channel_release(channel);
 #ifndef _WIN32
         close(fds[0]);
         close(fds[1]);
@@ -1222,6 +1523,11 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         tjs__message_clone_abort(ctx, user_data_clone);
         return JS_EXCEPTION;
     }
+
+    /* The parent pipe retained the channel; this reference is for the child
+     * endpoint and is transferred to worker_data below. */
+    TJSMessagePipeChannel *worker_channel = msgpipe_channel_retain(channel);
+    msgpipe_channel_release(channel);
 
     TJSWorker *w = tjs_worker_get(ctx, obj);
     w->self_obj = JS_DupValue(ctx, obj);
@@ -1234,6 +1540,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     worker_data_t *worker_data = tjs__mallocz(sizeof(*worker_data));
     if (!worker_data) {
+        msgpipe_channel_release(worker_channel);
         uv_sem_destroy(&ready_sem);
         uv_sem_destroy(&start_sem);
 #ifndef _WIN32
@@ -1246,6 +1553,7 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         return JS_ThrowOutOfMemory(ctx);
     }
     worker_data->channel_fd = fds[1];
+    worker_data->channel = worker_channel;
     worker_data->start_sem = &start_sem;
     worker_data->ready_sem = &ready_sem;
     worker_data->worker = w;
@@ -1259,6 +1567,8 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
     r = uv_thread_create(&w->tid, worker_entry, (void *) worker_data);
     if (r != 0) {
         tjs_worker_count_remove();
+        msgpipe_channel_release(worker_data->channel);
+        worker_data->channel = NULL;
         uv_sem_destroy(&ready_sem);
         uv_sem_destroy(&start_sem);
 #ifndef _WIN32
@@ -1271,6 +1581,8 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
         tjs__message_clone_abort(ctx, user_data_clone);
         return tjs_throw_errno(ctx, r);
     }
+    w->state = TJS_WORKER_JOINABLE;
+	list_add_tail(&w->link, &qrt->workers);
 	/* Child blocks until commit; no half-detached workerData is exposed. */
 	int commit_error = tjs__message_clone_commit(ctx, user_data_clone);
 	atomic_store_explicit(&worker_data->commit_error, commit_error,
@@ -1281,14 +1593,15 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 		/* The child releases its transfer-owner reference and signals this
 		 * semaphore before returning. Join it before disposing of the owner. */
 		uv_sem_wait(&ready_sem);
+		CHECK(worker_claim_join(w));
 		CHECK_EQ(uv_thread_join(&w->tid), 0);
 		worker_mark_joined(w);
 		uv_sem_destroy(&ready_sem);
 		uv_sem_destroy(&start_sem);
-		worker_dispose_unstarted(ctx, obj, w);
+		worker_dispose_joined_failure(ctx, obj, w);
+		tjs__message_clone_abort(ctx, user_data_clone);
 		return JS_EXCEPTION;
 	}
-	list_add(&w->link, &qrt->workers);
 
     /* Wait for the worker to initialize. */
     uv_sem_wait(&ready_sem);
@@ -1297,7 +1610,14 @@ static JSValue tjs_worker_constructor(JSContext *ctx, JSValue new_target, int ar
 
     uv_update_time(tjs_get_loop(ctx));
 
-    CHECK_NOT_NULL(worker_get_runtime(w));
+    r = worker_get_init_error(w);
+    if (r != 0) {
+        CHECK(worker_claim_join(w));
+        CHECK_EQ(uv_thread_join(&w->tid), 0);
+        worker_mark_joined(w);
+        worker_dispose_joined_failure(ctx, obj, w);
+        return tjs_throw_errno(ctx, r);
+    }
 
     return obj;
 }
@@ -1345,23 +1665,49 @@ static const JSCFunctionListEntry tjs_worker_proto_funcs[] = {
 
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JSValue proto, obj;
-	TJSRuntime* trt = TJS_GetRuntime(ctx);
+    TJSRuntime *trt = TJS_GetRuntime(ctx);
 
     /* Worker class */
-    JS_NewClassID(rt, &tjs_worker_class_id);
-    JS_NewClass(rt, tjs_worker_class_id, &tjs_worker_class);
-    proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_worker_proto_funcs, countof(tjs_worker_proto_funcs));
-    JS_SetClassProto(ctx, tjs_worker_class_id, proto);
+    JSClassID id = JS_NewClassID(rt, &tjs_worker_class_id);
+    if (id == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Worker class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, id) &&
+        JS_NewClass(rt, id, &tjs_worker_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Worker class");
+        return;
+    }
+    JSValue proto = JS_GetClassProto(ctx, id);
+    if (JS_IsNull(proto)) {
+        proto = JS_NewObject(ctx);
+        if (JS_IsException(proto)) return;
+        if (JS_SetPropertyFunctionList(ctx, proto, tjs_worker_proto_funcs,
+                                       countof(tjs_worker_proto_funcs)) < 0) {
+            JS_FreeValue(ctx, proto);
+            return;
+        }
+        JS_SetClassProto(ctx, id, JS_DupValue(ctx, proto));
+    }
 
     /* Worker object */
-    obj = JS_NewCFunction2(ctx, tjs_worker_constructor, "Worker", 2, JS_CFUNC_constructor, 0);
-	JS_SetConstructor(ctx, obj, proto);
-    JS_DefinePropertyValueStr(ctx, ns, "Worker", obj, JS_PROP_C_W_E);
+    JSValue obj = JS_NewCFunction2(ctx, tjs_worker_constructor, "Worker", 2,
+                                  JS_CFUNC_constructor, 0);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, proto);
+        return;
+    }
+    int result = JS_SetConstructor(ctx, obj, proto);
+    JS_FreeValue(ctx, proto);
+    if (result < 0) {
+        JS_FreeValue(ctx, obj);
+        return;
+    }
+    if (JS_DefinePropertyValueStr(ctx, ns, "Worker", obj, JS_PROP_C_W_E) < 0)
+        return;
 
     /* MessagePipe class */
-	if (!trt->is_worker) reg_msgpipe(ctx);
+	if (!trt->is_worker && reg_msgpipe(ctx) < 0) return;
 
 	/* If we are in a worker, we need to initialize the pipe. */
 	JS_SetPropertyStr(ctx, ns, "isWorker", JS_NewBool(ctx, trt->is_worker));
