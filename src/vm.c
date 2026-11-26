@@ -182,10 +182,45 @@ static uint32_t tjs__count_closing_handles(TJSRuntime *qrt) {
 
 static void tjs__drain_closing_handles(TJSRuntime *qrt, int max_ticks) {
     for (int i = 0; i < max_ticks; i++) {
-        if (tjs__count_closing_handles(qrt) == 0) {
+        if (tjs__count_closing_handles(qrt) == 0)
             return;
-        }
         uv_run(&qrt->loop, UV_RUN_NOWAIT);
+    }
+}
+
+struct TJSRuntimeCleanup {
+    struct list_head link;
+    void (*callback)(void *);
+    void *opaque;
+};
+
+TJSRuntimeCleanup *TJS_AddRuntimeCleanup(TJSRuntime *runtime,
+                                         void (*callback)(void *), void *opaque) {
+    if (!runtime || runtime->freeing || !callback) return NULL;
+    TJSRuntimeCleanup *cleanup = tjs__malloc(sizeof(*cleanup));
+    if (!cleanup) return NULL;
+    cleanup->callback = callback;
+    cleanup->opaque = opaque;
+    list_add(&cleanup->link, &runtime->native_cleanup);
+    return cleanup;
+}
+
+void TJS_RemoveRuntimeCleanup(TJSRuntimeCleanup *cleanup) {
+    /* A running callback has already been detached into a self-linked node. */
+    if (!cleanup || list_empty(&cleanup->link)) return;
+    list_del(&cleanup->link);
+    tjs__free(cleanup);
+}
+
+static void tjs__cleanup_native_resources(TJSRuntime *runtime) {
+    while (!list_empty(&runtime->native_cleanup)) {
+        TJSRuntimeCleanup *cleanup = list_entry(runtime->native_cleanup.next, TJSRuntimeCleanup, link);
+        void (*callback)(void *) = cleanup->callback;
+        void *opaque = cleanup->opaque;
+        list_del(&cleanup->link);
+        init_list_head(&cleanup->link);
+        callback(opaque);
+        tjs__free(cleanup);
     }
 }
 
@@ -228,14 +263,13 @@ static int tjs__use_sourcemap(JSContext* ctx, const char* name, int* line, int* 
     return res.found;
 }
 
-/* thread_local: each worker owns its runtime on its own thread. */
-static thread_local int tjs__rejection_deferrals = 0;
-
 /* Hop bound used ONLY while another deferral is already outstanding. See the
  * termination argument in tjs__promise_rejection_dispatch. */
 #define TJS_REJECTION_MAX_HOPS 16
 
 static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValueConst* argv) {
+    TJSRuntime* qrt = TJS_GetRuntime(ctx);
+    CHECK_NOT_NULL(qrt);
     JSValue promise = argv[0], reason = argv[1];
 
     /* argv[2] is the re-enqueued hop count; the matching decrement must hit
@@ -243,7 +277,8 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
     int hop = 0;
     if (argc > 2) {
         hop = JS_VALUE_GET_INT(argv[2]);
-        tjs__rejection_deferrals--;
+        CHECK_GT(qrt->jobs.rejection_deferrals, 0);
+        qrt->jobs.rejection_deferrals--;
     }
 
     if (JS_PromiseIsHandled(ctx, promise)) return JS_UNDEFINED;
@@ -251,12 +286,12 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
     /* Thenable adoption lands one job later: re-enqueue (FIFO) and look again.
      * Unbounded wait only with no other deferral outstanding; else capped. */
     if (JS_IsJobPending(JS_GetRuntime(ctx)) &&
-        (tjs__rejection_deferrals == 0 || hop < TJS_REJECTION_MAX_HOPS)) {
+        (qrt->jobs.rejection_deferrals == 0 || hop < TJS_REJECTION_MAX_HOPS)) {
         JSValue again[3] = { promise, reason, JS_NewInt32(ctx, hop + 1) };
         /* JS_EnqueueJob dups argv and frees its copies, so no manual dup/free;
          * if the enqueue fails, fall through and report now. */
         if (JS_EnqueueJob(ctx, tjs__promise_rejection_dispatch, 3, (JSValueConst*) again) >= 0) {
-            tjs__rejection_deferrals++;
+            qrt->jobs.rejection_deferrals++;
             return JS_UNDEFINED;
         }
     }
@@ -277,8 +312,6 @@ static JSValue tjs__promise_rejection_dispatch(JSContext* ctx, int argc, JSValue
         if (!JS_IsEqual(ctx, ret, JS_FALSE)) {
             // The event wasn't cancelled or not handled(true), maybe abort.
         fail:;
-            TJSRuntime* qrt = TJS_GetRuntime(ctx);
-            CHECK_NOT_NULL(qrt);
 #ifdef DEBUG
             fprintf(stderr, "[CORE] PROMISE_REJECTION: ");
             tjs_dump_error(ctx, reason);
@@ -309,6 +342,22 @@ static void tjs__promise_rejection_tracker(JSContext* ctx, JSValue promise, JSVa
 static void uv__stop(uv_async_t* handle) {
     TJSRuntime* trt = handle->data;
     CHECK_NOT_NULL(trt);
+    /* TJS_FreeRuntime() still pumps libuv to complete close callbacks after
+     * setting freeing.  A stop notification already queued at that point must
+     * not re-enter the JS event bus or dispatch user EV_EXIT listeners. */
+    if (trt->freeing) {
+        atomic_store_explicit(&trt->jobs.stop_pending, false, memory_order_release);
+        uv_stop(&trt->loop);
+        return;
+    }
+    if (trt->unload_dispatched) {
+        atomic_store_explicit(&trt->jobs.stop_pending, false, memory_order_release);
+        uv_stop(&trt->loop);
+        return;
+    }
+    if (!trt->is_worker && trt->exit_code == 0)
+        trt->exit_code = 1;
+    atomic_store_explicit(&trt->jobs.stop_pending, false, memory_order_release);
 
     /* Dispatch EV_EXIT inside the loop thread: TJS_Stop may run on another
      * thread, so JS dispatch must not happen in TJS_Stop itself. */
@@ -343,7 +392,13 @@ TJSRuntime* TJS_NewRuntimeWorker(void) {
 
 App* TJS_NewAppInternal(TJSRuntime* trt, bool is_sandbox) {
     JSContext* ctx = is_sandbox ? JS_NewContextRaw(trt->rt) : JS_NewContext(trt->rt);
+    if (!ctx)
+        return NULL;
     App* app = tjs__mallocz(sizeof(App));
+    if (!app) {
+        JS_FreeContext(ctx);
+        return NULL;
+    }
     app->ctx = ctx;
     app->is_sandbox = is_sandbox;
     app->trt = trt;
@@ -361,20 +416,33 @@ App* TJS_NewApp(TJSRuntime* trt) {
     return TJS_NewAppInternal(trt, true);
 }
 
+static void tjs__script_boundary_hook(JSRuntime* rt, void* opaque);
+
 TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     JSRuntime* rt = NULL;
     TJSRuntime* qrt = tjs__mallocz(sizeof(*qrt));
+    if (!qrt)
+        return NULL;
+    atomic_init(&qrt->jobs.stop_pending, false);
 
     memcpy(&qrt->options, options, sizeof(*options));
 
     /* Create Runtime */
     rt = JS_NewRuntime2(&tjs_mf, NULL);
-    CHECK_NOT_NULL(rt);
+    if (!rt) {
+        tjs__free(qrt);
+        return NULL;
+    }
     qrt->rt = rt;
     JS_SetRuntimeOpaque(rt, qrt);
 
     /* Create main app */
     App* app = TJS_NewAppInternal(qrt, false);
+    if (!app) {
+        JS_FreeRuntime(rt);
+        tjs__free(qrt);
+        return NULL;
+    }
     JSContext* ctx = app->ctx;
     qrt->main_ctx = ctx;
 
@@ -403,6 +471,11 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     init_list_head(&qrt->dns_queries);
     init_list_head(&qrt->dns_getaddrinfo);
     init_list_head(&qrt->dns_getnameinfo);
+    init_list_head(&qrt->asyncfs_requests);
+    init_list_head(&qrt->processes);
+    init_list_head(&qrt->sockets);
+    init_list_head(&qrt->udps);
+    init_list_head(&qrt->native_cleanup);
 
     CHECK_EQ(uv_loop_init(&qrt->loop), 0);
 
@@ -425,6 +498,11 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     /* handle for stopping this runtime (also works from another thread) */
     CHECK_EQ(uv_async_init(&qrt->loop, &qrt->stop, uv__stop), 0);
     qrt->stop.data = qrt;
+
+    /* Module-body boundaries are macrotask boundaries for process.nextTick:
+       the checkpoint lives in mod_engine.c and runs the registered drain
+       before the body's own microtasks. */
+    JS_SetScriptBoundaryHook(rt, tjs__script_boundary_hook, qrt);  /* defined below */
 
     /* loader for ES modules */
     JS_SetModuleLoaderFunc2(rt, tjs__module_normalizer, tjs__module_loader, tjs__module_checkattr, qrt);
@@ -505,6 +583,14 @@ TJSRuntime* TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions* options) {
     qrt->console.counters = NULL;
     qrt->console.timers = NULL;
     qrt->console.group_indent = 0;
+    qrt->console.map_size = qrt->console.map_entries =
+        qrt->console.map_iterator_next = qrt->console.set_size =
+        qrt->console.set_values = qrt->console.set_iterator_next =
+        qrt->console.date_to_iso_string = JS_UNDEFINED;
+    if (tjs__console_init_runtime(qrt) < 0) {
+        TJS_FreeRuntime(qrt);
+        return NULL;
+    }
 
     return qrt;
 }
@@ -515,34 +601,67 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     TJS_SetCapabilityHook(qrt, NULL, NULL, 0);
     qrt->freeing = true;
 
+    JS_SetPromiseHook(qrt->rt, NULL, NULL);
+    JS_SetHostPromiseRejectionTracker(qrt->rt, NULL, NULL);
+    JS_SetScriptBoundaryHook(qrt->rt, NULL, NULL);
+    JS_SetBacktraceHook(qrt->rt, NULL, NULL);
+
+    /* Cleanup may pump libuv; stop JS scheduling before any native teardown. */
+    uv_close((uv_handle_t*) &qrt->jobs.prepare, NULL);
+    uv_close((uv_handle_t*) &qrt->jobs.idle, NULL);
+    uv_close((uv_handle_t*) &qrt->jobs.check, NULL);
+
     tjs__console_cleanup_runtime(qrt);
 
-    /* Release raw DNS JS refs while the runtime is valid, then drain until
-     * send/close callbacks have detached every native query context. */
+    /* Stop every callback source before any loop pump. Requests and handles
+     * below retain JSContext pointers; their callbacks only become safe once
+     * they have either completed or entered their RT-only freeing branch. */
+    tjs__destroy_timers(qrt);
+    tjs__mod_asyncfs_cleanup_runtime(qrt);
+    tjs__mod_process_cleanup_runtime(qrt);
+    tjs__mod_socket_cleanup_runtime(qrt);
+    tjs__mod_udp_cleanup_runtime(qrt);
+    tjs__cleanup_native_resources(qrt);
+
+    /* Release raw DNS JS refs while the runtime is valid. Its resolver and UDP
+     * callbacks are now teardown-only, so they can be drained with the rest. */
     tjs__mod_dns_cleanup_runtime(qrt);
-    tjs__mod_dns_drain_runtime(qrt);
-    tjs__drain_closing_handles(qrt, 64);
 
     /* Stop workers and join their threads before freeing shared state;
      * TJS_Stop is async. TJSWorker is freed by the JS finalizer. */
-    {
-        struct list_head* p, * tmp;
-        list_for_each_safe(p, tmp, &qrt->workers) {
-            TJSWorker* worker = list_entry(p, TJSWorker, link);
-            tjs__worker_stop_and_join(worker->ctx, worker);
+    for (;;) {
+        TJSWorker *worker = NULL;
+        struct list_head *p;
+
+        /* Joining can release a worker's self-reference, which may run a
+         * finalizer that removes and frees another worker record. Restart the
+         * scan after every join instead of retaining a successor pointer. */
+        list_for_each(p, &qrt->workers) {
+            TJSWorker *candidate = list_entry(p, TJSWorker, link);
+            if (!tjs__worker_is_joined(candidate)) {
+                worker = candidate;
+                break;
+            }
         }
+        if (!worker) break;
+        tjs__worker_stop_and_join(worker->ctx, worker);
     }
     /* Close stream handles before freeing JS so stream_pin() self-references
      * don't survive into QuickJS leak checking as TCP/Pipe/TTY objects. */
     tjs__close_all_streams(qrt);
     tjs__close_all_msgpipes(qrt);
-    tjs__drain_closing_handles(qrt, 64);
 
-    /* Close all core loop handles. */
-    uv_close((uv_handle_t*) &qrt->jobs.prepare, NULL);
-    uv_close((uv_handle_t*) &qrt->jobs.idle, NULL);
-    uv_close((uv_handle_t*) &qrt->jobs.check, NULL);
+    /* Native addon callbacks must be disabled before pumping libuv too. */
+    tjs__nodeapi_cleanup_runtime(qrt);
     uv_close((uv_handle_t*) &qrt->stop, NULL);
+
+    /* Every module callback source is now stopped or has a freeing-only
+     * callback. Drain requests only after that invariant holds; UV_RUN_ONCE in
+     * one module can dispatch callbacks owned by every other module. */
+    tjs__mod_asyncfs_drain_runtime(qrt);
+    tjs__mod_process_drain_runtime(qrt);
+    tjs__mod_udp_drain_runtime(qrt);
+    tjs__mod_dns_drain_runtime(qrt);
     tjs__drain_closing_handles(qrt, 64);
 
     /* Poison module hooks: later C-closure access ASan-reports, not UAF. */
@@ -564,9 +683,6 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* remove built-in data */
     JS_FreeValue(ctx, qrt->builtins.worker_udata);
     qrt->builtins.worker_udata = JS_UNDEFINED;
-    /* Unregister before freeing: the hook still fires from the job drain/GC;
-     * leaving it installed over a freed hook_fn is a use-after-free. */
-    JS_SetPromiseHook(qrt->rt, NULL, NULL);
     JS_FreeValue(ctx, qrt->builtins.promise_hook_fn);
     qrt->builtins.promise_hook_fn = JS_UNDEFINED;
     JS_FreeValue(ctx, qrt->builtins.message_pipe);
@@ -601,12 +717,10 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     /* Remove runtime-owned values before contexts and their atoms are freed. */
     tjs__evbus_cleanup_rt(qrt);
 
-    /* Destroy all timers and drain the Promise job queue. */
-    JSContext *job_ctx;
-    tjs__destroy_timers(qrt);
-    while (JS_ExecutePendingJob(qrt->rt, &job_ctx) != 0) {
-        /* drain */
-    }
+    /* Do not execute pending Promise jobs during teardown. They are user JS
+     * and may create a Worker, timer, stream, or other native resource after
+     * the corresponding close pass above has completed. QuickJS releases
+     * queued job arguments from JS_FreeRuntime(). */
     tjs__mod_ffi_drain_runtime(qrt);
 
     /* Release Node-API persistent refs before leak checking; env structs stay
@@ -626,18 +740,14 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
     tjs__mod_ffi_drain_runtime(qrt);
     tjs__drain_closing_handles(qrt, 64);
 
-    /* Release the runtime's context references; sandbox wrapper finalizers
-     * may already have released theirs. */
+    /* Native users have drained; release the runtime's retained contexts. */
     App* main_app = TJS_GetApp(ctx);
     {
         JS_FreeContext(main_app->ctx);
         struct list_head *cur, *tmp;
         list_for_each_safe(cur, tmp, &main_app->link) {
             App* app = list_entry(cur, App, link);
-            if (!app->context_released) {
-                JS_FreeContext(app->ctx);
-                app->context_released = true;
-            }
+            JS_FreeContext(app->ctx);
         }
     }
 
@@ -667,6 +777,9 @@ void TJS_FreeRuntime(TJSRuntime* qrt) {
         list_for_each_safe(p, tmp, &qrt->module.dyn_libs) {
             TJSDynLib* node = list_entry(p, TJSDynLib, link);
             list_del(p);
+            if (node->nodeapi && tjs__nodeapi_defer_dynlib(node)) {
+                continue;
+            }
             uv_dlclose(&node->lib);
             free(node);
         }
@@ -718,10 +831,28 @@ static void uv__idle_cb(uv_idle_t* handle) {
     // Noop
 }
 
+static void uv__maybe_idle(TJSRuntime* qrt);
+
+void tjs__notify_work(TJSRuntime* qrt) {
+    uv__maybe_idle(qrt);
+}
+
 static void uv__maybe_idle(TJSRuntime* qrt) {
+    /* Cleanup callbacks may notify after the core handles have closed. */
+    if (qrt->freeing) return;
+
     /* ticks_pending counts as work: the nextTick queue lives outside the
-     * QuickJS job queue, so JS_IsJobPending() cannot see it. */
-    if (JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending) {
+     * QuickJS job queue, so JS_IsJobPending() cannot see it. stop_pending
+     * likewise: a TJS_Stop from a callback must keep the loop alive until
+     * uv__stop dispatches EV_EXIT, or a natural drain races the async and
+     * the exit status is lost. */
+    bool pending_jobs = JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending ||
+        atomic_load_explicit(&qrt->jobs.stop_pending, memory_order_acquire);
+    if (pending_jobs || qrt->timers.pending_immediates) {
+        if (pending_jobs)
+            uv_ref((uv_handle_t *)&qrt->jobs.idle);
+        else
+            uv_unref((uv_handle_t *)&qrt->jobs.idle);
         CHECK_EQ(uv_idle_start(&qrt->jobs.idle, uv__idle_cb), 0);
     }
     else {
@@ -777,19 +908,50 @@ static bool tjs__execute_pending_jobs(TJSRuntime* trt) {
 void tjs__execute_jobs(TJSRuntime* trt) {
     assert(trt != NULL);
 
-    /* Node's microtask checkpoint */
-    do {
+    /* Node's microtask checkpoint: ticks registered before this point run
+       first; ticks queued during the drain re-checkpoint after the promise
+       queue reaches exhaustion. A module boundary starts with Promise jobs,
+       so it suppresses only this checkpoint's initial tick drain. */
+    if (!trt->jobs.module_checkpoint_pending)
         tjs__run_next_ticks(trt);
-    } while (!tjs__execute_pending_jobs(trt) && trt->jobs.ticks_pending && !trt->jobs.paused);
+
+    for (;;) {
+        if (tjs__execute_pending_jobs(trt)) {
+            trt->jobs.module_checkpoint_pending = false;
+            break;
+        }
+
+        if (trt->jobs.paused)
+            break;
+        if (trt->jobs.module_checkpoint_pending || trt->jobs.ticks_pending) {
+            trt->jobs.module_checkpoint_pending = false;
+            tjs__run_next_ticks(trt);
+            continue;
+        }
+        break;
+    }
     tjs__mod_ffi_drain_runtime(trt);
+}
+
+/* Module evaluation is an ESM microtask checkpoint: mark it here so the event
+ * loop drains Promise jobs before nextTick, as Node does for ESM. */
+static void tjs__script_boundary_hook(JSRuntime* rt, void* opaque) {
+    (void) rt;
+    TJSRuntime* trt = opaque;
+    if (trt->freeing) return;
+    /* Let the outer checkpoint drain jobs. Calling JS_ExecutePendingJob here
+     * would re-enter an active job drain when a module is loaded by import(). */
+    trt->jobs.module_checkpoint_pending = true;
 }
 
 static void uv__check_cb(uv_check_t* handle) {
     TJSRuntime* qrt = handle->data;
     CHECK_NOT_NULL(qrt);
 
-    /* Don't execute jobs here if we're inside waitIO - it handles jobs itself */
-    if (qrt->jobs.waitio_depth == 0) {
+    /* Teardown still pumps libuv to deliver close callbacks. Those passes must
+     * never execute user Promise jobs after native resources have started
+     * closing; JS_FreeRuntime() owns the queued job arguments. */
+    if (!qrt->freeing && qrt->jobs.waitio_depth == 0) {
         tjs__execute_jobs(qrt);
     }
 
@@ -866,14 +1028,14 @@ error:
     return -1;
 }
 
-void tjs__run_main(TJSRuntime* qrt) {
+int tjs__run_main(TJSRuntime* qrt) {
     /* get built-in script */
     uint8_t* tjs__core_js = NULL;
     uint32_t tjs__core_js_size = 0;
     tjs__core_js = tjs__read_self_attached(&tjs__core_js_size);
     if (tjs__core_js_size == 0 || !tjs__core_js) {
         fprintf(stderr, "CorePanic: Cannot load embedded core JS script\n");
-        exit(1);
+        return -1;
     }
 
     /* If we are running the main interpreter, run the entrypoint. */
@@ -881,8 +1043,9 @@ void tjs__run_main(TJSRuntime* qrt) {
 #ifdef DEBUG
         fprintf(stderr, "CorePanic: Eval entry script failed immediately\n");
 #endif
-        exit(1);
+        return -1;
     }
+    return 0;
 }
 
 /* exit_code wins when nonzero (fatal paths only); else js_exit_code, including
@@ -898,7 +1061,9 @@ static int tjs__resolved_exit_code(TJSRuntime* qrt) {
 /* Three independent queues, all must be checked: promise jobs, nextTick
  * (invisible to JS_IsJobPending), and live libuv handles. */
 static bool tjs__has_new_work(TJSRuntime* qrt) {
-    return JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending || uv_loop_alive(&qrt->loop) != 0;
+    return JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending ||
+        atomic_load_explicit(&qrt->jobs.stop_pending, memory_order_acquire) ||
+        uv_loop_alive(&qrt->loop) != 0;
 }
 
 /* Lifecycle teardown; true = caller runs another loop pass. Only an explicit
@@ -969,8 +1134,19 @@ int TJS_Run(TJSRuntime* qrt) {
     uv_unref((uv_handle_t*) &qrt->jobs.check);
 
     uv_unref((uv_handle_t*) &qrt->stop);
+    if (!qrt->is_worker &&
+        atomic_load_explicit(&qrt->jobs.stop_pending, memory_order_acquire)) {
+        /* TJS_Stop() is allowed before the first TJS_Run() call.  There is no
+         * event-loop pass to deliver the async notification yet, so dispatch
+         * the same loop-thread callback directly and preserve EV_EXIT. */
+        uv__stop(&qrt->stop);
+        return tjs__resolved_exit_code(qrt);
+    }
     if (!qrt->is_worker) {
-        tjs__run_main(qrt);
+        if (tjs__run_main(qrt) < 0) {
+            qrt->exit_code = 1;
+            return qrt->exit_code;
+        }
     }
 
     if (qrt->exit_code != 0) {
@@ -985,8 +1161,11 @@ int TJS_Run(TJSRuntime* qrt) {
         r = uv_run(&qrt->loop, UV_RUN_DEFAULT);
 
         if (r != 0
-            ? JS_IsJobPending(qrt->rt)
-            : (!qrt->jobs.paused && (JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending))
+            ? (JS_IsJobPending(qrt->rt) ||
+               atomic_load_explicit(&qrt->jobs.stop_pending, memory_order_acquire))
+            : (!qrt->jobs.paused &&
+               (JS_IsJobPending(qrt->rt) || qrt->jobs.ticks_pending ||
+                atomic_load_explicit(&qrt->jobs.stop_pending, memory_order_acquire)))
         )
             continue;
 
@@ -1005,7 +1184,10 @@ int TJS_Run(TJSRuntime* qrt) {
 
 void TJS_Stop(TJSRuntime* qrt) {
     CHECK_NOT_NULL(qrt);
-    if (!qrt->is_worker && qrt->exit_code == 0) qrt->exit_code = 1;
+    /* This may be called from another thread. The exit code is assigned by
+     * uv__stop on the loop thread; this atomic keeps the natural-drain path
+     * from racing past the async event. */
+    atomic_store_explicit(&qrt->jobs.stop_pending, true, memory_order_release);
     /* Only uv_async_send is thread-safe; JS dispatch is deferred to uv__stop
      * which runs inside the target runtime's own event loop thread. */
     uv_async_send(&qrt->stop);

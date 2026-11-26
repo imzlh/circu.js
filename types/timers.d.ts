@@ -1,5 +1,5 @@
 /**
- * Timers module - setTimeout and setInterval
+ * Timers module - timeout, interval, and check-phase immediate callbacks
  * 
  * @example
  * const timers = import.meta.use('timers');
@@ -50,6 +50,23 @@ declare namespace CModuleTimers {
     export function clearInterval(timerId: number): void;
 
     /**
+     * Schedule a callback for the next check phase
+     * @param func Callback function
+     * @param args Callback arguments (optional)
+     * @returns Immediate ID
+     */
+    export function setImmediate<TArgs extends any[]>(
+        func: (...args: TArgs) => any,
+        ...args: TArgs
+    ): number;
+
+    /**
+     * Clear an immediate callback
+     * @param immediateId Immediate ID
+     */
+    export function clearImmediate(immediateId: number): void;
+
+    /**
      * Reference timer
      * @param timerId Timer ID
      */
@@ -67,4 +84,23 @@ declare namespace CModuleTimers {
      * @returns True if timer is referenced
      */
     export function hasRef(timerId: number): boolean;
+
+    /**
+     * Reference an immediate callback
+     * @param immediateId Immediate ID
+     */
+    export function refImmediate(immediateId: number): void;
+
+    /**
+     * Unreference an immediate callback
+     * @param immediateId Immediate ID
+     */
+    export function unrefImmediate(immediateId: number): void;
+
+    /**
+     * Check if an immediate callback is referenced
+     * @param immediateId Immediate ID
+     * @returns True if the immediate is referenced
+     */
+    export function hasRefImmediate(immediateId: number): boolean;
 }

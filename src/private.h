@@ -36,6 +36,7 @@
 #include <curl/curl.h>
 #include <sqlite3.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <uv.h>
 #include <openssl/ssl.h>
 
@@ -54,6 +55,7 @@ enum {
 };
 
 typedef struct TJSTimer TJSTimer;
+typedef struct TJSImmediateState TJSImmediateState;
 typedef struct TJSEvBus TJSEvBus;
 typedef struct ConsoleCounter ConsoleCounter;
 typedef struct ConsoleTimer ConsoleTimer;
@@ -76,6 +78,7 @@ struct TJSRuntime {
     uint32_t capability_hook_flags;
     uint32_t capability_hook_depth;
     uv_loop_t loop;
+    struct list_head native_cleanup;
     struct {
         uv_check_t check;
         uv_idle_t idle;
@@ -86,6 +89,19 @@ struct TJSRuntime {
 		 * ticks_draining blocks drain re-entry from a tick callback. */
 		bool ticks_pending;
 		bool ticks_draining;
+		/* Rejection deferrals belong to this runtime. Multiple runtimes may be
+		 * driven sequentially on one thread, so thread-local state is incorrect. */
+		unsigned int rejection_deferrals;
+		/* A module body is an ESM checkpoint: its Promise jobs must run before
+		 * nextTick callbacks queued by that body. The boundary hook only marks
+		 * this state; the normal checkpoint consumes it without re-entering the
+		 * QuickJS job queue. */
+		bool module_checkpoint_pending;
+		/* Set by TJS_Stop until uv__stop dispatched EV_EXIT. While set, the
+		 * loop counts as having work: a stop requested from a callback must
+		 * never be lost to a natural drain that would otherwise exit before
+		 * the stop async is processed. */
+		_Atomic bool stop_pending;
     } jobs;
     uv_async_t stop;
 
@@ -109,6 +125,10 @@ struct TJSRuntime {
     /* Resolver requests are uv_req_t objects, not walkable handles. */
     struct list_head dns_getaddrinfo;
     struct list_head dns_getnameinfo;
+    struct list_head asyncfs_requests;
+    struct list_head processes;
+    struct list_head sockets;
+    struct list_head udps;
 
     /* Opaque cleanup queue owned by mod_ffi.c. */
     void *ffi_cleanup;
@@ -116,12 +136,21 @@ struct TJSRuntime {
 	bool freeing;
     struct {
         TJSTimer *timers;
+        TJSImmediateState *immediates;
         int64_t next_timer;
+        size_t pending_immediates;
     } timers;
     struct {
         ConsoleCounter *counters;
         ConsoleTimer *timers;
         int group_indent;
+        JSValue map_size;
+        JSValue map_entries;
+        JSValue map_iterator_next;
+        JSValue set_size;
+        JSValue set_values;
+        JSValue set_iterator_next;
+        JSValue date_to_iso_string;
     } console;
     struct {
         JSValue promise_hook_fn;
@@ -139,7 +168,7 @@ struct TJSRuntime {
 
 		JSValue imod_ns;
 		JSValue dyn_registry;       /* name -> path map for external native modules */
-		struct list_head dyn_libs;  /* loaded uv_lib_t handles, freed after JS shutdown */
+		struct list_head dyn_libs;  /* loaded handles; Node-API owners may defer unload */
 		MappingContext* mapctx;
 	} module;
     struct {
@@ -161,7 +190,10 @@ struct TJSApp {
     JSContext *ctx;
 
     bool is_sandbox;
-    bool context_released;
+    /* The Sandbox wrapper may be collected before native users release the
+     * context. This gates new evbus ownership without claiming that the
+     * JSContext has already been physically freed. */
+    bool context_invalid;
     struct list_head link;
 };
 
@@ -175,7 +207,19 @@ typedef struct {
 typedef struct TJSDynLib {
 	uv_lib_t lib;
 	struct list_head link;
+	bool nodeapi;
+	size_t nodeapi_pins;
+	bool nodeapi_deferred;
 } TJSDynLib;
+
+typedef enum {
+    TJS_WORKER_UNSTARTED,
+    TJS_WORKER_JOINABLE,
+    TJS_WORKER_JOINING,
+    /* The thread is joined, but releasing JS references can run finalizers. */
+    TJS_WORKER_RELEASING,
+    TJS_WORKER_JOINED,
+} TJSWorkerState;
 
 typedef struct {
     JSContext *ctx;
@@ -184,11 +228,11 @@ typedef struct {
     JSValue self_obj;
     JSValue message_pipe;
     TJSRuntime *wrt;
-    bool terminated;
-    bool exited;
-    bool joined;
+    TJSWorkerState state;
+    bool stop_requested;
     bool finalized_by_gc;
-	struct list_head link;
+    int init_error;
+    struct list_head link;
 } TJSWorker;
 
 typedef enum {
@@ -206,6 +250,7 @@ typedef enum {
 void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns);
 void tjs__mod_bjson_init(JSContext *ctx, JSValue ns);
 void tjs__mod_dns_init(JSContext *ctx, JSValue ns);
+const char *tjs__dns_uv_gai_code(int status);
 void tjs__mod_dns_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_dns_drain_runtime(TJSRuntime *trt);
 void tjs__mod_engine_init(JSContext *ctx, JSValue ns);
@@ -215,20 +260,29 @@ JSValue tjs__mod_evbus_dispatch_runtime_event(JSContext *ctx, int32_t event_name
 void tjs__evbus_cleanup(App *app);
 void tjs__evbus_cleanup_rt(TJSRuntime *trt);
 void tjs__mod_error_init(JSContext *ctx, JSValue ns);
+int tjs__console_init_runtime(TJSRuntime *trt);
 void tjs__console_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_ffi_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ffi_drain_runtime(TJSRuntime *trt);
 void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns);
+void tjs__mod_asyncfs_cleanup_runtime(TJSRuntime *trt);
+void tjs__mod_asyncfs_drain_runtime(TJSRuntime *trt);
 void tjs__mod_fs_init(JSContext* ctx, JSValue ns);
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns);
 void tjs__mod_os_init(JSContext *ctx, JSValue ns);
 void tjs__mod_process_init(JSContext *ctx, JSValue ns);
+void tjs__mod_process_cleanup_runtime(TJSRuntime *trt);
+void tjs__mod_process_drain_runtime(TJSRuntime *trt);
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns);
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns);
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
+int tjs__streams_register_pipe_class(JSContext *ctx);
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
+void tjs__mod_udp_cleanup_runtime(TJSRuntime *trt);
+void tjs__mod_udp_drain_runtime(TJSRuntime *trt);
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
+bool tjs__worker_is_joined(TJSWorker *w);
 void tjs__worker_stop_and_join(JSContext *ctx, TJSWorker *w);
 void tjs__mod_http_init(JSContext *ctx, JSValue ns);
 void tjs__mod_curl_init(JSContext* ctx, JSValue ns);
@@ -236,11 +290,13 @@ void tjs__mod_crypto_init(JSContext* ctx, JSValue ns);
 void tjs__mod_console_init(JSContext *ctx, JSValue ns);
 void tjs__mod_nodeapi_init(JSContext *ctx, JSValue ns);
 void tjs__nodeapi_cleanup_runtime(TJSRuntime *trt);
+bool tjs__nodeapi_defer_dynlib(TJSDynLib *lib);
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns);
 void tjs__mod_sourcemap_init(JSContext* ctx, JSValue ns);
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ssl_init(JSContext *ctx, JSValue ns);
 void tjs__mod_socket_init(JSContext *ctx, JSValue ns);
+void tjs__mod_socket_cleanup_runtime(TJSRuntime *trt);
 void tjs__mod_debug_init(JSContext *ctx, JSValue ns);
 
 #ifdef _WIN32
@@ -313,11 +369,16 @@ int tjs__module_checkattr(JSContext *ctx, void *opaque, JSValueConst attributes)
 int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpath, bool is_main);
 
 JSValue tjs__get_args(JSContext *ctx);
-void tjs__run_main(TJSRuntime* qrt);
+int tjs__run_main(TJSRuntime* qrt);
 void tjs__destroy_timers(TJSRuntime *qrt);
+void tjs__cancel_timers_for_context(TJSRuntime *qrt, JSContext *ctx);
 void tjs__close_all_streams(TJSRuntime *qrt);
 void tjs__free_orphaned_streams(TJSRuntime *qrt);
 void tjs__close_all_msgpipes(TJSRuntime *qrt);
+/* Wake the loop for newly enqueued work (jobs queued from I/O callbacks run
+ * after the current pass's checkpoint, and without a ref'd handle the loop
+ * would otherwise exit first). Implemented in vm.c. */
+void tjs__notify_work(TJSRuntime *qrt);
 /* Number of Worker threads whose native runtime has not fully returned. */
 size_t tjs__active_worker_count(void);
 
