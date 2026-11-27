@@ -188,7 +188,7 @@ static JSModuleDef *tjs__load_static_esm(JSContext *ctx,
 static JSValue tjs__dynmod_load(JSContext *ctx, const char *name, const char *path) {
 	TJSRuntime *qrt = TJS_GetRuntime(ctx);
 
-	TJSDynLib *node = malloc(sizeof(TJSDynLib));
+	TJSDynLib *node = calloc(1, sizeof(TJSDynLib));
 	if (!node) {
 		return JS_ThrowOutOfMemory(ctx);
 	}
@@ -217,10 +217,14 @@ static JSValue tjs__dynmod_load(JSContext *ctx, const char *name, const char *pa
 		return JS_ThrowTypeError(ctx, "native module '%s' returned null info", path);
 	}
 	if (info->abi_version != TJS_ABI_VERSION) {
+		/* The info struct belongs to the dynamic library. Capture the value
+		 * before unloading it; formatting the diagnostic after uv_dlclose()
+		 * would dereference unmapped extension memory. */
+		uint32_t got_abi_version = info->abi_version;
 		uv_dlclose(&node->lib);
 		free(node);
 		return JS_ThrowTypeError(ctx, "native module '%s' abi version mismatch: got %u, want %u",
-		                        path, info->abi_version, TJS_ABI_VERSION);
+		                        path, got_abi_version, TJS_ABI_VERSION);
 	}
 	if (!info->init) {
 		uv_dlclose(&node->lib);
@@ -246,7 +250,21 @@ static JSValue tjs__dynmod_load(JSContext *ctx, const char *name, const char *pa
 	list_add_tail(&node->link, &qrt->module.dyn_libs);
 
 	JSValue module_obj = JS_NewObjectProto(ctx, JS_NULL);
+	if (JS_IsException(module_obj)) {
+		/* No addon code can have installed finalizers without a module object;
+		 * undo the tracking before unloading this failed load. */
+		list_del(&node->link);
+		uv_dlclose(&node->lib);
+		free(node);
+		return module_obj;
+	}
 	info->init(ctx, module_obj);
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, module_obj);
+		/* Keep the library tracked: a partially initialized addon may have
+		 * installed class finalizers that still refer to its code. */
+		return JS_EXCEPTION;
+	}
 	return module_obj;
 }
 
@@ -285,8 +303,21 @@ JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 			return JS_NULL;
 		}
 		JSValue module_obj = JS_NewObjectProto(ctx, JS_NULL);
+		if (JS_IsException(module_obj)) {
+			JS_FreeCString(ctx, name);
+			return module_obj;
+		}
 		mod->init(ctx, module_obj);
-		JS_SetPropertyStr(ctx, ns, name, JS_DupValue(ctx, module_obj));
+		if (JS_HasException(ctx)) {
+			JS_FreeValue(ctx, module_obj);
+			JS_FreeCString(ctx, name);
+			return JS_EXCEPTION;
+		}
+		if (JS_SetPropertyStr(ctx, ns, name, JS_DupValue(ctx, module_obj)) < 0) {
+			JS_FreeValue(ctx, module_obj);
+			JS_FreeCString(ctx, name);
+			return JS_EXCEPTION;
+		}
 		JS_FreeCString(ctx, name);
 		return module_obj;
 	}
@@ -304,7 +335,11 @@ JSValue tjs__module_use(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 		JSValue result = tjs__dynmod_load(ctx, name, path);
 		JS_FreeCString(ctx, path);
 		if (JS_IsObject(result)) {
-			JS_SetPropertyStr(ctx, ns, name, JS_DupValue(ctx, result));
+			if (JS_SetPropertyStr(ctx, ns, name, JS_DupValue(ctx, result)) < 0) {
+				JS_FreeValue(ctx, result);
+				JS_FreeCString(ctx, name);
+				return JS_EXCEPTION;
+			}
 		}
 		JS_FreeCString(ctx, name);
 		return result;

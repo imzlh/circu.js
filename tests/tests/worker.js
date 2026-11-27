@@ -3,10 +3,10 @@
  */
 
 const { use } = import.meta;
-const { Worker, isWorker, pipe, workerData } = use('worker');
+const { Worker, isWorker, pipe, workerData, close } = use('worker');
 const console = use('console');
 const os = use('os');
-const { setTimeout, clearTimeout, setInterval, clearInterval } = use('timers');
+const { setTimeout, clearTimeout } = use('timers');
 
 // If running inside Worker, handle worker logic
 if (isWorker) {
@@ -105,6 +105,17 @@ if (isWorker) {
             };
             break;
 
+        case 'queueThenClose':
+            pipe.postMessage({ type: 'pending-before-close' });
+            close();
+            break;
+
+        case 'manyThenClose':
+            for (let i = 0; i < workerData.count; i++)
+                pipe.postMessage({ type: 'pending-before-close', index: i });
+            close();
+            break;
+
         case 'exitDuringImport': {
             const state = new Int32Array(workerData.state);
             Atomics.store(state, 0, 1);
@@ -135,39 +146,36 @@ if (isWorker) {
 
 // Wait for message helper
 function waitForMessage(pipe, timeout = 5000) {
-    return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(new Error('Timeout waiting for message'));
-        }, timeout);
-        
-        const originalHandler = pipe.onmessage;
-        pipe.onmessage = (data) => {
-            clearTimeout(timer);
-            pipe.onmessage = originalHandler;
-            resolve(data);
-        };
-    });
+    return waitForMessageType(pipe, undefined, timeout);
 }
 
 // Wait for specific message type
-async function waitForMessageType(pipe, expectedType, timeout = 5000) {
-    const startTime = Date.now();
+function waitForMessageType(pipe, expectedType, timeout = 5000, label = '') {
     return new Promise((resolve, reject) => {
-        const checkTimeout = () => {
-            if (Date.now() - startTime > timeout) {
-                reject(new Error(`Timeout waiting for message type: ${expectedType}`));
-            }
+        const originalHandler = pipe.onmessage;
+        const originalError = pipe.onmessageerror;
+        let settled = false;
+        const finish = (error, data) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (pipe.onmessage === handler) pipe.onmessage = originalHandler;
+            if (pipe.onmessageerror === onerror) pipe.onmessageerror = originalError;
+            if (error) reject(error);
+            else resolve(data);
         };
-        
-        const timer = setInterval(checkTimeout, 100);
-        
         const handler = (data) => {
-            if (data.type === expectedType) {
-                clearInterval(timer);
-                pipe.onmessage = null;
-                resolve(data);
-            }
+            if (expectedType === undefined || data?.type === expectedType)
+                finish(null, data);
         };
+        const onerror = cause => finish(new Error(
+            `Message error waiting for ${expectedType ?? 'message'} ${label}: ${cause}`,
+        ));
+        const timer = setTimeout(() => finish(new Error(
+            `Timeout waiting for message type: ${expectedType ?? '*'} ${label}; ` +
+            `pending=${JSON.stringify(pipe.pendingStats())}`,
+        )), timeout);
+        pipe.onmessageerror = onerror;
         pipe.onmessage = handler;
     });
 }
@@ -177,8 +185,24 @@ await test('Worker basic creation and termination', async () => {
     assert(worker, 'Worker should be created');
     assert(worker.messagePipe, 'Worker should have pipe');
     assert(typeof worker.terminate === 'function', 'Worker should have terminate method');
+
+    let missingArgumentError;
+    try {
+        worker.messagePipe.postMessage();
+    } catch (error) {
+        missingArgumentError = error;
+    }
+    assert(missingArgumentError instanceof TypeError,
+        'postMessage() must reject a missing value without reading argv[0]');
     
     // Clean up
+    await worker.terminate();
+});
+
+await test('Worker termination is idempotent', async () => {
+    const worker = new Worker({ type: 'checkIsWorker', testId: 'idempotent' });
+    await waitForMessage(worker.messagePipe);
+    await worker.terminate();
     await worker.terminate();
 });
 
@@ -219,6 +243,32 @@ await test('Worker message passing', async () => {
         assertEquals(response.type, 'echo');
         assert(response.original !== undefined, 'Response should contain original data');
     }
+
+    const backing = new ArrayBuffer(16);
+    const view = new Uint8Array(backing, 4, 3);
+    view.set([17, 23, 41]);
+    const shared = new SharedArrayBuffer(4);
+    new Uint8Array(shared)[2] = 59;
+    const transferred = waitForMessage(worker.messagePipe);
+    worker.messagePipe.postMessage({ backing, view, shared }, [backing]);
+    assertEquals(backing.byteLength, 0);
+    const echoed = (await transferred).original;
+    assertEquals(echoed.backing.byteLength, 16);
+    assertEquals(echoed.view.buffer, echoed.backing);
+    assertEquals(echoed.view.byteOffset, 4);
+    assertEquals(echoed.view.join(','), '17,23,41');
+    new Uint8Array(echoed.shared)[2] = 61;
+    assertEquals(new Uint8Array(shared)[2], 61);
+
+    const retained = new ArrayBuffer(8);
+    let duplicateRejected = false;
+    try {
+        worker.messagePipe.postMessage(retained, [retained, retained]);
+    } catch {
+        duplicateRejected = true;
+    }
+    assert(duplicateRejected);
+    assertEquals(retained.byteLength, 8);
     
     await worker.terminate();
 });
@@ -239,26 +289,26 @@ await test('Worker stress test - concurrent workers', async () => {
     const workers = [];
     const promises = [];
     
-    // Create multiple workers
-    for (let i = 0; i < WORKER_COUNT; i++) {
-        const worker = new Worker({ type: 'stress', testId: `stress-${i}` });
-        workers.push(worker);
-        promises.push(waitForMessageType(worker.messagePipe, 'stress'));
-    }
-    
-    // Wait for all to complete
-    const results = await Promise.all(promises);
-    
-    // Verify all workers completed successfully
-    for (let i = 0; i < WORKER_COUNT; i++) {
-        assertEquals(results[i].type, 'stress');
-        assertEquals(results[i].testId, `stress-${i}`);
-        assert(typeof results[i].result === 'number', 'Result should be a number');
-    }
-    
-    // Clean up
-    for (const worker of workers) {
-        await worker.terminate();
+    try {
+        // Start all workers before arming the response deadline. Startup is
+        // synchronous; early responses remain buffered by MessagePipe.
+        for (let i = 0; i < WORKER_COUNT; i++)
+            workers.push(new Worker({ type: 'stress', testId: `stress-${i}` }));
+        for (let i = 0; i < WORKER_COUNT; i++)
+            promises.push(waitForMessageType(
+                workers[i].messagePipe, 'stress', 5000, `stress-${i}`,
+            ));
+        const results = await Promise.all(promises);
+        for (let i = 0; i < WORKER_COUNT; i++) {
+            assertEquals(results[i].type, 'stress');
+            assertEquals(results[i].testId, `stress-${i}`);
+            assert(typeof results[i].result === 'number', 'Result should be a number');
+        }
+    } finally {
+        for (const worker of workers)
+            await worker.terminate();
+        // Let every helper release its timer/handlers even after one fails.
+        await Promise.allSettled(promises);
     }
 });
 
@@ -341,6 +391,100 @@ await test('Worker multiple messages', async () => {
     }
     
     await worker.terminate();
+});
+
+await test('MessagePipe preserves queued messages for a handler installed after close', async () => {
+    const worker = new Worker({ type: 'queueThenClose' });
+    let timeout;
+    try {
+        const deadline = Date.now() + 3000;
+        while (worker.messagePipe.pendingStats().messages === 0) {
+            if (Date.now() >= deadline) {
+                throw new Error('Worker message did not become pending');
+            }
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        const closePromise = new Promise((resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error('Worker close timed out')), 3000);
+            worker.messagePipe.onclose = () => {
+                clearTimeout(timeout);
+                resolve();
+            };
+        });
+        await closePromise;
+        assertEquals(worker.messagePipe.pendingStats().messages, 1,
+            'EOF must preserve messages until a consumer is installed');
+        const message = await waitForMessage(worker.messagePipe);
+        assertEquals(message.type, 'pending-before-close');
+        assertEquals(worker.messagePipe.pendingStats().messages, 0);
+    } finally {
+        clearTimeout(timeout);
+        await worker.terminate();
+    }
+});
+
+await test('MessagePipe delivers queued messages before close when handlers are installed', async () => {
+    const worker = new Worker({ type: 'queueThenClose' });
+    const events = [];
+    let timeout;
+    try {
+        const closed = new Promise((resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error('Worker close timed out')), 3000);
+            worker.messagePipe.onmessage = data => events.push(data.type);
+            worker.messagePipe.onclose = () => {
+                events.push('close');
+                resolve();
+            };
+        });
+        await closed;
+        assertEquals(events.length, 2);
+        assertEquals(events[0], 'pending-before-close');
+        assertEquals(events[1], 'close');
+        assertEquals(worker.messagePipe.pendingStats().messages, 0);
+    } finally {
+        clearTimeout(timeout);
+        await worker.terminate();
+    }
+});
+
+await test('MessagePipe close completes if onmessage is removed during a drain', async () => {
+    const worker = new Worker({ type: 'manyThenClose', count: 5 });
+    const events = [];
+    let timeout;
+    try {
+        const closed = new Promise((resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error('Worker close timed out')), 3000);
+            worker.messagePipe.onmessage = data => {
+                events.push(data.index);
+                worker.messagePipe.onmessage = null;
+            };
+            worker.messagePipe.onclose = () => {
+                events.push('close');
+                resolve();
+            };
+        });
+        await closed;
+        assertEquals(events[0], 0);
+        assertEquals(events[events.length - 1], 'close');
+        const remaining = worker.messagePipe.pendingStats().messages;
+        const delivered = events.slice(0, -1);
+        if (remaining > 0) {
+            await new Promise((resolve, reject) => {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => reject(new Error('Late drain timed out')), 3000);
+                worker.messagePipe.onmessage = data => {
+                    delivered.push(data.index);
+                    if (delivered.length === 5) resolve();
+                };
+            });
+        }
+        assertEquals(delivered.join(','), '0,1,2,3,4',
+            'removing a handler must not discard later frames');
+        assertEquals(worker.messagePipe.pendingStats().messages, 0);
+    } finally {
+        clearTimeout(timeout);
+        await worker.terminate();
+    }
 });
 
 await test('Worker bidirectional communication', async () => {

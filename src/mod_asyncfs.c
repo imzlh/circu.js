@@ -32,11 +32,86 @@
 #include <uv.h>
 
 #ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef F_DUPFD_QUERY
+#define F_DUPFD_QUERY 1027 /* Linux UAPI, since 6.10. */
+#endif
+#ifndef KCMP_FILE
+#define KCMP_FILE 0
+#endif
+#endif
 #endif
 
-static thread_local JSClassID tjs_file_class_id;
+#ifdef _WIN32
+#include <windows.h>
+#include <sys/stat.h>
+#include <wchar.h>
+#endif
+
+#ifndef S_ISREG
+#  ifdef _S_IFREG
+#    define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#  else
+#    define S_ISREG(m) 0
+#  endif
+#endif
+
+#ifdef _WIN32
+/* GetFileAttributesW does not open the data stream, unlike uv_fs_open().
+ * Reject Windows namespaces which can name devices or named pipes before the
+ * worker reaches the non-cancellable CreateFileW call. */
+static int tjs_windows_readfile_path_check(const char *path) {
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                     path, -1, NULL, 0);
+    if (length <= 0)
+        return uv_translate_sys_error(GetLastError());
+
+    WCHAR *wide = tjs__malloc((size_t)length * sizeof(*wide));
+    if (!wide)
+        return UV_ENOMEM;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                             path, -1, wide, length)) {
+        int result = uv_translate_sys_error(GetLastError());
+        tjs__free(wide);
+        return result;
+    }
+
+    static const WCHAR device_prefix[] = L"\\\\.\\";
+    static const WCHAR pipe_prefix[] = L"\\\\?\\pipe\\";
+    static const WCHAR globalroot_device_prefix[] = L"\\\\?\\globalroot\\device\\";
+    int result = 0;
+    if (_wcsnicmp(wide, device_prefix, countof(device_prefix) - 1) == 0 ||
+        _wcsnicmp(wide, pipe_prefix, countof(pipe_prefix) - 1) == 0 ||
+        _wcsnicmp(wide, globalroot_device_prefix,
+                  countof(globalroot_device_prefix) - 1) == 0) {
+        result = UV_ENOTSUP;
+    } else {
+        DWORD attributes = GetFileAttributesW(wide);
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            result = uv_translate_sys_error(GetLastError());
+        } else if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+            result = UV_EISDIR;
+        } else if (attributes & FILE_ATTRIBUTE_DEVICE) {
+            result = UV_ENOTSUP;
+        }
+    }
+    tjs__free(wide);
+    return result;
+}
+
+static int tjs_windows_readfile_fd_check(uv_file fd) {
+    return uv_guess_handle(fd) == UV_FILE ? 0 : UV_ENOTSUP;
+}
+#endif
+
+static JSClassID tjs_file_class_id;
 
 static void* tjs__buf_realloc_untracked(JSRuntime *rt, void *opaque, void *ptr, size_t size) {
     (void) rt; (void) opaque;
@@ -83,7 +158,7 @@ static JSClassDef tjs_file_class = {
 	.gc_mark = tjs_file_gc_mark,
 };
 
-static thread_local JSClassID tjs_dir_class_id;
+static JSClassID tjs_dir_class_id;
 
 typedef struct {
     JSContext *ctx;
@@ -121,7 +196,7 @@ static JSClassDef tjs_dir_class = {
 	.gc_mark = tjs_dir_gc_mark,
 };
 
-static thread_local JSClassID tjs_dirent_class_id;
+static JSClassID tjs_dirent_class_id;
 
 typedef struct {
     JSValue name;
@@ -149,7 +224,7 @@ static JSClassDef tjs_dirent_class = {
 	.gc_mark = tjs_dirent_gc_mark 
 };
 
-static thread_local JSClassID tjs_stat_class_id;
+static JSClassID tjs_stat_class_id;
 
 typedef struct {
     uint64_t st_mode;
@@ -167,7 +242,44 @@ static JSClassDef tjs_stat_class = {
 	.finalizer = tjs_stat_finalizer 
 };
 
+typedef struct TJSAsyncFsReq {
+    struct list_head link;
+    TJSRuntime *trt;
+    uv_req_t *req;
+    bool linked;
+    _Atomic bool canceled;
+} TJSAsyncFsReq;
+
+static void tjs_file_io_cancel(TJSAsyncFsReq *base);
+
+static void tjs_asyncfs_register(TJSAsyncFsReq *base, TJSRuntime *trt, uv_req_t *req) {
+    base->trt = trt;
+    base->req = req;
+    init_list_head(&base->link);
+    list_add_tail(&base->link, &trt->asyncfs_requests);
+    base->linked = true;
+}
+
+static void tjs_asyncfs_unregister(TJSAsyncFsReq *base) {
+    if (!base->linked) return;
+    list_del(&base->link);
+    base->linked = false;
+}
+
+static void tjs_asyncfs_cancel(TJSRuntime *trt) {
+    struct list_head *pos;
+    list_for_each(pos, &trt->asyncfs_requests) {
+        TJSAsyncFsReq *base = list_entry(pos, TJSAsyncFsReq, link);
+        atomic_store_explicit(&base->canceled, true, memory_order_release);
+        if (base->req)
+            (void) uv_cancel(base->req);
+        else
+            tjs_file_io_cancel(base);
+    }
+}
+
 typedef struct {
+    TJSAsyncFsReq base;
     uv_fs_t req;
     JSContext *ctx;
     JSValue obj;
@@ -181,7 +293,19 @@ typedef struct {
     } rw;
 } TJSFsReq;
 
+/* Special descriptors must not occupy an uncancellable libuv pool worker.
+ * This thread owns only native I/O; the loop retains all JS state until join. */
 typedef struct {
+    TJSFsReq fs;
+    uv_async_t completion;
+    uv_thread_t thread;
+    _Atomic bool done;
+    uv_file fd;
+    int64_t position;
+} TJSFileIOReq;
+
+typedef struct {
+    TJSAsyncFsReq base;
     uv_work_t req;
     DynBuf dbuf;
     JSContext *ctx;
@@ -190,11 +314,133 @@ typedef struct {
     TJSPromise result;
 } TJSReadFileReq;
 
-/* uv_fs_* may allocate before a synchronous error; cleanup with no callback. */
-static inline void tjs_fsreq_free_immediate(JSContext *ctx, TJSFsReq *fr) {
-    if (!fr) return;
-    uv_fs_req_cleanup(&fr->req);
+static void tjs_fsreq_release_js(JSContext *ctx, TJSFsReq *fr) {
+    if (fr->file_pending) {
+        TJSFile *f = JS_GetOpaque(fr->obj,
+                                  tjs_file_class_id);
+        CHECK_NOT_NULL(f);
+        CHECK_GT(f->pending, 0);
+        f->pending--;
+        fr->file_pending = false;
+    }
+    JS_FreeValue(ctx, fr->obj);
+    JS_FreeValue(ctx, fr->rw.tarray);
+    TJS_FreePromise(ctx, &fr->result);
+    js_free(ctx, fr->rw.data);
+}
+
+/* The request has not been handed to libuv, so no uv request cleanup is
+ * needed. This is the abort path after Promise initialization fails. */
+static void tjs_fsreq_abort(JSContext *ctx, TJSFsReq *fr) {
+    tjs_fsreq_release_js(ctx, fr);
     js_free(ctx, fr);
+}
+
+static void tjs_fsreq_cleanup_native(TJSFsReq *fr) {
+    /* A canceled/unqueued closedir still borrows the Directory's uv_dir_t.
+     * libuv's generic cleanup must not take ownership of that pointer. */
+    if (fr->req.fs_type == UV_FS_CLOSEDIR && fr->req.result < 0)
+        fr->req.ptr = NULL;
+    uv_fs_req_cleanup(&fr->req);
+}
+
+static void tjs_fsreq_cleanup_immediate(JSContext *ctx, TJSFsReq *fr) {
+    tjs_fsreq_cleanup_native(fr);
+    tjs_fsreq_release_js(ctx, fr);
+    js_free(ctx, fr);
+}
+
+static void tjs_asyncfs_cleanup_fs_req(TJSFsReq *fr) {
+    JSRuntime *rt = fr->base.trt->rt;
+
+    /* Reconcile wrapper state before dropping fr->obj: that release may run
+     * the File/Directory finalizer synchronously. */
+    TJSFile *f = JS_GetOpaque(fr->obj,
+                              tjs_file_class_id);
+    TJSDir *d = JS_GetOpaque(fr->obj,
+                             tjs_dir_class_id);
+    if (fr->file_pending && f) {
+        if (f->pending > 0) f->pending--;
+        fr->file_pending = false;
+    }
+    if (fr->req.fs_type == UV_FS_READDIR && d) {
+        d->pending = false;
+    }
+    if (fr->req.fs_type == UV_FS_CLOSE && f) {
+        f->closing = false;
+        if (fr->req.result >= 0) {
+            f->fd = -1;
+            JS_FreeValueRT(rt, f->path);
+            f->path = JS_UNDEFINED;
+        }
+    }
+    if (fr->req.fs_type == UV_FS_CLOSEDIR && d) {
+        d->closing = false;
+        if (fr->req.result >= 0) {
+            d->dir = NULL;
+            JS_FreeValueRT(rt, d->path);
+            d->path = JS_UNDEFINED;
+        }
+    }
+
+    if (fr->req.result >= 0) {
+        uv_fs_t close_req;
+        switch (fr->req.fs_type) {
+            case UV_FS_OPEN:
+            case UV_FS_MKSTEMP:
+                uv_fs_close(NULL, &close_req, (uv_file) fr->req.result, NULL);
+                uv_fs_req_cleanup(&close_req);
+                break;
+            case UV_FS_OPENDIR:
+                uv_fs_closedir(NULL, &close_req, fr->req.ptr, NULL);
+                uv_fs_req_cleanup(&close_req);
+                break;
+            default:
+                break;
+        }
+    }
+    /* READDIR cleanup dereferences uv_dir_t and its wrapper-owned dirents.
+     * Finish it before any JS release can finalize the Directory. */
+    tjs_fsreq_cleanup_native(fr);
+    JS_FreeValueRT(rt, fr->obj);
+    JS_FreeValueRT(rt, fr->rw.tarray);
+    TJS_FreePromiseRT(rt, &fr->result);
+    js_free_rt(rt, fr->rw.data);
+    js_free_rt(rt, fr);
+}
+
+static void tjs_asyncfs_cleanup_readfile(TJSReadFileReq *fr) {
+    JSRuntime *rt = fr->base.trt->rt;
+    dbuf_free(&fr->dbuf);
+    TJS_FreePromiseRT(rt, &fr->result);
+    js_free_rt(rt, fr->filename);
+    js_free_rt(rt, fr);
+}
+
+void tjs__mod_asyncfs_cleanup_runtime(TJSRuntime *trt) {
+    if (!trt) return;
+    tjs_asyncfs_cancel(trt);
+}
+
+void tjs__mod_asyncfs_drain_runtime(TJSRuntime *trt) {
+    if (!trt) return;
+    while (!list_empty(&trt->asyncfs_requests)) {
+#ifdef _WIN32
+        /* CancelSynchronousIo can miss a thread between its canceled check
+         * and ReadFile/WriteFile. Retry until that thread publishes completion. */
+        struct list_head *pos;
+        list_for_each(pos, &trt->asyncfs_requests) {
+            TJSAsyncFsReq *base = list_entry(pos, TJSAsyncFsReq, link);
+            if (!base->req)
+                tjs_file_io_cancel(base);
+        }
+        uv_run(&trt->loop, UV_RUN_NOWAIT);
+        if (!list_empty(&trt->asyncfs_requests))
+            uv_sleep(1);
+#else
+        uv_run(&trt->loop, UV_RUN_ONCE);
+#endif
+    }
 }
 
 static JSValue tjs_new_file(JSContext *ctx, uv_file fd, const char *path) {
@@ -241,10 +487,26 @@ static TJSFile *tjs_file_get_open(JSContext *ctx, JSValue obj) {
     return f;
 }
 
+static int tjs_file_needs_io_thread(JSContext *ctx, TJSFile *f) {
+    uv_fs_t req;
+    int r = uv_fs_fstat(NULL, &req, f->fd, NULL);
+    if (r < 0) {
+        uv_fs_req_cleanup(&req);
+        tjs_throw_errno(ctx, r);
+        return -1;
+    }
+    /* Directories must reach libuv too, preserving the platform's errno. */
+    bool special = !S_ISREG(req.statbuf.st_mode) &&
+                   (req.statbuf.st_mode & S_IFMT) != S_IFDIR;
+    uv_fs_req_cleanup(&req);
+    return special;
+}
+
 /* Whether two descriptors refer to the same open file description. A
  * capability hook can close a numeric descriptor and reuse its slot, so the
- * number alone says nothing. Windows compares kernel handles; POSIX uses the
- * inode identity of a dup, which shares the open file description. */
+ * number and inode alone say nothing. Never mutate shared descriptor state
+ * while answering this question: a duplicate shares O_NONBLOCK with the
+ * caller's descriptor and a failed restore would permanently change it. */
 static TJSObjectHandleIdentity tjs_fs_fd_identity(int first, int second) {
 #ifdef _WIN32
     HANDLE first_handle = uv_get_osfhandle(first);
@@ -255,16 +517,37 @@ static TJSObjectHandleIdentity tjs_fs_fd_identity(int first, int second) {
     }
     return TJS_CompareObjectHandles(first_handle, second_handle);
 #else
+#ifdef __linux__
+    int same = fcntl(first, F_DUPFD_QUERY, second);
+    if (same >= 0)
+        return same ? TJS_OBJECT_HANDLE_IDENTITY_SAME
+                    : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+#ifdef SYS_kcmp
+    long comparison = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE,
+                              first, second);
+    if (comparison == 0)
+        return TJS_OBJECT_HANDLE_IDENTITY_SAME;
+    if (comparison > 0)
+        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+#endif
+#endif
+
+    int first_flags = fcntl(first, F_GETFL);
+    int second_flags = fcntl(second, F_GETFL);
+    if (first_flags >= 0 && second_flags >= 0 &&
+        (first_flags & O_ACCMODE) != (second_flags & O_ACCMODE))
+        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+
     struct stat first_stat;
     struct stat second_stat;
     if (fstat(first, &first_stat) != 0 || fstat(second, &second_stat) != 0)
-        return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
-    bool same = first_stat.st_dev == second_stat.st_dev &&
-                first_stat.st_ino == second_stat.st_ino &&
-                (first_stat.st_mode & S_IFMT) ==
-                    (second_stat.st_mode & S_IFMT);
-    return same ? TJS_OBJECT_HANDLE_IDENTITY_SAME
-                : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
+        return TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED;
+    bool different = first_stat.st_dev != second_stat.st_dev ||
+                     first_stat.st_ino != second_stat.st_ino ||
+                     (first_stat.st_mode & S_IFMT) !=
+                         (second_stat.st_mode & S_IFMT);
+    return different ? TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT
+                     : TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED;
 #endif
 }
 
@@ -410,6 +693,7 @@ static JSValue tjs_new_statfs(JSContext *ctx, uv_statfs_t *st) {
 #define DEF_FIELD(x) JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, (int64_t) st->f_##x), JS_PROP_C_W_E);
     DEF_FIELD(type);
     DEF_FIELD(bsize);
+    DEF_FIELD(frsize);
     DEF_FIELD(blocks);
     DEF_FIELD(bfree);
     DEF_FIELD(bavail);
@@ -421,7 +705,10 @@ static JSValue tjs_new_statfs(JSContext *ctx, uv_statfs_t *st) {
 }
 
 static JSValue tjs_fsreq_init(JSContext *ctx, TJSFsReq *fr, JSValue obj) {
+    JSValue promise;
+
     fr->ctx = ctx;
+    fr->base.trt = TJS_GetRuntime(ctx);
     fr->req.data = fr;
     fr->obj = JS_DupValue(ctx, obj);
     fr->file_pending = false;
@@ -429,19 +716,37 @@ static JSValue tjs_fsreq_init(JSContext *ctx, TJSFsReq *fr, JSValue obj) {
     fr->rw.data = NULL;
     fr->rw.len = 0;
     fr->rw.is_write = false;
-
-    return TJS_InitPromise(ctx, &fr->result);
+    fr->base.linked = false;
+    atomic_init(&fr->base.canceled, false);
+    promise = TJS_InitPromise(ctx, &fr->result);
+    return promise;
 }
 
-static JSValue tjs_file_fsreq_init(JSContext *ctx, TJSFsReq *fr, JSValue obj) {
+static JSValue tjs_filereq_init(JSContext *ctx, TJSFsReq *fr,
+                                JSValue obj, TJSFile *f) {
+    /* Promise hooks run synchronously. Reserve the descriptor before creating
+     * the Promise so a hook cannot close it while this request is prepared. */
+    f->pending++;
     JSValue promise = tjs_fsreq_init(ctx, fr, obj);
     fr->file_pending = true;
+    if (JS_IsException(promise)) {
+        /* tjs_fsreq_init returns before the flag assignment above on Promise
+         * allocation failure, so roll back the reservation here. */
+        f->pending--;
+        fr->file_pending = false;
+    }
     return promise;
 }
 
 static void uv__fs_req_cb(uv_fs_t *req) {
     TJSFsReq *fr = req->data;
     if (!fr) {
+        return;
+    }
+
+    tjs_asyncfs_unregister(&fr->base);
+    if (fr->base.trt->freeing) {
+        tjs_asyncfs_cleanup_fs_req(fr);
         return;
     }
 
@@ -632,14 +937,92 @@ static void uv__fs_req_cb(uv_fs_t *req) {
     }
 
 skip:
+    tjs_fsreq_cleanup_native(fr);
     TJS_SettlePromise(ctx, &fr->result, is_reject, 1, &arg);
 
     JS_FreeValue(ctx, fr->obj);
     JS_FreeValue(ctx, fr->rw.tarray);
     js_free(ctx, fr->rw.data);
 
-    uv_fs_req_cleanup(&fr->req);
     js_free(ctx, fr);
+}
+
+static void tjs_file_io_cancel(TJSAsyncFsReq *base) {
+    TJSFileIOReq *io = container_of(base, TJSFileIOReq, fs.base);
+    if (atomic_load_explicit(&io->done, memory_order_acquire))
+        return;
+#ifdef _WIN32
+    (void) CancelSynchronousIo(io->thread);
+#else
+    /* Deferred cancellation is confined to read/write cancellation points in
+     * our own thread, never libuv's shared worker pool or a JS call. */
+    (void) pthread_cancel(io->thread);
+#endif
+}
+
+static void tjs_file_io_done(void *opaque) {
+    TJSFileIOReq *io = opaque;
+    atomic_store_explicit(&io->done, true, memory_order_release);
+    uv_async_send(&io->completion);
+}
+
+static void tjs_file_io_work(void *opaque) {
+    TJSFileIOReq *io = opaque;
+    TJSFsReq *fr = &io->fs;
+    fr->req.result = UV_ECANCELED;
+#ifdef _WIN32
+    if (!atomic_load_explicit(&fr->base.canceled, memory_order_acquire)) {
+        uv_buf_t buffer = uv_buf_init((char *)fr->rw.data, fr->rw.len);
+        if (fr->rw.is_write)
+            uv_fs_write(NULL, &fr->req, io->fd, &buffer, 1,
+                         io->position, NULL);
+        else
+            uv_fs_read(NULL, &fr->req, io->fd, &buffer, 1,
+                        io->position, NULL);
+    }
+    tjs_file_io_done(io);
+#else
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(tjs_file_io_done, io);
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    if (!atomic_load_explicit(&fr->base.canceled, memory_order_acquire)) {
+        ssize_t count;
+        size_t length = fr->rw.len > INT32_MAX ? INT32_MAX : fr->rw.len;
+        do {
+            if (io->position < 0) {
+                count = fr->rw.is_write
+                    ? write(io->fd, fr->rw.data, length)
+                    : read(io->fd, fr->rw.data, length);
+            } else {
+                count = fr->rw.is_write
+                    ? pwrite(io->fd, fr->rw.data, length, io->position)
+                    : pread(io->fd, fr->rw.data, length, io->position);
+            }
+        } while (count < 0 && errno == EINTR &&
+                 !atomic_load_explicit(&fr->base.canceled, memory_order_acquire));
+        fr->req.result = count < 0 ? uv_translate_sys_error(errno) : count;
+    }
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_pop(1);
+#endif
+}
+
+static void tjs_file_io_close_cb(uv_handle_t *handle) {
+    TJSFileIOReq *io = handle->data;
+    uv__fs_req_cb(&io->fs.req);
+}
+
+static void tjs_file_io_complete(uv_async_t *handle) {
+    TJSFileIOReq *io = handle->data;
+    CHECK_EQ(uv_thread_join(&io->thread), 0);
+    /* The request allocation embeds the async handle. Release it only from
+     * close_cb, after the I/O thread and libuv are both finished with it. */
+    uv_close((uv_handle_t *)handle, tjs_file_io_close_cb);
+}
+
+static void tjs_file_io_start_failed(uv_handle_t *handle) {
+    TJSFileIOReq *io = handle->data;
+    js_free_rt(io->fs.base.trt->rt, io);
 }
 
 /* File functions */
@@ -671,24 +1054,72 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
 
     TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | (magic ? TJS_CAP_IO_WRITE : TJS_CAP_IO_READ), TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, magic ? "asyncfs.file.write" : "asyncfs.file.read", NULL), (void)0, do { f = tjs_file_get_open(ctx, this_val); if (!f) return (JS_EXCEPTION); buf = JS_GetUint8Array(ctx, &size, argv[0]); if (!buf) return (JS_EXCEPTION); } while (0));
 
-    TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
+    int threaded = tjs_file_needs_io_thread(ctx, f);
+    if (threaded < 0)
+        return JS_EXCEPTION;
+
+    TJSFsReq *fr = js_mallocz(ctx, threaded ? sizeof(TJSFileIOReq) : sizeof(*fr));
     if (!fr) {
         return JS_EXCEPTION;
     }
-    memset(fr, 0, sizeof(*fr));
 
-    /* tjs_fsreq_init() resets fr->rw.*; assign after it or rw.data is
-     * clobbered (NULL-deref on read copy-back, I/O buffer leak on write). */
-    uint8_t *data = js_malloc(ctx, size);
-    if (!data) {
-        tjs_fsreq_free_immediate(ctx, fr);
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
+
+    /* Promise initialization can detach or resize the view through a hook. */
+    buf = JS_GetUint8Array(ctx, &size, argv[0]);
+    if (!buf) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
+    fr->rw.tarray = JS_DupValue(ctx, argv[0]);
+    /* libuv accepts a zero-length buffer, but QuickJS allocators are allowed
+     * to return NULL for js_malloc(ctx, 0). Keep one harmless sentinel byte so
+     * an empty read/write is not mistaken for an allocation failure. */
+    fr->rw.data = js_malloc(ctx, size ? size : 1);
+    if (!fr->rw.data) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeValue(ctx, promise);
         return JS_ThrowOutOfMemory(ctx);
     }
     if (magic) {
-        memcpy(data, buf, size);
+        memcpy(fr->rw.data, buf, size);
+    }
+    fr->rw.len = size;
+    fr->rw.is_write = magic != 0;
+
+    if (threaded) {
+        TJSFileIOReq *io = (TJSFileIOReq *)fr;
+        io->fd = f->fd;
+        io->position = pos;
+        atomic_init(&io->done, false);
+        fr->req.fs_type = magic ? UV_FS_WRITE : UV_FS_READ;
+        int r = uv_async_init(tjs_get_loop(ctx), &io->completion,
+                               tjs_file_io_complete);
+        if (r != 0) {
+            tjs_fsreq_abort(ctx, fr);
+            JS_FreeValue(ctx, promise);
+            return tjs_throw_errno(ctx, r);
+        }
+        io->completion.data = io;
+        r = uv_thread_create(&io->thread, tjs_file_io_work, io);
+        if (r != 0) {
+            /* No worker exists, but the initialized handle still needs its
+             * close callback before the embedded storage can be freed. */
+            tjs_fsreq_release_js(ctx, fr);
+            uv_close((uv_handle_t *)&io->completion, tjs_file_io_start_failed);
+            JS_FreeValue(ctx, promise);
+            return tjs_throw_errno(ctx, r);
+        }
+        tjs_asyncfs_register(&fr->base, fr->base.trt, NULL);
+        return promise;
     }
 
-    uv_buf_t b = uv_buf_init((char *) data, size);
+    uv_buf_t b = uv_buf_init((char *) fr->rw.data, size);
 
     int r;
     if (magic) {
@@ -697,22 +1128,15 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
         r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
     }
     if (r != 0) {
-        js_free(ctx, data);
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    /* tjs_fsreq_init() returns a dup'd promise ref; returning fr->result.p
-     * directly would leak a reference and break settlement ref-counting. */
-    f->pending++;
-    JSValue promise = tjs_file_fsreq_init(ctx, fr, this_val);
-    fr->rw.data = data;
-    fr->rw.len = size;
-    fr->rw.is_write = magic != 0;
-    fr->rw.tarray = JS_DupValue(ctx, argv[0]);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
     return promise;
 }
 
@@ -731,17 +1155,25 @@ static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValu
     }
 
     f->closing = true;
+    JSValue promise = tjs_fsreq_init(ctx, fr, this_val);
+    if (JS_IsException(promise)) {
+        f->closing = false;
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_close(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
         f->closing = false;
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    return tjs_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -757,17 +1189,23 @@ static JSValue tjs_file_stat(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_fstat(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -790,17 +1228,23 @@ static JSValue tjs_file_truncate(JSContext *ctx, JSValue this_val, int argc, JSV
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_ftruncate(tjs_get_loop(ctx), &fr->req, f->fd, offset, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -825,21 +1269,27 @@ static JSValue tjs_file_sync(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r;
     if (sync_metadata)
         r = uv_fs_fsync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     else
         r = uv_fs_fdatasync(tjs_get_loop(ctx), &fr->req, f->fd, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -862,17 +1312,23 @@ static JSValue tjs_file_chmod(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_fchmod(tjs_get_loop(ctx), &fr->req, f->fd, mode, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -900,17 +1356,23 @@ static JSValue tjs_file_chown(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_fchown(tjs_get_loop(ctx), &fr->req, f->fd, uid, gid, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -939,18 +1401,24 @@ static JSValue tjs_file_utime(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_filereq_init(ctx, fr, this_val, f);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     /* Date.getTime is in ms, convert to seconds. */
     int r = uv_fs_futime(tjs_get_loop(ctx), &fr->req, f->fd, atime / 1000, mtime / 1000, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, f->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    f->pending++;
-    return tjs_file_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_file_fileno(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -962,6 +1430,20 @@ static JSValue tjs_file_fileno(JSContext *ctx, JSValue this_val, int argc, JSVal
     TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.file.fileno", NULL), (void)0, do { f = tjs_file_get_open(ctx, this_val); if (!f) return (JS_EXCEPTION); } while (0));
 
     return JS_NewInt32(ctx, f->fd);
+}
+
+static JSValue tjs_file_detach(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    TJSFile *f = tjs_file_get_open(ctx, this_val);
+    if (!f) return JS_EXCEPTION;
+
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "asyncfs.file.detach", NULL), (void)0, do { f = tjs_file_get_open(ctx, this_val); if (!f) return (JS_EXCEPTION); } while (0));
+
+    if (f->pending != 0) return tjs_throw_errno(ctx, UV_EBUSY);
+    JSValue result = JS_NewInt32(ctx, f->fd);
+    f->fd = -1;
+    JS_FreeValue(ctx, f->path);
+    f->path = JS_UNDEFINED;
+    return result;
 }
 
 static JSValue tjs_file_path_get(JSContext *ctx, JSValue this_val) {
@@ -997,17 +1479,25 @@ static JSValue tjs_dir_close(JSContext *ctx, JSValue this_val, int argc, JSValue
     }
 
     d->closing = true;
+    JSValue promise = tjs_fsreq_init(ctx, fr, this_val);
+    if (JS_IsException(promise)) {
+        d->closing = false;
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     int r = uv_fs_closedir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
         d->closing = false;
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, d->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    return tjs_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_dir_path_get(JSContext *ctx, JSValue this_val) {
@@ -1039,21 +1529,29 @@ static JSValue tjs_dir_next(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    d->pending = true;
+    JSValue promise = tjs_fsreq_init(ctx, fr, this_val);
+    if (JS_IsException(promise)) {
+        d->pending = false;
+        tjs_fsreq_abort(ctx, fr);
+        return promise;
+    }
     d->dir->dirents = &d->dirent;
     d->dir->nentries = 1;
 
-    d->pending = true;
     int r = uv_fs_readdir(tjs_get_loop(ctx), &fr->req, d->dir, uv__fs_req_cb);
     if (r != 0) {
         d->pending = false;
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         const char *path = JS_ToCString(ctx, d->path);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
 
-    return tjs_fsreq_init(ctx, fr, this_val);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_dir_iterator(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1273,16 +1771,24 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static int tjs_fs_create_file_from_fd_options(JSContext *ctx, JSValueConst value,
@@ -1357,28 +1863,19 @@ static JSValue tjs_fs_create_file_from_fd(JSContext *ctx, JSValue this_val, int 
         return obj;
     }
 
-    if (close_on_close) {
-        /* Transfer only when the numeric slot still names the file validated
-         * above. Otherwise the hook took the slot; keep the duplicate as the
-         * owned descriptor and leave the replacement alone. */
-        TJSObjectHandleIdentity identity = tjs_fs_fd_identity(pin.fd, fd);
-        if (identity == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {
-            pin.owned = false;
-            JS_FreeValue(ctx, obj);
-            return TJS_ThrowObjectHandleIdentityUnsupported(ctx);
-        }
-        if (identity == TJS_OBJECT_HANDLE_IDENTITY_SAME) {
-            TJSFile *f = tjs_file_get(ctx, obj);
-            CHECK_NOT_NULL(f);
-            f->fd = fd;
-            TJS_UnpinFd(&pin);
-        } else {
-            pin.owned = false;
-        }
-    } else {
-        pin.owned = false;
-    }
+    if (!close_on_close) return obj;
 
+    TJSObjectHandleIdentity identity = tjs_fs_fd_identity(pin.fd, fd);
+    if (identity == TJS_OBJECT_HANDLE_IDENTITY_UNSUPPORTED) {
+        JS_FreeValue(ctx, obj);
+        return TJS_ThrowObjectHandleIdentityUnsupported(ctx);
+    }
+    if (identity == TJS_OBJECT_HANDLE_IDENTITY_SAME) {
+        TJSFile *f = tjs_file_get(ctx, obj);
+        CHECK_NOT_NULL(f);
+        f->fd = fd;
+        TJS_UnpinFd(&pin);
+    }
     return obj;
 }
 
@@ -1399,6 +1896,12 @@ static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r;
     if (magic) {
         r = uv_fs_lstat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
@@ -1406,14 +1909,16 @@ static JSValue tjs_fs_stat(JSContext *ctx, JSValue this_val, int argc, JSValue *
         r = uv_fs_stat(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     }
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1433,16 +1938,24 @@ static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_realpath(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1462,16 +1975,24 @@ static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1498,9 +2019,17 @@ static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, new_path);
+        return promise;
+    }
     int r = uv_fs_rename(tjs_get_loop(ctx), &fr->req, path, new_path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, new_path);
@@ -1509,7 +2038,8 @@ static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, new_path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1529,16 +2059,24 @@ static JSValue tjs_fs_mkdtemp(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, tpl);
+        return promise;
+    }
     int r = uv_fs_mkdtemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, tpl);
         JS_FreeCString(ctx, tpl);
         return err;
     }
     JS_FreeCString(ctx, tpl);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1558,16 +2096,24 @@ static JSValue tjs_fs_mkstemp(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, tpl);
+        return promise;
+    }
     int r = uv_fs_mkstemp(tjs_get_loop(ctx), &fr->req, tpl, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, tpl);
         JS_FreeCString(ctx, tpl);
         return err;
     }
     JS_FreeCString(ctx, tpl);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1587,16 +2133,24 @@ static JSValue tjs_fs_rmdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_rmdir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1624,16 +2178,24 @@ static JSValue tjs_fs_mkdir(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_mkdir(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1651,6 +2213,13 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    int flags = 0;
+    if (argc > 2 && JS_ToInt32(ctx, &flags, argv[2])) {
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, new_path);
+        return JS_EXCEPTION;
+    }
+
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "asyncfs.copyFile", path), (JS_FreeCString(ctx, path), JS_FreeCString(ctx, new_path)));
 
     TJSFsReq *fr = js_malloc(ctx, sizeof(*fr));
@@ -1660,9 +2229,17 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
-    int r = uv_fs_copyfile(tjs_get_loop(ctx), &fr->req, path, new_path, 0, uv__fs_req_cb);
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, new_path);
+        return promise;
+    }
+    int r = uv_fs_copyfile(tjs_get_loop(ctx), &fr->req, path, new_path, flags, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, new_path);
@@ -1671,7 +2248,8 @@ static JSValue tjs_fs_copyfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, new_path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1691,47 +2269,171 @@ static JSValue tjs_fs_readdir(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_opendir(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static void tjs__readfile_work_cb(uv_work_t *req) {
     TJSReadFileReq *fr = req->data;
     CHECK_NOT_NULL(fr);
 
-    fr->r = tjs__load_file(fr->ctx, &fr->dbuf, fr->filename);
+    /* Keep the worker independent of QuickJS. A running uv_work_t cannot be
+     * canceled by uv_cancel: check our flag between reads as well. On POSIX,
+     * nonblocking open prevents a FIFO without a writer from trapping the
+     * worker in open() before it can observe cancellation. */
+    fr->r = UV_ECANCELED;
+    if (atomic_load_explicit(&fr->base.canceled, memory_order_acquire)) return;
+#ifdef _WIN32
+    int path_result = tjs_windows_readfile_path_check(fr->filename);
+    if (path_result < 0) {
+        fr->r = path_result;
+        return;
+    }
+#endif
+    int flags = O_RDONLY;
+#ifndef _WIN32
+    flags |= O_NONBLOCK;
+#endif
+    uv_fs_t fsreq;
+    int fd = uv_fs_open(NULL, &fsreq, fr->filename, flags, 0, NULL);
+    uv_fs_req_cleanup(&fsreq);
+    if (fd < 0) {
+        fr->r = fd;
+        return;
+    }
+
+    bool can_read = true;
+#ifndef _WIN32
+    struct stat st;
+    int stat_result = fstat(fd, &st);
+    can_read = stat_result == 0;
+    bool is_fifo = can_read && S_ISFIFO(st.st_mode);
+    bool is_regular = can_read && S_ISREG(st.st_mode);
+    bool fifo_writer_seen = false;
+    if (!can_read) {
+        fr->r = uv_translate_sys_error(errno);
+    }
+    /* Switch only regular files back to blocking mode. Other file types stay
+     * nonblocking so the worker can return to its cancellation check instead
+     * of entering an uninterruptible read on a tty or device. */
+    if (can_read && is_regular) {
+        int status_flags = fcntl(fd, F_GETFL);
+        if (status_flags < 0 ||
+            ((status_flags & O_NONBLOCK) &&
+             fcntl(fd, F_SETFL, status_flags & ~O_NONBLOCK) < 0)) {
+            fr->r = uv_translate_sys_error(errno);
+            can_read = false;
+        }
+    }
+#else
+    if (tjs_windows_readfile_fd_check((uv_file)fd) < 0) {
+        fr->r = UV_ENOTSUP;
+        can_read = false;
+    }
+#endif
+    char storage[64 * 1024];
+    uv_buf_t buffer = uv_buf_init(storage, sizeof(storage));
+    for (;;) {
+        if (!can_read) break;
+        if (atomic_load_explicit(&fr->base.canceled, memory_order_acquire)) {
+            fr->r = UV_ECANCELED;
+            break;
+        }
+#ifndef _WIN32
+        if (is_fifo) {
+            struct pollfd pipe_poll = { .fd = fd, .events = POLLIN };
+            int poll_result = poll(&pipe_poll, 1, 50);
+            if (poll_result < 0) {
+                if (errno == EINTR) continue;
+                fr->r = uv_translate_sys_error(errno);
+                break;
+            }
+#ifdef __linux__
+            /* Linux reports HUP for a departed writer, even when it closed
+             * before our first read. */
+            if (pipe_poll.revents & POLLHUP)
+                fifo_writer_seen = true;
+#endif
+        } else if (!is_regular) {
+            /* Keep special files interruptible even when they do not report
+             * readable data yet. The bounded wait gives teardown a chance to
+             * set canceled before the next read attempt. */
+            struct pollfd special_poll = { .fd = fd, .events = POLLIN };
+            int poll_result = poll(&special_poll, 1, 50);
+            if (poll_result < 0) {
+                if (errno == EINTR) continue;
+                fr->r = uv_translate_sys_error(errno);
+                break;
+            }
+            if (poll_result == 0) continue;
+        }
+#endif
+        int count = uv_fs_read(NULL, &fsreq, fd, &buffer, 1, -1, NULL);
+        uv_fs_req_cleanup(&fsreq);
+        if (count == 0) {
+#ifndef _WIN32
+            if (is_fifo && !fifo_writer_seen) {
+                uv_sleep(10);
+                continue;
+            }
+#endif
+            fr->r = 0;
+            break;
+        }
+        if (count < 0) {
+#ifndef _WIN32
+            if (is_fifo &&
+                (count == UV_EAGAIN ||
+                 count == uv_translate_sys_error(EWOULDBLOCK))) {
+                /* A nonblocking FIFO read returns EAGAIN only while a writer
+                 * is connected but has not produced data yet. */
+                fifo_writer_seen = true;
+                continue;
+            }
+#endif
+            fr->r = count;
+            break;
+        }
+#ifndef _WIN32
+        if (is_fifo) fifo_writer_seen = true;
+#endif
+        if (dbuf_put(&fr->dbuf, storage, count) < 0) {
+            fr->r = UV_ENOMEM;
+            break;
+        }
+    }
+    uv_fs_close(NULL, &fsreq, fd, NULL);
+    uv_fs_req_cleanup(&fsreq);
 }
 
 static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
     TJSReadFileReq *fr = req->data;
     CHECK_NOT_NULL(fr);
 
-    JSContext *ctx = fr->ctx;
-    JSRuntime *rt = JS_GetRuntime(ctx);
-    TJSRuntime *qrt = rt ? JS_GetRuntimeOpaque(rt) : NULL;
+    tjs_asyncfs_unregister(&fr->base);
+    TJSRuntime *qrt = fr->base.trt;
     if (!qrt || qrt->freeing) {
         /* Runtime teardown drains queued work without entering JS. */
-        dbuf_free(&fr->dbuf);
-        if (rt) TJS_FreePromiseRT(rt, &fr->result);
-        if (rt) {
-            js_free_rt(rt, fr->filename);
-            js_free_rt(rt, fr);
-        } else {
-            /* Embedder may invoke this after detaching the runtime: free
-             * without rt. */
-            tjs__free(fr->filename);
-            tjs__free(fr);
-        }
+        tjs_asyncfs_cleanup_readfile(fr);
         return;
     }
+    JSContext *ctx = fr->ctx;
     JSValue arg;
     bool is_reject = false;
 
@@ -1744,10 +2446,22 @@ static void tjs__readfile_after_work_cb(uv_work_t *req, int status) {
         is_reject = true;
         dbuf_free(&fr->dbuf);
     } else {
-        
-        arg = JS_NewUint8Array(ctx, fr->dbuf.buf, fr->dbuf.size, tjs__buf_realloc_untracked, NULL, false);
-        if (JS_IsException(arg)) {
+        /* JS_NewArrayBuffer takes ownership only after construction succeeds;
+         * keep the DynBuf attached until that handoff is complete. */
+        JSValue buffer = JS_NewArrayBuffer(ctx, fr->dbuf.buf, fr->dbuf.size, 0,
+                                           tjs__buf_realloc_untracked, NULL, false);
+        if (JS_IsException(buffer)) {
             dbuf_free(&fr->dbuf);
+            arg = JS_EXCEPTION;
+        } else {
+            fr->dbuf.buf = NULL;
+            fr->dbuf.size = fr->dbuf.allocated_size = 0;
+            arg = JS_NewTypedArray(ctx, 1, &buffer, JS_TYPED_ARRAY_UINT8);
+            JS_FreeValue(ctx, buffer);
+        }
+        if (JS_IsException(arg)) {
+            arg = JS_GetException(ctx);
+            is_reject = true;
         }
     }
 
@@ -1775,6 +2489,8 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     }
 
     fr->ctx = ctx;
+    fr->base.trt = TJS_GetRuntime(ctx);
+    atomic_init(&fr->base.canceled, false);
     TJS_ClearPromise(ctx, &fr->result);
     
     dbuf_init2(&fr->dbuf, NULL, tjs__dbuf_realloc);
@@ -1811,6 +2527,8 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
         return err;
     }
 
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *) &fr->req);
+
     return promise;
 }
 
@@ -1842,16 +2560,24 @@ static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = (magic == 1 ? uv_fs_lchown : uv_fs_chown)(tjs_get_loop(ctx), &fr->req, path, uid, gid, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1877,16 +2603,24 @@ static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_chmod(tjs_get_loop(ctx), &fr->req, path, mode, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
@@ -1917,18 +2651,26 @@ static JSValue tjs_fs_xutime(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     /* Date.getTime is in ms, convert to seconds. */
     int r = (magic == 1 ? uv_fs_lutime
                         : uv_fs_utime)(tjs_get_loop(ctx), &fr->req, path, atime / 1000, mtime / 1000, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1949,16 +2691,24 @@ static JSValue tjs_fs_readlink(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_readlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
-        tjs_fsreq_free_immediate(ctx, fr);
+        tjs_fsreq_cleanup_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1989,18 +2739,27 @@ static JSValue tjs_fs_link(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, path2);
+        return promise;
+    }
     int r = uv_fs_link(tjs_get_loop(ctx), &fr->req, path, path2, uv__fs_req_cb);
     if (r != 0) {
+        tjs_fsreq_cleanup_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, path2);
-        tjs_fsreq_free_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         return err;
     }
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, path2);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -2038,18 +2797,27 @@ static JSValue tjs_fs_symlink(JSContext *ctx, JSValue this_val, int argc, JSValu
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, path2);
+        return promise;
+    }
     int r = uv_fs_symlink(tjs_get_loop(ctx), &fr->req, path, path2, flags, uv__fs_req_cb);
     if (r != 0) {
+        tjs_fsreq_cleanup_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
         JS_FreeCString(ctx, path2);
-        tjs_fsreq_free_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         return err;
     }
     JS_FreeCString(ctx, path);
     JS_FreeCString(ctx, path2);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -2070,16 +2838,24 @@ static JSValue tjs_fs_statfs(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
+    JSValue promise = tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (JS_IsException(promise)) {
+        tjs_fsreq_abort(ctx, fr);
+        JS_FreeCString(ctx, path);
+        return promise;
+    }
     int r = uv_fs_statfs(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
     if (r != 0) {
+        tjs_fsreq_cleanup_immediate(ctx, fr);
         JSValue err = tjs_throw_errno_path(ctx, r, path);
         JS_FreeCString(ctx, path);
-        tjs_fsreq_free_immediate(ctx, fr);
+        JS_FreeValue(ctx, promise);
         return err;
     }
     JS_FreeCString(ctx, path);
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    tjs_asyncfs_register(&fr->base, fr->base.trt, (uv_req_t *)&fr->req);
+    return promise;
 }
 
 static const JSCFunctionListEntry tjs_file_proto_funcs[] = {
@@ -2087,6 +2863,7 @@ static const JSCFunctionListEntry tjs_file_proto_funcs[] = {
     TJS_CFUNC_MAGIC_DEF("write", 2, tjs_file_rw, 1),
     TJS_CFUNC_DEF("close", 0, tjs_file_close),
     TJS_CFUNC_DEF("fileno", 0, tjs_file_fileno),
+    TJS_CFUNC_DEF("detach", 0, tjs_file_detach),
     TJS_CFUNC_DEF("stat", 0, tjs_file_stat),
     TJS_CFUNC_DEF("truncate", 1, tjs_file_truncate),
     TJS_CFUNC_DEF("sync", 1, tjs_file_sync),
@@ -2131,6 +2908,9 @@ static const JSCFunctionListEntry tjs_stat_proto_funcs[] = {
 static const JSCFunctionListEntry tjs_fs_funcs[] = {
     TJS_UVCONST(FS_SYMLINK_DIR),
     TJS_UVCONST(FS_SYMLINK_JUNCTION),
+    TJS_UVCONST(FS_COPYFILE_EXCL),
+    TJS_UVCONST(FS_COPYFILE_FICLONE),
+    TJS_UVCONST(FS_COPYFILE_FICLONE_FORCE),
     TJS_CFUNC_DEF("open", 3, tjs_fs_open),
     TJS_CFUNC_DEF("createFrom", 1, tjs_fs_create_file_from_fd),
     TJS_CFUNC_MAGIC_DEF("stat", 1, tjs_fs_stat, 0),
@@ -2161,30 +2941,66 @@ void tjs__mod_asyncfs_init(JSContext *ctx, JSValue ns) {
     JSValue proto;
 
     /* File object */
-    JS_NewClassID(rt, &tjs_file_class_id);
-    JS_NewClass(rt, tjs_file_class_id, &tjs_file_class);
+    if (JS_NewClassID(rt, &tjs_file_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate File class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_file_class_id) &&
+        JS_NewClass(rt, tjs_file_class_id, &tjs_file_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register File class");
+        return;
+    }
     proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return;
     JS_SetPropertyFunctionList(ctx, proto, tjs_file_proto_funcs, countof(tjs_file_proto_funcs));
     JS_SetClassProto(ctx, tjs_file_class_id, proto);
 
     /* Dir object */
-    JS_NewClassID(rt, &tjs_dir_class_id);
-    JS_NewClass(rt, tjs_dir_class_id, &tjs_dir_class);
+    if (JS_NewClassID(rt, &tjs_dir_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Dir class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_dir_class_id) &&
+        JS_NewClass(rt, tjs_dir_class_id, &tjs_dir_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Dir class");
+        return;
+    }
     proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return;
     JS_SetPropertyFunctionList(ctx, proto, tjs_dir_proto_funcs, countof(tjs_dir_proto_funcs));
     JS_SetClassProto(ctx, tjs_dir_class_id, proto);
 
     /* DirEnt object */
-    JS_NewClassID(rt, &tjs_dirent_class_id);
-    JS_NewClass(rt, tjs_dirent_class_id, &tjs_dirent_class);
+    if (JS_NewClassID(rt, &tjs_dirent_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate DirEnt class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_dirent_class_id) &&
+        JS_NewClass(rt, tjs_dirent_class_id, &tjs_dirent_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register DirEnt class");
+        return;
+    }
     proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return;
     JS_SetPropertyFunctionList(ctx, proto, tjs_dirent_proto_funcs, countof(tjs_dirent_proto_funcs));
     JS_SetClassProto(ctx, tjs_dirent_class_id, proto);
 
     /* StatResult object */
-    JS_NewClassID(rt, &tjs_stat_class_id);
-    JS_NewClass(rt, tjs_stat_class_id, &tjs_stat_class);
+    if (JS_NewClassID(rt, &tjs_stat_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate StatResult class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_stat_class_id) &&
+        JS_NewClass(rt, tjs_stat_class_id, &tjs_stat_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register StatResult class");
+        return;
+    }
     proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return;
     JS_SetPropertyFunctionList(ctx, proto, tjs_stat_proto_funcs, countof(tjs_stat_proto_funcs));
     JS_SetClassProto(ctx, tjs_stat_class_id, proto);
 

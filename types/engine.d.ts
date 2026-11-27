@@ -195,6 +195,19 @@ declare namespace CModuleEngine {
     export function setCanBlock(val: boolean): void;
 
     /**
+     * Return the source/module name at a JavaScript stack level, or null when
+     * the frame has no bytecode-backed source name. Level zero is the current
+     * native caller; positive levels walk toward its JavaScript caller.
+     */
+    export function getScriptOrModuleName(level?: number): string | null;
+
+    /** Register the runtime's process.nextTick drain for native checkpoints. */
+    export function setNextTickDrain(drain: () => void): void;
+
+    /** Schedule the registered process.nextTick drain at the next checkpoint. */
+    export function notifyNextTick(): void;
+
+    /**
      * Execute JavaScript code, defaults to module mode
      * @param code Code to compile
      * @param moduleName Module name (for error messages)
@@ -409,8 +422,8 @@ declare namespace CModuleEngine {
     /**
      * Get/Set Promise hook
      */
-    export function promiseHook(): PromiseHookFn;
-    export function promiseHook(hook: PromiseHookFn): void;
+    export function promiseHook(): PromiseHookFn | undefined;
+    export function promiseHook(hook: PromiseHookFn | undefined): void;
 
     /**
      * Inspect a Promise without awaiting it.

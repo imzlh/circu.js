@@ -8,6 +8,8 @@ declare namespace CModuleAsyncFS {
          * Defaults to `false`; the caller keeps ownership unless this is set.
          * With `false`, the handle operates on a duplicate so the caller's
          * descriptor remains valid for its entire lifetime.
+         * Setting this to `true` can throw if the platform cannot prove that
+         * the pinned descriptor and `fd` refer to the same open file description.
          */
         closeOnClose?: boolean;
     }
@@ -40,6 +42,13 @@ declare namespace CModuleAsyncFS {
     /** Windows junction flag. */
     export const FS_SYMLINK_JUNCTION: number;
 
+    /** Fail atomically if the copy destination exists. */
+    export const FS_COPYFILE_EXCL: number;
+    /** Attempt a copy-on-write clone, falling back to a byte copy. */
+    export const FS_COPYFILE_FICLONE: number;
+    /** Require a copy-on-write clone; fail if unsupported. */
+    export const FS_COPYFILE_FICLONE_FORCE: number;
+
     /** Symlink flags accepted by `symlink()`. */
     export type SymlinkType = number;
 
@@ -64,7 +73,7 @@ declare namespace CModuleAsyncFS {
      */
     export class FileHandle {
         /**
-         * Read data from file (async)
+         * Read data from the descriptor (async).
          * @param buffer Buffer to write data into (will be modified)
          * @param position File read position; omit it to use the current offset
          * @returns Actual bytes read, or `null` on EOF
@@ -72,7 +81,7 @@ declare namespace CModuleAsyncFS {
         read(buffer: Uint8Array, position?: number): Promise<number | null>;
 
         /**
-         * Write data to file (async)
+         * Write data to the descriptor (async).
          * @param buffer Data to write
          * @param position File write position; omit it to use the current offset
          * @returns Actual bytes written
@@ -85,6 +94,9 @@ declare namespace CModuleAsyncFS {
 
         /** Get underlying file descriptor (for debugging) */
         fileno(): number;
+
+        /** Transfer the descriptor to the caller; fails while I/O is pending and invalidates this handle. */
+        detach(): number;
 
         /** Get file metadata (async) */
         stat(): Promise<StatResult>;
@@ -183,6 +195,7 @@ declare namespace CModuleAsyncFS {
     export interface StatFsResult {
         readonly type: number;
         readonly bsize: number;
+        readonly frsize: number;
         readonly blocks: number;
         readonly bfree: number;
         readonly bavail: number;
@@ -218,8 +231,8 @@ declare namespace CModuleAsyncFS {
     /** Rename file (async) */
     export function rename(path: string, newPath: string): Promise<void>;
 
-    /** Copy file (async) */
-    export function copyFile(path: string, newPath: string): Promise<void>;
+    /** Copy a file, overwriting by default. Accepts bitwise OR of FS_COPYFILE_* flags. */
+    export function copyFile(path: string, newPath: string, flags?: number): Promise<void>;
 
     /** 
      * Read entire file into memory (async)
@@ -292,6 +305,8 @@ declare namespace CModuleAsyncFS {
      * By default the descriptor is borrowed: the handle wraps a duplicate and
      * closing it never closes `fd`. Pass `{ closeOnClose: true }` to transfer
      * ownership; the handle then wraps `fd` itself and closes it on close.
+     * Ownership transfer may throw when the platform cannot safely compare
+     * open file descriptions; inode equality alone is not sufficient.
      *
      * When ownership transfers, it happens only after the handle is fully
      * constructed. If construction throws, the caller still owns `fd`.

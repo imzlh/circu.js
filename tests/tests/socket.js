@@ -134,3 +134,34 @@ await test('UDP fileno round-trips through socket.createFrom without narrowing',
         handle.close();
     }
 });
+
+await test('UDP send keeps its owner alive until an asynchronous completion', async () => {
+    // Windows reports this oversized datagram synchronously from uv_udp_send.
+    if (os.platform === 'windows') return;
+
+    let handle = new udp.UDP();
+    let timeout;
+    try {
+        const pending = handle.send(new Uint8Array(65508), { ip: loopback.ip, port: 9 });
+        const completion = pending.then(
+            value => ({ value }),
+            error => ({ error }),
+        );
+        assertEquals(engine.promiseResult(pending), null, 'send must take the async callback path');
+
+        handle = null;
+        engine.gc.run();
+        assertEquals(engine.promiseResult(pending), null, 'GC must not cancel the submitted send');
+
+        const outcome = await Promise.race([
+            completion,
+            new Promise((_, reject) => {
+                timeout = setTimeout(() => reject(new Error('UDP send completion timed out')), 3000);
+            }),
+        ]);
+        assert(outcome.error, 'oversized datagram should reject when its send callback completes');
+    } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+        handle?.close();
+    }
+});

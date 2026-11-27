@@ -56,6 +56,15 @@ declare namespace CModuleFS {
     export const OPEN_TRUNC: number;
     /** Append to file */
     export const OPEN_APPEND: number;
+    /** Open without blocking on FIFOs or devices when supported by the host. */
+    export const OPEN_NONBLOCK: number;
+
+    /** Fail atomically if the copy destination exists. */
+    export const FS_COPYFILE_EXCL: number;
+    /** Attempt a copy-on-write clone, falling back to a byte copy. */
+    export const FS_COPYFILE_FICLONE: number;
+    /** Require a copy-on-write clone; fail if unsupported. */
+    export const FS_COPYFILE_FICLONE_FORCE: number;
 
     // ============================================================================
     // File Mode Constants
@@ -152,6 +161,7 @@ declare namespace CModuleFS {
     export interface StatFsResult {
         readonly type: number;
         readonly bsize: number;
+        readonly frsize: number;
         readonly blocks: number;
         readonly bfree: number;
         readonly bavail: number;
@@ -324,14 +334,16 @@ declare namespace CModuleFS {
     ): void;
 
     /**
-     * High-performance file copy (OS-level optimization)
+     * Copy a file using libuv, overwriting by default.
      * @param srcPath - Source file path
      * @param destPath - Destination file path
-     * @throws Error if copy fails
+     * @param flags - Bitwise OR of FS_COPYFILE_* flags (default: 0)
+     * @throws IOError with a numeric UV code if copying fails
      */
     export function copy(
         srcPath: string,
-        destPath: string
+        destPath: string,
+        flags?: number
     ): void;
 
     // ============================================================================
@@ -491,7 +503,7 @@ declare namespace CModuleFS {
      * @param fd - File descriptor
      * @param uid - User ID
      * @param gid - Group ID
-     * @throws Error if fchown fails (not supported on Windows)
+     * @throws Error if fchown fails. This operation is a no-op on Windows.
      */
     export function fchown(fd: number, uid: number, gid: number): void;
 

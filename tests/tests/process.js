@@ -6,7 +6,7 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 const worker = import.meta.use('worker');
-const { setTimeout, clearTimeout } = import.meta.use('timers');
+const { setTimeout, clearTimeout, setImmediate } = import.meta.use('timers');
 
 if (worker.isWorker && worker.workerData?.type === 'processForkProbe') {
     assert(signals !== null, 'workers should be able to load signal numbers');
@@ -41,6 +41,31 @@ if (worker.isWorker && worker.workerData?.type === 'processForkHold') {
 
 // ========== Process Fork (Linux/POSIX) ==========
 if (os.platform === 'linux') {
+    function drainProcessHandles() {
+        engine.waitIO(new Promise((resolve) => setImmediate(resolve)));
+    }
+
+    function assertForkRequiresIdle() {
+        let error = null;
+        let unexpectedChild;
+        try {
+            unexpectedChild = proc.fork();
+        } catch (cause) {
+            error = cause;
+        }
+        if (unexpectedChild === null) {
+            os.exit(99);
+            return;
+        }
+        if (unexpectedChild) {
+            unexpectedChild.kill(signals.signals.SIGKILL);
+            unexpectedChild.waitSync();
+        }
+        assert(error instanceof TypeError, 'fork should reject pending work with TypeError');
+        assert(String(error.message).includes('idle event loop'),
+            'fork error should explain the idle event loop requirement');
+    }
+
     await test('proc.fork - child continues with copied JS state', async () => {
         const shared = { value: 41 };
         const child = proc.fork();
@@ -62,26 +87,22 @@ if (os.platform === 'linux') {
         assertEquals(shared.value, 43, 'parent state should remain independent');
     });
 
-    await test('proc.fork - parent can fork multiple children', async () => {
-        const children = [];
+    await test('proc.fork - parent can fork sequential children after handles close', () => {
         for (let index = 0; index < 2; index++) {
+            drainProcessHandles();
             const child = proc.fork();
             if (child === null) {
-                // Let the inherited loop run once. The second child inherited
-                // the first child's parent-side fork waiter and must disown it.
-                await new Promise((resolve) => setTimeout(resolve, 20));
                 os.exit(30 + index);
                 return;
             }
-            children.push(child);
+            const status = child.waitSync();
+            assertEquals(status.exit_status, 30 + index, 'child exit status should be preserved');
+            assertForkRequiresIdle();
         }
-
-        const statuses = await Promise.all(children.map((child) => child.wait()));
-        assertEquals(statuses[0].exit_status, 30, 'first child exit status should be preserved');
-        assertEquals(statuses[1].exit_status, 31, 'second child exit status should be preserved');
     });
 
-    await test('proc.fork - inherited sibling wait promise rejects in child', async () => {
+    await test('proc.fork - rejects another fork while a child wait is pending', async () => {
+        drainProcessHandles();
         const first = proc.fork();
         if (first === null) {
             await new Promise((resolve) => setTimeout(resolve, 10000));
@@ -89,28 +110,42 @@ if (os.platform === 'linux') {
             return;
         }
 
-        const inheritedWait = first.wait();
-        const second = proc.fork();
-        if (second === null) {
-            let rejected = false;
-            try {
-                await inheritedWait;
-            } catch (cause) {
-                rejected = String(cause?.message ?? cause).includes('ECHILD');
-            }
-            os.exit(rejected ? 41 : 42);
-            return;
+        const pendingWait = first.wait();
+        let firstStatus;
+        try {
+            assertEquals(first.wait(), pendingWait, 'live child should retain its wait promise');
+            assertForkRequiresIdle();
+        } finally {
+            first.kill(signals.signals.SIGTERM);
+            firstStatus = await pendingWait;
         }
-
-        first.kill(signals.signals.SIGTERM);
-        const [firstStatus, secondStatus] = await Promise.all([first.wait(), second.wait()]);
         assertEquals(firstStatus.term_signal, signals.signals.SIGTERM,
             'parent should still own first child');
-        assertEquals(secondStatus.exit_status, 41,
-            'later child should reject the inherited parent-only wait promise');
+    });
+
+    await test('proc.fork - rejects active and closing timers', () => {
+        drainProcessHandles();
+        const timer = setTimeout(() => panic('fork rejection timer should not run'), 10000);
+        try {
+            assertForkRequiresIdle();
+        } finally {
+            clearTimeout(timer);
+        }
+        assertForkRequiresIdle();
+    });
+
+    await test('proc.fork - rejects pending JS jobs', async () => {
+        drainProcessHandles();
+        let jobRan = false;
+        const pendingJob = Promise.resolve().then(() => { jobRan = true; });
+        assertForkRequiresIdle();
+        assertEquals(jobRan, false, 'queued job should still be pending during fork');
+        await pendingJob;
+        assertEquals(jobRan, true, 'rejected fork should preserve the queued job');
     });
 
     await test('proc.fork - waitSync reaps the child', () => {
+        drainProcessHandles();
         const child = proc.fork();
         if (child === null) {
             os.exit(24);
@@ -122,6 +157,7 @@ if (os.platform === 'linux') {
     });
 
     await test('proc.fork - parent can terminate child', async () => {
+        drainProcessHandles();
         const child = proc.fork();
         if (child === null) {
             await new Promise((resolve) => setTimeout(resolve, 10000));
@@ -244,8 +280,8 @@ await test('proc.spawn - basic spawn', async () => {
     assertEquals(status.exit_status, 0, 'Should exit with code 0');
 });
 
-await test('proc.spawn - spawn with string args', async () => {
-    const child = proc.spawn('echo test', {
+await test('proc.spawn - spawn with executable string', async () => {
+    const child = proc.spawn('echo', {
         stdout: 'pipe'
     });
     
@@ -255,10 +291,34 @@ await test('proc.spawn - spawn with string args', async () => {
         const buf = new Uint8Array(1024);
         const r = await child.stdout.read(buf);
         const t = engine.decodeString(buf.slice(0, r));
-        assert(t.includes('test'), 'Should output test');
+        assertEquals(t, '\n', 'Executable string should run without extra arguments');
     }
     
     await child.wait();
+});
+
+await test('proc.spawn and spawnSync - reject oversized argv lengths', () => {
+    const spawnArgs = [];
+    spawnArgs.length = 0x80000000;
+    let spawnError = null;
+    try {
+        proc.spawn(spawnArgs);
+    } catch (cause) {
+        spawnError = cause;
+    }
+    assert(spawnError instanceof RangeError,
+        'spawn should reject argv lengths that do not fit its native index type');
+
+    const syncArgs = [];
+    syncArgs.length = 0x7fffffff;
+    let syncError = null;
+    try {
+        proc.spawnSync('echo', syncArgs);
+    } catch (cause) {
+        syncError = cause;
+    }
+    assert(syncError instanceof RangeError,
+        'spawnSync should reject command-plus-args lengths that do not fit');
 });
 
 await test('proc.spawn - spawn with stdin', async () => {
@@ -481,21 +541,26 @@ await test('proc.exec - replace process', () => {
 });
 
 // ========== Error Handling ==========
-await test('proc.spawn - invalid command', async () => {
-    const child = proc.spawn(['/nonexistent/command']);
-    
-    const status = await child.wait();
-    // Should fail to execute
-    assert(status.exit_status !== 0, 'Should fail with non-zero exit');
+await test('proc.spawn - invalid command', () => {
+    let error;
+    try {
+        proc.spawn(['/nonexistent/command']);
+    } catch (cause) {
+        error = cause;
+    }
+    assert(error, 'Should throw when the executable cannot be started');
+    assert(String(error.message).includes('ENOENT'), 'Should report a missing executable');
 });
 
 await test('proc.kill - invalid PID', () => {
+    let error;
     try {
-        proc.kill(-1);
-        assert(false, 'Should throw for invalid PID');
-    } catch (e) {
-        assert(e instanceof Error, 'Should throw Error');
+        proc.kill(2147483647, signals.signals.SIGTERM);
+    } catch (cause) {
+        error = cause;
     }
+    assert(error instanceof Error, 'Should throw for a nonexistent PID');
+    assert(String(error.message).includes('ESRCH'), 'Should report a nonexistent process');
 });
 
 await test('proc.kill - rejects string signals', async () => {

@@ -231,7 +231,7 @@ static JSValue tjs_reg_delete(JSContext *ctx, JSValue this_val, int argc, JSValu
 
 /* ── RegWatch class ──────────────────────────────────────────── */
 
-static thread_local JSClassID tjs_regwatch_classid;
+static JSClassID tjs_regwatch_classid;
 
 typedef struct {
     HKEY        hkey;
@@ -456,8 +456,15 @@ static const JSCFunctionListEntry win32_funcs[] = {
 
 void tjs__mod_win32_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_NewClassID(rt, &tjs_regwatch_classid);
-    JS_NewClass(rt, tjs_regwatch_classid, &tjs_regwatch_class);
+    if (JS_NewClassID(rt, &tjs_regwatch_classid) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate RegWatch class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_regwatch_classid) &&
+        JS_NewClass(rt, tjs_regwatch_classid, &tjs_regwatch_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register RegWatch class");
+        return;
+    }
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_regwatch_proto_funcs, countof(tjs_regwatch_proto_funcs));
     JS_SetClassProto(ctx, tjs_regwatch_classid, proto);

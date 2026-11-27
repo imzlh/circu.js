@@ -58,7 +58,7 @@
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 #define TJS_SOCK_CLASS_NAME "Socket"
-static thread_local JSClassID tjs_sock_classid;
+static JSClassID tjs_sock_classid;
 
 #ifdef _WIN32
 typedef struct {
@@ -1316,8 +1316,15 @@ static const JSCFunctionListEntry socket_module_funcs[] = {
 
 void tjs__mod_socket_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_NewClassID(rt, &tjs_sock_classid);
-    JS_NewClass(rt, tjs_sock_classid, &tjs_sock_class);
+    if (JS_NewClassID(rt, &tjs_sock_classid) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Socket class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_sock_classid) &&
+        JS_NewClass(rt, tjs_sock_classid, &tjs_sock_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Socket class");
+        return;
+    }
 
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_sock_proto_funcs, countof(tjs_sock_proto_funcs));

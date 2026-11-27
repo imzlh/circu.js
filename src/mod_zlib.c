@@ -341,8 +341,8 @@ static JSValue tjs_zlib_adler32(JSContext* ctx, JSValueConst this_val, int argc,
 }
 
 /* Class IDs */
-static thread_local JSClassID tjs_deflate_class_id;
-static thread_local JSClassID tjs_inflate_class_id;
+static JSClassID tjs_deflate_class_id;
+static JSClassID tjs_inflate_class_id;
 
 /* Deflate stream object */
 typedef struct {
@@ -968,9 +968,18 @@ static int tjs_zlib_export_subclass(JSContext* ctx, JSValueConst ns,
 }
 
 void tjs__mod_zlib_init(JSContext* ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+
     /* Initialize Deflate class */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_deflate_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_deflate_class_id, &tjs_deflate_class);
+    if (JS_NewClassID(rt, &tjs_deflate_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Deflate class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_deflate_class_id) &&
+        JS_NewClass(rt, tjs_deflate_class_id, &tjs_deflate_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Deflate class");
+        return;
+    }
     JSValue deflate_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, deflate_proto, tjs_deflate_proto_funcs, countof(tjs_deflate_proto_funcs));
     JS_SetClassProto(ctx, tjs_deflate_class_id, JS_DupValue(ctx, deflate_proto));
@@ -995,8 +1004,15 @@ void tjs__mod_zlib_init(JSContext* ctx, JSValue ns) {
     JS_FreeValue(ctx, deflate_proto);
     
     /* Initialize Inflate class */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_inflate_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_inflate_class_id, &tjs_inflate_class);
+    if (JS_NewClassID(rt, &tjs_inflate_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Inflate class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_inflate_class_id) &&
+        JS_NewClass(rt, tjs_inflate_class_id, &tjs_inflate_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Inflate class");
+        return;
+    }
     JSValue inflate_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, inflate_proto, tjs_inflate_proto_funcs, countof(tjs_inflate_proto_funcs));
     JS_SetClassProto(ctx, tjs_inflate_class_id, JS_DupValue(ctx, inflate_proto));

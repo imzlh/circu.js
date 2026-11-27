@@ -75,16 +75,20 @@ globalThis.assertEquals = (actual, expected, message) => {
 };
 
 const [, script] = args;
-if (!script || !script.endsWith(".js")) {
-    throw new Error("Script must be a .js file");
+try {
+    if (!script || !script.endsWith(".js")) {
+        throw new Error("Script must be a .js file");
+    }
+    const scriptPath = realpath(script);
+    if (!worker.isWorker) {
+        console.log("Test suite, tjs", versions.core, "on", uname().machine);
+        console.log("Loading script:", scriptPath);
+    }
+    await import(scriptPath);
+} catch (error) {
+    console.error('Test module failed to load or evaluate:', error);
+    exit(1);
 }
-
-const un = uname();
-if (!worker.isWorker) {
-    console.log("Test suite, tjs", versions.core, "on", un.machine);
-    console.log("Loading script:", realpath(script));
-}
-await import(realpath(script));
 if (!worker.isWorker){
     console.log("🎉 " + script.split('/').at(-1).split('.').at(0) + ": All tests passed!")
 }

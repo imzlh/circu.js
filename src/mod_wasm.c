@@ -61,7 +61,7 @@ typedef struct {
     JSValue owner;
 } TJSWasmExternImport;
 
-static thread_local JSClassID tjs_wasm_module_class_id;
+static JSClassID tjs_wasm_module_class_id;
 
 typedef struct {
     wasm_module_t module;
@@ -199,7 +199,7 @@ static void tjs_wasm_module_mark(JSRuntime *rt, JSValue val,
     }
 }
 
-static thread_local JSClassID tjs_wasm_instance_class_id;
+static JSClassID tjs_wasm_instance_class_id;
 
 static bool tjs__wasm_is_bytecode_module(wasm_module_t module);
 
@@ -4885,15 +4885,29 @@ void tjs__mod_wasm_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
     /* Module object */
-    JS_NewClassID(rt, &tjs_wasm_module_class_id);
-    JS_NewClass(rt, tjs_wasm_module_class_id, &tjs_wasm_module_class);
+    if (JS_NewClassID(rt, &tjs_wasm_module_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate WasmModule class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_wasm_module_class_id) &&
+        JS_NewClass(rt, tjs_wasm_module_class_id, &tjs_wasm_module_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register WasmModule class");
+        return;
+    }
     JSValue module_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, module_proto, tjs_wasm_module_funcs, countof(tjs_wasm_module_funcs));
     JS_SetClassProto(ctx, tjs_wasm_module_class_id, module_proto);
 
     /* Instance object */
-    JS_NewClassID(rt, &tjs_wasm_instance_class_id);
-    JS_NewClass(rt, tjs_wasm_instance_class_id, &tjs_wasm_instance_class);
+    if (JS_NewClassID(rt, &tjs_wasm_instance_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate WasmInstance class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_wasm_instance_class_id) &&
+        JS_NewClass(rt, tjs_wasm_instance_class_id, &tjs_wasm_instance_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register WasmInstance class");
+        return;
+    }
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_wasm_instance_funcs, countof(tjs_wasm_instance_funcs));
     JS_SetClassProto(ctx, tjs_wasm_instance_class_id, proto);

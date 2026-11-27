@@ -64,11 +64,9 @@ struct TJSEvBus {
     uint64_t next_listener_sequence;
     size_t ref_count;
     size_t dispatch_depth;
-    bool released_entries_pending;
     bool disposed;
 };
 
-static void evbus_cleanup_released_contexts(TJSEvBus *bus);
 static void evbus_retain(TJSEvBus *bus);
 static void evbus_release(TJSEvBus *bus);
 
@@ -80,11 +78,6 @@ static void evbus_dispatch_enter(TJSEvBus *bus) {
 static void evbus_dispatch_leave(TJSEvBus *bus) {
     assert(bus->dispatch_depth > 0);
     bus->dispatch_depth--;
-    if (bus->dispatch_depth == 0 && bus->released_entries_pending) {
-        /* A snapshotted callback can create entries after its owner was freed. */
-        bus->released_entries_pending = false;
-        evbus_cleanup_released_contexts(bus);
-    }
     evbus_release(bus);
 }
 
@@ -197,12 +190,9 @@ static TJSEvBus *evbus_get(JSContext *ctx, App **app_out) {
         tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "evbus is unavailable while its runtime is shutting down");
         return NULL;
     }
-    if (app_out && app->context_released) {
-        if (bus->dispatch_depth == 0) {
-            JS_ThrowTypeError(ctx, "evbus cannot create entries for a released sandbox");
-            return NULL;
-        }
-        bus->released_entries_pending = true;
+    if (app_out && app->context_invalid) {
+        JS_ThrowTypeError(ctx, "evbus cannot create entries for a released sandbox");
+        return NULL;
     }
 
     if (app_out) {
@@ -439,6 +429,14 @@ static JSValue tjs_evbus_on(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
 
+    int32_t priority = 0;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) &&
+        JS_ToInt32(ctx, &priority, argv[3])) {
+        JS_FreeAtom(ctx, namespace_atom);
+        JS_FreeAtom(ctx, event_atom);
+        return JS_EXCEPTION;
+    }
+
     App *app;
     TJSEvBus *bus = evbus_get(ctx, &app);
     if (!bus) {
@@ -451,14 +449,6 @@ static JSValue tjs_evbus_on(JSContext *ctx, JSValueConst this_val, int argc,
         JS_FreeAtom(ctx, event_atom);
         return JS_ThrowRangeError(ctx, "evbus listener id space exhausted");
     }
-    int32_t priority = 0;
-    if (argc >= 4 && !JS_IsUndefined(argv[3]) &&
-        JS_ToInt32(ctx, &priority, argv[3])) {
-        JS_FreeAtom(ctx, namespace_atom);
-        JS_FreeAtom(ctx, event_atom);
-        return JS_EXCEPTION;
-    }
-
     TJSEvBusListener *listener = tjs__mallocz(sizeof(*listener));
     if (!listener) {
         JS_FreeAtom(ctx, namespace_atom);
@@ -524,34 +514,6 @@ static JSValue evbus_move_exception(JSContext *from, JSContext *to) {
         JS_Throw(to, JS_GetException(from));
     }
     return JS_EXCEPTION;
-}
-
-static void evbus_cleanup_released_contexts(TJSEvBus *bus) {
-    for (;;) {
-        App *owner = NULL;
-        struct list_head *pos;
-
-        list_for_each(pos, &bus->values) {
-            TJSEvBusValue *entry = list_entry(pos, TJSEvBusValue, link);
-            if (entry->owner->context_released) {
-                owner = entry->owner;
-                break;
-            }
-        }
-        if (!owner) {
-            list_for_each(pos, &bus->listeners) {
-                TJSEvBusListener *listener = list_entry(pos, TJSEvBusListener, link);
-                if (listener->owner->context_released) {
-                    owner = listener->owner;
-                    break;
-                }
-            }
-        }
-        if (!owner) {
-            return;
-        }
-        tjs__evbus_cleanup(owner);
-    }
 }
 
 static JSValue evbus_emit_atoms(JSContext *ctx, TJSEvBus *bus,

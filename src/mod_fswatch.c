@@ -36,7 +36,7 @@ typedef struct {
     int finalized;
 } TJSFsWatch;
 
-static thread_local JSClassID tjs_fswatch_class_id;
+static JSClassID tjs_fswatch_class_id;
 
 static TJSFsWatch *tjs_fswatch_get(JSValue obj) {
     return JS_GetOpaque(obj, tjs_fswatch_class_id);
@@ -307,8 +307,15 @@ static const JSCFunctionListEntry tjs_fswatch_funcs[] = {
 void tjs__mod_fswatch_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
-    JS_NewClassID(rt, &tjs_fswatch_class_id);
-    JS_NewClass(rt, tjs_fswatch_class_id, &tjs_fswatch_class);
+    if (JS_NewClassID(rt, &tjs_fswatch_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate FsWatcher class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_fswatch_class_id) &&
+        JS_NewClass(rt, tjs_fswatch_class_id, &tjs_fswatch_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register FsWatcher class");
+        return;
+    }
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_fswatch_proto_funcs, countof(tjs_fswatch_proto_funcs));
     JS_SetClassProto(ctx, tjs_fswatch_class_id, proto);

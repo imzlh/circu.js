@@ -755,16 +755,23 @@ await test('evbus - detached snapshot callbacks cannot leave owned entries', () 
     const ns = `${namespacePrefix}.detached-snapshot`;
     let sandbox = new engine.Sandbox();
     sandbox.global.evbus = evbus;
+    const errors = [];
+    sandbox.global.errors = errors;
     const offMain = evbus.on(ns, 'event', () => {
         sandbox = null;
         engine.gc.run();
     });
     sandbox.call(`evbus.on(${JSON.stringify(ns)}, 'event', () => {
-        evbus.set(${JSON.stringify(ns)}, 'late', 1);
-        evbus.on(${JSON.stringify(ns)}, 'late-event', () => {});
+        for (const operation of [
+            () => evbus.set(${JSON.stringify(ns)}, 'late', 1),
+            () => evbus.on(${JSON.stringify(ns)}, 'late-event', () => {}),
+        ]) {
+            try { operation(); } catch (error) { errors.push(error.name); }
+        }
     })`);
 
     assertEquals(evbus.emit(ns, 'event'), true);
+    assertEquals(errors.join(','), 'TypeError,TypeError');
     offMain();
     assertEquals(evbus.has(ns, 'late'), false);
     assertEquals(evbus.emit(ns, 'late-event'), false);
@@ -772,15 +779,21 @@ await test('evbus - detached snapshot callbacks cannot leave owned entries', () 
 
 await test('evbus - detached snapshot cleanup also runs after throw undefined', () => {
     const ns = `${namespacePrefix}.detached-snapshot-error`;
+    const errors = [];
     let sandbox = new engine.Sandbox();
     sandbox.global.evbus = evbus;
+    sandbox.global.errors = errors;
     const offMain = evbus.on(ns, 'event', () => {
         sandbox = null;
         engine.gc.run();
     });
     sandbox.call(`evbus.on(${JSON.stringify(ns)}, 'event', () => {
-        evbus.set(${JSON.stringify(ns)}, 'late', 1);
-        evbus.on(${JSON.stringify(ns)}, 'late-event', () => {});
+        try { evbus.set(${JSON.stringify(ns)}, 'late', 1); } catch (error) {
+            errors.push(error.name);
+        }
+        try { evbus.on(${JSON.stringify(ns)}, 'late-event', () => {}); } catch (error) {
+            errors.push(error.name);
+        }
         throw undefined;
     })`);
 
@@ -792,6 +805,7 @@ await test('evbus - detached snapshot cleanup also runs after throw undefined', 
         assertEquals(error, undefined);
     }
     assert(threw, 'throw undefined must survive detached-context cleanup');
+    assertEquals(errors.join(','), 'TypeError,TypeError');
     offMain();
     assertEquals(evbus.has(ns, 'late'), false);
     assertEquals(evbus.emit(ns, 'late-event'), false);
@@ -817,6 +831,55 @@ await test('evbus - escaped callbacks cannot create released sandbox entries', (
     }
     assertEquals(evbus.has(ns, 'key'), false);
     assertEquals(evbus.emit(ns, 'event'), false);
+
+    sandbox = new engine.Sandbox();
+    sandbox.global.evbus = evbus;
+    const register = sandbox.call(`priority => evbus.on(${JSON.stringify(ns)}, 'event', () => {}, priority)`);
+    let converted = false;
+    let rejected;
+    let unsubscribe;
+    try {
+        unsubscribe = register({
+            valueOf() {
+                converted = true;
+                sandbox = null;
+                engine.gc.run();
+                return 0;
+            },
+        });
+    } catch (error) {
+        rejected = error;
+    } finally {
+        if (unsubscribe) unsubscribe();
+    }
+    assert(converted);
+    assertEquals(rejected?.name, 'TypeError', 'priority conversion must not bypass sandbox disposal');
+    assertEquals(evbus.emit(ns, 'event'), false);
+});
+
+await test('evbus - released snapshot callbacks cannot register before nested emit', () => {
+    const ns = `${namespacePrefix}.released-nested-emit`;
+    const calls = [];
+    let sandbox = new engine.Sandbox();
+    sandbox.global.evbus = evbus;
+    sandbox.global.calls = calls;
+    evbus.on(ns, 'event', () => {
+        sandbox = null;
+        engine.gc.run();
+    });
+    sandbox.call(`evbus.on(${JSON.stringify(ns)}, 'event', () => {
+        try {
+            evbus.on(${JSON.stringify(ns)}, 'late-event', () => calls.push('late'));
+        } catch (error) {
+            calls.push(error.name);
+        }
+        calls.push(String(evbus.emit(${JSON.stringify(ns)}, 'late-event')));
+    })`);
+
+    assertEquals(evbus.emit(ns, 'event'), true);
+    assertEquals(calls.join(','), 'TypeError,false');
+    assertEquals(evbus.emit(ns, 'late-event'), false);
+    evbus.clear(ns);
 });
 
 await test('evbus - throwing during nested dispatch releases all snapshot references', () => {

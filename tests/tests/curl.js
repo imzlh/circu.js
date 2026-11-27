@@ -1,6 +1,27 @@
 const CURLMod = import.meta.use('curl');
 const { setTimeout } = import.meta.use('timers');
 
+await test('ConnPool option conversion observes reentrant close', () => {
+    for (const method of ['setMaxPipelineLength', 'setMaxConcurrentStreams']) {
+        const candidate = new CURLMod.ConnPool();
+        let rejected = false;
+        try {
+            candidate[method]({
+                valueOf() {
+                    candidate.close();
+                    return 1;
+                },
+            });
+        } catch (error) {
+            assert(error instanceof TypeError, `${method} should reject a closed pool`);
+            rejected = true;
+        } finally {
+            candidate.close();
+        }
+        assert(rejected, `${method} accepted a pool closed during conversion`);
+    }
+});
+
 // ============ Basic functionality tests ============
 
 await test('CURL.version - check version info', () => {
@@ -317,13 +338,15 @@ await test('ConnPool - perform after close throws', () => {
     const curl = new CURLMod.CURL(closedPool);
     closedPool.close();
 
-    let threw = false;
-    try {
-        curl.setUrl('http://127.0.0.1:9/').perform();
-    } catch (e) {
-        threw = e instanceof TypeError;
+    for (const method of ['perform', 'performSync']) {
+        let threw = false;
+        try {
+            curl.setUrl('http://127.0.0.1:9/')[method]();
+        } catch (e) {
+            threw = e instanceof TypeError && /closed/.test(String(e.message));
+        }
+        assert(threw, `${method}() after pool.close() should throw a closed-pool TypeError`);
     }
-    assert(threw, 'perform() after pool.close() should throw a TypeError');
 });
 
 await test('CURL instance - getInfo ignores pointer-typed infos', () => {

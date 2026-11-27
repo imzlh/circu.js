@@ -70,8 +70,8 @@ typedef struct {
 } encoder_t;
 
 /* Class IDs for QuickJS finalizers */
-static thread_local JSClassID tjs_text_decoder_class_id;
-static thread_local JSClassID tjs_text_encoder_class_id;
+static JSClassID tjs_text_decoder_class_id;
+static JSClassID tjs_text_encoder_class_id;
 
 /* ===== Growable output buffer ===== */
 typedef struct {
@@ -951,8 +951,15 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
     /* TextDecoder */
-    JS_NewClassID(rt, &tjs_text_decoder_class_id);
-    JS_NewClass(rt, tjs_text_decoder_class_id, &tjs_text_decoder_class);
+    if (JS_NewClassID(rt, &tjs_text_decoder_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate TextDecoder class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_text_decoder_class_id) &&
+        JS_NewClass(rt, tjs_text_decoder_class_id, &tjs_text_decoder_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register TextDecoder class");
+        return;
+    }
 
     JSValue decoder_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, decoder_proto, tjs_text_decoder_proto_funcs,
@@ -965,8 +972,15 @@ void tjs__mod_text_init(JSContext *ctx, JSValue ns) {
     JS_SetPropertyStr(ctx, ns, "Decoder", decoder_ctor);
 
     /* TextEncoder */
-    JS_NewClassID(rt, &tjs_text_encoder_class_id);
-    JS_NewClass(rt, tjs_text_encoder_class_id, &tjs_text_encoder_class);
+    if (JS_NewClassID(rt, &tjs_text_encoder_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate TextEncoder class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_text_encoder_class_id) &&
+        JS_NewClass(rt, tjs_text_encoder_class_id, &tjs_text_encoder_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register TextEncoder class");
+        return;
+    }
 
     JSValue encoder_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, encoder_proto, tjs_text_encoder_proto_funcs,

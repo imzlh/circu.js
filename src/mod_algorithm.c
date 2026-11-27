@@ -1251,7 +1251,7 @@ typedef struct {
     xoshiro256_state state;
 } XoshiroRNG;
 
-static thread_local JSClassID xoshiro_class_id;
+static JSClassID xoshiro_class_id;
 
 static void xoshiro_finalizer(JSRuntime *rt, JSValue val) {
     XoshiroRNG *rng = JS_GetOpaque(val, xoshiro_class_id);
@@ -1411,11 +1411,15 @@ static const JSCFunctionListEntry xoshiro_proto_funcs[] = {
 };
 
 static JSValue xoshiro_init(JSContext *ctx) {
-    JS_NewClassID(JS_GetRuntime(ctx), &xoshiro_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), xoshiro_class_id, &(JSClassDef){
-        .class_name = "XoshiroRNG",
-        .finalizer = xoshiro_finalizer,
-    });
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (JS_NewClassID(rt, &xoshiro_class_id) == JS_INVALID_CLASS_ID)
+        return JS_ThrowInternalError(ctx, "failed to allocate XoshiroRNG class ID");
+    if (!JS_IsRegisteredClass(rt, xoshiro_class_id) &&
+        JS_NewClass(rt, xoshiro_class_id, &(JSClassDef){
+            .class_name = "XoshiroRNG",
+            .finalizer = xoshiro_finalizer,
+        }) < 0)
+        return JS_ThrowInternalError(ctx, "failed to register XoshiroRNG class");
     
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, xoshiro_proto_funcs, countof(xoshiro_proto_funcs));
@@ -2278,5 +2282,6 @@ void tjs__mod_algorithm_init(JSContext* ctx, JSValue ns){
 	JS_SetPropertyFunctionList(ctx, ns, tjs_algorithm_funcs, countof(tjs_algorithm_funcs));
 
 	JSValue xoshiro_obj = xoshiro_init(ctx);
+	if (JS_IsException(xoshiro_obj)) return;
 	JS_SetPropertyStr(ctx, ns, "XoshiroRNG", xoshiro_obj);
 }

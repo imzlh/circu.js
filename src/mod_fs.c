@@ -32,6 +32,8 @@
 #include <math.h>
 #include <string.h>
 
+static inline int fs_errno2uv(int crt_err);
+
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -241,50 +243,66 @@ typedef struct _REPARSE_DATA_BUFFER {
 #ifndef S_IXOTH
 #define S_IXOTH 00001  /* Execute permission other */
 #endif
-typedef int64_t fs_off_t;
-static int64_t fs_pread(int fd, void* buf, int64_t len, int64_t off)
+static HANDLE fs_win_handle_from_fd(int fd) {
+    HANDLE handle = uv_get_osfhandle(fd);
+    /* The CRT can also return -2 for a stdio slot without a backing handle. */
+    return handle == (HANDLE) (intptr_t) -2 ? INVALID_HANDLE_VALUE : handle;
+}
+
+static int fs_win_flush(int fd) {
+    HANDLE handle = fs_win_handle_from_fd(fd);
+    if (handle == INVALID_HANDLE_VALUE) return UV_EBADF;
+    if (!FlushFileBuffers(handle)) return uv_translate_sys_error(GetLastError());
+    return 0;
+}
+
+/* Return bytes or a UV error; position restoration is best-effort like libuv. */
+static ssize_t fs_pread(int fd, void* buf, size_t len, int64_t off)
 {
+    HANDLE h = fs_win_handle_from_fd(fd);
+    if (h == INVALID_HANDLE_VALUE) return UV_EBADF;
+    if (len > UINT32_MAX) return UV_EOVERFLOW;
+
     OVERLAPPED ov = { 0 };
     ov.Offset = (DWORD) (off & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD rd = 0;
-    HANDLE h = (HANDLE) _get_osfhandle(fd);
     /* An OVERLAPPED offset still moves the file pointer of a synchronous
      * handle; save it so pread() leaves the position untouched. */
     LARGE_INTEGER orig = { 0 }, zero = { 0 };
     BOOL have_pos = SetFilePointerEx(h, zero, &orig, FILE_CURRENT);
     BOOL ok = ReadFile(h, buf, (DWORD) len, &rd, &ov);
-    DWORD last = GetLastError();
-    if (have_pos) SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
-    if (!ok) {
-        if (last == ERROR_HANDLE_EOF) return 0;
-        SetLastError(last);
-        return -1;
-    }
-    return rd;
+    DWORD last = ok ? ERROR_SUCCESS : GetLastError();
+    if (have_pos)
+        SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
+    if (ok || rd > 0) return rd;
+    if (last == ERROR_HANDLE_EOF || last == ERROR_BROKEN_PIPE) return 0;
+    /* Like libuv, access denied on an open fd means the wrong open mode. */
+    if (last == ERROR_ACCESS_DENIED) return UV_EBADF;
+    return uv_translate_sys_error(last);
 }
-static int64_t fs_pwrite(int fd, const void* buf, int64_t len, int64_t off)
+static ssize_t fs_pwrite(int fd, const void* buf, size_t len, int64_t off)
 {
+    HANDLE h = fs_win_handle_from_fd(fd);
+    if (h == INVALID_HANDLE_VALUE) return UV_EBADF;
+    if (len > UINT32_MAX) return UV_EOVERFLOW;
+
     OVERLAPPED ov = { 0 };
     ov.Offset = (DWORD) (off & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD wr = 0;
-    HANDLE h = (HANDLE) _get_osfhandle(fd);
     LARGE_INTEGER orig = { 0 }, zero = { 0 };
     BOOL have_pos = SetFilePointerEx(h, zero, &orig, FILE_CURRENT);
     BOOL ok = WriteFile(h, buf, (DWORD) len, &wr, &ov);
-    DWORD last = GetLastError();
-    if (have_pos) SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
-    if (!ok) {
-        SetLastError(last);
-        return -1;
-    }
-    return wr;
+    DWORD last = ok ? ERROR_SUCCESS : GetLastError();
+    if (have_pos)
+        SetFilePointerEx(h, orig, NULL, FILE_BEGIN);
+    if (ok || wr > 0) return wr;
+    if (last == ERROR_ACCESS_DENIED) return UV_EBADF;
+    if (last == ERROR_BROKEN_PIPE || last == ERROR_NO_DATA) return UV_EPIPE;
+    return uv_translate_sys_error(last);
 }
 #else
-typedef off_t fs_off_t;
-#define fs_pread pread
-#define fs_pwrite pwrite
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -294,6 +312,17 @@ typedef off_t fs_off_t;
 #endif
 #include <sys/stat.h>
 #include <sys/file.h>
+
+static ssize_t fs_pread(int fd, void* buf, size_t len, int64_t off) {
+    ssize_t result = pread(fd, buf, len, off);
+    return result < 0 ? uv_translate_sys_error(errno) : result;
+}
+
+static ssize_t fs_pwrite(int fd, const void* buf, size_t len, int64_t off) {
+    ssize_t result = pwrite(fd, buf, len, off);
+    return result < 0 ? uv_translate_sys_error(errno) : result;
+}
+
 #endif
 
 #ifndef S_ISBLK
@@ -343,6 +372,11 @@ enum {
     OPEN_EXCL = O_EXCL,
     OPEN_TRUNC = O_TRUNC,
     OPEN_APPEND = O_APPEND,
+#ifdef O_NONBLOCK
+    OPEN_NONBLOCK = O_NONBLOCK,
+#else
+    OPEN_NONBLOCK = 0,
+#endif
 };
 
 /* Helper: build flags from JS object */
@@ -589,8 +623,8 @@ static TJSObjectHandleIdentity tjs_syncfs_pin_matches_fd(
                              : TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
     }
 
-    HANDLE raw_handle = uv_get_osfhandle(fd);
-    HANDLE pinned_handle = uv_get_osfhandle(pin->fd);
+    HANDLE raw_handle = fs_win_handle_from_fd(fd);
+    HANDLE pinned_handle = fs_win_handle_from_fd(pin->fd);
     if (raw_handle == INVALID_HANDLE_VALUE ||
         pinned_handle == INVALID_HANDLE_VALUE) {
         return TJS_OBJECT_HANDLE_IDENTITY_DIFFERENT;
@@ -647,16 +681,6 @@ static JSValue tjs_syncfs_throw_pinned_errno(JSContext* ctx, TJSSyncFsFdPin* pin
     return tjs_throw_errno(ctx, fs_errno2uv(saved_errno));
 }
 
-static JSValue tjs_syncfs_throw_pinned_positional_io(JSContext* ctx, TJSSyncFsFdPin* pin) {
-#ifdef _WIN32
-    DWORD saved_error = GetLastError();
-    tjs_syncfs_unpin_fd(pin);
-    return tjs_throw_errno(ctx, uv_translate_sys_error(saved_error));
-#else
-    return tjs_syncfs_throw_pinned_errno(ctx, pin);
-#endif
-}
-
 static JSValue tjs_syncfs_throw_pinned_uv(JSContext* ctx, TJSSyncFsFdPin* pin, int uv_error) {
     tjs_syncfs_unpin_fd(pin);
     return tjs_throw_errno(ctx, uv_error);
@@ -682,8 +706,7 @@ static JSValue tjs_syncfs_throw_pinned_uv(JSContext* ctx, TJSSyncFsFdPin* pin, i
 
 #ifdef _WIN32
 static JSValue tjs_syncfs_throw_pinned_win32(JSContext* ctx, TJSSyncFsFdPin* pin, DWORD error) {
-    tjs_syncfs_unpin_fd(pin);
-    return tjs_throw_errno(ctx, uv_translate_sys_error(error));
+    return tjs_syncfs_throw_pinned_uv(ctx, pin, uv_translate_sys_error(error));
 }
 #endif
 
@@ -839,14 +862,12 @@ void tjs_win_stat_times_from_path(const char* path,
 }
 
 void tjs_win_stat_times_from_fd(int fd, tjs_win_stat_times_t* out) {
-    intptr_t raw = _get_osfhandle(fd);
-
+    HANDLE handle = fs_win_handle_from_fd(fd);
     out->valid = 0;
-    /* _get_osfhandle yields -1 for a bad fd and -2 for a closed stdio slot. */
-    if (raw == -1 || raw == -2) {
+    if (handle == INVALID_HANDLE_VALUE) {
         return;
     }
-    tjs_win_stat_times_from_handle((HANDLE) raw, out);
+    tjs_win_stat_times_from_handle(handle, out);
 }
 
 /* times may be NULL/invalid; a stat never fails if the FILETIME read does. */
@@ -903,6 +924,7 @@ static JSValue build_statfs_obj(JSContext* ctx, const uv_statfs_t* st) {
     JS_DefinePropertyValueStr(ctx, obj, STRINGIFY(x), JS_NewInt64(ctx, (int64_t) st->f_##x), JS_PROP_C_W_E);
     SET_STATFS_FIELD(type);
     SET_STATFS_FIELD(bsize);
+    SET_STATFS_FIELD(frsize);
     SET_STATFS_FIELD(blocks);
     SET_STATFS_FIELD(bfree);
     SET_STATFS_FIELD(bavail);
@@ -1324,7 +1346,7 @@ static JSValue tjs_syncfs_pread(JSContext* ctx, JSValueConst this_val, int argc,
     ssize_t bytes_read = fs_pread(fd, buffer, buf_size, offset);
 
     if (bytes_read < 0) {
-        return tjs_syncfs_throw_pinned_positional_io(ctx, &pin);
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, (int) bytes_read);
     }
 
     JSValue result = JS_NewInt32(ctx, bytes_read);
@@ -1361,7 +1383,7 @@ static JSValue tjs_syncfs_pwrite(JSContext* ctx, JSValueConst this_val, int argc
     ssize_t bytes_written = fs_pwrite(fd, buffer, buf_size, offset);
 
     if (bytes_written < 0) {
-        return tjs_syncfs_throw_pinned_positional_io(ctx, &pin);
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, (int) bytes_written);
     }
 
     JSValue result = JS_NewInt32(ctx, bytes_written);
@@ -1793,43 +1815,39 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
     }
 
 #ifdef _WIN32
-    // Windows implementation using CreateSymbolicLink
-    DWORD flags = 0;
     bool is_directory = false;
+    bool has_type = argc >= 3 && !JS_IsUndefined(argv[2]);
 
     // Check if an explicit link type was supplied.
-    if (argc >= 3) {
-        JSValue type_val = argv[2];
-        if (JS_IsString(type_val)) {
-            const char* type_str = JS_ToCString(ctx, type_val);
-            if (!type_str) {
-                JS_FreeCString(ctx, target);
-                JS_FreeCString(ctx, path);
-                return JS_EXCEPTION;
-            }
-            if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
-                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
-                is_directory = true;
-            }
-            else if (strcmp(type_str, "file") == 0) {
-                flags = 0;
-                is_directory = false;
-            }
-            else {
-                JS_FreeCString(ctx, target);
-                JS_FreeCString(ctx, path);
-                JS_FreeCString(ctx, type_str);
-                return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
-            }
-            JS_FreeCString(ctx, type_str);
+    if (has_type) {
+        if (!JS_IsString(argv[2])) {
+            JS_FreeCString(ctx, target);
+            JS_FreeCString(ctx, path);
+            return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
         }
+        const char* type_str = JS_ToCString(ctx, argv[2]);
+        if (!type_str) {
+            JS_FreeCString(ctx, target);
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        if (strcmp(type_str, "dir") == 0 || strcmp(type_str, "directory") == 0) {
+            is_directory = true;
+        }
+        else if (strcmp(type_str, "file") != 0) {
+            JS_FreeCString(ctx, target);
+            JS_FreeCString(ctx, path);
+            JS_FreeCString(ctx, type_str);
+            return JS_ThrowTypeError(ctx, "Link type must be 'file' or 'dir' on Windows");
+        }
+        JS_FreeCString(ctx, type_str);
     }
 #endif
 
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.symlink", path), (JS_FreeCString(ctx, target), JS_FreeCString(ctx, path)));
 
 #ifdef _WIN32
-    if (argc < 3) {
+    if (!has_type) {
         // Auto-detect: try to determine if target is a directory
         WCHAR *wtarget = utf8_to_wcs(target);
         DWORD attribs = INVALID_FILE_ATTRIBUTES;
@@ -1839,12 +1857,7 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
         }
         if (attribs != INVALID_FILE_ATTRIBUTES) {
             if (attribs & FILE_ATTRIBUTE_DIRECTORY) {
-                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
                 is_directory = true;
-            }
-            else {
-                flags = 0;
-                is_directory = false;
             }
         }
         else {
@@ -1855,65 +1868,22 @@ static JSValue tjs_syncfs_symlink(JSContext* ctx, JSValueConst this_val,
 
             if (last_dot && (!last_slash || last_dot > last_slash)) {
                 // Has file extension, treat as file
-                flags = 0;
                 is_directory = false;
             }
             else {
                 // No extension or extension before slash, treat as directory
-                flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
                 is_directory = true;
             }
         }
     }
 
-    // Convert paths to wide strings for Windows API
-    wchar_t* w_target = NULL;
-    wchar_t* w_path = NULL;
-    int w_target_len = 0, w_path_len = 0;
-    bool success = false;
-
-    do {
-        w_target_len = MultiByteToWideChar(CP_UTF8, 0, target, -1, NULL, 0);
-        w_path_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-
-        if (w_target_len <= 0 || w_path_len <= 0) {
-            break;
-        }
-
-        w_target = (wchar_t*) js_malloc(ctx, w_target_len * sizeof(wchar_t));
-        w_path = (wchar_t*) js_malloc(ctx, w_path_len * sizeof(wchar_t));
-
-        if (!w_target || !w_path) {
-            break;
-        }
-
-        if (MultiByteToWideChar(CP_UTF8, 0, target, -1, w_target, w_target_len) == 0 ||
-            MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, w_path_len) == 0) {
-            break;
-        }
-
-        // Create the symbolic link
-        success = CreateSymbolicLinkW(w_path, w_target, flags);
-
-        if (!success) {
-            DWORD error = GetLastError();
-            // Check if we need administrator privileges
-            if (error == ERROR_PRIVILEGE_NOT_HELD) {
-                // Try without the flag (for older Windows versions)
-                success = CreateSymbolicLinkW(w_path, w_target, 0);
-            }
-        }
-    } while (0);
-
-    // Clean up wide strings
-    if (w_target) js_free(ctx, w_target);
-    if (w_path) js_free(ctx, w_path);
-
-    if (!success) {
-        DWORD error_code = GetLastError();
-        char errbuf[512];
-        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
-        JSValue error = JS_ThrowTypeError(ctx, "Failed to create symbolic link: %s", errbuf);
+    uv_fs_t req;
+    int ret = uv_fs_symlink(NULL, &req, target, path,
+                            is_directory ? UV_FS_SYMLINK_DIR : 0, NULL);
+    int uv_err = ret;
+    uv_fs_req_cleanup(&req);
+    if (ret < 0) {
+        JSValue error = tjs_throw_errno_path(ctx, uv_err, path);
         JS_FreeCString(ctx, target);
         JS_FreeCString(ctx, path);
         return error;
@@ -2036,7 +2006,7 @@ static JSValue tjs_syncfs_readlink(JSContext* ctx, JSValueConst this_val,
     return result;
 }
 
-/* copy(): high-performance file copy */
+/* copy(): libuv file copy */
 static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
     int argc, JSValueConst* argv)
 {
@@ -2048,216 +2018,40 @@ static JSValue tjs_syncfs_copy(JSContext* ctx, JSValueConst this_val,
 
     src_path = JS_ToCString(ctx, argv[0]);
     if (!src_path) {
-        return JS_ThrowTypeError(ctx, "First argument must be a string");
+        return JS_EXCEPTION;
     }
 
     dest_path = JS_ToCString(ctx, argv[1]);
     if (!dest_path) {
         JS_FreeCString(ctx, src_path);
-        return JS_ThrowTypeError(ctx, "Second argument must be a string");
+        return JS_EXCEPTION;
     }
 
-    if (strlen(src_path) == 0 || strlen(dest_path) == 0) {
+    if (src_path[0] == '\0' || dest_path[0] == '\0') {
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
         return JS_ThrowRangeError(ctx, "Paths cannot be empty");
     }
 
+    int flags = 0;
+    if (argc > 2 && JS_ToInt32(ctx, &flags, argv[2])) {
+        JS_FreeCString(ctx, src_path);
+        JS_FreeCString(ctx, dest_path);
+        return JS_EXCEPTION;
+    }
+
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.copy", src_path), (JS_FreeCString(ctx, src_path), JS_FreeCString(ctx, dest_path)));
 
-#ifdef _WIN32
-    // Check if source is a regular file (not a directory)
-    WCHAR *wsrc = utf8_to_wcs(src_path);
-    DWORD src_attribs = INVALID_FILE_ATTRIBUTES;
-    if (wsrc) {
-        src_attribs = GetFileAttributesW(wsrc);
-        free(wsrc);
-    }
-    if (src_attribs == INVALID_FILE_ATTRIBUTES) {
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        THROW2("copy: cannot access source file");
-    }
-    if (src_attribs & FILE_ATTRIBUTE_DIRECTORY) {
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, "Source is a directory, not a file");
-    }
-
-    // Windows high-performance copy using CopyFileEx with progress callback (NULL for simple copy)
-    // Note: We use 0 flags (not COPY_FILE_FAIL_IF_EXISTS) to match Unix behavior (overwrite)
-    WCHAR *wsrc_copy = utf8_to_wcs(src_path);
-    WCHAR *wdest_copy = utf8_to_wcs(dest_path);
-    bool result = false;
-    if (wsrc_copy && wdest_copy) {
-        result = CopyFileExW(wsrc_copy, wdest_copy, NULL, NULL, NULL, 0);
-    }
-    free(wsrc_copy);
-    free(wdest_copy);
-    if (!result) {
-        DWORD error_code = GetLastError();
-        char error_msg[512];
-        char errbuf[400];
-        win32_strerror_utf8(error_code, errbuf, sizeof(errbuf));
-        snprintf(error_msg, sizeof(error_msg), "Failed to copy file: %s", errbuf);
-
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, "%s", error_msg);
-    }
-#else
-    // Unix high-performance copy using sendfile() for efficient kernel-space copying
-    int src_fd = -1, dest_fd = -1;
-    struct stat src_stat;
-    ssize_t bytes_copied;
-
-    // Open source file (read-only)
-    src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
-    if (src_fd == -1) {
-        int uv_err = fs_errno2uv(errno);
-        JSValue err = tjs_throw_errno_path(ctx, uv_err, src_path);
+    uv_fs_t req;
+    int ret = uv_fs_copyfile(NULL, &req, src_path, dest_path, flags, NULL);
+    uv_fs_req_cleanup(&req);
+    if (ret < 0) {
+        JSValue err = tjs_throw_errno_path(ctx, ret, src_path);
         JS_FreeCString(ctx, src_path);
         JS_FreeCString(ctx, dest_path);
         return err;
     }
 
-    // Check if source is a regular file (don't copy directories or special files)
-    if (fstat(src_fd, &src_stat) == -1) {
-        int uv_err = fs_errno2uv(errno);
-        close(src_fd);
-        JSValue err = tjs_throw_errno_path(ctx, uv_err, src_path);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return err;
-    }
-    if (!S_ISREG(src_stat.st_mode)) {
-        close(src_fd);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, "Source is not a regular file");
-    }
-
-    // No O_TRUNC: it would destroy the source before the same-file check below.
-    dest_fd = open(dest_path, O_WRONLY | O_CREAT | O_CLOEXEC, src_stat.st_mode);
-    if (dest_fd == -1) {
-        int uv_err = fs_errno2uv(errno);
-        close(src_fd);
-        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return err;
-    }
-
-    struct stat dest_stat;
-    if (fstat(dest_fd, &dest_stat) == -1) {
-        int uv_err = fs_errno2uv(errno);
-        close(src_fd);
-        close(dest_fd);
-        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return err;
-    }
-    if (dest_stat.st_dev == src_stat.st_dev && dest_stat.st_ino == src_stat.st_ino) {
-        close(src_fd);
-        close(dest_fd);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, "Source and destination are the same file");
-    }
-    if (S_ISREG(dest_stat.st_mode) && ftruncate(dest_fd, 0) == -1) {
-        int uv_err = fs_errno2uv(errno);
-        close(src_fd);
-        close(dest_fd);
-        JSValue err = tjs_throw_errno_path(ctx, uv_err, dest_path);
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return err;
-    }
-
-    // Use sendfile for efficient zero-copy file transfer (where available)
-#ifdef __linux__
-
-    off_t offset = 0;
-    // Loop to handle partial writes and EINTR
-    bytes_copied = 0;
-    int copy_errno = 0;
-    while (offset < src_stat.st_size) {
-        size_t to_send = (size_t) (src_stat.st_size - offset);
-        // Limit chunk size to avoid issues with large files on 32-bit systems
-        if (to_send > 0x7ffff000) to_send = 0x7ffff000;
-        ssize_t ret = sendfile(dest_fd, src_fd, &offset, to_send);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            copy_errno = errno;
-            bytes_copied = -1;
-            break;
-        }
-        if (ret == 0) {
-            // EOF reached before expected (file truncated during copy)
-            break;
-        }
-        bytes_copied += ret;
-    }
-#else
-    // Fallback to read/write for systems without sendfile
-    char buffer[65536]; // 64KB buffer
-    ssize_t bytes_read;
-    bytes_copied = 0;
-    int copy_errno = 0;
-
-    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) != 0) {
-        if (bytes_read < 0) {
-            if (errno == EINTR) continue;
-            copy_errno = errno;
-            bytes_copied = -1;
-            break;
-        }
-        ssize_t total_written = 0;
-        while (total_written < bytes_read) {
-            ssize_t bytes_written = write(dest_fd, buffer + total_written, bytes_read - total_written);
-            if (bytes_written < 0) {
-                if (errno == EINTR) continue;
-                copy_errno = errno;
-                bytes_copied = -1;
-                break;
-            }
-            total_written += bytes_written;
-        }
-        if (bytes_copied == -1) break;
-        bytes_copied += bytes_read;
-    }
-#endif
-
-    // Close file descriptors
-    // Capture errno right after each failing call; later calls overwrite it.
-    int close_errno = 0;
-    if (close(src_fd) < 0) close_errno = errno;
-    if (close(dest_fd) < 0 && !close_errno) close_errno = errno;
-    int saved_errno = copy_errno;
-    if (bytes_copied >= 0 && close_errno) {
-        saved_errno = close_errno;
-        bytes_copied = -1;
-    }
-
-    // Check if copy was successful (bytes_copied should match file size)
-    if (bytes_copied < 0 || bytes_copied != src_stat.st_size) {
-        // Clean up partial destination file on error (dest is known not to be src)
-        unlink(dest_path);
-
-        if (saved_errno != 0) {
-            JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(saved_errno), src_path);
-            JS_FreeCString(ctx, src_path);
-            JS_FreeCString(ctx, dest_path);
-            return err;
-        }
-        JS_FreeCString(ctx, src_path);
-        JS_FreeCString(ctx, dest_path);
-        return JS_ThrowTypeError(ctx, "Failed to copy file data (file may have been modified during copy)");
-    }
-#endif
-
-    // Clean up and return success
     JS_FreeCString(ctx, src_path);
     JS_FreeCString(ctx, dest_path);
 
@@ -2329,60 +2123,50 @@ static JSValue tjs_syncfs_readdir(JSContext* ctx, JSValueConst this_val, int arg
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "fs.readdir", path), JS_FreeCString(ctx, path));
 
 #ifdef _WIN32
-    if (path[0] == '\0') {
-        /* "" + "\\*" would list the current drive root */
-        JSValue err = tjs_throw_errno_path(ctx, UV_ENOENT, path);
+    uv_fs_t req;
+    int ret = uv_fs_scandir(NULL, &req, path, 0, NULL);
+    if (ret < 0) {
+        int uv_err = ret;
+        uv_fs_req_cleanup(&req);
+        JSValue err = tjs_throw_errno_path(ctx, uv_err, path);
         JS_FreeCString(ctx, path);
         return err;
     }
-    WCHAR *wpath = utf8_to_wcs(path);
-    if (!wpath) { JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
-
-    /* Build wide-char search path: path\\* */
-    size_t wlen = wcslen(wpath);
-    WCHAR *wsearch = (WCHAR *)malloc((wlen + 3) * sizeof(WCHAR));
-    if (!wsearch) { free(wpath); JS_FreeCString(ctx, path); return JS_ThrowOutOfMemory(ctx); }
-    wcscpy(wsearch, wpath);
-    wsearch[wlen] = L'\\';
-    wsearch[wlen + 1] = L'*';
-    wsearch[wlen + 2] = L'\0';
-    free(wpath);
-
-    WIN32_FIND_DATAW find_data;
-    HANDLE handle = FindFirstFileW(wsearch, &find_data);
-    free(wsearch);
-
-    if (handle == INVALID_HANDLE_VALUE) {
-        JSValue err = tjs_throw_errno_path(ctx, uv_translate_sys_error(GetLastError()), path);
-        JS_FreeCString(ctx, path);
-        return err;
-    }
-    JS_FreeCString(ctx, path);
 
     JSValue arr = JS_NewArray(ctx);
+    if (JS_IsException(arr)) {
+        uv_fs_req_cleanup(&req);
+        JS_FreeCString(ctx, path);
+        return arr;
+    }
+
     uint32_t idx = 0;
-
-    do {
-        if (wcscmp(find_data.cFileName, L".") != 0 &&
-            wcscmp(find_data.cFileName, L"..") != 0) {
-            char *utf8_name = wcs_to_utf8(find_data.cFileName, -1);
-            if (utf8_name) {
-                if (with_types) {
-                    int kind = UV_DIRENT_UNKNOWN;
-                    DWORD attrs = find_data.dwFileAttributes;
-                    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) kind = UV_DIRENT_LINK;
-                    else if (attrs & FILE_ATTRIBUTE_DIRECTORY) kind = UV_DIRENT_DIR;
-                    else kind = UV_DIRENT_FILE;
-                    JS_SetPropertyUint32(ctx, arr, idx++, build_dirent_obj(ctx, utf8_name, kind));
-                } else {
-                    JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, utf8_name));
-                }
-                free(utf8_name);
-            }
+    uv_dirent_t entry;
+    for (;;) {
+        ret = uv_fs_scandir_next(&req, &entry);
+        if (ret == UV_EOF) break;
+        if (ret < 0) {
+            uv_fs_req_cleanup(&req);
+            JS_FreeValue(ctx, arr);
+            JSValue err = tjs_throw_errno_path(ctx, ret, path);
+            JS_FreeCString(ctx, path);
+            return err;
         }
-    } while (FindNextFileW(handle, &find_data));
 
-    FindClose(handle);
+        JSValue value = with_types
+            ? build_dirent_obj(ctx, entry.name, entry.type)
+            : JS_NewString(ctx, entry.name);
+        if (JS_IsException(value) || JS_SetPropertyUint32(ctx, arr, idx++, value) < 0) {
+            uv_fs_req_cleanup(&req);
+            JS_FreeValue(ctx, arr);
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+    }
+
+    uv_fs_req_cleanup(&req);
+    JS_FreeCString(ctx, path);
+    return arr;
 #else
     DIR* dir = opendir(path);
 
@@ -2550,9 +2334,9 @@ static JSValue tjs_syncfs_flock(JSContext* ctx, JSValueConst this_val, int argc,
 #ifdef _WIN32
     /* Lock the caller's handle, not the pin's duplicate: LockFileEx locks
      * belong to that handle and die when it closes. */
-    HANDLE hFile = (HANDLE) _get_osfhandle(fd);
+    HANDLE hFile = fs_win_handle_from_fd(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, UV_EBADF);
     }
 
     OVERLAPPED overlapped = { 0 };
@@ -2604,14 +2388,8 @@ static JSValue tjs_syncfs_fsync(JSContext* ctx, JSValueConst this_val, int argc,
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fsync", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 
 #ifdef _WIN32
-    HANDLE hFile = (HANDLE) _get_osfhandle(fd);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
-    }
-
-    if (!FlushFileBuffers(hFile)) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
-    }
+    int ret = fs_win_flush(fd);
+    if (ret < 0) return tjs_syncfs_throw_pinned_uv(ctx, &pin, ret);
 #else
     if (fsync(fd) < 0) {
         return tjs_syncfs_throw_pinned_errno(ctx, &pin);
@@ -2636,15 +2414,8 @@ static JSValue tjs_syncfs_fdatasync(JSContext* ctx, JSValueConst this_val, int a
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fdatasync", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 
 #ifdef _WIN32
-    // Windows doesn't distinguish between fsync and fdatasync
-    HANDLE hFile = (HANDLE) _get_osfhandle(fd);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
-    }
-
-    if (!FlushFileBuffers(hFile)) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
-    }
+    int ret = fs_win_flush(fd);
+    if (ret < 0) return tjs_syncfs_throw_pinned_uv(ctx, &pin, ret);
 #else
 #ifdef __APPLE__
     // macOS doesn't have fdatasync, use fcntl F_FULLFSYNC
@@ -2739,9 +2510,9 @@ static JSValue tjs_syncfs_ftruncate(JSContext* ctx, JSValueConst this_val, int a
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.ftruncate", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 
 #ifdef _WIN32
-    HANDLE hFile = (HANDLE) _get_osfhandle(fd);
+    HANDLE hFile = fs_win_handle_from_fd(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        return tjs_syncfs_throw_pinned_win32(ctx, &pin, GetLastError());
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, UV_EBADF);
     }
 
     LARGE_INTEGER li, orig = { 0 }, zero = { 0 };
@@ -2891,14 +2662,13 @@ static JSValue tjs_syncfs_fchown(JSContext* ctx, JSValueConst this_val, int argc
 
     TJSSyncFsFdPin pin = { fd, 0, false };
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_posix_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.fchown", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
-#ifdef _WIN32
-    return tjs_throw_errno_msg(ctx, UV_ENOSYS, "fchown not supported on Windows");
-#else
+    /* Like libuv, fchown is a no-op on Windows, even for a closed fd. */
+#ifndef _WIN32
     if (fchown(fd, uid, gid) < 0) {
         return tjs_syncfs_throw_pinned_errno(ctx, &pin);
     }
-    tjs_syncfs_unpin_fd(&pin);
 #endif
+    tjs_syncfs_unpin_fd(&pin);
 
     return JS_UNDEFINED;
 }
@@ -2997,10 +2767,9 @@ static JSValue tjs_syncfs_futimes(JSContext* ctx, JSValueConst this_val, int arg
     TJS_CAPABILITY_GUARDED(pin = tjs_syncfs_pin_fd(fd), tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_WRITE, TJS_CAP_FLAG_REPLACEABLE, "fs.futimes", NULL), tjs_syncfs_unpin_fd(&pin), TJS_SYNCFS_REVALIDATE_PIN(pin, fd));
 
 #ifdef _WIN32
-    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    HANDLE hFile = fs_win_handle_from_fd(fd);
     if (hFile == INVALID_HANDLE_VALUE) {
-        tjs_syncfs_unpin_fd(&pin);
-        return JS_ThrowTypeError(ctx, "futimes: invalid file descriptor");
+        return tjs_syncfs_throw_pinned_uv(ctx, &pin, UV_EBADF);
     }
 
     FILETIME ft_atime, ft_mtime;
@@ -3146,6 +2915,12 @@ static const JSCFunctionListEntry tjs_syncfs_funcs[] = {
     CCONST(OPEN_EXCL),
     CCONST(OPEN_TRUNC),
     CCONST(OPEN_APPEND),
+    CCONST(OPEN_NONBLOCK),
+
+    /* Constants - file copy flags */
+    TJS_UVCONST(FS_COPYFILE_EXCL),
+    TJS_UVCONST(FS_COPYFILE_FICLONE),
+    TJS_UVCONST(FS_COPYFILE_FICLONE_FORCE),
 
     /* Constants - file modes */
     CCONST(S_IFMT),

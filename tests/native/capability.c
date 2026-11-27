@@ -283,7 +283,8 @@ static void set_global(JSContext *ctx, const char *name, JSValue value) {
 static void expect_hook_revalidation(JSContext *ctx,
                                      TJSRuntime *runtime,
                                      HookState *state,
-                                     const char *source) {
+                                     const char *source,
+                                     const char *expected_error) {
     size_t source_len = strlen(source);
     state->callback = eval_function(ctx, source, source_len);
     if (JS_IsException(state->callback)) TJS_DumpException(ctx);
@@ -292,7 +293,14 @@ static void expect_hook_revalidation(JSContext *ctx,
 
     JSValue result = eval_function(ctx, "run()", sizeof("run()") - 1);
     assert(JS_IsException(result));
-    clear_exception(ctx);
+    assert(JS_HasException(ctx));
+    JSValue exception = JS_GetException(ctx);
+    if (expected_error) {
+        const char *message = JS_ToCString(ctx, exception);
+        assert(message && strcmp(message, expected_error) == 0);
+        JS_FreeCString(ctx, message);
+    }
+    JS_FreeValue(ctx, exception);
 
     TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
     JS_FreeValue(ctx, state->callback);
@@ -308,6 +316,7 @@ int main(void) {
     assert(ctx != NULL);
     assert(JS_AddIntrinsicEval(ctx) == 0);
     set_global(ctx, "asyncfs", use_module(ctx, "asyncfs"));
+    set_global(ctx, "curl", use_module(ctx, "curl"));
     set_global(ctx, "sqlite3", use_module(ctx, "sqlite3"));
     set_global(ctx, "socket", use_module(ctx, "socket"));
     set_global(ctx, "streams", use_module(ctx, "streams"));
@@ -634,14 +643,20 @@ int main(void) {
         "globalThis.db = sqlite3.open(':memory:', sqlite3.O_CREATE | sqlite3.O_READWRITE);\n"
         "globalThis.run = () => db.exec('SELECT 1');\n"
         "globalThis.closeTarget = () => db.close();\n"
-        "closeTarget");
+        "closeTarget", NULL);
 
     expect_hook_revalidation(
         ctx, runtime, &state,
         "globalThis.pipe = new streams.Pipe();\n"
         "globalThis.run = () => pipe.open(0);\n"
         "globalThis.closeTarget = () => pipe.close();\n"
-        "closeTarget");
+        "closeTarget", NULL);
+
+    expect_hook_revalidation(
+        ctx, runtime, &state,
+        "(() => { const pool = new curl.ConnPool(); const request = new curl.CURL(pool);"
+        " globalThis.run = () => request.performSync(); return () => pool.close(); })()",
+        "TypeError: ConnPool is closed");
 
 #ifndef _WIN32
     /* A borrowed asyncfs.createFrom must retain the pre-hook file description
@@ -747,6 +762,53 @@ int main(void) {
     close(owned_pipe[1]);
     close(owned_replacement[0]);
     close(owned_replacement[1]);
+
+    int getter_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, getter_pair) == 0);
+    set_global(ctx, "fs", use_module(ctx, "fs"));
+    set_global(ctx, "fileFd", JS_NewInt32(ctx, getter_pair[0]));
+    const char getter_transfer[] =
+        "asyncfs.createFrom(fileFd, undefined, { get closeOnClose() {"
+        "  fs.close(fileFd);"
+        "  if (fs.open('/dev/null', 'r') !== fileFd) throw Error('fd not reused');"
+        "  return true;"
+        "} }).detach()";
+    result = eval_function(ctx, getter_transfer, sizeof(getter_transfer) - 1);
+    assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT);
+    int getter_fd = JS_VALUE_GET_INT(result);
+    JS_FreeValue(ctx, result);
+    assert(getter_fd != getter_pair[0]);
+    assert(send(getter_pair[1], &byte, 1, 0) == 1);
+    assert(recv(getter_fd, &byte, 1, MSG_DONTWAIT) == 1);
+    assert(close(getter_fd) == 0);
+    assert(read(getter_pair[0], &byte, 1) == 0);
+    assert(close(getter_pair[0]) == 0);
+    assert(close(getter_pair[1]) == 0);
+
+    int identity_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, identity_pair) == 0);
+    set_global(ctx, "fileFd", JS_NewInt32(ctx, identity_pair[0]));
+    state.mode = HOOK_PASS;
+    state.reuse_api = NULL;
+    TJS_SetCapabilityHook(runtime, capability_hook, &state, 0);
+    const char identity_transfer[] =
+        "asyncfs.createFrom(fileFd, undefined, { closeOnClose: true }).detach()";
+    result = eval_function(ctx, identity_transfer, sizeof(identity_transfer) - 1);
+    TJS_SetCapabilityHook(runtime, NULL, NULL, 0);
+    if (JS_IsException(result)) {
+        JSValue exception = JS_GetException(ctx);
+        const char *message = JS_ToCString(ctx, exception);
+        assert(message && strcmp(message, "TypeError: object handle identity comparison is not supported on this platform") == 0);
+        JS_FreeCString(ctx, message);
+        JS_FreeValue(ctx, exception);
+    } else {
+        assert(JS_VALUE_GET_TAG(result) == JS_TAG_INT);
+        assert(JS_VALUE_GET_INT(result) == identity_pair[0]);
+        JS_FreeValue(ctx, result);
+    }
+    assert(close(identity_pair[0]) == 0);
+    assert(recv(identity_pair[1], &byte, 1, MSG_DONTWAIT) == 0);
+    assert(close(identity_pair[1]) == 0);
 
     /* createFrom itself must pin before its capability hook. Otherwise a hook
      * can replace the numeric slot and make the returned wrapper target the

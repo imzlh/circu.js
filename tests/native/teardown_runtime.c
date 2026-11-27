@@ -39,6 +39,81 @@ static void eval(JSContext *ctx, const char *source) {
     JS_FreeValue(ctx, result);
 }
 
+static JSValue noop_job(JSContext *ctx, int argc, JSValueConst *argv) {
+    (void)ctx;
+    (void)argc;
+    (void)argv;
+    return JS_UNDEFINED;
+}
+
+static void init_rejection_counter(TJSRuntime *runtime) {
+    JSContext *ctx = runtime->main_ctx;
+    JSValue evbus = JS_NewObject(ctx);
+    CHECK(!JS_IsException(evbus));
+    tjs__mod_evbus_init(ctx, evbus);
+    CHECK(!JS_HasException(ctx));
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    CHECK_GE(JS_SetPropertyStr(ctx, global, "evbus", evbus), 0);
+    JS_FreeValue(ctx, global);
+    eval(ctx,
+         "globalThis.rejectionCount = 0;"
+         "evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, frame => {"
+         "  if (frame.name === 0) globalThis.rejectionCount++;"
+         "  return false;"
+         "});");
+}
+
+static int32_t get_global_int32(TJSRuntime *runtime, const char *name) {
+    JSContext *ctx = runtime->main_ctx;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue value = JS_GetPropertyStr(ctx, global, name);
+    int32_t result = 0;
+    CHECK_EQ(JS_ToInt32(ctx, &result, value), 0);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, global);
+    return result;
+}
+
+static void drain_jobs(TJSRuntime *runtime) {
+    while (JS_IsJobPending(runtime->rt)) {
+        JSContext *job_ctx = NULL;
+        CHECK_EQ(JS_ExecutePendingJob(runtime->rt, &job_ctx), 1);
+    }
+}
+
+static void test_rejection_deferral_per_runtime(void) {
+    TJSRuntime *source = TJS_NewRuntime();
+    TJSRuntime *target = TJS_NewRuntime();
+    CHECK(source && target);
+
+    /* Leave one deferral outstanding in source. The target runtime must not
+     * inherit its hop bound merely because both are driven by this thread. */
+    eval(source->main_ctx, "Promise.reject(new Error('source rejection')); ");
+    CHECK_EQ(JS_EnqueueJob(source->main_ctx, noop_job, 0, NULL), 0);
+    JSContext *source_job_ctx = NULL;
+    CHECK_EQ(JS_ExecutePendingJob(source->rt, &source_job_ctx), 1);
+
+    init_rejection_counter(target);
+    eval(target->main_ctx,
+         "globalThis.handled = false;"
+         "async function leaf() { throw new Error('adopted rejection'); }"
+         "let fn = leaf;"
+         "for (let i = 0; i < 40; i++) {"
+         "  const previous = fn;"
+         "  fn = async function () { return previous(); };"
+         "}"
+         "fn().then(undefined, () => { globalThis.handled = true; });");
+    drain_jobs(target);
+
+    CHECK_EQ(get_global_int32(target, "handled"), 1);
+    CHECK_EQ(get_global_int32(target, "rejectionCount"), 0);
+
+    drain_jobs(source);
+    TJS_FreeRuntime(target);
+    TJS_FreeRuntime(source);
+}
+
 static JSValue call_method(JSContext *ctx, JSValue obj, const char *name,
                            int argc, JSValue *argv) {
     JSValue fn = JS_GetPropertyStr(ctx, obj, name);
@@ -46,6 +121,35 @@ static JSValue call_method(JSContext *ctx, JSValue obj, const char *name,
     JSValue result = JS_Call(ctx, fn, obj, argc, argv);
     JS_FreeValue(ctx, fn);
     return result;
+}
+
+typedef struct {
+    TJSRuntime *runtime;
+    TJSRuntimeCleanup *token;
+    TJSRuntimeCleanup *cancel;
+    unsigned calls;
+} RuntimeCleanupProbe;
+
+static void reenter_runtime_cleanup(void *opaque) {
+    RuntimeCleanupProbe *probe = opaque;
+    probe->calls++;
+    TJS_RemoveRuntimeCleanup(probe->token);
+    TJS_RemoveRuntimeCleanup(probe->cancel);
+    CHECK(!TJS_AddRuntimeCleanup(probe->runtime, reenter_runtime_cleanup, probe));
+}
+
+static void test_runtime_cleanup_cancellation(void) {
+    TJSRuntime *runtime = TJS_NewRuntime();
+    CHECK(runtime);
+    RuntimeCleanupProbe skipped = { .runtime = runtime };
+    RuntimeCleanupProbe called = { .runtime = runtime };
+    skipped.token = TJS_AddRuntimeCleanup(runtime, reenter_runtime_cleanup, &skipped);
+    called.token = TJS_AddRuntimeCleanup(runtime, reenter_runtime_cleanup, &called);
+    CHECK(skipped.token && called.token);
+    called.cancel = skipped.token;
+    TJS_FreeRuntime(runtime);
+    CHECK_EQ(called.calls, 1);
+    CHECK_EQ(skipped.calls, 0);
 }
 
 typedef struct {
@@ -125,6 +229,112 @@ static void test_udp_recv_promise_reentry(void) {
     TJS_FreeRuntime(runtime);
 }
 
+static void test_network_classes_across_runtimes(void) {
+    TJSRuntime *first = TJS_NewRuntime();
+    CHECK(first);
+    JSContext *first_ctx = first->main_ctx;
+    JSValue first_udp_module = JS_NewObject(first_ctx);
+    JSValue first_dns_module = JS_NewObject(first_ctx);
+    tjs__mod_dns_init(first_ctx, first_dns_module);
+    CHECK(!JS_HasException(first_ctx));
+
+    TJSRuntime *second = TJS_NewRuntime();
+    CHECK(second);
+    JSContext *second_ctx = second->main_ctx;
+    JSValue dns_module = JS_NewObject(second_ctx);
+    JSValue udp_module = JS_NewObject(second_ctx);
+    tjs__mod_udp_init(second_ctx, udp_module);
+    CHECK(!JS_HasException(second_ctx));
+    tjs__mod_udp_init(first_ctx, first_udp_module);
+    CHECK(!JS_HasException(first_ctx));
+    tjs__mod_dns_init(second_ctx, dns_module);
+    CHECK(!JS_HasException(second_ctx));
+    JSValue first_ctor = JS_GetPropertyStr(first_ctx, first_udp_module, "UDP");
+    JSValue first_udp = JS_CallConstructor(first_ctx, first_ctor, 0, NULL);
+    CHECK(!JS_IsException(first_udp));
+    JSValue udp_ctor = JS_GetPropertyStr(second_ctx, udp_module, "UDP");
+    JSValue udp = JS_CallConstructor(second_ctx, udp_ctor, 0, NULL);
+    CHECK(!JS_IsException(udp));
+    CHECK_EQ(JS_GetClassID(first_udp), JS_GetClassID(udp));
+
+    JSContext *contexts[] = { first_ctx, second_ctx };
+    JSValue dns_modules[] = { first_dns_module, dns_module };
+    JSClassID curl_class_ids[3] = { 0 };
+    for (unsigned index = 0; index < countof(contexts); index++) {
+        JSContext *ctx = contexts[index];
+        JSValue curl_module = JS_NewObject(ctx);
+        tjs__mod_curl_init(ctx, curl_module);
+        CHECK(!JS_HasException(ctx));
+        JSValue pool_constructor = JS_GetPropertyStr(ctx, curl_module, "ConnPool");
+        JSValue curl_constructor = JS_GetPropertyStr(ctx, curl_module, "CURL");
+        JSValue share_constructor = JS_GetPropertyStr(ctx, curl_module, "Share");
+        JSValue pool = JS_CallConstructor(ctx, pool_constructor, 0, NULL);
+        CHECK(!JS_IsException(pool));
+        JSValue request = JS_CallConstructor(ctx, curl_constructor, 1, &pool);
+        JSValue share = JS_CallConstructor(ctx, share_constructor, 0, NULL);
+        CHECK(!JS_IsException(request));
+        CHECK(!JS_IsException(share));
+        JSValue instances[] = { pool, request, share };
+        for (unsigned instance = 0; instance < countof(instances); instance++) {
+            JSClassID class_id = JS_GetClassID(instances[instance]);
+            if (index == 0)
+                curl_class_ids[instance] = class_id;
+            else
+                CHECK_EQ(class_id, curl_class_ids[instance]);
+            CHECK_NE(class_id, JS_GetClassID(first_udp));
+        }
+        JSValue closed_pool = call_method(ctx, pool, "close", 0, NULL);
+        CHECK(!JS_IsException(closed_pool));
+        JS_FreeValue(ctx, closed_pool);
+        for (unsigned instance = 0; instance < countof(instances); instance++)
+            JS_FreeValue(ctx, instances[instance]);
+        JS_FreeValue(ctx, pool_constructor);
+        JS_FreeValue(ctx, curl_constructor);
+        JS_FreeValue(ctx, share_constructor);
+        JS_FreeValue(ctx, curl_module);
+
+        JSValue query_arguments[] = {
+            JS_NewString(ctx, "class-id-test.invalid"), JS_NewInt32(ctx, 1),
+            JS_NewString(ctx, "127.0.0.1"), JS_NewInt32(ctx, 9),
+        };
+        JSValue pending = call_method(ctx, dns_modules[index], "query",
+                                      countof(query_arguments), query_arguments);
+        CHECK(!JS_IsException(pending));
+        CHECK_EQ(JS_PromiseState(ctx, pending), JS_PROMISE_PENDING);
+        JSValue aborted = call_method(ctx, pending, "abort", 0, NULL);
+        CHECK(!JS_IsException(aborted));
+        CHECK_EQ(JS_PromiseState(ctx, pending), JS_PROMISE_REJECTED);
+        JS_FreeValue(ctx, aborted);
+        aborted = call_method(ctx, pending, "abort", 0, NULL);
+        CHECK(!JS_IsException(aborted));
+        JS_FreeValue(ctx, aborted);
+        JS_FreeValue(ctx, pending);
+        for (unsigned arg = 0; arg < countof(query_arguments); arg++)
+            JS_FreeValue(ctx, query_arguments[arg]);
+    }
+
+    JSValue first_close = JS_GetPropertyStr(first_ctx, first_udp, "close");
+    JSValue first_closed = JS_Call(first_ctx, first_close, first_udp, 0, NULL);
+    CHECK(!JS_IsException(first_closed));
+    JS_FreeValue(first_ctx, first_closed);
+    JS_FreeValue(first_ctx, first_close);
+    JSValue close = JS_GetPropertyStr(second_ctx, udp, "close");
+    JSValue closed = JS_Call(second_ctx, close, udp, 0, NULL);
+    CHECK(!JS_IsException(closed));
+    JS_FreeValue(second_ctx, closed);
+    JS_FreeValue(second_ctx, close);
+    JS_FreeValue(second_ctx, udp);
+    JS_FreeValue(second_ctx, udp_ctor);
+    JS_FreeValue(second_ctx, udp_module);
+    JS_FreeValue(second_ctx, dns_module);
+    TJS_FreeRuntime(second);
+    JS_FreeValue(first_ctx, first_udp);
+    JS_FreeValue(first_ctx, first_ctor);
+    JS_FreeValue(first_ctx, first_udp_module);
+    JS_FreeValue(first_ctx, first_dns_module);
+    TJS_FreeRuntime(first);
+}
+
 typedef struct {
     JSValue pool;
     unsigned calls;
@@ -199,6 +409,95 @@ static void test_curl_completion_closes_pool(void) {
     JS_FreeValue(ctx, pool);
     JS_FreeValue(ctx, module);
     TJS_FreeRuntime(runtime);
+}
+
+typedef struct {
+    JSValue pool;
+    JSValue request;
+    const char *operation;
+    bool called;
+} CurlInitHookState;
+
+static void curl_init_promise_hook(JSContext *ctx, JSPromiseHookType type,
+                                  JSValueConst promise, JSValueConst parent,
+                                  void *opaque) {
+    (void)promise;
+    (void)parent;
+    CurlInitHookState *state = opaque;
+    if (type != JS_PROMISE_HOOK_INIT) return;
+    state->called = true;
+    JS_SetPromiseHook(JS_GetRuntime(ctx), NULL, NULL);
+    JSValue result;
+    if (strcmp(state->operation, "close") == 0) {
+        result = call_method(ctx, state->pool, "close", 0, NULL);
+    } else if (strcmp(state->operation, "setUrl") == 0) {
+        JSValue url = JS_NewString(ctx, "circu-test-unsupported://changed");
+        result = call_method(ctx, state->request, "setUrl", 1, &url);
+        JS_FreeValue(ctx, url);
+    } else {
+        result = call_method(ctx, state->request, state->operation, 0, NULL);
+    }
+    if (strcmp(state->operation, "perform") == 0) {
+        CHECK(JS_IsException(result));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        CHECK(!JS_IsException(result));
+    }
+    JS_FreeValue(ctx, result);
+}
+
+static void test_curl_promise_initialization_reentry(void) {
+    const char *operations[] = { "close", "perform", "reset", "abort", "setUrl" };
+    for (unsigned index = 0; index < countof(operations); index++) {
+        TJSRuntime *runtime = TJS_NewRuntime();
+        CHECK(runtime);
+        JSContext *ctx = runtime->main_ctx;
+        JSValue module = JS_NewObject(ctx);
+        tjs__mod_curl_init(ctx, module);
+        CHECK(!JS_HasException(ctx));
+        JSValue pool_constructor = JS_GetPropertyStr(ctx, module, "ConnPool");
+        JSValue curl_constructor = JS_GetPropertyStr(ctx, module, "CURL");
+        JSValue pool = JS_CallConstructor(ctx, pool_constructor, 0, NULL);
+        CHECK(!JS_IsException(pool));
+        JSValue request = JS_CallConstructor(ctx, curl_constructor, 1, &pool);
+        CHECK(!JS_IsException(request));
+        JSValue url = JS_NewString(ctx, "circu-test-unsupported://init");
+        JSValue configured = call_method(ctx, request, "setUrl", 1, &url);
+        CHECK(!JS_IsException(configured));
+        JS_FreeValue(ctx, configured);
+
+        CurlInitHookState state = { pool, request, operations[index], false };
+        JS_SetPromiseHook(runtime->rt, curl_init_promise_hook, &state);
+        JSValue promise = call_method(ctx, request, "perform", 0, NULL);
+        CHECK(state.called);
+        if (strcmp(state.operation, "perform") == 0) {
+            CHECK(!JS_IsException(promise));
+            JSValue processed = call_method(ctx, pool, "process", 0, NULL);
+            CHECK(!JS_IsException(processed));
+            CHECK_EQ(JS_PromiseState(ctx, promise), JS_PROMISE_REJECTED);
+            JS_FreeValue(ctx, processed);
+        } else {
+            CHECK(JS_IsException(promise));
+            JSValue error = JS_GetException(ctx);
+            JSValue name = JS_GetPropertyStr(ctx, error, "name");
+            const char *name_text = JS_ToCString(ctx, name);
+            CHECK(name_text && strcmp(name_text, "TypeError") == 0);
+            JS_FreeCString(ctx, name_text);
+            JS_FreeValue(ctx, name);
+            JS_FreeValue(ctx, error);
+        }
+        JSValue closed = call_method(ctx, pool, "close", 0, NULL);
+        CHECK(!JS_IsException(closed));
+        JS_FreeValue(ctx, closed);
+        JS_FreeValue(ctx, promise);
+        JS_FreeValue(ctx, url);
+        JS_FreeValue(ctx, request);
+        JS_FreeValue(ctx, curl_constructor);
+        JS_FreeValue(ctx, pool_constructor);
+        JS_FreeValue(ctx, pool);
+        JS_FreeValue(ctx, module);
+        TJS_FreeRuntime(runtime);
+    }
 }
 
 #ifndef _WIN32
@@ -624,6 +923,32 @@ static void test_immediate_loop_wakeup(void) {
     TJS_FreeRuntime(runtime);
 }
 
+static void test_immediate_fifo_and_cancellation(void) {
+    TJSRuntime *runtime = TJS_NewRuntime();
+    CHECK(runtime);
+    JSContext *ctx = runtime->main_ctx;
+    JSValue timers = JS_NewObject(ctx);
+    tjs__mod_timers_init(ctx, timers);
+    JSValue global = JS_GetGlobalObject(ctx);
+    CHECK(JS_SetPropertyStr(ctx, global, "timers", timers) >= 0);
+    JS_FreeValue(ctx, global);
+
+    eval(ctx,
+         "globalThis.immediateOrder = [];"
+         "let canceledImmediate;"
+         "timers.setImmediate(() => {"
+         "  immediateOrder.push(1);"
+         "  timers.clearImmediate(canceledImmediate);"
+         "  timers.setImmediate(() => immediateOrder.push(3));"
+         "});"
+         "canceledImmediate = timers.setImmediate(() => immediateOrder.push(2));");
+    uv_run(&runtime->loop, UV_RUN_NOWAIT);
+    eval(ctx, "if (immediateOrder.join(',') !== '1') throw new Error('immediate FIFO/cancel failed');");
+    uv_run(&runtime->loop, UV_RUN_NOWAIT);
+    eval(ctx, "if (immediateOrder.join(',') !== '1,3') throw new Error('queued immediate order failed');");
+    TJS_FreeRuntime(runtime);
+}
+
 static void test_timer_type_isolation(void) {
     TJSRuntime *runtime = TJS_NewRuntime();
     CHECK(runtime);
@@ -680,13 +1005,13 @@ static void reenter_timer_cleanup(void *opaque) {
     uv_run(&probe->runtime->loop, UV_RUN_NOWAIT);
 }
 
-static void test_timer_cleanup_reentry(bool freeing_runtime, bool pump_first) {
+static void test_timer_cleanup_reentry(bool freeing_runtime, bool pump_first, bool immediate) {
     TJSRuntime *runtime = TJS_NewRuntime();
     CHECK(runtime);
     JSContext *ctx = runtime->main_ctx;
     JSValue timers = JS_NewObject(ctx);
     tjs__mod_timers_init(ctx, timers);
-    JSValue schedule = JS_GetPropertyStr(ctx, timers, "setTimeout");
+    JSValue schedule = JS_GetPropertyStr(ctx, timers, immediate ? "setImmediate" : "setTimeout");
     CHECK(JS_IsFunction(ctx, schedule));
     TimerCleanupProbe probe = { .runtime = runtime, .pump_first = pump_first };
     for (unsigned index = 0; index < 2; index++) {
@@ -696,7 +1021,7 @@ static void test_timer_cleanup_reentry(bool freeing_runtime, bool pump_first) {
             JS_NewInt32(ctx, pump_first && index == 1 ? 0 : 60000),
         };
         CHECK(!JS_IsException(arguments[0]));
-        JSValue timer = JS_Call(ctx, schedule, timers, 2, arguments);
+        JSValue timer = JS_Call(ctx, schedule, timers, immediate ? 1 : 2, arguments);
         CHECK(!JS_IsException(timer));
         JS_FreeValue(ctx, timer);
         JS_FreeValue(ctx, arguments[0]);
@@ -778,6 +1103,9 @@ static void test_timer_callback_reentry(bool immediate, bool clear_timer) {
 }
 
 int main(void) {
+    test_runtime_cleanup_cancellation();
+    test_network_classes_across_runtimes();
+    test_rejection_deferral_per_runtime();
     TJSRuntime *stopped = TJS_NewRuntime();
     assert(stopped != NULL);
     TJS_Stop(stopped);
@@ -805,15 +1133,20 @@ int main(void) {
     test_udp_cleanup_reentry();
     test_udp_recv_promise_reentry();
     test_curl_completion_closes_pool();
+    test_curl_promise_initialization_reentry();
 #ifndef _WIN32
     test_curl_runtime_teardown_detaches_socket();
 #endif
     test_immediate_context_cancellation();
     test_immediate_loop_wakeup();
+    test_immediate_fifo_and_cancellation();
     test_timer_type_isolation();
-    test_timer_cleanup_reentry(false, false);
-    test_timer_cleanup_reentry(true, false);
-    test_timer_cleanup_reentry(true, true);
+    test_timer_cleanup_reentry(false, false, false);
+    test_timer_cleanup_reentry(true, false, false);
+    test_timer_cleanup_reentry(true, true, false);
+    test_timer_cleanup_reentry(false, false, true);
+    test_timer_cleanup_reentry(true, false, true);
+    test_timer_cleanup_reentry(true, true, true);
     test_timer_callback_reentry(false, true);
     test_timer_callback_reentry(true, false);
     test_timer_callback_reentry(true, true);

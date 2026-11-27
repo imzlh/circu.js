@@ -177,11 +177,12 @@ static void parse_inspect_options(JSContext* ctx, JSValue opts_val, InspectOptio
     IF_LIMIT("breakLength", &opts->break_length);
     IF_BOOL("colors", opts->colors);
     IF_BOOL("showHidden", opts->show_hidden);
-    IF_INT("maxArrayLength", &opts->max_array_length);
+    IF_LIMIT("maxArrayLength", &opts->max_array_length);
     IF_INT("maxStringLength", &opts->max_string_length);
     IF_BOOL("compact", opts->compact);
 
     if (opts->depth < 0) opts->depth = 0;
+    if (opts->max_array_length < 0) opts->max_array_length = 0;
 #undef IF
 #undef IF_BOOL
 #undef IF_INT
@@ -685,36 +686,47 @@ static void format_symbol(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     JS_FreeValue(ctx, desc);
 }
 
+/* Used only at runtime bootstrap, while the main realm's prototypes are pristine. */
+static JSValue capture_inspect_intrinsic(JSContext* ctx, JSValueConst proto, const char* name, bool getter) {
+    JSAtom atom = JS_NewAtom(ctx, name);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
+    JSPropertyDescriptor desc;
+    int found = JS_GetOwnProperty(ctx, &desc, proto, atom);
+    JS_FreeAtom(ctx, atom);
+    if (found < 0) return JS_EXCEPTION;
+    if (!found) return JS_ThrowTypeError(ctx, "missing inspect intrinsic: %s", name);
+    JSValue member = JS_DupValue(ctx, getter ? desc.getter : desc.value);
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+    if (!JS_IsFunction(ctx, member)) {
+        JS_FreeValue(ctx, member);
+        return JS_ThrowTypeError(ctx, "invalid inspect intrinsic: %s", name);
+    }
+    return member;
+}
+
+static int32_t get_collection_size(JSContext* ctx, JSValue val) {
+    TJSRuntime* runtime = TJS_GetRuntime(ctx);
+    JSValue getter = JS_IsMap(val) ? runtime->console.map_size : runtime->console.set_size;
+    JSValue size = JS_Call(ctx, getter, val, 0, NULL);
+    int32_t result = -1;
+    if (!JS_IsException(size)) JS_ToInt32(ctx, &result, size);
+    JS_FreeValue(ctx, size);
+    if (result < 0) JS_FreeValue(ctx, JS_GetException(ctx));
+    return result;
+}
+
 static void format_date(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
-	/* Node renders a Date as toISOString (ISO-8601), not local time. */
-	put_color(buf, opts, ANSI_MAGENTA);
-
-	double t = 0;
-	bool valid = false;
-	JSValue getTime = JS_GetPropertyStr(ctx, val, "getTime");
-	if (JS_IsFunction(ctx, getTime)) {
-		JSValue tv = JS_Call(ctx, getTime, val, 0, NULL);
-		if (!JS_IsException(tv) && JS_ToFloat64(ctx, &t, tv) == 0 && !isnan(t)) valid = true;
-		else JS_FreeValue(ctx, JS_GetException(ctx));
-		JS_FreeValue(ctx, tv);
-	}
-	JS_FreeValue(ctx, getTime);
-
-	const char* str = NULL;
-	if (valid) {
-		JSValue iso_fn = JS_GetPropertyStr(ctx, val, "toISOString");
-		if (JS_IsFunction(ctx, iso_fn)) {
-			JSValue s = JS_Call(ctx, iso_fn, val, 0, NULL);
-			if (JS_IsString(s)) str = JS_ToCString(ctx, s);
-			else JS_FreeValue(ctx, JS_GetException(ctx));
-			JS_FreeValue(ctx, s);
-		}
-		JS_FreeValue(ctx, iso_fn);
-	}
-
-	dbuf_printf(buf, "%s", str ? str : "Invalid Date");
-	put_reset(buf, opts);
-	if (str) JS_FreeCString(ctx, str);
+    JSValue method = TJS_GetRuntime(ctx)->console.date_to_iso_string;
+    JSValue iso = JS_Call(ctx, method, val, 0, NULL);
+    const char* str = JS_IsString(iso) ? JS_ToCString(ctx, iso) : NULL;
+    if (JS_IsException(iso)) JS_FreeValue(ctx, JS_GetException(ctx));
+    put_color(buf, opts, ANSI_MAGENTA);
+    dbuf_putstr(buf, str ? str : "Invalid Date");
+    put_reset(buf, opts);
+    if (str) JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, iso);
 }
 
 static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const InspectOptions* opts) {
@@ -733,11 +745,59 @@ static void format_regexp(JSContext* ctx, JSValue val, DynBuf* buf, const Inspec
     JS_FreeValue(ctx, flags);
 }
 
-static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
+static void format_error_property(JSContext* ctx, const JSPropertyDescriptor* desc,
+                                  int depth, VisitStack* stack, DynBuf* buf,
+                                  const InspectOptions* opts) {
+    if (desc->flags & JS_PROP_GETSET) {
+        bool getter = !JS_IsUndefined(desc->getter);
+        bool setter = !JS_IsUndefined(desc->setter);
+        dbuf_putstr(buf, getter ? (setter ? "[Getter/Setter]" : "[Getter]") : "[Setter]");
+    } else {
+        format_value(ctx, desc->value, depth + 1, stack, buf, true, opts);
+    }
+}
+
+/* Error headers are intrinsic data except for the built-in stack accessor.
+ * Inspecting an own accessor must not execute user code: Node reports it as
+ * absent while still allowing the native prototype stack getter to run when
+ * no own override exists. */
+static JSValue get_error_header(JSContext* ctx, JSValue val, JSAtom atom) {
+    JSPropertyDescriptor desc;
+    int found = JS_GetOwnProperty(ctx, &desc, val, atom);
+    if (found < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_UNDEFINED;
+    }
+    if (found > 0) {
+        if (desc.flags & JS_PROP_GETSET) {
+            JS_FreeValue(ctx, desc.value);
+            JS_FreeValue(ctx, desc.getter);
+            JS_FreeValue(ctx, desc.setter);
+            return JS_UNDEFINED;
+        }
+        JSValue result = JS_DupValue(ctx, desc.value);
+        JS_FreeValue(ctx, desc.value);
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        return result;
+    }
+    return JS_GetProperty(ctx, val, atom);
+}
+
+static void format_error(JSContext* ctx, JSValue val, int depth, VisitStack* visits, DynBuf* buf,
                         const InspectOptions* opts) {
-    JSValue name = JS_GetProperty(ctx, val, JS_ATOM_name);
-    JSValue msg = JS_GetProperty(ctx, val, JS_ATOM_message);
-    JSValue stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
+    if (is_circular(visits, val)) {
+        put_color(buf, opts, ANSI_CYAN);
+        dbuf_putstr(buf, "[Circular]");
+        put_reset(buf, opts);
+        return;
+    }
+    visit_push(visits, val);
+    /* QuickJS exposes Error.stack through the prototype getter. The helper
+     * keeps that native getter available but never invokes an own user getter. */
+    JSValue name = get_error_header(ctx, val, JS_ATOM_name);
+    JSValue msg = get_error_header(ctx, val, JS_ATOM_message);
+    JSValue stack = get_error_header(ctx, val, JS_ATOM_stack);
 
     const char* name_str = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
     const char* msg_str = JS_IsString(msg) ? JS_ToCString(ctx, msg) : NULL;
@@ -747,50 +807,54 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
     if (msg_str && msg_str[0]) dbuf_printf(buf, ": %s", msg_str);
     put_reset(buf, opts);
 
-    /* Show extra own enumerable properties (e.g. err.code, err.errno) */
+    /* Include cause even when Error's constructor made it non-enumerable. */
+    JSPropertyDescriptor cause;
+    int has_cause = JS_GetOwnProperty(ctx, &cause, val, JS_ATOM_cause);
+    uint32_t shown = 0;
+    if (has_cause > 0) {
+        dbuf_putstr(buf, " { [cause]: ");
+        format_error_property(ctx, &cause, depth, visits, buf, opts);
+        JS_FreeValue(ctx, cause.value);
+        JS_FreeValue(ctx, cause.getter);
+        JS_FreeValue(ctx, cause.setter);
+        shown++;
+    } else if (has_cause < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    /* Show extra own enumerable properties (e.g. err.code, err.errno). */
     JSPropertyEnum* props = NULL;
     uint32_t count = 0;
     if (JS_GetOwnPropertyNames(ctx, &props, &count, val,
                                JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-        uint32_t extra = 0;
         for (uint32_t i = 0; i < count; i++) {
-            const char* k = JS_AtomToCString(ctx, props[i].atom);
-            bool skip = k && (strcmp(k, "name") == 0 || strcmp(k, "message") == 0 ||
-                              strcmp(k, "stack") == 0);
-            if (k) JS_FreeCString(ctx, k);
-            if (!skip) extra++;
-        }
-        if (extra > 0) {
-            dbuf_putstr(buf, " {");
-            uint32_t shown = 0;
-            for (uint32_t i = 0; i < count; i++) {
-                const char* k = JS_AtomToCString(ctx, props[i].atom);
-                bool skip = k && (strcmp(k, "name") == 0 || strcmp(k, "message") == 0 ||
-                                  strcmp(k, "stack") == 0);
-                if (skip) { if (k) JS_FreeCString(ctx, k); continue; }
-                if (shown > 0) dbuf_putstr(buf, ", ");
-                else dbuf_putstr(buf, " ");
-                put_color(buf, opts, ANSI_GREEN);
-                dbuf_printf(buf, "%s", k ? k : "");
-                put_reset(buf, opts);
-                dbuf_putstr(buf, ": ");
-                if (k) JS_FreeCString(ctx, k);
-                JSValue v = JS_GetProperty(ctx, val, props[i].atom);
-                if (JS_IsException(v)) {
-                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
-                    shown++;
-                    dbuf_putstr(buf, "[Exception]");
-                    continue;
-                }
-                VisitStack err_stack = {0};
-                format_value(ctx, v, depth + 1, &err_stack, buf, true, opts);
-                JS_FreeValue(ctx, v);
-                shown++;
+            JSAtom atom = props[i].atom;
+            if (atom == JS_ATOM_name || atom == JS_ATOM_message ||
+                atom == JS_ATOM_stack || atom == JS_ATOM_cause) continue;
+            JSPropertyDescriptor desc;
+            int found = JS_GetOwnProperty(ctx, &desc, val, atom);
+            if (found <= 0) {
+                if (found < 0) JS_FreeValue(ctx, JS_GetException(ctx));
+                continue;
             }
-            dbuf_putstr(buf, " }");
+            dbuf_putstr(buf, shown ? ", " : " { ");
+            const char* key = JS_AtomToCString(ctx, atom);
+            put_color(buf, opts, ANSI_GREEN);
+            dbuf_printf(buf, "%s", key ? key : "");
+            put_reset(buf, opts);
+            dbuf_putstr(buf, ": ");
+            if (key) JS_FreeCString(ctx, key);
+            format_error_property(ctx, &desc, depth, visits, buf, opts);
+            JS_FreeValue(ctx, desc.value);
+            JS_FreeValue(ctx, desc.getter);
+            JS_FreeValue(ctx, desc.setter);
+            shown++;
         }
         JS_FreePropertyEnum(ctx, props, count);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
     }
+    if (shown) dbuf_putstr(buf, " }");
 
     if (JS_IsString(stack)) {
         const char* stack_str = JS_ToCString(ctx, stack);
@@ -808,8 +872,8 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
                 }
                 p = end + 1;
             }
-            JS_FreeCString(ctx, stack_str);
         }
+        if (stack_str) JS_FreeCString(ctx, stack_str);
     }
 
     if (name_str) JS_FreeCString(ctx, name_str);
@@ -817,6 +881,7 @@ static void format_error(JSContext* ctx, JSValue val, int depth, DynBuf* buf,
     JS_FreeValue(ctx, name);
     JS_FreeValue(ctx, msg);
     JS_FreeValue(ctx, stack);
+    visit_pop(visits);
 }
 
 /* Estimate width for breakLength calculation - Fixed: no NULL stack access */
@@ -1060,7 +1125,7 @@ static void format_object(JSContext* ctx, JSValue val, int depth, VisitStack* st
                         JS_FreeValue(ctx, getter);
                         JS_FreeValue(ctx, setter);
                     } else {
-                        /* JS_PROP_NORMAL: desc.value is set, getter/setter are NOT initialized */
+                        /* Data descriptor: getter/setter are JS_UNDEFINED. */
                         JS_FreeValue(ctx, desc.value);
                     }
                     JS_FreeCString(ctx, k);
@@ -1283,17 +1348,17 @@ static void format_dataview(JSContext* ctx, JSValue val, DynBuf* buf, const Insp
     JS_FreeValue(ctx, buffer);
 }
 
-static void format_map(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
-                       DynBuf* buf, const InspectOptions* opts) {
-    JSValue size_val = JS_GetPropertyStr(ctx, val, "size");
-    int32_t size = 0;
-    if (!JS_IsException(size_val)) JS_ToInt32(ctx, &size, size_val);
-    JS_FreeValue(ctx, size_val);
+static void format_collection(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
+                              DynBuf* buf, const InspectOptions* opts) {
+    bool map = JS_IsMap(val);
+    int32_t size = get_collection_size(ctx, val);
 
     put_color(buf, opts, ANSI_CYAN);
-    dbuf_printf(buf, "Map(%d) ", size);
+    dbuf_putstr(buf, map ? "Map" : "Set");
+    if (size >= 0) dbuf_printf(buf, "(%d)", size);
+    dbuf_putc(buf, ' ');
     put_reset(buf, opts);
-
+    if (size < 0) { dbuf_putstr(buf, "{ [Exception] }"); return; }
     if (is_circular(stack, val)) {
         put_color(buf, opts, ANSI_CYAN);
         dbuf_putstr(buf, "[Circular]");
@@ -1304,102 +1369,28 @@ static void format_map(JSContext* ctx, JSValue val, int depth, VisitStack* stack
 
     visit_push(stack, val);
 
-    JSValue entries_fn = JS_GetPropertyStr(ctx, val, "entries");
-    JSValue iterator = JS_Call(ctx, entries_fn, val, 0, NULL);
-    JS_FreeValue(ctx, entries_fn);
+    int32_t max_show = MIN(size, opts->max_array_length);
+    TJSRuntime* runtime = TJS_GetRuntime(ctx);
+    JSValue method = map ? runtime->console.map_entries : runtime->console.set_values;
+    JSValue iterator = max_show ? JS_Call(ctx, method, val, 0, NULL) : JS_UNDEFINED;
     if (JS_IsException(iterator)) {
-        JS_FreeValue(ctx, iterator);
+        JS_FreeValue(ctx, JS_GetException(ctx));
         visit_pop(stack);
-        dbuf_putstr(buf, "{ ... }");
+        dbuf_putstr(buf, "{ [Exception] }");
         return;
     }
 
-    JSValue next_fn = JS_GetPropertyStr(ctx, iterator, "next");
-    int32_t max_show = size < opts->max_array_length ? size : opts->max_array_length;
+    JSValue next_fn = map ? runtime->console.map_iterator_next : runtime->console.set_iterator_next;
     bool inline_disp = opts->compact && size <= 4;
     dbuf_putstr(buf, inline_disp ? "{ " : "{\n");
 
     int shown = 0;
     while (shown < max_show) {
         JSValue step = JS_Call(ctx, next_fn, iterator, 0, NULL);
-        if (JS_IsException(step)) { JS_FreeValue(ctx, step); break; }
-        JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
-        bool done = JS_ToBool(ctx, done_val);
-        JS_FreeValue(ctx, done_val);
-        if (done) { JS_FreeValue(ctx, step); break; }
-
-        JSValue entry = JS_GetPropertyStr(ctx, step, "value");
-        JS_FreeValue(ctx, step);
-        JSValue key   = JS_GetPropertyUint32(ctx, entry, 0);
-        JSValue value = JS_GetPropertyUint32(ctx, entry, 1);
-        JS_FreeValue(ctx, entry);
-
-        if (shown > 0) dbuf_putstr(buf, inline_disp ? ", " : ",\n");
-        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
-        format_value(ctx, key,   depth + 1, stack, buf, true, opts);
-        dbuf_putstr(buf, " => ");
-        format_value(ctx, value, depth + 1, stack, buf, true, opts);
-        JS_FreeValue(ctx, key);
-        JS_FreeValue(ctx, value);
-        shown++;
-    }
-
-    JS_FreeValue(ctx, next_fn);
-    JS_FreeValue(ctx, iterator);
-
-    if (size > max_show) {
-        dbuf_putstr(buf, inline_disp ? ", " : ",\n");
-        if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
-        put_color(buf, opts, ANSI_GRAY);
-        dbuf_printf(buf, "... %d more items", size - max_show);
-        put_reset(buf, opts);
-    }
-    if (!inline_disp) { dbuf_putstr(buf, "\n"); dbuf_putstr(buf, get_indent(depth)); }
-    else dbuf_putstr(buf, " ");
-    dbuf_putstr(buf, "}");
-    visit_pop(stack);
-}
-
-static void format_set(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
-                       DynBuf* buf, const InspectOptions* opts) {
-    JSValue size_val = JS_GetPropertyStr(ctx, val, "size");
-    int32_t size = 0;
-    if (!JS_IsException(size_val)) JS_ToInt32(ctx, &size, size_val);
-    JS_FreeValue(ctx, size_val);
-
-    put_color(buf, opts, ANSI_CYAN);
-    dbuf_printf(buf, "Set(%d) ", size);
-    put_reset(buf, opts);
-
-    if (is_circular(stack, val)) {
-        put_color(buf, opts, ANSI_CYAN);
-        dbuf_putstr(buf, "[Circular]");
-        put_reset(buf, opts);
-        return;
-    }
-    if (size == 0) { dbuf_putstr(buf, "{}"); return; }
-
-    visit_push(stack, val);
-
-    JSValue values_fn = JS_GetPropertyStr(ctx, val, "values");
-    JSValue iterator  = JS_Call(ctx, values_fn, val, 0, NULL);
-    JS_FreeValue(ctx, values_fn);
-    if (JS_IsException(iterator)) {
-        JS_FreeValue(ctx, iterator);
-        visit_pop(stack);
-        dbuf_putstr(buf, "{ ... }");
-        return;
-    }
-
-    JSValue next_fn = JS_GetPropertyStr(ctx, iterator, "next");
-    int32_t max_show = size < opts->max_array_length ? size : opts->max_array_length;
-    bool inline_disp = opts->compact && size <= 4;
-    dbuf_putstr(buf, inline_disp ? "{ " : "{\n");
-
-    int shown = 0;
-    while (shown < max_show) {
-        JSValue step = JS_Call(ctx, next_fn, iterator, 0, NULL);
-        if (JS_IsException(step)) { JS_FreeValue(ctx, step); break; }
+        if (JS_IsException(step)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            break;
+        }
         JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
         bool done = JS_ToBool(ctx, done_val);
         JS_FreeValue(ctx, done_val);
@@ -1409,19 +1400,28 @@ static void format_set(JSContext* ctx, JSValue val, int depth, VisitStack* stack
         JS_FreeValue(ctx, step);
         if (shown > 0) dbuf_putstr(buf, inline_disp ? ", " : ",\n");
         if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
-        format_value(ctx, item, depth + 1, stack, buf, true, opts);
+        if (map) {
+            JSValue key = JS_GetPropertyUint32(ctx, item, 0);
+            JSValue value = JS_GetPropertyUint32(ctx, item, 1);
+            format_value(ctx, key, depth + 1, stack, buf, true, opts);
+            dbuf_putstr(buf, " => ");
+            format_value(ctx, value, depth + 1, stack, buf, true, opts);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, value);
+        } else {
+            format_value(ctx, item, depth + 1, stack, buf, true, opts);
+        }
         JS_FreeValue(ctx, item);
         shown++;
     }
 
-    JS_FreeValue(ctx, next_fn);
     JS_FreeValue(ctx, iterator);
 
-    if (size > max_show) {
-        dbuf_putstr(buf, inline_disp ? ", " : ",\n");
+    if (size > shown) {
+        if (shown) dbuf_putstr(buf, inline_disp ? ", " : ",\n");
         if (!inline_disp) dbuf_putstr(buf, get_indent(depth + 1));
         put_color(buf, opts, ANSI_GRAY);
-        dbuf_printf(buf, "... %d more items", size - max_show);
+        dbuf_printf(buf, "... %d more items", size - shown);
         put_reset(buf, opts);
     }
     if (!inline_disp) { dbuf_putstr(buf, "\n"); dbuf_putstr(buf, get_indent(depth)); }
@@ -1460,6 +1460,13 @@ static void format_promise(JSContext* ctx, JSValue val, int depth, VisitStack* s
 /* Main dispatch */
 static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* stack,
                         DynBuf* buf, bool quoted, const InspectOptions* opts) {
+    /* Even depth: Infinity must stay within the native traversal stack. */
+    if (depth >= MAX_DEPTH && JS_IsObject(val)) {
+        put_color(buf, opts, ANSI_GRAY);
+        dbuf_putstr(buf, is_circular(stack, val) ? "[Circular]" : "[Inspection depth limit]");
+        put_reset(buf, opts);
+        return;
+    }
     if (depth > opts->depth && JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
         /* Primitives (string, number, bool, null, undefined, symbol, bigint) always
          * pass through regardless of depth — only objects are collapsed. */
@@ -1484,29 +1491,15 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
             put_reset(buf, opts);
             format_date(ctx, val, buf, opts);
             return;
+        } else if (JS_IsMap(val) || JS_IsSet(val)) {
+            int32_t size = get_collection_size(ctx, val);
+            const char* kind = JS_IsMap(val) ? "Map" : "Set";
+            if (size >= 0) dbuf_printf(buf, "[%s(%d)]", kind, size);
+            else dbuf_printf(buf, "[%s]", kind);
         } else {
-            /* Map / Set / named class — give a hint */
-            JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
-            const char* ts = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
-            if (ts && strcmp(ts, "Map") == 0) {
-                JSValue sv = JS_GetPropertyStr(ctx, val, "size");
-                int32_t sz = 0;
-                if (!JS_IsException(sv)) JS_ToInt32(ctx, &sz, sv);
-                JS_FreeValue(ctx, sv);
-                dbuf_printf(buf, "[Map(%d)]", sz);
-            } else if (ts && strcmp(ts, "Set") == 0) {
-                JSValue sv = JS_GetPropertyStr(ctx, val, "size");
-                int32_t sz = 0;
-                if (!JS_IsException(sv)) JS_ToInt32(ctx, &sz, sv);
-                JS_FreeValue(ctx, sv);
-                dbuf_printf(buf, "[Set(%d)]", sz);
-            } else {
-                char* cls = get_class_name(ctx, val);
-                if (cls) { dbuf_printf(buf, "[%s]", cls); js_free(ctx, cls); }
-                else        dbuf_putstr(buf, "[Object]");
-            }
-            if (ts) JS_FreeCString(ctx, ts);
-            JS_FreeValue(ctx, tag);
+            char* cls = get_class_name(ctx, val);
+            if (cls) { dbuf_printf(buf, "[%s]", cls); js_free(ctx, cls); }
+            else dbuf_putstr(buf, "[Object]");
         }
         put_reset(buf, opts);
         return;
@@ -1550,7 +1543,7 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 			} else if (JS_IsFunction(ctx, val)) {
 				format_function(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsError(val)) {
-				format_error(ctx, val, depth, buf, opts);
+				format_error(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsArrayBuffer(val)) {
 				format_array_buffer(ctx, val, buf, opts);
 			} else if (JS_IsDataView(val)) {
@@ -1559,21 +1552,10 @@ static void format_value(JSContext* ctx, JSValue val, int depth, VisitStack* sta
 				format_typed_array(ctx, val, depth, stack, buf, opts);
 			} else if (JS_IsArray(val)) {
 				format_array(ctx, val, depth, stack, buf, opts);
+			} else if (JS_IsMap(val) || JS_IsSet(val)) {
+				format_collection(ctx, val, depth, stack, buf, opts);
 			} else {
-				/* Detect Map/Set via Symbol.toStringTag before generic object path */
-				JSValue tag = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toStringTag);
-				const char* tag_str = JS_IsString(tag) ? JS_ToCString(ctx, tag) : NULL;
-				bool handled = false;
-				if (tag_str && strcmp(tag_str, "Map") == 0) {
-					format_map(ctx, val, depth, stack, buf, opts);
-					handled = true;
-				} else if (tag_str && strcmp(tag_str, "Set") == 0) {
-					format_set(ctx, val, depth, stack, buf, opts);
-					handled = true;
-				}
-				if (tag_str) JS_FreeCString(ctx, tag_str);
-				JS_FreeValue(ctx, tag);
-				if (!handled) format_object(ctx, val, depth, stack, buf, opts);
+				format_object(ctx, val, depth, stack, buf, opts);
 			}
 			break;
 		case JS_TAG_EXCEPTION:
@@ -2094,7 +2076,71 @@ void tjs__mod_console_init(JSContext* ctx, JSValue ns) {
     JS_SetPropertyFunctionList(ctx, ns, console_funcs, countof(console_funcs));
 }
 
+int tjs__console_init_runtime(TJSRuntime* runtime) {
+    if (!JS_IsUndefined(runtime->console.date_to_iso_string)) return 0;
+    JSContext* ctx = runtime->main_ctx;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue ctor = JS_UNDEFINED, value = JS_UNDEFINED;
+    JSValue proto = JS_UNDEFINED, iterator = JS_UNDEFINED;
+    int result = -1;
+
+    for (int i = 0; i < 2; i++) {
+        ctor = JS_GetPropertyStr(ctx, global, i == 0 ? "Map" : "Set");
+        if (JS_IsException(ctor)) goto done;
+        value = JS_CallConstructor(ctx, ctor, 0, NULL);
+        if (JS_IsException(value)) goto done;
+        proto = JS_GetPrototype(ctx, value);
+        if (JS_IsException(proto)) goto done;
+        JSValue* size = i == 0 ? &runtime->console.map_size : &runtime->console.set_size;
+        *size = capture_inspect_intrinsic(ctx, proto, "size", true);
+        if (JS_IsException(*size)) goto done;
+        JSValue* method = i == 0 ? &runtime->console.map_entries : &runtime->console.set_values;
+        *method = capture_inspect_intrinsic(ctx, proto, i == 0 ? "entries" : "values", false);
+        if (JS_IsException(*method)) goto done;
+        iterator = JS_Call(ctx, *method, value, 0, NULL);
+        if (JS_IsException(iterator)) goto done;
+        JS_FreeValue(ctx, proto);
+        proto = JS_GetPrototype(ctx, iterator);
+        if (JS_IsException(proto)) goto done;
+        JSValue* next = i == 0 ? &runtime->console.map_iterator_next : &runtime->console.set_iterator_next;
+        *next = capture_inspect_intrinsic(ctx, proto, "next", false);
+        if (JS_IsException(*next)) goto done;
+        JS_FreeValue(ctx, ctor);
+        JS_FreeValue(ctx, value);
+        JS_FreeValue(ctx, proto);
+        JS_FreeValue(ctx, iterator);
+        ctor = value = proto = iterator = JS_UNDEFINED;
+    }
+    value = JS_NewDate(ctx, 0);
+    if (JS_IsException(value)) goto done;
+    proto = JS_GetPrototype(ctx, value);
+    if (JS_IsException(proto)) goto done;
+    runtime->console.date_to_iso_string = capture_inspect_intrinsic(ctx, proto, "toISOString", false);
+    if (JS_IsException(runtime->console.date_to_iso_string)) goto done;
+    result = 0;
+
+done:
+    JS_FreeValue(ctx, iterator);
+    JS_FreeValue(ctx, proto);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, global);
+    return result;
+}
+
 void tjs__console_cleanup_runtime(TJSRuntime *runtime) {
+    JS_FreeValueRT(runtime->rt, runtime->console.map_size);
+    JS_FreeValueRT(runtime->rt, runtime->console.map_entries);
+    JS_FreeValueRT(runtime->rt, runtime->console.map_iterator_next);
+    JS_FreeValueRT(runtime->rt, runtime->console.set_size);
+    JS_FreeValueRT(runtime->rt, runtime->console.set_values);
+    JS_FreeValueRT(runtime->rt, runtime->console.set_iterator_next);
+    JS_FreeValueRT(runtime->rt, runtime->console.date_to_iso_string);
+    runtime->console.map_size = runtime->console.map_entries =
+        runtime->console.map_iterator_next = runtime->console.set_size =
+        runtime->console.set_values = runtime->console.set_iterator_next =
+        runtime->console.date_to_iso_string = JS_UNDEFINED;
+
     ConsoleCounter *counter = runtime->console.counters;
     while (counter) {
         ConsoleCounter *next = counter->next;

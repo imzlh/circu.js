@@ -76,7 +76,7 @@ typedef struct {
 	bool pause_requested;
 } TJSLlhttpParser;
 
-static thread_local JSClassID tjs_llhttp_parser_class_id;
+static JSClassID tjs_llhttp_parser_class_id;
 
 /* ----------------------------- helpers ------------------------------ */
 
@@ -568,8 +568,15 @@ static const JSCFunctionListEntry tjs_module_consts[] = {
 void tjs__mod_http_init(JSContext* ctx, JSValue ns) {
 	JSRuntime* rt = JS_GetRuntime(ctx);
 
-	JS_NewClassID(rt, &tjs_llhttp_parser_class_id);
-	JS_NewClass(rt, tjs_llhttp_parser_class_id, &tjs_llhttp_parser_class);
+	if (JS_NewClassID(rt, &tjs_llhttp_parser_class_id) == JS_INVALID_CLASS_ID) {
+		JS_ThrowInternalError(ctx, "failed to allocate HTTP parser class ID");
+		return;
+	}
+	if (!JS_IsRegisteredClass(rt, tjs_llhttp_parser_class_id) &&
+		JS_NewClass(rt, tjs_llhttp_parser_class_id, &tjs_llhttp_parser_class) < 0) {
+		JS_ThrowInternalError(ctx, "failed to register HTTP parser class");
+		return;
+	}
 
 	/* prototype */
 	JSValue proto = JS_NewObject(ctx);

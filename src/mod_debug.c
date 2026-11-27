@@ -893,7 +893,7 @@ static JSValue tjs_debug_set_step_mode(JSContext *ctx, JSValue this_val, int arg
 
 /* ---- DebugChannel JS object (main-thread handle) ------------------------- */
 
-static thread_local JSClassID tjs_dc_main_class_id;
+static JSClassID tjs_dc_main_class_id;
 
 #ifdef _WIN32
 static HANDLE tjs_dc_active_stop_event = NULL;
@@ -1124,7 +1124,7 @@ static JSValue tjs_debug_create_channel(JSContext *ctx, JSValue this_val, int ar
 
 /* ---- DebugChannel JS object (worker-thread handle) ----------------------- */
 
-static thread_local JSClassID tjs_dc_worker_class_id;
+static JSClassID tjs_dc_worker_class_id;
 
 typedef struct {
     DebugControlBlock *cb;
@@ -1462,18 +1462,32 @@ static const JSCFunctionListEntry tjs_debug_funcs[] = {
 void tjs__mod_debug_init(JSContext *ctx, JSValue ns) {
     JSRuntime* rt = JS_GetRuntime(ctx);
 
-    /* Register JS classes (thread-local class IDs, one set per runtime/thread) */
-    JS_NewClassID(rt, &tjs_dc_main_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_dc_main_class_id, &tjs_dc_main_class);
+    /* Class IDs are shared; class definitions belong to this runtime. */
+    if (JS_NewClassID(rt, &tjs_dc_main_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate DebugMain class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_dc_main_class_id) &&
+        JS_NewClass(rt, tjs_dc_main_class_id, &tjs_dc_main_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register DebugMain class");
+        return;
+    }
 
-    JS_NewClassID(rt, &tjs_dc_worker_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_dc_worker_class_id, &tjs_dc_worker_class);
+    if (JS_NewClassID(rt, &tjs_dc_worker_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate DebugWorker class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_dc_worker_class_id) &&
+        JS_NewClass(rt, tjs_dc_worker_class_id, &tjs_dc_worker_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register DebugWorker class");
+        return;
+    }
 
     JS_SetPropertyFunctionList(ctx, ns, tjs_debug_funcs, countof(tjs_debug_funcs));
 }
 
 #else
 void tjs__mod_debug_init(JSContext *ctx, JSValue ns) {
-    (void*)&ctx; (void*)&ns;
+    (void)ctx; (void)ns;
 }
 #endif

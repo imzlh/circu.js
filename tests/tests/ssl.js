@@ -202,19 +202,12 @@ await test('ssl.ciphers - get cipher list', () => {
 });
 
 await test('ssl.loadPEM - load certificate PEM', () => {
-    // Test with a self-signed cert PEM
-    const certPEM = `-----BEGIN CERTIFICATE-----
-MIIBkTCB+wIJAKHBfpegPjMCMA0GCSqGSIb3DQEBCwUAMBExDzANBgNVBAMMBnRlc
-3RjYTAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAwMDBaMBExDzANBgNVBAMMBn
-Rlc3RjYTBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC5kzmkCRnEGOrWNwux5S2KwL7
------END CERTIFICATE-----`;
-    
-    try {
-        const cert = ssl.loadPEM(certPEM, 'certificate');
-        // May return null for invalid/incomplete cert
-    } catch (e) {
-        // Expected for invalid cert
-    }
+    const { cert: certPEM } = ssl.createSelfSignedCert({ commonName: 'loadpem.example', days: 1 });
+    const cert = ssl.loadPEM(certPEM, 'certificate');
+    assert(cert instanceof ssl.Certificate, 'Should return a Certificate');
+    assertEquals(cert.info.subject, 'CN=loadpem.example', 'Subject should round-trip');
+    assertEquals(cert.pem, certPEM, 'PEM should round-trip');
+    assert(cert.raw.byteLength > 0, 'DER should be exposed');
 });
 
 await test('ssl.loadPEM - load key PEM', () => {
@@ -229,6 +222,25 @@ ZGF0YSBmb3IgdGVzdGluZyBvbmx5MLOWfjAlgM5E
     } catch (e) {
         // Expected for invalid key
     }
+});
+
+await test('ssl.Certificate - parses PEM and DER and exposes digests', () => {
+    const { cert: certPEM } = ssl.createSelfSignedCert({ commonName: 'cert.example', days: 1 });
+    const fromPem = new ssl.Certificate(encode(certPEM));
+    const fromDer = new ssl.Certificate(fromPem.raw);
+    assertEquals(fromDer.info.subject, 'CN=cert.example', 'DER should parse to the same subject');
+    assert(/^[0-9A-F]{2}(:[0-9A-F]{2}){19}$/.test(fromPem.fingerprint), 'SHA-1 fingerprint shape');
+    assert(fromPem.publicKey.byteLength > 0, 'publicKey should be SPKI DER');
+    assertEquals(fromPem.checkHost('cert.example'), 'cert.example', 'CN should match the host');
+    assertEquals(fromPem.checkHost('other.example'), undefined, 'Foreign host should not match');
+    assert(fromPem.checkIssued(fromPem), 'Self-signed certificate issued itself');
+});
+
+await test('ssl.Certificate - accepts a Certificate where PEM is expected', () => {
+    const { cert: certPEM, key } = ssl.createSelfSignedCert({ commonName: 'ctx.example', days: 1 });
+    const certificate = new ssl.Certificate(encode(certPEM));
+    const ctx = new ssl.Context({ mode: 'server', cert: certificate, key });
+    assert(ctx, 'Context should accept a Certificate instance');
 });
 
 await test('ssl.createSelfSignedCert - generate certificate', () => {

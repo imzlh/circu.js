@@ -345,17 +345,12 @@ await test('fs.rmdir - error on nonempty directory', () => {
     }
 });
 
-await test('fs.copy - same file is rejected and source survives', () => {
+await test('fs.copy - same inode is a no-op and source survives', () => {
     const src = TEST_DIR + '/copy_self.txt';
     const alias = TEST_DIR + '/copy_self_link';
     fs.writeFile(src, encode('keep me'));
     fs.symlink(src, alias);
-    try {
-        fs.copy(src, alias);
-        assert(false, 'Should throw when source and destination are the same file');
-    } catch (e) {
-        assert(e instanceof Error, 'Should throw Error');
-    }
+    fs.copy(src, alias);
     assertEquals(decoder.decode(new Uint8Array(fs.readFile(src))), 'keep me',
         'Source content must be intact');
     fs.unlink(alias);
@@ -374,6 +369,26 @@ await test('fs.copy - overwrites a longer destination', () => {
     fs.unlink(dst);
 });
 
+await test('fs.copy rejects a directory source without changing an existing destination', () => {
+    const src = TEST_DIR + '/copy_directory_src';
+    const dst = TEST_DIR + '/copy_directory_dst.txt';
+    fs.mkdir(src, 0o755);
+    fs.writeFile(dst, encode('keep existing data'));
+
+    let threw = false;
+    try {
+        fs.copy(src, dst);
+    } catch {
+        threw = true;
+    }
+
+    assert(threw, 'copying a directory must fail');
+    assertEquals(decoder.decode(new Uint8Array(fs.readFile(dst))), 'keep existing data',
+        'a failed copy must leave the existing destination intact');
+    fs.rmdir(src);
+    fs.unlink(dst);
+});
+
 await test('fs.utimes - negative fractional time', () => {
     const f = TEST_DIR + '/utimes_neg.txt';
     fs.writeFile(f, encode('x'));
@@ -385,13 +400,13 @@ await test('fs.utimes - negative fractional time', () => {
 await test('fs - cleanup test files', () => {
     try {
         // Remove all test files
-        const files = [TEST_FILE, TEST_DIR + '/copy_self.txt', TEST_DIR + '/copy_self_link', TEST_DIR + '/copy_src.txt', TEST_DIR + '/copy_dst.txt', TEST_DIR + '/utimes_neg.txt', TEST_DIR + '/link', TEST_DIR + '/symlink', TEST_DIR + '/hardlink'];
+        const files = [TEST_FILE, TEST_DIR + '/copy_self.txt', TEST_DIR + '/copy_self_link', TEST_DIR + '/copy_src.txt', TEST_DIR + '/copy_dst.txt', TEST_DIR + '/copy_directory_dst.txt', TEST_DIR + '/utimes_neg.txt', TEST_DIR + '/link', TEST_DIR + '/symlink', TEST_DIR + '/hardlink'];
         for (const f of files) {
             try { fs.unlink(f); } catch (e) {}
         }
         
         // Remove test directories
-        const dirs = [TEST_DIR + '/subdir', TEST_DIR + '/newdir', TEST_DIR];
+        const dirs = [TEST_DIR + '/copy_directory_src', TEST_DIR + '/subdir', TEST_DIR + '/newdir', TEST_DIR];
         for (const d of dirs) {
             try { fs.rmdir(d); } catch (e) {}
         }

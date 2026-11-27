@@ -33,7 +33,7 @@
 
 #define TJS_SQLITE3_MAX_SAFE_INTEGER INT64_C(9007199254740991)
 
-static thread_local JSClassID tjs_sqlite3_class_id;
+static JSClassID tjs_sqlite3_class_id;
 
 typedef struct {
     sqlite3 *handle;
@@ -92,7 +92,7 @@ static TJSSqlite3Handle *tjs_sqlite3_get_open(JSContext *ctx, JSValue obj) {
     return h;
 }
 
-static thread_local JSClassID tjs_sqlite3_stmt_class_id;
+static JSClassID tjs_sqlite3_stmt_class_id;
 
 typedef struct {
     sqlite3_stmt *stmt;
@@ -1995,15 +1995,29 @@ void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
     /* Handle object */
-    JS_NewClassID(rt, &tjs_sqlite3_class_id);
-    JS_NewClass(rt, tjs_sqlite3_class_id, &tjs_sqlite3_class);
+    if (JS_NewClassID(rt, &tjs_sqlite3_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate SQLite class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_sqlite3_class_id) &&
+        JS_NewClass(rt, tjs_sqlite3_class_id, &tjs_sqlite3_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register SQLite class");
+        return;
+    }
     JSValue handle_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, handle_proto, tjs_sqlite3_proto_funcs, countof(tjs_sqlite3_proto_funcs));
     JS_SetClassProto(ctx, tjs_sqlite3_class_id, handle_proto);
 
     /* Statement object */
-    JS_NewClassID(rt, &tjs_sqlite3_stmt_class_id);
-    JS_NewClass(rt, tjs_sqlite3_stmt_class_id, &tjs_sqlite3_stmt_class);
+    if (JS_NewClassID(rt, &tjs_sqlite3_stmt_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate SQLite statement class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_sqlite3_stmt_class_id) &&
+        JS_NewClass(rt, tjs_sqlite3_stmt_class_id, &tjs_sqlite3_stmt_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register SQLite statement class");
+        return;
+    }
     JSValue stmt_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, stmt_proto, tjs_sqlite3_stmt_proto_funcs, countof(tjs_sqlite3_stmt_proto_funcs));
     JS_SetClassProto(ctx, tjs_sqlite3_stmt_class_id, stmt_proto);

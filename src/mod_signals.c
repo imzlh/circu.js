@@ -37,7 +37,7 @@ typedef struct {
 
 } TJSSignalHandler;
 
-static thread_local JSClassID tjs_signal_handler_class_id;
+static JSClassID tjs_signal_handler_class_id;
 
 static void uv__signal_close_cb(uv_handle_t *handle) {
     TJSSignalHandler *sh = handle->data;
@@ -179,8 +179,15 @@ static const JSCFunctionListEntry tjs_signal_funcs[] = {
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
-    JS_NewClassID(rt, &tjs_signal_handler_class_id);
-    JS_NewClass(rt, tjs_signal_handler_class_id, &tjs_signal_handler_class);
+    if (JS_NewClassID(rt, &tjs_signal_handler_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate SignalHandler class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_signal_handler_class_id) &&
+        JS_NewClass(rt, tjs_signal_handler_class_id, &tjs_signal_handler_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register SignalHandler class");
+        return;
+    }
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_signal_handler_proto_funcs, countof(tjs_signal_handler_proto_funcs));
     JS_SetClassProto(ctx, tjs_signal_handler_class_id, proto);

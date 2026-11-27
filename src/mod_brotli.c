@@ -391,8 +391,8 @@ static JSValue tjs_brotli_max_compressed_size(JSContext *ctx, JSValueConst this_
 }
 
 /* Class IDs */
-static thread_local JSClassID tjs_brotli_compress_class_id;
-static thread_local JSClassID tjs_brotli_decompress_class_id;
+static JSClassID tjs_brotli_compress_class_id;
+static JSClassID tjs_brotli_decompress_class_id;
 
 /* Streaming Brotli encoder object */
 typedef struct {
@@ -777,17 +777,33 @@ static const JSCFunctionListEntry tjs_brotli_funcs[] = {
 };
 
 void tjs__mod_brotli_init(JSContext *ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+
     /* BrotliCompress class */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_brotli_compress_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_brotli_compress_class_id, &tjs_brotli_compress_class);
+    if (JS_NewClassID(rt, &tjs_brotli_compress_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate BrotliCompress class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_brotli_compress_class_id) &&
+        JS_NewClass(rt, tjs_brotli_compress_class_id, &tjs_brotli_compress_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register BrotliCompress class");
+        return;
+    }
     JSValue compress_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, compress_proto, tjs_brotli_compress_proto_funcs,
                                countof(tjs_brotli_compress_proto_funcs));
     JS_SetClassProto(ctx, tjs_brotli_compress_class_id, compress_proto);
 
     /* BrotliDecompress class */
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_brotli_decompress_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_brotli_decompress_class_id, &tjs_brotli_decompress_class);
+    if (JS_NewClassID(rt, &tjs_brotli_decompress_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate BrotliDecompress class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_brotli_decompress_class_id) &&
+        JS_NewClass(rt, tjs_brotli_decompress_class_id, &tjs_brotli_decompress_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register BrotliDecompress class");
+        return;
+    }
     JSValue decompress_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, decompress_proto, tjs_brotli_decompress_proto_funcs,
                                countof(tjs_brotli_decompress_proto_funcs));

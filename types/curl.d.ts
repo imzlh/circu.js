@@ -159,6 +159,9 @@ declare namespace CModuleCURL {
          */
         close(): void;
 
+        /** Close idle connections without interrupting transfers. Available with libcurl >= 8.16. */
+        closeIdleConnections?(): void;
+
         /**
          * Set HTTP pipeline maximum length (HTTP/2 only)
          * @param length Maximum pipeline length

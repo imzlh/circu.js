@@ -2424,10 +2424,10 @@ static JSValue tjs_crypto_verify(JSContext* ctx, JSValueConst this_val, int argc
 }
 
 /* Class IDs */
-static thread_local JSClassID tjs_hash_class_id;
-static thread_local JSClassID tjs_hmac_class_id;
-static thread_local JSClassID tjs_cipher_class_id;
-static thread_local JSClassID tjs_gcm_class_id;
+static JSClassID tjs_hash_class_id;
+static JSClassID tjs_hmac_class_id;
+static JSClassID tjs_cipher_class_id;
+static JSClassID tjs_gcm_class_id;
 
 typedef struct {
     EVP_CIPHER_CTX *ctx;
@@ -3494,29 +3494,57 @@ void tjs__mod_crypto_init(JSContext* ctx, JSValue ns) {
 	JSRuntime* rt = JS_GetRuntime(ctx);
 
     /* Initialize Hash class */
-    JS_NewClassID(rt, &tjs_hash_class_id);
-    JS_NewClass(rt, tjs_hash_class_id, &tjs_hash_class);
+    if (JS_NewClassID(rt, &tjs_hash_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Hash class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_hash_class_id) &&
+        JS_NewClass(rt, tjs_hash_class_id, &tjs_hash_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Hash class");
+        return;
+    }
     JSValue hash_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, hash_proto, tjs_hash_proto_funcs, countof(tjs_hash_proto_funcs));
     JS_SetClassProto(ctx, tjs_hash_class_id, hash_proto);
     
     /* Initialize HMAC class */
-    JS_NewClassID(rt, &tjs_hmac_class_id);
-    JS_NewClass(rt, tjs_hmac_class_id, &tjs_hmac_class);
+    if (JS_NewClassID(rt, &tjs_hmac_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate HMAC class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_hmac_class_id) &&
+        JS_NewClass(rt, tjs_hmac_class_id, &tjs_hmac_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register HMAC class");
+        return;
+    }
     JSValue hmac_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, hmac_proto, tjs_hmac_proto_funcs, countof(tjs_hmac_proto_funcs));
     JS_SetClassProto(ctx, tjs_hmac_class_id, hmac_proto);
     
     /* Initialize Cipher class */
-    JS_NewClassID(rt, &tjs_cipher_class_id);
-    JS_NewClass(rt, tjs_cipher_class_id, &tjs_cipher_class);
+    if (JS_NewClassID(rt, &tjs_cipher_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Cipher class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_cipher_class_id) &&
+        JS_NewClass(rt, tjs_cipher_class_id, &tjs_cipher_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Cipher class");
+        return;
+    }
     JSValue cipher_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, cipher_proto, tjs_cipher_proto_funcs, countof(tjs_cipher_proto_funcs));
     JS_SetClassProto(ctx, tjs_cipher_class_id, cipher_proto);
 
 	/* Initialize GCM class */
-	JS_NewClassID(JS_GetRuntime(ctx), &tjs_gcm_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_gcm_class_id, &tjs_gcm_class);
+    if (JS_NewClassID(rt, &tjs_gcm_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate GCM class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_gcm_class_id) &&
+        JS_NewClass(rt, tjs_gcm_class_id, &tjs_gcm_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register GCM class");
+        return;
+    }
 	JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_gcm_proto_funcs, 
         sizeof(tjs_gcm_proto_funcs) / sizeof(JSCFunctionListEntry));

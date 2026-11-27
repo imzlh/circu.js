@@ -199,7 +199,7 @@ XML_CALLBACK(namespace_end, const XML_Char *prefix) {
 }
 
 /* Class ID */
-static thread_local JSClassID tjs_xml_parser_class_id;
+static JSClassID tjs_xml_parser_class_id;
 
 /* Finalizer */
 static void tjs_xml_parser_finalizer(JSRuntime *rt, JSValue val) {
@@ -479,8 +479,16 @@ static const JSCFunctionListEntry tjs_xml_funcs[] = {
 
 /* Module initialization */
 void tjs__mod_xml_init(JSContext *ctx, JSValue ns) {
-    JS_NewClassID(JS_GetRuntime(ctx), &tjs_xml_parser_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), tjs_xml_parser_class_id, &tjs_xml_parser_class);
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (JS_NewClassID(rt, &tjs_xml_parser_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate XML parser class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_xml_parser_class_id) &&
+        JS_NewClass(rt, tjs_xml_parser_class_id, &tjs_xml_parser_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register XML parser class");
+        return;
+    }
     
     JSValue proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_xml_parser_proto_funcs,

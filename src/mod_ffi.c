@@ -50,8 +50,8 @@ typedef struct FfiBound FfiBound;
 typedef struct FfiBindCache FfiBindCache;
 typedef struct FfiCleanupNode FfiCleanupNode;
 
-static thread_local JSClassID type_class, pointer_class, owned_class;
-static thread_local JSClassID library_class, bound_class, callback_class;
+static JSClassID type_class, pointer_class, owned_class;
+static JSClassID library_class, bound_class, callback_class;
 static thread_local int last_errno;
 
 typedef enum { CLEANUP_STATE_UNREF, CLEANUP_DISPOSE } CleanupKind;
@@ -2196,8 +2196,14 @@ static int register_class(JSContext *ctx, JSClassID *id, JSClassDef *def,
                           const JSCFunctionListEntry *props, size_t count,
                           JSCFunction *dispose) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_NewClassID(rt, id);
-    if (JS_NewClass(rt, *id, def) < 0) return -1;
+    if (JS_NewClassID(rt, id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate %s class ID", def->class_name);
+        return -1;
+    }
+    if (!JS_IsRegisteredClass(rt, *id) && JS_NewClass(rt, *id, def) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register %s class", def->class_name);
+        return -1;
+    }
     JSValue proto = JS_NewObject(ctx);
     if (JS_IsException(proto)) return -1;
     if (props &&

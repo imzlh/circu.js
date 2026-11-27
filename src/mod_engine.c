@@ -29,7 +29,6 @@
 
 #include <string.h>
 #include <stdlib.h>
-
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -138,7 +137,7 @@ static JSValue tjs_gc_getThreshold(JSContext *ctx, JSValue this_val, int argc, J
 }
 
 
-static thread_local JSClassID js_module_class_id;
+static JSClassID js_module_class_id;
 typedef struct {
     struct list_head local_def;
     JSModuleDef* def;
@@ -527,10 +526,13 @@ static const JSCFunctionListEntry js_module_proto_funcs[] = {
 
 /* ── Sandbox class ─────────────────────────────────────────────────────── */
 
-static thread_local JSClassID js_sandbox_class_id;
+static JSClassID js_sandbox_class_id;
 
 static JSValue js_sandbox_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv) {
     TJSRuntime *trt = TJS_GetRuntime(ctx);
+
+    if (!trt || trt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
 
     App *app = TJS_NewAppInternal(trt, true);
     if (!app)
@@ -570,14 +572,19 @@ static void js_sandbox_finalizer(JSRuntime *rt, JSValueConst val) {
     JS_FreeValueRT(rt, sb->global);
     sb->global = JS_UNDEFINED;
 
-    if (!sb->trt->freeing) {
-        App *app = sb->app;
-        if (app && !app->context_released) {
+    App *app = sb->app;
+    if (app) {
+        /* Logical disposal is separate from JS_FreeContext(): escaped
+         * functions must stop creating new evbus ownership immediately, while
+         * native callbacks may still retain this raw context pointer. */
+        app->context_invalid = true;
+        if (!sb->trt->freeing) {
+            /* Native callbacks retain raw context pointers. Keep the context
+             * until runtime shutdown has stopped and drained their sources. */
             tjs__evbus_cleanup(app);
-            JS_FreeContext(app->ctx);
-            app->context_released = true;
-            sb->app = NULL;
+            tjs__cancel_timers_for_context(app->trt, app->ctx);
         }
+        sb->app = NULL;
     }
 
     tjs__free(sb);
@@ -840,6 +847,33 @@ static JSValue tjs_setMaxStackSize(JSContext *ctx, JSValue this_val, int argc, J
     return JS_UNDEFINED;
 }
 
+/* Return the source/module name at a caller stack level.  QuickJS owns the
+ * returned atom, so convert and release it before returning to JavaScript. */
+static JSValue tjs_get_script_or_module_name(JSContext *ctx, JSValue this_val,
+                                              int argc, JSValue *argv) {
+    (void)this_val;
+    CHECK_IF_IN_SANDBOX();
+
+    int32_t level = 0;
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &level, argv[0]) < 0)
+        return JS_EXCEPTION;
+    if (level < 0)
+        return JS_ThrowRangeError(ctx, "stack level must be non-negative");
+
+    JSAtom atom = JS_GetScriptOrModuleName(ctx, level);
+    if (atom == JS_ATOM_NULL)
+        return JS_NULL;
+    const char *name = JS_AtomToCString(ctx, atom);
+    if (!name) {
+        JS_FreeAtom(ctx, atom);
+        return JS_EXCEPTION;
+    }
+    JSValue result = JS_NewString(ctx, name);
+    JS_FreeCString(ctx, name);
+    JS_FreeAtom(ctx, atom);
+    return result;
+}
+
 static JSValue tjs_eval(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     size_t len = 0;
     const char *buf = JS_ToCStringLen(ctx, &len, argv[0]);
@@ -995,6 +1029,7 @@ static JSValue tjs__set_nexttick_drain(JSContext *ctx, JSValue this_val, int arg
 
 static JSValue tjs__notify_nexttick(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     TJSRuntime* trt = TJS_GetRuntime(ctx);
+    if (!trt || trt->freeing) return JS_UNDEFINED;
     trt->jobs.ticks_pending = true;
     return JS_UNDEFINED;
 }
@@ -1346,6 +1381,7 @@ static const JSCFunctionListEntry tjs_engine_funcs[] = {
     TJS_CFUNC_DEF("setCanBlock", 1, tjs_setCanBlock),
     TJS_CFUNC_DEF("setMemoryLimit", 1, tjs_setMemoryLimit),
     TJS_CFUNC_DEF("setMaxStackSize", 1, tjs_setMaxStackSize),
+    TJS_CFUNC_DEF("getScriptOrModuleName", 1, tjs_get_script_or_module_name),
     TJS_CFUNC_DEF("eval", 3, tjs_eval),
     TJS_CFUNC_DEF("serialize", 2, tjs_serialize),
     TJS_CFUNC_DEF("deserialize", 1, tjs_deserialize),
@@ -1479,8 +1515,15 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, ns, "EventType", event_enum, JS_PROP_C_W_E);
 
     // class Module
-    JS_NewClassID(JS_GetRuntime(ctx), &js_module_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_module_class_id, &js_module_class);
+    if (JS_NewClassID(JS_GetRuntime(ctx), &js_module_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Module class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(JS_GetRuntime(ctx), js_module_class_id) &&
+        JS_NewClass(JS_GetRuntime(ctx), js_module_class_id, &js_module_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Module class");
+        return;
+    }
     JSValue proto = JS_NewObjectProto(ctx, JS_NULL);
     JS_SetPropertyFunctionList(ctx, proto, js_module_proto_funcs, countof(js_module_proto_funcs));
     JS_SetClassProto(ctx, js_module_class_id, proto);
@@ -1497,8 +1540,15 @@ void tjs__mod_engine_init(JSContext *ctx, JSValue ns) {
     JS_DefinePropertyValueStr(ctx, ctor, "from", mfrom, JS_PROP_C_W_E);
 
     // class Sandbox
-    JS_NewClassID(JS_GetRuntime(ctx), &js_sandbox_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_sandbox_class_id, &js_sandbox_class);
+    if (JS_NewClassID(JS_GetRuntime(ctx), &js_sandbox_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Sandbox class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(JS_GetRuntime(ctx), js_sandbox_class_id) &&
+        JS_NewClass(JS_GetRuntime(ctx), js_sandbox_class_id, &js_sandbox_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Sandbox class");
+        return;
+    }
     JSValue sb_proto = JS_NewObjectProto(ctx, JS_NULL);
     JS_SetPropertyFunctionList(ctx, sb_proto, js_sandbox_proto_funcs, countof(js_sandbox_proto_funcs));
     JS_SetClassProto(ctx, js_sandbox_class_id, sb_proto);

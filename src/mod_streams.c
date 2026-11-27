@@ -46,6 +46,18 @@
 /* ---- Forward declarations ---- */
 static JSValue tjs_new_tcp(JSContext *ctx, int af);
 JSValue tjs_new_pipe(JSContext *ctx);  /* exported: used by other modules */
+static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
+static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf);
+static void uv__read_once_alloc_cb(uv_handle_t *handle,
+                                   size_t suggested_size,
+                                   uv_buf_t *buf);
+static void uv__read_once_cb(uv_stream_t *handle,
+                             ssize_t nread,
+                             const uv_buf_t *buf);
+#ifdef _WIN32
+static void uv__read_restart_cb(uv_timer_t *handle);
+static void uv__read_restart_close_cb(uv_handle_t *handle);
+#endif
 
 
 /* ---- Data structures ---- */
@@ -76,6 +88,11 @@ typedef struct {
     int pin_count;
     JSValue callbacks[STREAM_CB_MAX];
     uint8_t *read_buf;               /* dynamically allocated for the streaming onread path */
+#ifdef _WIN32
+    uint8_t *tty_read_buf;
+    size_t tty_read_buf_size;
+#endif
+    unsigned int callback_refs;      /* native callbacks that still reference s */
     bool listening;                  /* listen() owns one GC pin while active */
     bool streaming_read;             /* startRead() owns one GC pin while active */
     bool streaming_read_started_foreground;
@@ -85,6 +102,11 @@ typedef struct {
     bool shutdown_starting;          /* promise hook reentrancy reservation */
     bool close_pinned;               /* close() owns one GC pin until uv__close_cb */
     TJSReadReq *read_req;            /* non-NULL while a one-shot read(buf) is in flight */
+#ifdef _WIN32
+    uv_timer_t read_restart_timer;   /* defers TTY restart past read_cb */
+    bool read_restart_initialized;
+    bool tty_read_callback_active;
+#endif
     TJSPromise connect_promise;
     TJSPromise shutdown_promise;
 
@@ -106,7 +128,7 @@ typedef struct {
 struct TJSReadReq {
     JSValue buf;        /* user-provided buffer, pinned */
     TJSPromise result;
-    uint8_t *data;      /* native read buffer owned by the request */
+    uint8_t *data;      /* native buffer; Windows TTY reads use stream storage */
     size_t data_len;
     bool tty_read_started_foreground;
     int settled;        /* promise already resolved/rejected */
@@ -156,19 +178,17 @@ static const char *tjs_stream_format_destination(const struct sockaddr_storage *
     return NULL;
 }
 
-static void tjs_read_req_free(JSContext *ctx, TJSReadReq *rr) {
+static void tjs_read_req_free_native(TJSReadReq *rr) {
     if (!rr) return;
-    js_free(ctx, rr->data);
-    JS_FreeValue(ctx, rr->buf);
-    js_free(ctx, rr);
+    tjs__free(rr->data);
+    tjs__free(rr);
 }
 
-static void tjs_read_req_free_rt(JSRuntime *rt, TJSReadReq *rr) {
+static void tjs_read_req_free(JSContext *ctx, TJSReadReq *rr) {
     if (!rr) return;
-    js_free_rt(rt, rr->data);
-    TJS_FreePromiseRT(rt, &rr->result);
-    JS_FreeValueRT(rt, rr->buf);
-    js_free_rt(rt, rr);
+    TJS_FreePromise(ctx, &rr->result);
+    JS_FreeValue(ctx, rr->buf);
+    tjs_read_req_free_native(rr);
 }
 
 static void tjs_write_req_free(JSContext *ctx, TJSWriteReq *wr) {
@@ -198,9 +218,9 @@ static void stream_unlink(TJSStream *s) {
 
 
 /* ---- Class IDs (assigned at init time, used by finalizers and gc_mark) ---- */
-static thread_local JSClassID tjs_tcp_class_id;
-static thread_local JSClassID tjs_tty_class_id;
-static thread_local JSClassID tjs_pipe_class_id;
+static JSClassID tjs_tcp_class_id;
+static JSClassID tjs_tty_class_id;
+static JSClassID tjs_pipe_class_id;
 
 #pragma region Inline helpers
 /* Get the TJSStream from any stream-derived JS object (TCP/TTY/Pipe). */
@@ -221,7 +241,7 @@ static inline bool stream_check_open(JSContext *ctx, TJSStream *s) {
 
 static inline void stream_maybe_free(TJSStream *s) {
     /* uv__close_cb may fire after JS ctx/rt is gone — use tjs__ allocator. */
-    if (s->closed && s->finalized)
+    if (s->closed && s->finalized && s->callback_refs == 0)
         tjs__free(s);
 }
 
@@ -239,6 +259,19 @@ static inline void stream_unpin(TJSStream *s) {
         JS_FreeValue(s->ctx, obj);
         /* Do NOT touch s after this point — it may have been freed above. */
     }
+}
+
+/* A native callback has its own lifetime reference in addition to the JS
+ * wrapper pin. Keep the decrement paired with the callback's final unpin. */
+static inline void stream_callback_release_pin(TJSStream *s) {
+    bool finalized = s->finalized;
+    if (s->callback_refs > 0)
+        s->callback_refs--;
+    if (finalized) {
+        stream_maybe_free(s);
+        return;
+    }
+    stream_unpin(s);
 }
 
 #ifndef NDEBUG
@@ -366,19 +399,109 @@ static inline bool stream_tty_read_was_backgrounded(TJSStream *s,
            stream_tty_foreground_state(s) == 0;
 }
 
+#ifdef _WIN32
+static inline bool stream_is_windows_tty(TJSStream *s) {
+    return s->h.handle.type == UV_TTY;
+}
+
+/* The Windows line-read worker may write until its completion reaches the
+ * loop. Keep its buffer stream-owned across stop/restart and release it only
+ * after the handle close callback. */
+static void stream_alloc_tty_read_buf(TJSStream *s,
+                                      size_t size,
+                                      uv_buf_t *buf) {
+    if (s->finalized || s->closing_for_runtime || s->trt->freeing ||
+        uv_is_closing(&s->h.handle) || size == 0) {
+        buf->base = NULL;
+        buf->len = 0;
+        return;
+    }
+
+    if (s->tty_read_buf_size < size) {
+        uint8_t *data = tjs__realloc(s->tty_read_buf, size);
+        if (!data) {
+            buf->base = NULL;
+            buf->len = 0;
+            return;
+        }
+        s->tty_read_buf = data;
+        s->tty_read_buf_size = size;
+    }
+
+    buf->base = (char *)s->tty_read_buf;
+    buf->len = size;
+}
+
+static void stream_free_tty_read_buf(TJSStream *s) {
+    tjs__free(s->tty_read_buf);
+    s->tty_read_buf = NULL;
+    s->tty_read_buf_size = 0;
+}
+
+/* A TTY read callback can run inside libuv's read start or completion.
+ * A one-shot timer restarts after that call unwinds and wakes an idle loop. */
+static int stream_schedule_read_restart(TJSStream *s) {
+    if (!s->read_restart_initialized) {
+        int r = uv_timer_init(&s->trt->loop, &s->read_restart_timer);
+        if (r != 0)
+            return r;
+        s->read_restart_timer.data = s;
+        s->read_restart_initialized = true;
+        s->callback_refs++;
+    }
+
+    return uv_timer_start(&s->read_restart_timer, uv__read_restart_cb, 0, 0);
+}
+
+static void stream_close_read_restart(TJSStream *s) {
+    if (!s->read_restart_initialized)
+        return;
+
+    uv_handle_t *handle = (uv_handle_t *)&s->read_restart_timer;
+    if (!uv_is_closing(handle))
+        uv_close(handle, uv__read_restart_close_cb);
+}
+#endif
+
+static int stream_begin_read(TJSStream *s) {
+#ifdef _WIN32
+    if (s->tty_read_callback_active)
+        return stream_schedule_read_restart(s);
+#endif
+    if (s->streaming_read)
+        return uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
+    return uv_read_start(&s->h.stream, uv__read_once_alloc_cb, uv__read_once_cb);
+}
+
+static int stream_stop_read(TJSStream *s) {
+#ifdef _WIN32
+    if (s->read_restart_initialized)
+        uv_timer_stop(&s->read_restart_timer);
+#endif
+    return uv_read_stop(&s->h.stream);
+}
+
 #pragma endregion
 #pragma region callbacks
 static void uv__close_cb(uv_handle_t *handle) {
     TJSStream *s = handle->data;
     unsigned int release_pins = 0;
     CHECK_NOT_NULL(s);
-    s->closed = 1;
+#ifdef _WIN32
+    stream_free_tty_read_buf(s);
+    stream_close_read_restart(s);
+#endif
     if (!s->closing_for_runtime)
         stream_unlink(s);
 
-    /* If the finalizer already ran, the JS wrapper is gone and this close is
-     * the second (final) flag. Hand off to the arbiter and stop. */
+    TJSReadReq *rr = s->read_req;
+    s->read_req = NULL;
+    if (rr)
+        s->callback_refs--;
+
     if (s->finalized) {
+        tjs_read_req_free_native(rr);
+        s->closed = 1;
         stream_maybe_free(s);
         return;
     }
@@ -402,16 +525,21 @@ static void uv__close_cb(uv_handle_t *handle) {
     js_free(s->ctx, s->read_buf);
     s->read_buf = NULL;
 
-    if (s->read_req && (s->read_req->canceled || s->read_req->settled)) {
-        tjs_read_req_free(s->ctx, s->read_req);
-        s->read_req = NULL;
+    if (rr) {
+        tjs_read_req_free(s->ctx, rr);
         release_pins++;
     }
 
     /* Fire onclose callback if set. */
-    JSValue fn = s->callbacks[STREAM_CB_CLOSE];
-    if (!s->closing_for_runtime && JS_IsFunction(s->ctx, fn)) {
-        tjs_call_handler(s->ctx, fn, 0, NULL);
+    if (!s->closing_for_runtime && !s->finalized) {
+        JSValue fn = s->callbacks[STREAM_CB_CLOSE];
+        if (JS_IsFunction(s->ctx, fn))
+            tjs_call_handler(s->ctx, fn, 0, NULL);
+    }
+    s->closed = 1;
+    if (s->finalized) {
+        stream_maybe_free(s);
+        return;
     }
     while (release_pins > 1) {
         stream_unpin(s);
@@ -461,11 +589,11 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
     TJSReadReq *rr = s->read_req;
     if (rr) {
         rr->canceled = 1;
-        uv_read_stop(&s->h.stream);
+        stream_stop_read(s);
     }
 
     if (s->streaming_read)
-        uv_read_stop(&s->h.stream);
+        stream_stop_read(s);
 
     s->close_pinned = true;
     stream_pin(ctx, s, this_val);
@@ -484,6 +612,12 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
 static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+#ifdef _WIN32
+    if (stream_is_windows_tty(s)) {
+        stream_alloc_tty_read_buf(s, suggested_size, buf);
+        return;
+    }
+#endif
     s->read_buf = js_malloc(s->ctx, suggested_size);
     if (s->read_buf) {
         buf->base = (char *)s->read_buf;
@@ -497,6 +631,9 @@ static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_b
 static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+    if (s->finalized || s->closing_for_runtime || s->trt->freeing ||
+        uv_is_closing(&s->h.handle))
+        return;
     JSContext *ctx = s->ctx;
 
     if (nread == 0) { /* EAGAIN — nothing to read, discard buffer */
@@ -523,10 +660,20 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
                 JS_SetPropertyStr(ctx, args[1], "_cnoTransientTtyEio", JS_TRUE);
         }
     } else {
-        /* Hand off ownership of read_buf to the new Uint8Array. */
-        args[0] = TJS_NewUint8Array(ctx, s->read_buf, nread);
+        /* TTY buffers can remain in use by a Windows worker after the read
+         * callback. Copy those bytes; other stream buffers transfer ownership. */
+#ifdef _WIN32
+        if (stream_is_windows_tty(s)) {
+            args[0] = JS_NewUint8ArrayCopy(ctx,
+                                           (const uint8_t *)buf->base,
+                                           (size_t)nread);
+        } else
+#endif
+        {
+            args[0] = TJS_NewUint8Array(ctx, s->read_buf, nread);
+            s->read_buf = NULL;
+        }
         args[1] = JS_UNDEFINED;
-        s->read_buf = NULL;
         if (JS_IsException(args[0])) {
             args[0] = JS_UNDEFINED;
             args[1] = JS_GetException(ctx);
@@ -547,7 +694,14 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
         s->streaming_read = false;
         s->streaming_read_started_foreground = false;
     }
+#ifdef _WIN32
+    bool was_in_read_callback = s->tty_read_callback_active;
+    s->tty_read_callback_active = stream_is_windows_tty(s);
+#endif
     invoke_cb(s, STREAM_CB_READ, 2, args);
+#ifdef _WIN32
+    s->tty_read_callback_active = was_in_read_callback;
+#endif
     if (release_stream_pin)
         stream_unpin(s);
 }
@@ -566,11 +720,16 @@ static JSValue tjs_stream_start_read(JSContext *ctx, JSValue this_val, int argc,
     TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE, "stream.startRead", NULL), (void)0, if (!stream_revalidate_start_read(ctx, s)) return JS_EXCEPTION);
     bool started_foreground = s->h.handle.type == UV_TTY &&
                               stream_tty_foreground_state(s) == 1;
-    int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
-    if (r != 0) return tjs_throw_errno(ctx, r);
     s->streaming_read = true;
     s->streaming_read_started_foreground = started_foreground;
     stream_pin(ctx, s, this_val);
+    int r = stream_begin_read(s);
+    if (r != 0) {
+        s->streaming_read = false;
+        s->streaming_read_started_foreground = false;
+        STREAM_UNPIN_FINAL(s);
+        return tjs_throw_errno(ctx, r);
+    }
     return JS_UNDEFINED;
 }
 
@@ -579,14 +738,21 @@ static JSValue tjs_stream_stop_read(JSContext *ctx, JSValue this_val, int argc, 
     if (!s) return JS_EXCEPTION;
     if (uv_is_closing(&s->h.handle)) return JS_UNDEFINED;
     if (!s->streaming_read) return JS_UNDEFINED;
-    int r = uv_read_stop(&s->h.stream);
-    if (r != 0) return tjs_throw_errno(ctx, r);
+    int r = stream_stop_read(s);
+    if (r != 0) {
+#ifdef _WIN32
+        if (stream_is_windows_tty(s))
+            maybe_close(s);
+        else
+#endif
+            return tjs_throw_errno(ctx, r);
+    }
     js_free(ctx, s->read_buf);
     s->read_buf = NULL;
     s->streaming_read = false;
     s->streaming_read_started_foreground = false;
     STREAM_UNPIN_FINAL(s);
-    return JS_UNDEFINED;
+    return r != 0 ? tjs_throw_errno(ctx, r) : JS_UNDEFINED;
 }
 
 static JSValue tjs_stream_cancel_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -598,23 +764,26 @@ static JSValue tjs_stream_cancel_read(JSContext *ctx, JSValue this_val, int argc
     if (!rr) return JS_UNDEFINED;
     if (rr->canceled) return JS_UNDEFINED;
 
-    rr->canceled = 1;
-    int r = uv_read_stop(&s->h.stream);
+    int r = stream_stop_read(s);
     if (r != 0) {
-        rr->canceled = 0;
-        return tjs_throw_errno(ctx, r);
+#ifdef _WIN32
+        if (stream_is_windows_tty(s))
+            maybe_close(s);
+        else
+#endif
+            return tjs_throw_errno(ctx, r);
     }
     s->read_req = NULL;
 
     if (!rr->settled) {
-        JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
+        JSValue arg = tjs_new_error(ctx, r != 0 ? r : UV_ECANCELED);
         rr->settled = 1;
         TJS_RejectPromise(ctx, &rr->result, 1, &arg);
     }
 
     tjs_read_req_free(ctx, rr);
-    STREAM_UNPIN_FINAL(s);
-    return JS_UNDEFINED;
+    stream_callback_release_pin(s);
+    return r != 0 ? tjs_throw_errno(ctx, r) : JS_UNDEFINED;
 }
 
 static void uv__write_cb(uv_write_t *req, int status) {
@@ -729,8 +898,21 @@ static JSValue tjs_stream_write(JSContext *ctx, JSValue this_val, int argc, JSVa
 static void uv__read_once_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
-    (void)suggested_size;
+    if (s->finalized || s->closing_for_runtime || s->trt->freeing) {
+        buf->base = NULL;
+        buf->len = 0;
+        return;
+    }
     TJSReadReq *rr = s->read_req;
+#ifdef _WIN32
+    if (stream_is_windows_tty(s)) {
+        size_t size = rr ? rr->data_len : suggested_size;
+        if (size > suggested_size)
+            size = suggested_size;
+        stream_alloc_tty_read_buf(s, size, buf);
+        return;
+    }
+#endif
     if (rr && rr->data && rr->data_len > 0) {
         buf->base = (char *)rr->data;
         buf->len  = rr->data_len;
@@ -743,62 +925,92 @@ static void uv__read_once_alloc_cb(uv_handle_t *handle, size_t suggested_size, u
 static void uv__read_once_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+    if (s->finalized || s->closing_for_runtime || s->trt->freeing ||
+        uv_is_closing(&s->h.handle))
+        return;
 
     JSContext *ctx = s->ctx;
     TJSReadReq *rr = s->read_req;
 
     /* libuv: nread == 0 is "would block", not EOF — do not settle here. */
-    if (nread == 0)
+    if (!rr || nread == 0)
         return;
 
     bool eof = stream_is_eof(s, nread);
-    bool transient_tty_eio = rr && stream_tty_read_was_backgrounded(
+    bool transient_tty_eio = stream_tty_read_was_backgrounded(
         s, rr->tty_read_started_foreground, nread);
     uv_read_stop(&s->h.stream);
     s->read_req = NULL;
 
-    /* close() can race a pending one-shot read: rr may already be freed. */
-    if (!rr)
-        return;
-
     if (rr->canceled || rr->settled) {
         tjs_read_req_free(ctx, rr);
-        STREAM_UNPIN_FINAL(s);
+        stream_callback_release_pin(s);
         return;
     }
 
+#ifdef _WIN32
+    bool was_in_read_callback = s->tty_read_callback_active;
+    s->tty_read_callback_active = stream_is_windows_tty(s);
+#endif
     JSValue arg;
+    bool reject = false;
     if (nread > 0) {
         size_t sz;
         uint8_t *data = JS_GetAnyBuffer(ctx, &sz, rr->buf);
         if (!data || sz < (size_t)nread) {
+            if (!data)
+                JS_FreeValue(ctx, JS_GetException(ctx));
             arg = tjs_new_plain_error(ctx, "read buffer became invalid");
-            rr->settled = 1;
-            TJS_RejectPromise(ctx, &rr->result, 1, &arg);
-            tjs_read_req_free(ctx, rr);
-            STREAM_UNPIN_FINAL(s);
-            return;
+            reject = true;
+        } else {
+            memcpy(data, buf->base, (size_t)nread);
+            arg = JS_NewInt32(ctx, (int32_t)nread);
         }
-        memcpy(data, rr->data, (size_t)nread);
-        arg = JS_NewInt32(ctx, (int32_t)nread);
-        rr->settled = 1;
-        TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
     } else if (eof) {
         /* EOF: resolve with 0 */
         arg = JS_NewInt32(ctx, 0);
-        rr->settled = 1;
-        TJS_ResolvePromise(ctx, &rr->result, 1, &arg);
     } else {
         arg = tjs_new_error(ctx, transient_tty_eio ? UV_EIO : nread);
         if (transient_tty_eio)
             JS_SetPropertyStr(ctx, arg, "_cnoTransientTtyEio", JS_TRUE);
-        rr->settled = 1;
-        TJS_RejectPromise(ctx, &rr->result, 1, &arg);
+        reject = true;
     }
 
+    TJS_SettlePromise(ctx, &rr->result, reject, 1, &arg);
+#ifdef _WIN32
+    s->tty_read_callback_active = was_in_read_callback;
+#endif
     tjs_read_req_free(ctx, rr);
-    STREAM_UNPIN_FINAL(s);
+    stream_callback_release_pin(s);
 }
+
+#ifdef _WIN32
+static void uv__read_restart_cb(uv_timer_t *handle) {
+    TJSStream *s = handle->data;
+    if (s->finalized || s->closing_for_runtime ||
+        s->trt->freeing || uv_is_closing(&s->h.handle)) {
+        return;
+    }
+
+    const uv_buf_t empty = uv_buf_init(NULL, 0);
+    if (s->streaming_read) {
+        int r = uv_read_start(&s->h.stream, uv__stream_alloc_cb, uv__stream_read_cb);
+        if (r != 0)
+            uv__stream_read_cb(&s->h.stream, r, &empty);
+    } else if (s->read_req) {
+        int r = uv_read_start(&s->h.stream, uv__read_once_alloc_cb, uv__read_once_cb);
+        if (r != 0)
+            uv__read_once_cb(&s->h.stream, r, &empty);
+    }
+}
+
+static void uv__read_restart_close_cb(uv_handle_t *handle) {
+    TJSStream *s = handle->data;
+    s->read_restart_initialized = false;
+    s->callback_refs--;
+    stream_maybe_free(s);
+}
+#endif
 
 static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected read buffer");
@@ -816,52 +1028,56 @@ static JSValue tjs_stream_read(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (sz == 0) return JS_ThrowTypeError(ctx, "read buffer must not be empty");
     TJS_CAPABILITY_REVALIDATE(tjs_stream_capability(ctx, s, TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "stream.read", NULL), (void)0, if (!stream_revalidate_read_buffer(ctx, s, &buf, &sz, argv[0])) return JS_EXCEPTION);
 
-    TJSReadReq *rr = js_malloc(ctx, sizeof(*rr));
-    if (!rr) return JS_EXCEPTION;
-    memset(rr, 0, sizeof(*rr));
+    TJSReadReq *rr = tjs__mallocz(sizeof(*rr));
+    if (!rr) return JS_ThrowOutOfMemory(ctx);
     rr->buf     = JS_DupValue(ctx, argv[0]);
-    rr->data    = js_malloc(ctx, sz);
+#ifdef _WIN32
+    bool uses_tty_read_buf = stream_is_windows_tty(s);
+    rr->data = uses_tty_read_buf ? NULL : tjs__malloc(sz);
+#else
+    rr->data = tjs__malloc(sz);
+#endif
     rr->data_len = sz;
     TJS_ClearPromise(ctx, &rr->result);
     rr->tty_read_started_foreground = s->h.handle.type == UV_TTY &&
                                       stream_tty_foreground_state(s) == 1;
+#ifdef _WIN32
+    if (!uses_tty_read_buf && !rr->data) {
+#else
     if (!rr->data) {
+#endif
         JS_FreeValue(ctx, rr->buf);
-        js_free(ctx, rr);
+        tjs__free(rr);
         return JS_ThrowOutOfMemory(ctx);
     }
     s->read_starting = true;
     JSValue promise = TJS_InitPromise(ctx, &rr->result);
     s->read_starting = false;
     if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, rr->buf);
-        js_free(ctx, rr->data);
-        js_free(ctx, rr);
+        tjs_read_req_free(ctx, rr);
         return promise;
     }
     if (!stream_check_open(ctx, s)) {
-        TJS_FreePromise(ctx, &rr->result);
         JS_FreeValue(ctx, promise);
         tjs_read_req_free(ctx, rr);
         return JS_EXCEPTION;
     }
     if (s->read_req || s->streaming_read) {
-        TJS_FreePromise(ctx, &rr->result);
         JS_FreeValue(ctx, promise);
         tjs_read_req_free(ctx, rr);
         return tjs_throw_errno_msg(ctx, UV_EALREADY, "read already in progress");
     }
 
     s->read_req = rr;
+    s->callback_refs++;
     stream_pin(ctx, s, this_val);
 
-    int r = uv_read_start(&s->h.stream, uv__read_once_alloc_cb, uv__read_once_cb);
+    int r = stream_begin_read(s);
     if (r != 0) {
         s->read_req = NULL;
-        TJS_FreePromise(ctx, &rr->result);
         JS_FreeValue(ctx, promise);
         tjs_read_req_free(ctx, rr);
-        stream_unpin(s);
+        stream_callback_release_pin(s);
         return tjs_throw_errno(ctx, r);
     }
 
@@ -873,14 +1089,16 @@ static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
     CHECK_NOT_NULL(s);
     if (s->finalized) {
         tjs__free(req);
+        stream_callback_release_pin(s);
         return;
     }
     JSContext *ctx = s->ctx;
 
     // Guard against runtime freeing
-    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    TJSRuntime *qrt = s->trt;
     if (!qrt || qrt->freeing) {
         tjs__free(req);
+        stream_callback_release_pin(s);
         return;
     }
 
@@ -891,8 +1109,8 @@ static void uv__shutdown_cb(uv_shutdown_t *req, int status) {
         TJS_RejectPromise(ctx, &s->shutdown_promise, 1, &arg);
     }
 
-    stream_unpin(s);
     tjs__free(req);
+    stream_callback_release_pin(s);
 }
 
 static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -921,12 +1139,14 @@ static JSValue tjs_stream_shutdown(JSContext *ctx, JSValue this_val, int argc, J
         return JS_EXCEPTION;
     }
 
+    s->callback_refs++;
     stream_pin(ctx, s, this_val);
 
     int r = uv_shutdown(req, &s->h.stream, uv__shutdown_cb);
     if (r != 0) {
         TJS_FreePromise(ctx, &s->shutdown_promise);
         JS_FreeValue(ctx, promise);
+        s->callback_refs--;
         stream_unpin(s);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
@@ -939,10 +1159,11 @@ static void uv__connect_cb(uv_connect_t *req, int status) {
     TJSStream *s = req->handle->data;
     CHECK_NOT_NULL(s);
     JSContext *ctx = s->ctx;
-    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    TJSRuntime *qrt = s->trt;
 
     if (s->finalized || !qrt || qrt->freeing) {
         tjs__free(req);
+        stream_callback_release_pin(s);
         return;
     }
 
@@ -955,14 +1176,15 @@ static void uv__connect_cb(uv_connect_t *req, int status) {
 
     /* A synchronous promise hook may start reading while we settle connect.
      * That operation owns a separate pin; always release the connect pin. */
-    STREAM_UNPIN_FINAL(s);
-
     tjs__free(req);
+    stream_callback_release_pin(s);
 }
 
 static void uv__connection_cb(uv_stream_t *handle, int status) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+    if (s->closing_for_runtime || s->trt->freeing)
+        return;
     if (!JS_IsFunction(s->ctx, s->callbacks[STREAM_CB_CONNECTION]))
         return;
 
@@ -1140,7 +1362,14 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
     s->h.handle.data = s;
     s->obj           = JS_UNDEFINED;
     s->pin_count     = 0;
+    s->callback_refs = 0;
     s->read_buf      = NULL;
+#ifdef _WIN32
+    s->tty_read_buf = NULL;
+    s->tty_read_buf_size = 0;
+    s->read_restart_initialized = false;
+    s->tty_read_callback_active = false;
+#endif
     s->read_req      = NULL;
     init_list_head(&s->link);
     list_add_tail(&s->link, &trt->streams);
@@ -1173,8 +1402,10 @@ static void tjs_stream_finalizer(JSRuntime *rt, TJSStream *s) {
     s->read_buf = NULL;
 
     if (s->read_req) {
-        tjs_read_req_free_rt(rt, s->read_req);
-        s->read_req = NULL;
+        TJSReadReq *rr = s->read_req;
+        TJS_FreePromiseRT(rt, &rr->result);
+        JS_FreeValueRT(rt, rr->buf);
+        rr->buf = JS_UNDEFINED;
     }
 
     if (!JS_IsUndefined(s->shutdown_promise.p))
@@ -1208,23 +1439,41 @@ static void tjs_stream_mark(JSRuntime *rt, TJSStream *s, JS_MarkFunc *mark_func)
 }
 
 void tjs__close_all_streams(TJSRuntime *qrt) {
-    struct list_head *p, *tmp;
-    list_for_each_safe(p, tmp, &qrt->streams) {
-        TJSStream *s = list_entry(p, TJSStream, link);
+    struct list_head pending;
+    init_list_head(&pending);
+    while (!list_empty(&qrt->streams)) {
+        struct list_head *p = qrt->streams.next;
+        list_del(p);
+        list_add_tail(p, &pending);
+    }
+    while (!list_empty(&pending)) {
+        TJSStream *s = list_entry(pending.next, TJSStream, link);
+        /* Unpinning can finalize this stream and any streams retained by its
+         * callbacks. Take the next entry from the live pending list, while
+         * keeping surviving wrappers registered for orphan cleanup. */
+        list_del(&s->link);
+        list_add_tail(&s->link, &qrt->streams);
         s->closing_for_runtime = 1;
 
         if (s->read_req)
             s->read_req->canceled = 1;
-        uv_read_stop(&s->h.stream);
+        stream_stop_read(s);
         js_free(s->ctx, s->read_buf);
         s->read_buf = NULL;
 
         if (!uv_is_closing(&s->h.handle)) {
             uv_close(&s->h.handle, uv__close_cb);
         }
-        while (s->pin_count > 0) {
+        /* The final unpin can run the JS wrapper finalizer synchronously. It
+         * may free s when the handle was already closed, so do not read
+         * s->pin_count after that unpin. */
+        unsigned pins = (unsigned)s->pin_count;
+        while (pins > 1) {
             stream_unpin(s);
+            pins--;
         }
+        if (pins == 1)
+            stream_unpin(s);
     }
 }
 
@@ -1232,7 +1481,8 @@ void tjs__free_orphaned_streams(TJSRuntime *qrt) {
     struct list_head *p, *tmp;
     list_for_each_safe(p, tmp, &qrt->streams) {
         TJSStream *s = list_entry(p, TJSStream, link);
-        if (!s->closing_for_runtime || !s->closed || s->finalized)
+        if (!s->closing_for_runtime || !s->closed || s->finalized ||
+            s->callback_refs != 0)
             continue;
 
         /* Globals can reach JS_FreeRuntime without a finalizer run; with no
@@ -1259,6 +1509,9 @@ static JSClassDef tjs_tcp_class = {
 };
 
 static JSValue tjs_new_tcp(JSContext *ctx, int af) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     JSValue obj = JS_NewObjectClass(ctx, tjs_tcp_class_id);
     if (JS_IsException(obj)) return obj;
 
@@ -1374,12 +1627,14 @@ static JSValue tjs_tcp_connect(JSContext *ctx, JSValue this_val, int argc, JSVal
         return JS_EXCEPTION;
     }
 
+    t->callback_refs++;
     stream_pin(ctx, t, this_val);
 
     int r = uv_tcp_connect(req, &t->h.tcp, (struct sockaddr *)&ss, uv__connect_cb);
     if (r != 0) {
         TJS_FreePromise(ctx, &t->connect_promise);
         JS_FreeValue(ctx, promise);
+        t->callback_refs--;
         stream_unpin(t);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
@@ -1612,6 +1867,9 @@ static JSValue tjs_tty_constructor(JSContext *ctx, JSValue new_target, int argc,
     if ((readable = JS_ToBool(ctx, argv[1])) == -1) return JS_EXCEPTION;
     TJS_CAPABILITY(tjs__capability_io(ctx, TJS_CAP_IO | TJS_CAP_IO_CONTROL, TJS_CAP_FLAG_REPLACEABLE, "tty.create", NULL), (void)0);
 
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     JSValue obj = JS_NewObjectClass(ctx, tjs_tty_class_id);
     if (JS_IsException(obj)) return obj;
 
@@ -1783,6 +2041,9 @@ static JSClassDef tjs_pipe_class = {
 };
 
 JSValue tjs_new_pipe(JSContext *ctx) {
+    TJSRuntime *qrt = TJS_GetRuntime(ctx);
+    if (!qrt || qrt->freeing)
+        return tjs_throw_errno_msg(ctx, UV_ESHUTDOWN, "runtime is shutting down");
     JSValue obj = JS_NewObjectClass(ctx, tjs_pipe_class_id);
     if (JS_IsException(obj)) return obj;
 
@@ -1882,6 +2143,7 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
         return tjs_throw_errno_msg(ctx, UV_EISCONN, "pipe already open");
     }
 
+    t->callback_refs++;
     stream_pin(ctx, t, this_val);
 
     int r = uv_pipe_connect2(req, &t->h.pipe, name, len, 0, uv__connect_cb);
@@ -1889,6 +2151,7 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValue this_val, int argc, JSVa
     if (r != 0) {
         TJS_FreePromise(ctx, &t->connect_promise);
         JS_FreeValue(ctx, promise);
+        t->callback_refs--;
         stream_unpin(t);
         tjs__free(req);
         return tjs_throw_errno(ctx, r);
@@ -2038,34 +2301,101 @@ static const JSCFunctionListEntry tjs_streams_funcs[] = {
 };
 /* clang-format on */
 
-
-/* Register one class with its own prototype that inherits from stream_proto. */
-#define STREAM_CLASS_INIT(id, def, extra, ctor_name, ctor_fn) do { \
-    JS_NewClassID(rt, &(id));                                        \
-    JS_NewClass(rt, id, &(def));                                     \
-    proto = JS_NewObjectProto(ctx, stream_proto);                    \
-    JS_SetPropertyFunctionList(ctx, proto, extra, countof(extra));   \
-    JS_SetClassProto(ctx, id, proto);                                \
-    obj = JS_NewCFunction2(ctx, ctor_fn, ctor_name, 1,              \
-                           JS_CFUNC_constructor, 0);                 \
-    JS_DefinePropertyValueStr(ctx, ns, ctor_name, obj, JS_PROP_C_W_E); \
-} while (0)
-
-void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
+static int stream_register_class(JSContext *ctx, JSClassID *id,
+                                  const JSClassDef *definition) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JSValue proto, obj;
-
-    /* Shared base prototype for all stream types. */
-    JSValue stream_proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, stream_proto, tjs_stream_proto_funcs,
-                               countof(tjs_stream_proto_funcs));
-
-    STREAM_CLASS_INIT(tjs_tcp_class_id,  tjs_tcp_class,  tjs_tcp_proto_funcs,  "TCP",  tjs_tcp_constructor);
-    STREAM_CLASS_INIT(tjs_tty_class_id,  tjs_tty_class,  tjs_tty_proto_funcs,  "TTY",  tjs_tty_constructor);
-    STREAM_CLASS_INIT(tjs_pipe_class_id, tjs_pipe_class, tjs_pipe_proto_funcs, "Pipe", tjs_pipe_constructor);
-
-    JS_SetPropertyFunctionList(ctx, ns, tjs_streams_funcs, countof(tjs_streams_funcs));
-    JS_FreeValue(ctx, stream_proto);
+    JSClassID class_id = JS_NewClassID(rt, id);
+    if (class_id == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate %s class ID",
+                              definition->class_name);
+        return -1;
+    }
+    if (!JS_IsRegisteredClass(rt, class_id) &&
+        JS_NewClass(rt, class_id, definition) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register %s class",
+                              definition->class_name);
+        return -1;
+    }
+    return 0;
 }
 
-#undef STREAM_CLASS_INIT
+static int stream_init_class_proto(JSContext *ctx, JSClassID id, JSValue base,
+                                    const JSCFunctionListEntry *functions,
+                                    int count) {
+    JSValue proto = JS_GetClassProto(ctx, id);
+    if (!JS_IsNull(proto)) {
+        JS_FreeValue(ctx, proto);
+        return 0;
+    }
+    proto = JS_NewObjectProto(ctx, base);
+    if (JS_IsException(proto)) return -1;
+    if (JS_SetPropertyFunctionList(ctx, proto, functions, count) < 0) {
+        JS_FreeValue(ctx, proto);
+        return -1;
+    }
+    JS_SetClassProto(ctx, id, proto);
+    return 0;
+}
+
+int tjs__streams_register_pipe_class(JSContext *ctx) {
+    if (stream_register_class(ctx, &tjs_pipe_class_id, &tjs_pipe_class) < 0)
+        return -1;
+    JSValue proto = JS_GetClassProto(ctx, tjs_pipe_class_id);
+    if (!JS_IsNull(proto)) {
+        JS_FreeValue(ctx, proto);
+        return 0;
+    }
+
+    JSValue base = JS_NewObject(ctx);
+    if (JS_IsException(base)) return -1;
+    int result = JS_SetPropertyFunctionList(ctx, base, tjs_stream_proto_funcs,
+                                           countof(tjs_stream_proto_funcs));
+    if (result >= 0)
+        result = stream_init_class_proto(ctx, tjs_pipe_class_id, base,
+                                          tjs_pipe_proto_funcs,
+                                          countof(tjs_pipe_proto_funcs));
+    JS_FreeValue(ctx, base);
+    return result;
+}
+
+void tjs__mod_streams_init(JSContext *ctx, JSValue ns) {
+    if (tjs__streams_register_pipe_class(ctx) < 0) return;
+    JSValue pipe_proto = JS_GetClassProto(ctx, tjs_pipe_class_id);
+    JSValue base = JS_GetPrototype(ctx, pipe_proto);
+    JS_FreeValue(ctx, pipe_proto);
+    if (JS_IsException(base)) return;
+
+    if (stream_register_class(ctx, &tjs_tcp_class_id, &tjs_tcp_class) < 0 ||
+        stream_init_class_proto(ctx, tjs_tcp_class_id, base,
+                                  tjs_tcp_proto_funcs,
+                                  countof(tjs_tcp_proto_funcs)) < 0 ||
+        stream_register_class(ctx, &tjs_tty_class_id, &tjs_tty_class) < 0 ||
+        stream_init_class_proto(ctx, tjs_tty_class_id, base,
+                                  tjs_tty_proto_funcs,
+                                  countof(tjs_tty_proto_funcs)) < 0) {
+        JS_FreeValue(ctx, base);
+        return;
+    }
+    JS_FreeValue(ctx, base);
+
+    if (JS_SetPropertyFunctionList(ctx, ns, tjs_streams_funcs,
+                                   countof(tjs_streams_funcs)) < 0)
+        return;
+    const struct {
+        const char *name;
+        JSCFunction *function;
+    } constructors[] = {
+        { "TCP", tjs_tcp_constructor },
+        { "TTY", tjs_tty_constructor },
+        { "Pipe", tjs_pipe_constructor },
+    };
+    for (size_t i = 0; i < countof(constructors); i++) {
+        JSValue ctor = JS_NewCFunction2(ctx, constructors[i].function,
+                                        constructors[i].name, 1,
+                                        JS_CFUNC_constructor, 0);
+        if (JS_IsException(ctor)) return;
+        if (JS_DefinePropertyValueStr(ctx, ns, constructors[i].name, ctor,
+                                      JS_PROP_C_W_E) < 0)
+            return;
+    }
+}

@@ -68,6 +68,114 @@
     extern char **environ;
 #endif
 
+typedef struct TJSProcess TJSProcess;
+
+#ifndef _WIN32
+
+typedef struct TJSProcessReapTask {
+    pid_t pid;
+    bool terminate;
+    struct TJSProcessReapTask *next;
+} TJSProcessReapTask;
+
+static uv_once_t tjs_process_reaper_once = UV_ONCE_INIT;
+static uv_mutex_t tjs_process_reaper_mutex;
+static uv_cond_t tjs_process_reaper_cond;
+static uv_thread_t tjs_process_reaper_thread;
+static TJSProcessReapTask *tjs_process_reaper_head;
+static TJSProcessReapTask *tjs_process_reaper_tail;
+static size_t tjs_process_reaper_reservations;
+static bool tjs_process_reaper_active;
+static bool tjs_process_reaper_joinable;
+static bool tjs_process_fork_in_progress;
+static int tjs_process_reaper_init_error;
+
+static void process_reaper_init(void) {
+    tjs_process_reaper_init_error = uv_mutex_init(&tjs_process_reaper_mutex);
+    if (tjs_process_reaper_init_error != 0) return;
+    tjs_process_reaper_init_error = uv_cond_init(&tjs_process_reaper_cond);
+    if (tjs_process_reaper_init_error != 0)
+        uv_mutex_destroy(&tjs_process_reaper_mutex);
+}
+
+static void process_reaper_worker(void *arg) {
+    (void)arg;
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+
+    for (;;) {
+        TJSProcessReapTask *completed = NULL;
+        TJSProcessReapTask **completed_tail = &completed;
+        TJSProcessReapTask **link = &tjs_process_reaper_head;
+        TJSProcessReapTask *previous = NULL;
+        bool pending = false;
+
+        while (*link) {
+            TJSProcessReapTask *task = *link;
+            pid_t result;
+            if (task->terminate) {
+                int kill_result;
+                do {
+                    kill_result = kill(task->pid, SIGKILL);
+                } while (kill_result != 0 && errno == EINTR);
+                /* ESRCH means the child already exited; other errors leave
+                 * waitpid as the ownership-preserving fallback. */
+                task->terminate = false;
+            }
+            do {
+                result = waitpid(task->pid, NULL, WNOHANG);
+            } while (result < 0 && errno == EINTR);
+
+            if (result == task->pid || (result < 0 && errno == ECHILD)) {
+                *link = task->next;
+                if (tjs_process_reaper_tail == task)
+                    tjs_process_reaper_tail = previous;
+                task->next = NULL;
+                *completed_tail = task;
+                completed_tail = &task->next;
+                CHECK_GT(tjs_process_reaper_reservations, 0);
+                tjs_process_reaper_reservations--;
+                continue;
+            }
+
+            pending = true;
+            previous = task;
+            link = &task->next;
+        }
+
+        while (completed) {
+            TJSProcessReapTask *task = completed;
+            completed = task->next;
+            tjs__free(task);
+        }
+
+        if (tjs_process_reaper_reservations == 0) {
+            CHECK_NULL(tjs_process_reaper_head);
+            tjs_process_reaper_tail = NULL;
+            tjs_process_reaper_active = false;
+            uv_cond_broadcast(&tjs_process_reaper_cond);
+            uv_mutex_unlock(&tjs_process_reaper_mutex);
+            return;
+        }
+
+        if (pending) {
+            (void)uv_cond_timedwait(&tjs_process_reaper_cond,
+                                    &tjs_process_reaper_mutex,
+                                    20 * 1000 * 1000);
+        } else {
+            uv_cond_wait(&tjs_process_reaper_cond,
+                         &tjs_process_reaper_mutex);
+        }
+    }
+}
+
+static int process_reaper_reserve(TJSProcess *p);
+static void process_reaper_release(TJSProcess *p);
+static void process_reaper_adopt(TJSProcess *p, bool terminate);
+static int process_reaper_adopt_pid(pid_t pid);
+static int process_reaper_fork_prepare(void);
+static void process_reaper_fork_finish(void);
+#endif
+
 
 #ifdef _WIN32
 typedef HRESULT (WINAPI *CreatePseudoConsolePtr)(COORD, HANDLE, HANDLE, DWORD, HPCON *);
@@ -94,17 +202,36 @@ static bool load_conpty(void) {
 
 /* Modes: normal (uv_process_t + Pipe objects), PTY (fork+openpty / ConPTY),
  * raw fork (waitpid + timer). p->process is NOT initialized in PTY/fork. */
-static thread_local JSClassID tjs_process_class_id;
 static thread_local struct list_head tjs_fork_processes;
 static thread_local bool tjs_fork_processes_initialized;
 static thread_local size_t tjs_live_nonfork_processes;
 
-typedef struct {
+static JSClassID tjs_process_class_id;
+static JSClassDef tjs_process_class;
+
+static int tjs_process_register_class(JSContext *ctx) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSClassID class_id = JS_NewClassID(rt, &tjs_process_class_id);
+    if (class_id == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Process class ID");
+        return -1;
+    }
+    if (!JS_IsRegisteredClass(rt, class_id) &&
+        JS_NewClass(rt, class_id, &tjs_process_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register Process class");
+        return -1;
+    }
+    return 0;
+}
+
+struct TJSProcess {
+    TJSRuntime *trt;
     JSContext *ctx;
     JSValue    obj;        /* GC pin while live; intentionally omitted from gc_mark */
     bool pty_mode;
     bool fork_mode;
     bool handle_initialized;
+    bool process_spawned;
     bool closed;
     bool finalized;
     bool counted_nonfork;
@@ -133,13 +260,315 @@ typedef struct {
     uv_timer_t fork_waiter;
     struct list_head fork_link;
     bool    fork_linked;
+    struct list_head runtime_link;
+    bool    runtime_linked;
+    bool    runtime_cleanup_queued;
+    bool    runtime_cleaning;
+#ifndef _WIN32
+    TJSProcessReapTask *reaper_task;
+#endif
 #ifdef _WIN32
     HPCON  hpc;
     HANDLE pty_proc_handle; /* kept for waitSync */
 #else
     int master_fd;  /* ioctl target; libuv owns the fd via pty_readable */
 #endif
-} TJSProcess;
+};
+
+static void process_list_add(TJSProcess *p) {
+    init_list_head(&p->runtime_link);
+    list_add(&p->runtime_link, &p->trt->processes);
+    p->runtime_linked = true;
+    p->runtime_cleanup_queued = false;
+}
+
+static void process_list_remove(TJSProcess *p) {
+    if (!p->runtime_linked) return;
+    list_del(&p->runtime_link);
+    p->runtime_linked = false;
+}
+
+#ifdef _WIN32
+typedef struct {
+    HANDLE handle;
+} TJSProcessWaitTask;
+
+static void process_windows_wait_worker(void *arg) {
+    TJSProcessWaitTask *task = arg;
+    (void) WaitForSingleObject(task->handle, INFINITE);
+    CloseHandle(task->handle);
+    tjs__free(task);
+}
+
+/* Runtime teardown may outlive the JS Process wrapper. Transfer the process
+ * handle to a detached waiter instead of closing it while the child is live. */
+static int process_windows_adopt_wait(HANDLE handle, bool *consumed) {
+    TJSProcessWaitTask *task;
+    uv_thread_t thread;
+
+    *consumed = false;
+    if (!handle || handle == INVALID_HANDLE_VALUE) return UV_EINVAL;
+    task = tjs__mallocz(sizeof(*task));
+    if (!task) return UV_ENOMEM;
+    task->handle = handle;
+
+    int r = uv_thread_create(&thread, process_windows_wait_worker, task);
+    if (r != 0) {
+        tjs__free(task);
+        return r;
+    }
+    *consumed = true;
+    r = uv_thread_detach(&thread);
+    if (r != 0) {
+        /* The thread owns task after creation; joining is the only safe way
+         * to reclaim it if the platform refuses to detach the thread. */
+        (void) uv_thread_join(&thread);
+        return r;
+    }
+    return 0;
+}
+
+/* The caller must clear its handle after this returns. If the detached waiter
+ * could not be created, wait synchronously so the live process handle is still
+ * accounted for rather than being closed under a running child. */
+static void process_windows_relinquish_failed_handle(HANDLE *handle) {
+    bool consumed = false;
+    int r = process_windows_adopt_wait(*handle, &consumed);
+    if (consumed) {
+        *handle = NULL;
+        return;
+    }
+    if (r != 0) {
+        (void) WaitForSingleObject(*handle, INFINITE);
+        CloseHandle(*handle);
+    }
+    *handle = NULL;
+}
+
+/* Keep a normal uv_process_t's handle valid for libuv while a duplicate is
+ * watched independently. This is needed when uv_process_kill() fails: closing
+ * the uv handle alone would otherwise abandon a still-running child. */
+static void process_windows_preserve_process_until_exit(HANDLE handle) {
+    HANDLE duplicate = NULL;
+    bool consumed = false;
+
+    if (!handle || handle == INVALID_HANDLE_VALUE) return;
+    if (DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(),
+                        &duplicate, SYNCHRONIZE, FALSE, 0)) {
+        int r = process_windows_adopt_wait(duplicate, &consumed);
+        if (!consumed) {
+            (void) WaitForSingleObject(duplicate, INFINITE);
+            CloseHandle(duplicate);
+        } else if (r != 0) {
+            /* A failed detach still leaves ownership with the worker/join path. */
+        }
+        return;
+    }
+
+    /* Preserve ownership even if duplicating or creating a waiter is not
+     * possible. The original handle remains owned by libuv and is closed only
+     * after this bounded-to-exit fallback returns. */
+    (void) WaitForSingleObject(handle, INFINITE);
+}
+
+static int process_reaper_reserve(TJSProcess *p) {
+    (void)p;
+    return 0;
+}
+
+static void process_reaper_release(TJSProcess *p) {
+    (void)p;
+}
+
+static void process_reaper_adopt(TJSProcess *p, bool terminate) {
+    (void)p;
+    (void)terminate;
+}
+#else
+static int process_reaper_reserve(TJSProcess *p) {
+    TJSProcessReapTask *task = tjs__mallocz(sizeof(*task));
+    if (!task) return UV_ENOMEM;
+
+    uv_once(&tjs_process_reaper_once, process_reaper_init);
+    if (tjs_process_reaper_init_error != 0) {
+        tjs__free(task);
+        return tjs_process_reaper_init_error;
+    }
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    if (tjs_process_fork_in_progress) {
+        uv_mutex_unlock(&tjs_process_reaper_mutex);
+        tjs__free(task);
+        return UV_EBUSY;
+    }
+
+    CHECK_NULL(p->reaper_task);
+    int r = 0;
+    if (!tjs_process_reaper_active) {
+        if (tjs_process_reaper_joinable) {
+            r = uv_thread_join(&tjs_process_reaper_thread);
+            if (r != 0) {
+                uv_mutex_unlock(&tjs_process_reaper_mutex);
+                tjs__free(task);
+                return r;
+            }
+            tjs_process_reaper_joinable = false;
+        }
+
+        tjs_process_reaper_active = true;
+        tjs_process_reaper_reservations++;
+        r = uv_thread_create(&tjs_process_reaper_thread,
+                             process_reaper_worker, NULL);
+        if (r != 0) {
+            tjs_process_reaper_active = false;
+            tjs_process_reaper_reservations--;
+            uv_mutex_unlock(&tjs_process_reaper_mutex);
+            tjs__free(task);
+            return r;
+        }
+        tjs_process_reaper_joinable = true;
+    } else {
+        tjs_process_reaper_reservations++;
+    }
+
+    p->reaper_task = task;
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+    return 0;
+}
+
+static void process_reaper_release(TJSProcess *p) {
+    TJSProcessReapTask *task = p->reaper_task;
+    if (!task) return;
+    p->reaper_task = NULL;
+
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    CHECK_GT(tjs_process_reaper_reservations, 0);
+    tjs_process_reaper_reservations--;
+    uv_cond_signal(&tjs_process_reaper_cond);
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+    tjs__free(task);
+}
+
+static void process_reaper_adopt(TJSProcess *p, bool terminate) {
+    TJSProcessReapTask *task = p->reaper_task;
+    if (!task) return;
+    p->reaper_task = NULL;
+
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    CHECK(tjs_process_reaper_active);
+    CHECK_GT(tjs_process_reaper_reservations, 0);
+    task->pid = p->process.pid;
+    task->terminate = terminate;
+    if (tjs_process_reaper_tail)
+        tjs_process_reaper_tail->next = task;
+    else
+        tjs_process_reaper_head = task;
+    tjs_process_reaper_tail = task;
+    uv_cond_signal(&tjs_process_reaper_cond);
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+}
+
+static int process_reaper_adopt_pid(pid_t pid) {
+    TJSProcessReapTask *task;
+
+    if (pid <= 0) return UV_EINVAL;
+    task = tjs__mallocz(sizeof(*task));
+    if (!task) return UV_ENOMEM;
+
+    uv_once(&tjs_process_reaper_once, process_reaper_init);
+    if (tjs_process_reaper_init_error != 0) {
+        tjs__free(task);
+        return tjs_process_reaper_init_error;
+    }
+
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    if (tjs_process_fork_in_progress) {
+        uv_mutex_unlock(&tjs_process_reaper_mutex);
+        tjs__free(task);
+        return UV_EBUSY;
+    }
+
+    int r = 0;
+    if (!tjs_process_reaper_active) {
+        if (tjs_process_reaper_joinable) {
+            r = uv_thread_join(&tjs_process_reaper_thread);
+            if (r != 0) {
+                uv_mutex_unlock(&tjs_process_reaper_mutex);
+                tjs__free(task);
+                return r;
+            }
+            tjs_process_reaper_joinable = false;
+        }
+
+        tjs_process_reaper_active = true;
+        tjs_process_reaper_reservations++;
+        r = uv_thread_create(&tjs_process_reaper_thread,
+                             process_reaper_worker, NULL);
+        if (r != 0) {
+            tjs_process_reaper_active = false;
+            tjs_process_reaper_reservations--;
+            uv_mutex_unlock(&tjs_process_reaper_mutex);
+            tjs__free(task);
+            return r;
+        }
+        tjs_process_reaper_joinable = true;
+    } else {
+        tjs_process_reaper_reservations++;
+    }
+
+    task->pid = pid;
+    task->terminate = true;
+    if (tjs_process_reaper_tail)
+        tjs_process_reaper_tail->next = task;
+    else
+        tjs_process_reaper_head = task;
+    tjs_process_reaper_tail = task;
+    uv_cond_signal(&tjs_process_reaper_cond);
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+    return 0;
+}
+
+static int process_reaper_fork_prepare(void) {
+    uv_once(&tjs_process_reaper_once, process_reaper_init);
+    if (tjs_process_reaper_init_error != 0)
+        return tjs_process_reaper_init_error;
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    if (tjs_process_fork_in_progress || tjs_process_reaper_reservations != 0) {
+        uv_mutex_unlock(&tjs_process_reaper_mutex);
+        return UV_EBUSY;
+    }
+
+    tjs_process_fork_in_progress = true;
+    if (tjs_process_reaper_joinable) {
+        uv_cond_broadcast(&tjs_process_reaper_cond);
+        uv_thread_t thread = tjs_process_reaper_thread;
+        uv_mutex_unlock(&tjs_process_reaper_mutex);
+        int r = uv_thread_join(&thread);
+        uv_mutex_lock(&tjs_process_reaper_mutex);
+        if (r != 0) {
+            tjs_process_fork_in_progress = false;
+            uv_mutex_unlock(&tjs_process_reaper_mutex);
+            return r;
+        }
+        tjs_process_reaper_active = false;
+        tjs_process_reaper_joinable = false;
+    }
+    if (tjs_process_reaper_head || tjs_process_reaper_reservations != 0) {
+        tjs_process_fork_in_progress = false;
+        uv_mutex_unlock(&tjs_process_reaper_mutex);
+        return UV_EBUSY;
+    }
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+    return 0;
+}
+
+static void process_reaper_fork_finish(void) {
+    uv_mutex_lock(&tjs_process_reaper_mutex);
+    CHECK(tjs_process_fork_in_progress);
+    tjs_process_fork_in_progress = false;
+    uv_cond_broadcast(&tjs_process_reaper_cond);
+    uv_mutex_unlock(&tjs_process_reaper_mutex);
+}
+#endif
 
 #ifdef _WIN32
 static WCHAR *spawn_sync_utf8_to_wide(JSContext *ctx, const char *s);
@@ -265,11 +694,11 @@ fail:
     return NULL;
 }
 
-static char **empty_env(JSContext *ctx) {
+static inline char **empty_env(JSContext *ctx) {
     return js_mallocz(ctx, sizeof(char *));
 }
 
-static void free_env(JSContext *ctx, char **env) {
+static inline void free_env(JSContext *ctx, char **env) {
     if (!env) return;
     for (int i = 0; env[i]; i++) js_free(ctx, env[i]);
     js_free(ctx, env);
@@ -436,26 +865,17 @@ static int materialize_spawn_stdio(JSContext *ctx, TJSProcess *p,
 }
 
 static void free_str_arr(JSContext *ctx, char **arr, int len);
+static int process_argv_length(JSContext *ctx, JSValue array, uint64_t *len_out);
 
 /* Build a NULL-terminated argv array from a JS array.  Uses js_malloc / js_strdup. */
 static char **parse_argv_arr(JSContext *ctx, JSValue js_arr, int *len_out) {
     *len_out = 0;
-    JSValue lv = JS_GetPropertyStr(ctx, js_arr, "length");
-    uint64_t len64 = 0;
-    if (JS_IsException(lv) || JS_ToIndex(ctx, &len64, lv) < 0) {
-        JS_FreeValue(ctx, lv);
+    uint64_t len64;
+    if (process_argv_length(ctx, js_arr, &len64) < 0) {
         *len_out = -1;
         return NULL;
     }
-    JS_FreeValue(ctx, lv);
     if (len64 == 0) return NULL;
-    /* The process backends and free_str_arr use int lengths.  Reject an
-     * oversized JS array before narrowing or allocating its pointer table. */
-    if (len64 > INT_MAX || len64 > (uint64_t)(SIZE_MAX / sizeof(char *) - 1)) {
-        JS_ThrowRangeError(ctx, "argv array is too large");
-        *len_out = -1;
-        return NULL;
-    }
     int32_t len = (int32_t)len64;
     char **arr = js_mallocz(ctx, sizeof(char *) * ((size_t)len + 1));
     if (!arr) {
@@ -511,6 +931,22 @@ static void free_str_arr(JSContext *ctx, char **arr, int len) {
     js_free(ctx, arr);
 }
 
+static int process_argv_length(JSContext *ctx, JSValue array, uint64_t *len_out) {
+    JSValue length = JS_GetPropertyStr(ctx, array, "length");
+    uint64_t len;
+    if (JS_IsException(length) || JS_ToIndex(ctx, &len, length) < 0) {
+        JS_FreeValue(ctx, length);
+        return -1;
+    }
+    JS_FreeValue(ctx, length);
+    if (len > INT_MAX || len > (uint64_t)(SIZE_MAX / sizeof(char *) - 1)) {
+        JS_ThrowRangeError(ctx, "argv array is too large");
+        return -1;
+    }
+    *len_out = len;
+    return 0;
+}
+
 static char **tjs__parse_args(JSContext *ctx, JSValue arg0);
 static void tjs__free_args(JSContext *ctx, char **args);
 
@@ -538,12 +974,22 @@ static int parse_winsize(JSContext *ctx, JSValue opts, int *cols, int *rows) {
     return 0;
 }
 
-static TJSProcess *tjs_process_get(JSContext *ctx, JSValue obj) {
-    return JS_GetOpaque2(ctx, obj, tjs_process_class_id);
+static inline TJSProcess *tjs_process_get(JSContext *ctx, JSValue obj) {
+    JSClassID class_id = tjs_process_class_id;
+    if (class_id == 0) {
+        JS_ThrowTypeError(ctx, "invalid process runtime");
+        return NULL;
+    }
+    return JS_GetOpaque2(ctx, obj, class_id);
 }
 
 static TJSProcess *tjs_process_new(JSContext *ctx, JSValue *obj_out) {
-    JSValue obj = JS_NewObjectClass(ctx, tjs_process_class_id);
+    JSClassID class_id = tjs_process_class_id;
+    if (class_id == 0) {
+        *obj_out = JS_ThrowTypeError(ctx, "process module is not initialized");
+        return NULL;
+    }
+    JSValue obj = JS_NewObjectClass(ctx, class_id);
     if (JS_IsException(obj)) {
         *obj_out = obj;
         return NULL;
@@ -556,6 +1002,7 @@ static TJSProcess *tjs_process_new(JSContext *ctx, JSValue *obj_out) {
         return NULL;
     }
 
+    p->trt           = TJS_GetRuntime(ctx);
     p->ctx           = ctx;
     p->process.data  = p;
     p->obj           = JS_UNDEFINED;
@@ -573,6 +1020,7 @@ static TJSProcess *tjs_process_new(JSContext *ctx, JSValue *obj_out) {
     p->hpc             = NULL;
     p->pty_proc_handle = NULL;
 #endif
+    process_list_add(p);
     *obj_out = obj;
     return p;
 }
@@ -590,7 +1038,10 @@ static void uv__proc_close_cb(uv_handle_t *handle) {
         list_del(&p->fork_link);
         p->fork_linked = false;
     }
-    if (p->finalized) tjs__free(p);
+    if (p->finalized) {
+        process_list_remove(p);
+        tjs__free(p);
+    }
 }
 
 static void maybe_close(TJSProcess *p) {
@@ -613,11 +1064,18 @@ static void pty_win_close_hpcon(TJSProcess *p) {
     p->hpc = NULL;
     if (hpc && pClosePseudoConsole) pClosePseudoConsole(hpc);
 }
+
+static void process_windows_close_pty_handle(TJSProcess *p) {
+    HANDLE handle = p->pty_proc_handle;
+    p->pty_proc_handle = NULL;
+    if (handle) CloseHandle(handle);
+}
 #endif
 
 static void process_finish(TJSProcess *p, int64_t exit_status, int term_signal) {
-    if (p->status.exited) return;
+    if (p->status.exited || p->status.lost) return;
 
+    process_reaper_release(p);
     p->status.exited = true;
     p->status.exit_status = exit_status;
     p->status.term_signal = term_signal;
@@ -625,8 +1083,17 @@ static void process_finish(TJSProcess *p, int64_t exit_status, int term_signal) 
 #ifdef _WIN32
     /* Reached only after the child is confirmed dead; close before the
      * promise settles so EOF is already in flight when JS sees the exit. */
-    if (p->pty_mode) pty_win_close_hpcon(p);
+    if (p->pty_mode) {
+        pty_win_close_hpcon(p);
+        process_windows_close_pty_handle(p);
+    }
 #endif
+
+    if (p->trt && p->trt->freeing) {
+        process_list_remove(p);
+        maybe_close(p);
+        return;
+    }
 
     if (!JS_IsUndefined(p->status.result.p)) {
         JSValue arg = make_exit_obj(p->ctx, exit_status, term_signal);
@@ -634,6 +1101,7 @@ static void process_finish(TJSProcess *p, int64_t exit_status, int term_signal) 
     }
 
     maybe_close(p);
+    process_list_remove(p);
     if (!JS_IsUndefined(p->obj)) {
         JSValue obj = p->obj;
         p->obj = JS_UNDEFINED;
@@ -657,28 +1125,152 @@ static int decode_wait_status(int status, int64_t *exit_status, int *term_signal
 }
 #endif
 
+static int process_no_child_error(void) {
+#ifdef _WIN32
+    return UV_EIO;
+#else
+    return uv_translate_sys_error(ECHILD);
+#endif
+}
+
+#ifdef _WIN32
+static int process_windows_terminate_and_wait(HANDLE process_handle) {
+    if (!process_handle) return UV_EINVAL;
+
+    if (!TerminateProcess(process_handle, 1)) {
+        DWORD terminate_error = GetLastError();
+        DWORD wait_result = WaitForSingleObject(process_handle, 0);
+        if (wait_result != WAIT_OBJECT_0) {
+            if (wait_result == WAIT_FAILED)
+                terminate_error = GetLastError();
+            return uv_translate_sys_error((int)terminate_error);
+        }
+    }
+
+    DWORD wait_result = WaitForSingleObject(process_handle, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+        DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+        return uv_translate_sys_error((int)wait_error);
+    }
+    return 0;
+}
+
+static int process_windows_get_exit_code(HANDLE process_handle,
+                                         int64_t *exit_status) {
+    DWORD status;
+    if (!process_handle) return UV_EINVAL;
+    if (!GetExitCodeProcess(process_handle, &status))
+        return uv_translate_sys_error(GetLastError());
+    *exit_status = (int64_t)status;
+    return 0;
+}
+#else
+static int process_posix_kill_and_reap(pid_t pid, int64_t *exit_status,
+                                       int *term_signal) {
+    if (pid <= 0) return UV_EINVAL;
+
+    if (kill(pid, SIGKILL) != 0) {
+        int err = errno;
+        if (err != ESRCH) return uv_translate_sys_error(err);
+    }
+
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) {
+        int err = waited < 0 ? uv_translate_sys_error(errno)
+                             : process_no_child_error();
+        return err;
+    }
+
+    int64_t ignored_exit_status;
+    int ignored_term_signal;
+    if (!exit_status) exit_status = &ignored_exit_status;
+    if (!term_signal) term_signal = &ignored_term_signal;
+    if (decode_wait_status(status, exit_status, term_signal) < 0)
+        return process_no_child_error();
+    return 0;
+}
+
+/* Last-resort cleanup when the asynchronous reaper cannot be started. The
+ * caller still owns the child at this point, so a blocking wait is preferable
+ * to dropping the PID and leaving a zombie behind. */
+static int process_posix_force_reap(pid_t pid, int64_t *exit_status,
+                                    int *term_signal) {
+    if (pid <= 0) return UV_EINVAL;
+    int kill_result;
+    do {
+        kill_result = kill(pid, SIGKILL);
+    } while (kill_result != 0 && errno == EINTR);
+    /* A failed SIGKILL does not transfer waitpid ownership. Still wait and
+     * reap the child here; this is the last synchronous fallback after the
+     * independent reaper could not be started. */
+
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) {
+        int err = waited < 0 ? uv_translate_sys_error(errno)
+                             : process_no_child_error();
+        return err;
+    }
+
+    int64_t ignored_exit_status;
+    int ignored_term_signal;
+    if (!exit_status) exit_status = &ignored_exit_status;
+    if (!term_signal) term_signal = &ignored_term_signal;
+    if (decode_wait_status(status, exit_status, term_signal) < 0)
+        return process_no_child_error();
+    return 0;
+}
+#endif
+
+static void process_mark_lost_impl(TJSProcess *p, int err, bool terminate_reaper);
+
+static void process_mark_lost(TJSProcess *p, int err) {
+    process_mark_lost_impl(p, err, true);
+}
+
 static void uv__pty_wait_cb(uv_timer_t *handle) {
     TJSProcess *p = handle->data;
     CHECK_NOT_NULL(p);
-    if (p->status.exited) return;
+    if (p->status.exited || p->status.lost) return;
 
     int64_t exit_status = 0;
     int term_signal = 0;
 #ifdef _WIN32
     DWORD wait_result = WaitForSingleObject(p->pty_proc_handle, 0);
     if (wait_result == WAIT_TIMEOUT) return;
-    if (wait_result != WAIT_OBJECT_0) return;
-    DWORD status;
-    if (!GetExitCodeProcess(p->pty_proc_handle, &status)) return;
-    exit_status = (int64_t)status;
+    if (wait_result != WAIT_OBJECT_0) {
+        DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+        process_mark_lost(p, uv_translate_sys_error((int)wait_error));
+        return;
+    }
+    int exit_code_result = process_windows_get_exit_code(p->pty_proc_handle,
+                                                          &exit_status);
+    if (exit_code_result != 0) {
+        process_mark_lost(p, exit_code_result);
+        return;
+    }
 #else
     int status;
     pid_t result;
     do {
         result = waitpid(p->pty_pid, &status, WNOHANG);
     } while (result < 0 && errno == EINTR);
-    if (result <= 0) return;
-    if (decode_wait_status(status, &exit_status, &term_signal) < 0) return;
+    if (result == 0) return;
+    if (result < 0) {
+        process_mark_lost(p, uv_translate_sys_error(errno));
+        return;
+    }
+    if (decode_wait_status(status, &exit_status, &term_signal) < 0) {
+        process_mark_lost(p, process_no_child_error());
+        return;
+    }
 #endif
 
     process_finish(p, exit_status, term_signal);
@@ -696,10 +1288,36 @@ static JSValue make_fork_wait_error(TJSProcess *p, JSContext *ctx, int err) {
     return JS_GetException(ctx);
 }
 
-static void process_lose_fork_waiter(TJSProcess *p, int err) {
+static void process_mark_lost_impl(TJSProcess *p, int err, bool terminate_reaper) {
     if (p->status.exited || p->status.lost) return;
     p->status.lost = true;
     p->status.wait_error = err;
+
+#ifdef _WIN32
+    if (p->pty_mode && p->pty_proc_handle) {
+        /* The wait handle is no longer usable on this path. Keep an
+         * independent wait owner until the child exits before releasing it. */
+        process_windows_preserve_process_until_exit(p->pty_proc_handle);
+        process_windows_close_pty_handle(p);
+    }
+#endif
+
+    if (p->process_spawned && !p->pty_mode && !p->fork_mode) {
+#ifdef _WIN32
+        if (err != UV_ESRCH)
+            process_windows_preserve_process_until_exit(
+                p->process.process_handle);
+#endif
+        /* Remove libuv's wait owner before waking the independent reaper. */
+        maybe_close(p);
+        process_reaper_adopt(p, terminate_reaper);
+    }
+
+    if (p->trt && p->trt->freeing) {
+        process_list_remove(p);
+        maybe_close(p);
+        return;
+    }
 
     if (!JS_IsUndefined(p->status.result.p)) {
         JSValue arg = make_fork_wait_error(p, p->ctx, err);
@@ -707,6 +1325,7 @@ static void process_lose_fork_waiter(TJSProcess *p, int err) {
     }
 
     maybe_close(p);
+    process_list_remove(p);
     if (!JS_IsUndefined(p->obj)) {
         JSValue obj = p->obj;
         p->obj = JS_UNDEFINED;
@@ -724,7 +1343,7 @@ static bool fork_handle_is_foreign(const TJSProcess *p) {
  * new process; disarm the inherited timer so it cannot spin on ECHILD. */
 static void fork_disown_in_child(TJSProcess *p) {
     uv_timer_stop(&p->fork_waiter);
-    process_lose_fork_waiter(p, uv_translate_sys_error(ECHILD));
+    process_mark_lost(p, uv_translate_sys_error(ECHILD));
 }
 
 static void ensure_fork_process_list(void) {
@@ -758,7 +1377,7 @@ static void uv__fork_wait_cb(uv_timer_t *handle) {
 
     if (result == 0) return;
     if (result < 0) {
-        process_lose_fork_waiter(p, uv_translate_sys_error(errno));
+        process_mark_lost(p, uv_translate_sys_error(errno));
         return;
     }
 
@@ -770,37 +1389,217 @@ static void uv__fork_wait_cb(uv_timer_t *handle) {
 #endif
 
 static void tjs_process_finalizer(JSRuntime *rt, JSValue val) {
-    TJSProcess *p = JS_GetOpaque(val, tjs_process_class_id);
+    TJSProcess *p = JS_GetOpaque(val, JS_GetClassID(val));
     if (!p) return;
 
     /* p->obj pins this same Process wrapper while the child is alive. Once
      * QuickJS is finalizing the wrapper, only detach the pin. */
     p->obj = JS_UNDEFINED;
     TJS_FreePromiseRT(rt, &p->status.result);
-    for (int i = 0; i < 3; i++) JS_FreeValueRT(rt, p->stdio[i]);
-    JS_FreeValueRT(rt, p->stdio_extra);
-    JS_FreeValueRT(rt, p->ipc_pipe);
+    for (int i = 0; i < 3; i++) {
+        JSValue value = p->stdio[i];
+        p->stdio[i] = JS_UNDEFINED;
+        JS_FreeValueRT(rt, value);
+    }
+    JSValue stdio_extra = p->stdio_extra;
+    p->stdio_extra = JS_UNDEFINED;
+    JS_FreeValueRT(rt, stdio_extra);
+    JSValue ipc_pipe = p->ipc_pipe;
+    p->ipc_pipe = JS_UNDEFINED;
+    JS_FreeValueRT(rt, ipc_pipe);
 
     if (p->pty_mode) {
-        JS_FreeValueRT(rt, p->pty_readable);
-        JS_FreeValueRT(rt, p->pty_writable);
+        JSValue pty_readable = p->pty_readable;
+        JSValue pty_writable = p->pty_writable;
+        p->pty_readable = JS_UNDEFINED;
+        p->pty_writable = JS_UNDEFINED;
+        JS_FreeValueRT(rt, pty_readable);
+        JS_FreeValueRT(rt, pty_writable);
 #ifdef _WIN32
         /* Normally already closed by process_finish(); this covers a wrapper
          * collected while the child is still running. */
         pty_win_close_hpcon(p);
-        if (p->pty_proc_handle) { CloseHandle(p->pty_proc_handle); p->pty_proc_handle = NULL; }
 #else
         /* master_fd is owned by libuv through pty_readable; do NOT close here */
 #endif
     }
 
     p->finalized = true;
-    if (!p->handle_initialized || p->closed) tjs__free(p);
-    else maybe_close(p);
+    if (p->trt && p->trt->freeing && p->runtime_cleanup_queued)
+        return;
+    if (!p->handle_initialized || p->closed) {
+        process_list_remove(p);
+        tjs__free(p);
+    } else {
+        /* A live child's waiter owns its native lifetime after the JS wrapper
+         * is collected. Keep it open so process_finish() can reap the child
+         * and close the Windows PTY handle on the confirmed-exit path. */
+        if (p->status.exited || p->status.lost ||
+            (!p->pty_mode && !p->fork_mode && !p->process_spawned))
+            maybe_close(p);
+    }
+}
+
+void tjs__mod_process_cleanup_runtime(TJSRuntime *trt) {
+    struct list_head cleanup_list;
+    init_list_head(&cleanup_list);
+
+    /* Keep the live runtime list independent from JS refcount teardown. A
+     * finalizer may remove a different process, so a cached next pointer is
+     * not stable across JS_FreeValueRT(). */
+    while (!list_empty(&trt->processes)) {
+        TJSProcess *p = list_entry(trt->processes.next, TJSProcess,
+                                   runtime_link);
+        list_del(&p->runtime_link);
+        p->runtime_cleanup_queued = true;
+        list_add_tail(&p->runtime_link, &cleanup_list);
+    }
+
+    while (!list_empty(&cleanup_list)) {
+        TJSProcess *p = list_entry(cleanup_list.next, TJSProcess,
+                                   runtime_link);
+        list_del(&p->runtime_link);
+        p->runtime_linked = false;
+        p->runtime_cleanup_queued = false;
+        if (p->trt != trt || p->runtime_cleaning) continue;
+        p->runtime_cleaning = true;
+        JSValue obj = JS_UNDEFINED;
+        bool keep_for_drain = false;
+
+        TJS_FreePromiseRT(trt->rt, &p->status.result);
+        for (int i = 0; i < 3; i++) {
+            JS_FreeValueRT(trt->rt, p->stdio[i]);
+            p->stdio[i] = JS_UNDEFINED;
+        }
+        JS_FreeValueRT(trt->rt, p->stdio_extra);
+        p->stdio_extra = JS_UNDEFINED;
+        JS_FreeValueRT(trt->rt, p->ipc_pipe);
+        p->ipc_pipe = JS_UNDEFINED;
+        JS_FreeValueRT(trt->rt, p->pty_readable);
+        p->pty_readable = JS_UNDEFINED;
+        JS_FreeValueRT(trt->rt, p->pty_writable);
+        p->pty_writable = JS_UNDEFINED;
+
+        if (p->status.exited || p->status.lost) {
+            maybe_close(p);
+        } else if (p->fork_mode || p->pty_mode) {
+#ifdef _WIN32
+            if (!p->pty_mode || !p->pty_proc_handle) {
+                process_mark_lost(p, UV_EBADF);
+                goto runtime_drop_process_pin;
+            }
+            int teardown_result = process_windows_terminate_and_wait(
+                p->pty_proc_handle);
+            if (teardown_result != 0) {
+                process_windows_relinquish_failed_handle(&p->pty_proc_handle);
+                process_mark_lost(p, teardown_result);
+                goto runtime_drop_process_pin;
+            }
+            int exit_code_result = process_windows_get_exit_code(
+                p->pty_proc_handle, &p->status.exit_status);
+            if (exit_code_result != 0) {
+                process_mark_lost(p, exit_code_result);
+                goto runtime_drop_process_pin;
+            }
+            CloseHandle(p->pty_proc_handle);
+            p->pty_proc_handle = NULL;
+#else
+            pid_t pid = p->fork_mode ? p->fork_pid : p->pty_pid;
+            int teardown_result = process_posix_kill_and_reap(
+                pid, &p->status.exit_status, &p->status.term_signal);
+            if (teardown_result != 0) {
+                if (teardown_result == process_no_child_error()) {
+                    /* Another waiter owns the reap result; never hand this
+                     * numeric PID to a later reaper after possible reuse. */
+                    process_mark_lost(p, teardown_result);
+                    goto runtime_drop_process_pin;
+                }
+                /* The synchronous helper may fail while the child is still
+                 * alive. Keep waitpid ownership in the independent reaper
+                 * before dropping the Process wrapper and its timer. */
+                int adopt_result = process_reaper_adopt_pid(pid);
+                if (adopt_result != 0) {
+                    int reap_result = process_posix_force_reap(
+                        pid, &p->status.exit_status, &p->status.term_signal);
+                    if (reap_result == 0) {
+                        process_finish(p, p->status.exit_status,
+                                       p->status.term_signal);
+                        goto runtime_drop_process_pin;
+                    }
+                    process_mark_lost(p, reap_result);
+                } else {
+                    process_mark_lost(p, teardown_result);
+                }
+                goto runtime_drop_process_pin;
+            }
+#endif
+            p->status.exited = true;
+#ifdef _WIN32
+            if (p->pty_mode) pty_win_close_hpcon(p);
+#endif
+            if (p->handle_initialized) {
+                if (p->fork_mode) uv_timer_stop(&p->fork_waiter);
+                else uv_timer_stop(&p->pty_waiter);
+            }
+            maybe_close(p);
+            process_list_remove(p);
+        } else if (p->handle_initialized && p->process_spawned) {
+#ifdef _WIN32
+            int kill_result = uv_process_kill(&p->process, SIGTERM);
+#else
+            int kill_result = uv_process_kill(&p->process, SIGKILL);
+#endif
+            if (kill_result != 0)
+                /* SIGKILL was already attempted on this path. Preserve
+                 * waitpid ownership without issuing a redundant retry from
+                 * the independent reaper. */
+                process_mark_lost_impl(p, kill_result, false);
+            keep_for_drain = !p->status.exited && !p->status.lost;
+        }
+
+        if (keep_for_drain)
+            process_list_add(p);
+
+runtime_drop_process_pin:
+        /* Dropping the self pin may run the finalizer synchronously. Do not
+         * inspect p after this point; a pending handle callback owns it. */
+        obj = p->obj;
+        p->obj = JS_UNDEFINED;
+        JS_FreeValueRT(trt->rt, obj);
+    }
+}
+
+static bool process_runtime_has_active_normal(TJSRuntime *trt) {
+    struct list_head *el;
+    list_for_each(el, &trt->processes) {
+        TJSProcess *p = list_entry(el, TJSProcess, runtime_link);
+        if (!p->pty_mode && !p->fork_mode && p->process_spawned &&
+            !p->status.exited && !p->status.lost)
+            return true;
+    }
+    return false;
+}
+
+void tjs__mod_process_drain_runtime(TJSRuntime *trt) {
+    while (process_runtime_has_active_normal(trt)) {
+        if (uv_run(&trt->loop, UV_RUN_ONCE) == 0) {
+            /* A process handle that no longer keeps libuv alive cannot ever
+             * produce the exit callback needed by the list above. Preserve a
+             * bounded teardown even for a platform-specific kill failure. */
+            struct list_head *el, *tmp;
+            list_for_each_safe(el, tmp, &trt->processes) {
+                TJSProcess *p = list_entry(el, TJSProcess, runtime_link);
+                if (!p->pty_mode && !p->fork_mode && p->process_spawned &&
+                    !p->status.exited && !p->status.lost)
+                    process_mark_lost(p, process_no_child_error());
+            }
+            break;
+        }
+    }
 }
 
 static void tjs_process_mark(JSRuntime *rt, JSValue val, JS_MarkFunc *mark_func) {
-    TJSProcess *p = JS_GetOpaque(val, tjs_process_class_id);
+    TJSProcess *p = JS_GetOpaque(val, JS_GetClassID(val));
     if (!p) return;
     TJS_MarkPromise(rt, &p->status.result, mark_func);
     for (int i = 0; i < 3; i++) JS_MarkValue(rt, p->stdio[i], mark_func);
@@ -819,6 +1618,25 @@ static JSClassDef tjs_process_class = {
 };
 
 #ifndef _WIN32
+static JSValue pty_unix_spawn_abort(JSContext *ctx, JSValue error,
+                                    int master_fd, pid_t pid) {
+    if (master_fd >= 0) close(master_fd);
+    int cleanup_result = process_posix_kill_and_reap(pid, NULL, NULL);
+    if (cleanup_result != 0 && cleanup_result != process_no_child_error()) {
+        int adopt_result = process_reaper_adopt_pid(pid);
+        if (adopt_result != 0) {
+            cleanup_result = process_posix_force_reap(pid, NULL, NULL);
+            if (cleanup_result != 0) {
+                JSValue pending = JS_GetException(ctx);
+                JS_FreeValue(ctx, pending);
+                return tjs_throw_errno_msg(ctx, cleanup_result,
+                                           "PTY child cleanup failed");
+            }
+        }
+    }
+    return error;
+}
+
 static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
                                const char *name, const char *cwd,
                                char **env_arr, char **argv_arr, int argc_val,
@@ -880,21 +1698,21 @@ static JSValue pty_unix_spawn(TJSProcess *p, JSContext *ctx,
     close(slave_fd);
 
     JSValue pipe_obj = tjs_new_pipe(ctx);
-    if (JS_IsException(pipe_obj)) {
-        close(master_fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        return pipe_obj;
-    }
+    if (JS_IsException(pipe_obj))
+        return pty_unix_spawn_abort(ctx, pipe_obj, master_fd, pid);
     uv_pipe_t *pp = tjs_pipe_get_pipe(ctx, pipe_obj);
     if (!pp) {
         JS_FreeValue(ctx, pipe_obj);
-        close(master_fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        return tjs_throw_plain_error(ctx, "failed to get pipe handle");
+        return pty_unix_spawn_abort(ctx,
+                                    tjs_throw_plain_error(ctx,
+                                                          "failed to get pipe handle"),
+                                    master_fd, pid);
     }
     int r = uv_pipe_open(pp, master_fd);
     if (r != 0) {
         JS_FreeValue(ctx, pipe_obj);
-        close(master_fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        return tjs_throw_errno(ctx, r);
+        return pty_unix_spawn_abort(ctx, tjs_throw_errno(ctx, r),
+                                    master_fd, pid);
     }
     tjs_pipe_set_pty_master(ctx, pipe_obj);
     /* uv_pipe_open does not change handle->data — TJSStream pointer is intact. */
@@ -924,7 +1742,10 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     HANDLE hProc    = NULL;
     LPPROC_THREAD_ATTRIBUTE_LIST attrList = NULL;
     WCHAR *wapp = NULL, *wexe = NULL, *wcmd = NULL, *wcwd = NULL, *wenv = NULL;
+    JSValue write_obj = JS_UNDEFINED;
+    JSValue read_obj = JS_UNDEFINED;
     JSValue ret = JS_EXCEPTION;
+    int process_cleanup_error = 0;
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, true };
     if (!CreatePipe(&hConIn, &hPipeIn, &sa, 0) ||
@@ -993,20 +1814,29 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
         goto cleanup;
     }
     CloseHandle(pi.hThread);
+    pi.hThread = NULL;
     hProc = pi.hProcess; /* retain for waitSync */
+    pi.hProcess = NULL;
 
     /* ConPTY internal pipe ends are no longer needed. */
     CloseHandle(hConIn);  hConIn  = INVALID_HANDLE_VALUE;
     CloseHandle(hConOut); hConOut = INVALID_HANDLE_VALUE;
 
     /* Writable pipe: JS writes → ConPTY → child stdin */
-    JSValue write_obj = tjs_new_pipe(ctx);
+    write_obj = tjs_new_pipe(ctx);
     if (JS_IsException(write_obj)) goto cleanup;
     uv_pipe_t *pw = tjs_pipe_get_pipe(ctx, write_obj);
-    if (!pw) { JS_FreeValue(ctx, write_obj); goto cleanup; }
+    if (!pw) {
+        JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
+        if (!JS_HasException(ctx))
+            tjs_throw_plain_error(ctx, "failed to get PTY write pipe handle");
+        goto cleanup;
+    }
     int wfd = _open_osfhandle((intptr_t)hPipeIn, 0);
     if (wfd < 0) {
         JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
         int e = errno;
         tjs_throw_errno_msg(ctx, e, "_open_osfhandle (write) failed: %s", strerror(e));
         goto cleanup;
@@ -1014,20 +1844,36 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     hPipeIn = INVALID_HANDLE_VALUE; /* ownership transferred to the CRT fd */
     int r = uv_pipe_open(pw, wfd);
     if (r != 0) {
-        _close(wfd); JS_FreeValue(ctx, write_obj);
+        _close(wfd);
+        JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
         tjs_throw_errno(ctx, r);
         goto cleanup;
     }
 
     /* Readable pipe: child stdout → ConPTY → JS */
-    JSValue read_obj = tjs_new_pipe(ctx);
-    if (JS_IsException(read_obj)) { JS_FreeValue(ctx, write_obj); goto cleanup; }
+    read_obj = tjs_new_pipe(ctx);
+    if (JS_IsException(read_obj)) {
+        JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
+        goto cleanup;
+    }
     uv_pipe_t *pr = tjs_pipe_get_pipe(ctx, read_obj);
-    if (!pr) { JS_FreeValue(ctx, read_obj); JS_FreeValue(ctx, write_obj); goto cleanup; }
+    if (!pr) {
+        JS_FreeValue(ctx, read_obj);
+        read_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
+        if (!JS_HasException(ctx))
+            tjs_throw_plain_error(ctx, "failed to get PTY read pipe handle");
+        goto cleanup;
+    }
     int rfd = _open_osfhandle((intptr_t)hPipeOut, 0);
     if (rfd < 0) {
         JS_FreeValue(ctx, read_obj);
+        read_obj = JS_UNDEFINED;
         JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
         int e = errno;
         tjs_throw_errno_msg(ctx, e, "_open_osfhandle (read) failed: %s", strerror(e));
         goto cleanup;
@@ -1035,7 +1881,11 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     hPipeOut = INVALID_HANDLE_VALUE; /* ownership transferred to the CRT fd */
     int rr = uv_pipe_open(pr, rfd);
     if (rr != 0) {
-        _close(rfd); JS_FreeValue(ctx, read_obj); JS_FreeValue(ctx, write_obj);
+        _close(rfd);
+        JS_FreeValue(ctx, read_obj);
+        read_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, write_obj);
+        write_obj = JS_UNDEFINED;
         tjs_throw_errno(ctx, rr);
         goto cleanup;
     }
@@ -1045,21 +1895,40 @@ static JSValue pty_win_spawn(TJSProcess *p, JSContext *ctx,
     p->pty_proc_handle = hProc; hProc = NULL;
     p->pty_readable    = read_obj;
     p->pty_writable    = write_obj;
+    read_obj = JS_UNDEFINED;
+    write_obj = JS_UNDEFINED;
     ret = JS_UNDEFINED;
 
 cleanup:
+    if (!JS_IsUndefined(read_obj) && !JS_IsException(read_obj))
+        JS_FreeValue(ctx, read_obj);
+    if (!JS_IsUndefined(write_obj) && !JS_IsException(write_obj))
+        JS_FreeValue(ctx, write_obj);
     if (attrList) { DeleteProcThreadAttributeList(attrList); free(attrList); }
+    if (hProc) {
+        process_cleanup_error = process_windows_terminate_and_wait(hProc);
+        if (process_cleanup_error != 0)
+            process_windows_relinquish_failed_handle(&hProc);
+        else
+            CloseHandle(hProc);
+        hProc = NULL;
+    }
     if (hConIn  != INVALID_HANDLE_VALUE) CloseHandle(hConIn);
     if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
     if (hPipeIn != INVALID_HANDLE_VALUE) CloseHandle(hPipeIn);
     if (hPipeOut!= INVALID_HANDLE_VALUE) CloseHandle(hPipeOut);
     if (hPC && pClosePseudoConsole) pClosePseudoConsole(hPC);
-    if (hProc) CloseHandle(hProc);
     js_free(ctx, wapp);
     js_free(ctx, wexe);
     js_free(ctx, wcmd);
     js_free(ctx, wcwd);
     js_free(ctx, wenv);
+    if (process_cleanup_error != 0) {
+        JSValue pending = JS_GetException(ctx);
+        JS_FreeValue(ctx, pending);
+        ret = tjs_throw_errno_msg(ctx, process_cleanup_error,
+                                  "PTY child cleanup failed");
+    }
     return ret;
 }
 #endif /* _WIN32 */
@@ -1077,13 +1946,11 @@ static char **tjs__parse_args(JSContext *ctx, JSValue arg0) {
         JS_FreeCString(ctx, s);
         if (!args[0]) { js_free(ctx, args); return NULL; }
     } else if (JS_IsArray(arg0)) {
-        JSValue js_len = JS_GetPropertyStr(ctx, arg0, "length");
         uint64_t len;
-        if (JS_ToIndex(ctx, &len, js_len)) { JS_FreeValue(ctx, js_len); return NULL; }
-        JS_FreeValue(ctx, js_len);
-        args = js_mallocz(ctx, sizeof(*args) * (len + 1));
+        if (process_argv_length(ctx, arg0, &len) < 0) return NULL;
+        args = js_mallocz(ctx, sizeof(*args) * ((size_t)len + 1));
         if (!args) return NULL;
-        for (uint64_t i = 0; i < len; i++) {
+        for (uint32_t i = 0; i < (uint32_t)len; i++) {
             JSValue v = JS_GetPropertyUint32(ctx, arg0, (uint32_t)i);
             if (JS_IsException(v)) goto fail;
             const char *s = JS_ToCString(ctx, v);
@@ -1226,20 +2093,25 @@ static char **spawn_sync_parse_call_args(JSContext *ctx, int argc, JSValue *argv
             JS_ThrowTypeError(ctx, "spawnSync(command, args?, options?): command must be a string");
             return NULL;
         }
+        uint64_t len;
+        if (process_argv_length(ctx, argv[1], &len) < 0) {
+            return NULL;
+        }
+        if (len >= INT_MAX) {
+            JS_ThrowRangeError(ctx, "argv array is too large");
+            return NULL;
+        }
+
         JSValue full = JS_NewArray(ctx);
         if (JS_IsException(full)) return NULL;
         if (JS_SetPropertyUint32(ctx, full, 0, JS_DupValue(ctx, argv[0])) < 0) {
             JS_FreeValue(ctx, full);
             return NULL;
         }
-        JSValue lv = JS_GetPropertyStr(ctx, argv[1], "length");
-        uint64_t len = 0;
-        if (JS_ToIndex(ctx, &len, lv)) { JS_FreeValue(ctx, lv); JS_FreeValue(ctx, full); return NULL; }
-        JS_FreeValue(ctx, lv);
-        for (uint64_t i = 0; i < len; i++) {
+        for (uint32_t i = 0; i < (uint32_t)len; i++) {
             JSValue item = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
             if (JS_IsException(item)) { JS_FreeValue(ctx, full); return NULL; }
-            if (JS_SetPropertyUint32(ctx, full, (uint32_t)i + 1, item) < 0) {
+            if (JS_SetPropertyUint32(ctx, full, i + 1, item) < 0) {
                 JS_FreeValue(ctx, full);
                 return NULL;
             }
@@ -1984,6 +2856,7 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         free_str_arr(ctx, argv_arr, argv_len);
 
         if (JS_IsException(err)) {
+            process_list_remove(p);
             tjs__free(p); JS_FreeValue(ctx, obj);
             return err;
         }
@@ -1992,16 +2865,37 @@ static JSValue tjs_spawn(JSContext *ctx, JSValue this_val, int argc, JSValue *ar
         if (r != 0) {
             JSValue init_err = tjs_throw_errno(ctx, r);
 #ifdef _WIN32
-            TerminateProcess(p->pty_proc_handle, 1);
-            WaitForSingleObject(p->pty_proc_handle, INFINITE);
+            int cleanup_result = process_windows_terminate_and_wait(
+                p->pty_proc_handle);
+            if (cleanup_result != 0) {
+                process_windows_relinquish_failed_handle(&p->pty_proc_handle);
+                JS_FreeValue(ctx, init_err);
+                init_err = tjs_throw_errno_msg(ctx, cleanup_result,
+                                               "PTY child cleanup failed");
+            } else {
+                CloseHandle(p->pty_proc_handle);
+                p->pty_proc_handle = NULL;
+            }
             pty_win_close_hpcon(p);
-            if (p->pty_proc_handle) { CloseHandle(p->pty_proc_handle); p->pty_proc_handle = NULL; }
 #else
-            kill(p->pty_pid, SIGKILL);
-            while (waitpid(p->pty_pid, NULL, 0) < 0 && errno == EINTR) {}
+            int cleanup_result = process_posix_kill_and_reap(
+                p->pty_pid, NULL, NULL);
+            if (cleanup_result != 0 && cleanup_result != process_no_child_error()) {
+                int adopt_result = process_reaper_adopt_pid(p->pty_pid);
+                if (adopt_result != 0) {
+                    cleanup_result = process_posix_force_reap(
+                        p->pty_pid, NULL, NULL);
+                    if (cleanup_result != 0) {
+                        JS_FreeValue(ctx, init_err);
+                        init_err = tjs_throw_errno_msg(ctx, cleanup_result,
+                                                       "PTY child cleanup failed");
+                    }
+                }
+            }
 #endif
             JS_FreeValue(ctx, p->pty_readable);
             JS_FreeValue(ctx, p->pty_writable);
+            process_list_remove(p);
             tjs__free(p);
             JS_FreeValue(ctx, obj);
             return init_err;
@@ -2225,6 +3119,12 @@ pty_fail:
          * p->stdio[ipc_fd] is always JS_UNDEFINED here — nothing to free. */
     }
 
+    int reserve_result = process_reaper_reserve(p);
+    if (reserve_result != 0) {
+        tjs_throw_errno(ctx, reserve_result);
+        goto fail;
+    }
+
     options.exit_cb = uv__exit_cb;
     spawn_attempted = true;
     int r = uv_spawn(tjs_get_loop(ctx), &p->process, &options);
@@ -2232,8 +3132,26 @@ pty_fail:
      * until its close callback runs; a fork in that window copies it. */
     p->counted_nonfork = true;
     tjs_live_nonfork_processes++;
-    if (r != 0) { tjs_throw_errno(ctx, r); goto fail; }
+    if (r != 0) {
+#ifndef _WIN32
+        /* libuv may have exec'd the child before a parent-side stdio setup
+         * failure. Its error path removes the wait owner, so preserve the
+         * reaper reservation for that already-created child. Exec failures
+         * have pid == 0 because libuv has already waited for them. */
+        if (p->process.pid > 0) {
+            p->process_spawned = true;
+            process_reaper_adopt(p, true);
+        } else {
+            process_reaper_release(p);
+        }
+#else
+        process_reaper_release(p);
+#endif
+        tjs_throw_errno(ctx, r);
+        goto fail;
+    }
     p->handle_initialized = true;
+    p->process_spawned = true;
 
     /* libuv created and owns both ends of the UV_CREATE_PIPE IPC channel and
      * closes the child end itself, so there is nothing to close here. */
@@ -2245,6 +3163,7 @@ pty_fail:
 
 fail:
     if (p) {
+        process_reaper_release(p);
         for (int i = 0; i < 3; i++) { JS_FreeValue(ctx, p->stdio[i]); p->stdio[i] = JS_UNDEFINED; }
         JS_FreeValue(ctx, p->stdio_extra);
         p->stdio_extra = JS_UNDEFINED;
@@ -2257,6 +3176,7 @@ fail:
             p->finalized = true;
             maybe_close(p);
         } else {
+            process_list_remove(p);
             tjs__free(p);
         }
     }
@@ -2298,6 +3218,9 @@ static void fork_scan_handle(uv_handle_t *handle, void *opaque) {
 }
 
 static bool fork_runtime_is_quiescent(TJSRuntime *qrt) {
+    /* The current job may be the last queued job, while the idle handle still
+     * reflects the queue before this checkpoint. Refresh it before testing. */
+    tjs__notify_work(qrt);
     if (uv_loop_alive(&qrt->loop) != 0
         || JS_IsJobPending(qrt->rt)
         || qrt->jobs.ticks_pending) {
@@ -2356,11 +3279,23 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     if (fork_check_allowed(ctx, &qrt) < 0) return JS_EXCEPTION;
     ensure_fork_process_list();
 
+    int prepare_result = process_reaper_fork_prepare();
+    if (prepare_result != 0)
+        return tjs_throw_errno(ctx, prepare_result);
+
     pid_t pid = fork();
-    if (pid < 0)
-        return tjs_throw_errno(ctx, uv_translate_sys_error(errno));
+    int fork_error = errno;
+    if (pid < 0) {
+        process_reaper_fork_finish();
+        return tjs_throw_errno(ctx, uv_translate_sys_error(fork_error));
+    }
 
     if (pid == 0) {
+        /* The reaper thread was joined before fork(). No other thread exists
+         * in this child, so clear the inherited guard without touching the
+         * parent's mutex/condition variable; the child must be able to spawn
+         * its own processes after uv_loop_fork(). */
+        tjs_process_fork_in_progress = false;
         int r = uv_loop_fork(tjs_get_loop(ctx));
         /* A failed uv_loop_fork() may leave the backend half-rebuilt; keep
          * user JS off that loop by terminating only this failed child. */
@@ -2371,7 +3306,11 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
         return JS_NULL;
     }
 
-    JSValue obj = JS_NewObjectClass(ctx, tjs_process_class_id);
+    process_reaper_fork_finish();
+
+    JSClassID class_id = tjs_process_class_id;
+    if (class_id == 0) return JS_ThrowTypeError(ctx, "process module is not initialized");
+    JSValue obj = JS_NewObjectClass(ctx, class_id);
     if (JS_IsException(obj)) {
         reap_fork_failure(pid);
         return obj;
@@ -2384,6 +3323,7 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
         return JS_ThrowOutOfMemory(ctx);
     }
 
+    p->trt          = TJS_GetRuntime(ctx);
     p->ctx          = ctx;
     p->obj          = JS_UNDEFINED;
     p->fork_mode    = true;
@@ -2398,9 +3338,11 @@ static JSValue tjs_fork(JSContext *ctx, JSValue this_val, int argc, JSValue *arg
     p->pty_readable = JS_UNDEFINED;
     p->pty_writable = JS_UNDEFINED;
     TJS_ClearPromise(ctx, &p->status.result);
+    process_list_add(p);
 
     int r = uv_timer_init(tjs_get_loop(ctx), &p->fork_waiter);
     if (r != 0) {
+        process_list_remove(p);
         tjs__free(p);
         JS_FreeValue(ctx, obj);
         reap_fork_failure(pid);
@@ -2532,7 +3474,28 @@ static JSValue tjs_process_wait(JSContext *ctx, JSValue this_val, int argc, JSVa
     }
     if (!JS_IsUndefined(p->status.result.p))
         return JS_DupValue(ctx, p->status.result.p);
-    return TJS_InitPromise(ctx, &p->status.result);
+
+    /* INIT hooks may finish the child or publish another wait promise. Keep
+     * this capability local until that synchronous reentry has completed. */
+    TJSPromise pending;
+    JSValue promise = TJS_InitPromise(ctx, &pending);
+    if (JS_IsException(promise)) return promise;
+
+    if (p->status.exited || p->status.lost) {
+        bool lost = p->status.lost;
+        JSValue result = lost
+            ? make_fork_wait_error(p, ctx, p->status.wait_error)
+            : make_exit_obj(ctx, p->status.exit_status, p->status.term_signal);
+        TJS_SettlePromise(ctx, &pending, lost, 1, &result);
+    } else if (!JS_IsUndefined(p->status.result.p)) {
+        JSValue shared = JS_DupValue(ctx, p->status.result.p);
+        TJS_FreePromise(ctx, &pending);
+        JS_FreeValue(ctx, promise);
+        return shared;
+    } else {
+        p->status.result = pending;
+    }
+    return promise;
 }
 
 /* waitSync() — blocking wait, works for both modes */
@@ -2545,7 +3508,8 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 #else
     if (p->fork_mode)
         return tjs_throw_errno_msg(ctx, UV_ENOSYS, "fork process unavailable on Windows");
-    if (p->pty_mode && !p->pty_proc_handle)
+    if (p->pty_mode && !p->pty_proc_handle &&
+        !p->status.exited && !p->status.lost)
         return tjs_throw_errno_msg(ctx, UV_ENOSYS, "PTY process handle unavailable");
 #endif
     if (p->status.exited)
@@ -2566,7 +3530,7 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
         } while (result < 0 && errno == EINTR);
         if (result < 0) {
             int err = uv_translate_sys_error(errno);
-            process_lose_fork_waiter(p, err);
+            process_mark_lost(p, err);
             return tjs_throw_errno(ctx, err);
         }
         if (decode_wait_status(stat, &es, &ts) < 0)
@@ -2574,10 +3538,20 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 #endif
     } else if (p->pty_mode) {
 #ifdef _WIN32
-        if (WaitForSingleObject(p->pty_proc_handle, INFINITE) != WAIT_OBJECT_0)
-            return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
-        DWORD ws; GetExitCodeProcess(p->pty_proc_handle, &ws);
-        es = (int64_t)ws; ts = 0;
+        DWORD wait_result = WaitForSingleObject(p->pty_proc_handle, INFINITE);
+        if (wait_result != WAIT_OBJECT_0) {
+            DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+            int err = uv_translate_sys_error((int)wait_error);
+            process_mark_lost(p, err);
+            return tjs_throw_errno(ctx, err);
+        }
+        int exit_code_result = process_windows_get_exit_code(
+            p->pty_proc_handle, &es);
+        if (exit_code_result != 0) {
+            process_mark_lost(p, exit_code_result);
+            return tjs_throw_errno(ctx, exit_code_result);
+        }
+        ts = 0;
 #else
         int stat;
         pid_t result;
@@ -2591,10 +3565,20 @@ static JSValue tjs_process_wait_sync(JSContext *ctx, JSValue this_val, int argc,
 #endif
     } else {
 #ifdef _WIN32
-        if (WaitForSingleObject(p->process.process_handle, INFINITE) != WAIT_OBJECT_0)
-            return tjs_throw_errno(ctx, uv_translate_sys_error(GetLastError()));
-        DWORD ws; GetExitCodeProcess(p->process.process_handle, &ws);
-        es = (int64_t)ws; ts = 0;
+        DWORD wait_result = WaitForSingleObject(p->process.process_handle, INFINITE);
+        if (wait_result != WAIT_OBJECT_0) {
+            DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+            int err = uv_translate_sys_error((int)wait_error);
+            process_mark_lost(p, err);
+            return tjs_throw_errno(ctx, err);
+        }
+        int exit_code_result = process_windows_get_exit_code(
+            p->process.process_handle, &es);
+        if (exit_code_result != 0) {
+            process_mark_lost(p, exit_code_result);
+            return tjs_throw_errno(ctx, exit_code_result);
+        }
+        ts = 0;
 #else
         pid_t pid = uv_process_get_pid(&p->process);
         int stat;
@@ -2812,12 +3796,24 @@ static const JSCFunctionListEntry tjs_process_funcs[] = {
 /* clang-format on */
 
 void tjs__mod_process_init(JSContext *ctx, JSValue ns) {
-    JSRuntime *rt = JS_GetRuntime(ctx);
-    JS_NewClassID(rt, &tjs_process_class_id);
-    JS_NewClass(rt, tjs_process_class_id, &tjs_process_class);
-    JSValue proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, tjs_process_proto_funcs,
-                               countof(tjs_process_proto_funcs));
-    JS_SetClassProto(ctx, tjs_process_class_id, proto);
-    JS_SetPropertyFunctionList(ctx, ns, tjs_process_funcs, countof(tjs_process_funcs));
+    if (tjs__streams_register_pipe_class(ctx) < 0) return;
+    if (tjs_process_register_class(ctx) < 0) return;
+
+    JSValue proto = JS_GetClassProto(ctx, tjs_process_class_id);
+    if (JS_IsNull(proto)) {
+        proto = JS_NewObject(ctx);
+        if (JS_IsException(proto)) return;
+        if (JS_SetPropertyFunctionList(ctx, proto, tjs_process_proto_funcs,
+                                       countof(tjs_process_proto_funcs)) < 0) {
+            JS_FreeValue(ctx, proto);
+            return;
+        }
+        JS_SetClassProto(ctx, tjs_process_class_id, proto);
+    } else {
+        JS_FreeValue(ctx, proto);
+    }
+
+    if (JS_SetPropertyFunctionList(ctx, ns, tjs_process_funcs,
+                                   countof(tjs_process_funcs)) < 0)
+        return;
 }

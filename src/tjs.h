@@ -43,6 +43,7 @@ extern "C" {
 
 typedef struct TJSRuntime TJSRuntime;
 typedef struct TJSApp App;
+typedef struct TJSRuntimeCleanup TJSRuntimeCleanup;
 
 #ifdef _WIN32
 #define EXPORT __declspec(dllexport)
@@ -50,7 +51,10 @@ typedef struct TJSApp App;
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-#define TJS_ABI_VERSION 1u
+/* v2 adds the runtime-cleanup registration exports below.  Extensions that
+ * use them must not load into a v1 host, whose dynamic loader cannot provide
+ * those symbols. */
+#define TJS_ABI_VERSION 2u
 
 /* Capability hook ABI: one category bit (high 16) plus operation bits (low 16);
  * strings and JS values are borrowed for the duration of the hook. */
@@ -187,6 +191,11 @@ EXPORT TJSRuntime *TJS_NewRuntime(void);
 EXPORT TJSRuntime *TJS_NewRuntimeOptions(TJSRunOptions *options);
 EXPORT App* TJS_NewApp(TJSRuntime* trt);
 EXPORT void TJS_FreeRuntime(TJSRuntime *qrt);
+EXPORT TJSRuntimeCleanup *TJS_AddRuntimeCleanup(TJSRuntime *runtime,
+                                                void (*callback)(void *), void *opaque);
+/* A token may be removed once; removal invalidates it. A cleanup callback may
+ * remove its own token. Tokens still registered are reclaimed with the runtime. */
+EXPORT void TJS_RemoveRuntimeCleanup(TJSRuntimeCleanup *cleanup);
 EXPORT void TJS_Initialize(int argc, char **argv);
 /* Borrowed main context. It is owned by runtime and may only be used from the
  * runtime's owner thread. */

@@ -287,11 +287,10 @@ void tjs_call_handler(JSContext *ctx, JSValue func, int argc, JSValue *argv) {
     JSValue ret, func1;
     TJSRuntime *trt = TJS_GetRuntime(ctx);
 
-    // Don't call handlers if runtime is being freed
+    /* Do not call user code after teardown starts. The caller retains
+     * ownership of argv and will release those values after this helper
+     * returns, just as it does on the normal path. */
     if (trt && trt->freeing) {
-        for (int i = 0; i < argc; i++) {
-            JS_FreeValue(ctx, argv[i]);
-        }
         return;
     }
 
@@ -632,7 +631,7 @@ TJSObjectHandleIdentity TJS_CompareObjectHandles(void *first, void *second) {
 JSValue TJS_ThrowObjectHandleIdentityUnsupported(JSContext *ctx) {
     return JS_ThrowTypeError(
         ctx,
-        "object handle identity comparison is not supported on this Windows version");
+        "object handle identity comparison is not supported on this platform");
 }
 
 static const char *const tjs_signal_map[] = {

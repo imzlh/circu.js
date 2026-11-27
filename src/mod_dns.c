@@ -24,6 +24,7 @@
  */
 
 #include "capability.h"
+#include "mem.h"
 #include "private.h"
 #include "utils.h"
 
@@ -93,63 +94,34 @@ static int dns_ai_flags(int hints) {
 	return flags;
 }
 
-static const char* dns_uv_gai_code(int status) {
+const char* tjs__dns_uv_gai_code(int status) {
 	/* uv_getaddrinfo callbacks report libuv's stable UV_EAI_* values. */
+	if (status == UV_ENOMEM) return "ENOMEM";
 	if (status == UV_EAI_NONAME || status == UV_EAI_NODATA) return "ENOTFOUND";
 	if (status == UV_EAI_AGAIN) return "EAI_AGAIN";
 	if (status == UV_EAI_ADDRFAMILY) return "EAI_ADDRFAMILY";
 	if (status == UV_EAI_BADFLAGS) return "EAI_BADFLAGS";
+	if (status == UV_EAI_BADHINTS) return "EAI_BADHINTS";
+	if (status == UV_EAI_CANCELED) return "EAI_CANCELED";
 	if (status == UV_EAI_FAIL) return "EAI_FAIL";
 	if (status == UV_EAI_FAMILY) return "EAI_FAMILY";
 	if (status == UV_EAI_MEMORY) return "ENOMEM";
+	if (status == UV_EAI_PROTOCOL) return "EAI_PROTOCOL";
 	if (status == UV_EAI_SERVICE) return "EAI_SERVICE";
 	if (status == UV_EAI_SOCKTYPE) return "EAI_SOCKTYPE";
 	if (status == UV_EAI_OVERFLOW) return "EAI_OVERFLOW";
-	return "EAI_SYSTEM";
+	return uv_err_name(status);
 }
 
-static const char* dns_platform_gai_code(int status) {
-#ifdef EAI_NONAME
-	if (status == EAI_NONAME) return "ENOTFOUND";
-#endif
-#ifdef EAI_NODATA
-	if (status == EAI_NODATA) return "ENOTFOUND";
-#endif
-#ifdef EAI_AGAIN
-	if (status == EAI_AGAIN) return "EAI_AGAIN";
-#endif
-#ifdef EAI_ADDRFAMILY
-	if (status == EAI_ADDRFAMILY) return "EAI_ADDRFAMILY";
-#endif
-#ifdef EAI_BADFLAGS
-	if (status == EAI_BADFLAGS) return "EAI_BADFLAGS";
-#endif
-#ifdef EAI_FAIL
-	if (status == EAI_FAIL) return "EAI_FAIL";
-#endif
-#ifdef EAI_FAMILY
-	if (status == EAI_FAMILY) return "EAI_FAMILY";
-#endif
-#ifdef EAI_MEMORY
-	if (status == EAI_MEMORY) return "ENOMEM";
-#endif
-#ifdef EAI_SERVICE
-	if (status == EAI_SERVICE) return "EAI_SERVICE";
-#endif
-#ifdef EAI_SOCKTYPE
-	if (status == EAI_SOCKTYPE) return "EAI_SOCKTYPE";
-#endif
-#ifdef EAI_OVERFLOW
-	if (status == EAI_OVERFLOW) return "EAI_OVERFLOW";
-#endif
-	return "EAI_SYSTEM";
-}
-
-static JSValue dns_new_gai_error(JSContext* ctx, int status, bool from_uv) {
-	const char* message = from_uv ? uv_strerror(status) : gai_strerror(status);
-	return tjs_new_coded_error(ctx, NULL,
-		JS_NewString(ctx, from_uv ? dns_uv_gai_code(status) : dns_platform_gai_code(status)),
-		JS_NewString(ctx, message ? message : "getaddrinfo failed"));
+static JSValue dns_new_gai_error(JSContext* ctx, int status) {
+	JSValue error = tjs_new_coded_error(ctx, NULL,
+		JS_NewString(ctx, tjs__dns_uv_gai_code(status)), JS_NewString(ctx, uv_strerror(status)));
+	if (JS_IsException(error)) return error;
+	if (JS_DefinePropertyValueStr(ctx, error, "errno", JS_NewInt32(ctx, status), JS_PROP_C_W_E) < 0) {
+		JS_FreeValue(ctx, error);
+		return JS_EXCEPTION;
+	}
+	return error;
 }
 
 static void dns_getaddrinfo_unlink(TJSGetAddrInfoReq* gr) {
@@ -191,7 +163,8 @@ static void uv__getaddrinfo_cb(uv_getaddrinfo_t* req, int status, struct addrinf
 	bool is_reject = status != 0;
 
 	if (status != 0) {
-		arg = dns_new_gai_error(ctx, status, true);
+		arg = dns_new_gai_error(ctx, status);
+		if (JS_IsException(arg)) arg = JS_GetException(ctx);
 	}
 	else {
 		arg = tjs_addrinfo2obj(ctx, res);
@@ -334,23 +307,21 @@ static JSValue tjs_dns_getaddrinfo_sync(JSContext* ctx, JSValue this_val, int ar
 	hints.ai_flags = dns_ai_flags(hint_bits);
 
 	TJS_CAPABILITY(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "dns.resolveSync", node), JS_FreeCString(ctx, node));
-	// Direct system call instead of using libuv
-	struct addrinfo* res = NULL;
-	int r = getaddrinfo(node, NULL, &hints, &res);
+	uv_getaddrinfo_t request = {0};
+	int r = uv_getaddrinfo(NULL, &request, NULL, node, NULL, &hints);
 
 	JS_FreeCString(ctx, node);
 
 	JSValue result;
 	if (r != 0) {
-		result = dns_new_gai_error(ctx, r, false);
+		result = dns_new_gai_error(ctx, r);
+		if (JS_IsException(result)) return result;
 		return JS_Throw(ctx, result);
 	} else {
-		result = tjs_addrinfo2obj(ctx, res);
+		result = tjs_addrinfo2obj(ctx, request.addrinfo);
 	}
 
-	if (res) {
-		freeaddrinfo(res);
-	}
+	if (request.addrinfo) uv_freeaddrinfo(request.addrinfo);
 
 	return result;
 }
@@ -376,7 +347,8 @@ static void uv__getnameinfo_cb(uv_getnameinfo_t* req, int status,
 	JSValue result;
 	bool reject = status != 0;
 	if (reject) {
-		result = tjs_new_error(ctx, status);
+		result = dns_new_gai_error(ctx, status);
+		if (JS_IsException(result)) result = JS_GetException(ctx);
 	} else {
 		result = JS_NewObjectProto(ctx, JS_NULL);
 		JS_SetPropertyStr(ctx, result, "hostname", JS_NewString(ctx, hostname ? hostname : ""));
@@ -554,6 +526,7 @@ typedef struct {
 #define DNS_ANY     255   /* Any available record */
 
 static JSClassID tjs_dns_query_class_id;
+
 static void tjs_dns_query_finalizer(JSRuntime* rt, JSValue val);
 static JSClassDef tjs_dns_query_class = {
 	"DNSQuery",
@@ -1600,7 +1573,14 @@ static const JSCFunctionListEntry tjs_dns_funcs[] = {
 
 void tjs__mod_dns_init(JSContext* ctx, JSValue ns) {
 	JSRuntime* rt = JS_GetRuntime(ctx);
-	JS_NewClassID(rt, &tjs_dns_query_class_id);
-	JS_NewClass(rt, tjs_dns_query_class_id, &tjs_dns_query_class);
+	if (JS_NewClassID(rt, &tjs_dns_query_class_id) == JS_INVALID_CLASS_ID) {
+		JS_ThrowInternalError(ctx, "failed to allocate DNS query class ID");
+		return;
+	}
+	if (!JS_IsRegisteredClass(rt, tjs_dns_query_class_id) &&
+		JS_NewClass(rt, tjs_dns_query_class_id, &tjs_dns_query_class) < 0) {
+		JS_ThrowInternalError(ctx, "failed to register DNS query class");
+		return;
+	}
 	JS_SetPropertyFunctionList(ctx, ns, tjs_dns_funcs, countof(tjs_dns_funcs));
 }

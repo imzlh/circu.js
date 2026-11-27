@@ -1,5 +1,3 @@
-import { readOnce } from "../polyfill/stream.read.js";
-
 // test-stream-sync.ts
 const engine = import.meta.use('engine');
 const stream = import.meta.use('streams');

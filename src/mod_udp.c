@@ -31,10 +31,17 @@
 
 
 typedef struct {
+    TJSRuntime *trt;
     JSContext *ctx;
     int closed;
     int finalized;
+    int runtime_cleaned;
+    unsigned callbacks;
+    int cleanup_active;
     uv_udp_t udp;
+    struct list_head runtime_link;
+    bool runtime_linked;
+    struct list_head sends;
     struct {
         struct {
             JSValue tarray;
@@ -42,6 +49,7 @@ typedef struct {
             size_t len;
         } b;
         TJSPromise result;
+        int starting;
         int settled;
         int canceled;
     } read;
@@ -49,27 +57,69 @@ typedef struct {
 
 typedef struct {
     uv_udp_send_t req;
+    TJSUdp *owner;
+    /* External GC root: the request owns its wrapper until completion. */
+    JSValue owner_ref;
+    struct list_head link;
+    bool linked;
+    int js_released;
     TJSPromise result;
     JSValue tarray;
     uint8_t *data;
 } TJSSendReq;
 
-static thread_local JSClassID tjs_udp_class_id;
+static JSClassID tjs_udp_class_id;
+
+static void tjs_udp_list_add(TJSUdp *u) {
+    init_list_head(&u->runtime_link);
+    init_list_head(&u->sends);
+    list_add(&u->runtime_link, &u->trt->udps);
+    u->runtime_linked = true;
+}
+
+static void tjs_udp_list_remove(TJSUdp *u) {
+    if (!u->runtime_linked) return;
+    list_del(&u->runtime_link);
+    u->runtime_linked = false;
+}
+
+static void tjs_udp_maybe_free(TJSUdp *u) {
+    if (!u->finalized || !u->closed || !list_empty(&u->sends) ||
+        u->callbacks || u->cleanup_active)
+        return;
+    tjs_udp_list_remove(u);
+    u->udp.data = NULL;
+    tjs__free(u);
+}
+
+static void tjs_udp_callback_leave(TJSUdp *u) {
+    CHECK_GT(u->callbacks, 0);
+    u->callbacks--;
+    tjs_udp_maybe_free(u);
+}
+
+static void tjs_udp_send_list_remove(TJSSendReq *sr) {
+    if (!sr->linked) return;
+    list_del(&sr->link);
+    sr->linked = false;
+}
 
 static void tjs_udp_read_buffer_clear(JSContext *ctx, TJSUdp *u) {
     js_free(ctx, u->read.b.data);
     u->read.b.data = NULL;
     u->read.b.len = 0;
-    JS_FreeValue(ctx, u->read.b.tarray);
+    JSValue tarray = u->read.b.tarray;
     u->read.b.tarray = JS_UNDEFINED;
+    JS_FreeValue(ctx, tarray);
 }
 
 static void tjs_udp_read_buffer_clear_rt(JSRuntime *rt, TJSUdp *u) {
     js_free_rt(rt, u->read.b.data);
     u->read.b.data = NULL;
     u->read.b.len = 0;
-    JS_FreeValueRT(rt, u->read.b.tarray);
+    JSValue tarray = u->read.b.tarray;
     u->read.b.tarray = JS_UNDEFINED;
+    JS_FreeValueRT(rt, tarray);
 }
 
 static void tjs_udp_read_clear(JSContext *ctx, TJSUdp *u) {
@@ -86,16 +136,34 @@ static void tjs_udp_read_clear_rt(JSRuntime *rt, TJSUdp *u) {
 
 static void tjs_udp_send_req_free(JSContext *ctx, TJSSendReq *sr) {
     if (!sr) return;
-    js_free(ctx, sr->data);
-    JS_FreeValue(ctx, sr->tarray);
+    tjs_udp_send_list_remove(sr);
+    uint8_t *data = sr->data;
+    JSValue tarray = sr->tarray;
+    JSValue owner_ref = sr->owner_ref;
+    sr->data = NULL;
+    sr->tarray = JS_UNDEFINED;
+    sr->owner_ref = JS_UNDEFINED;
+    js_free(ctx, data);
     js_free(ctx, sr);
+    JS_FreeValue(ctx, tarray);
+    JS_FreeValue(ctx, owner_ref);
 }
 
 static void tjs_udp_send_req_free_rt(JSRuntime *rt, TJSSendReq *sr) {
     if (!sr) return;
+    tjs_udp_send_list_remove(sr);
     js_free_rt(rt, sr->data);
-    TJS_FreePromiseRT(rt, &sr->result);
-    JS_FreeValueRT(rt, sr->tarray);
+    sr->data = NULL;
+    if (!sr->js_released) {
+        sr->js_released = 1;
+        JSValue tarray = sr->tarray;
+        JSValue owner_ref = sr->owner_ref;
+        sr->tarray = JS_UNDEFINED;
+        sr->owner_ref = JS_UNDEFINED;
+        TJS_FreePromiseRT(rt, &sr->result);
+        JS_FreeValueRT(rt, tarray);
+        JS_FreeValueRT(rt, owner_ref);
+    }
     js_free_rt(rt, sr);
 }
 
@@ -103,9 +171,7 @@ static void uv__udp_close_cb(uv_handle_t *handle) {
     TJSUdp *u = handle->data;
     CHECK_NOT_NULL(u);
     u->closed = 1;
-    if (u->finalized) {
-        tjs__free(u);
-    }
+    tjs_udp_maybe_free(u);
 }
 
 static void maybe_close(TJSUdp *u) {
@@ -125,8 +191,7 @@ static void tjs_udp_finalizer(JSRuntime *rt, JSValue val) {
         TJS_FreePromiseRT(rt, &u->read.result);
         tjs_udp_read_clear_rt(rt, u);
         if (u->closed) {
-            u->udp.data = NULL;
-            tjs__free(u);
+            tjs_udp_maybe_free(u);
         } else {
             maybe_close(u);
         }
@@ -147,12 +212,12 @@ static JSClassDef tjs_udp_class = {
     .gc_mark = tjs_udp_mark,
 };
 
-static TJSUdp *tjs_udp_get(JSContext *ctx, JSValue obj) {
+static TJSUdp *tjs_udp_get(JSContext *ctx, JSValueConst obj) {
     return JS_GetOpaque2(ctx, obj, tjs_udp_class_id);
 }
 
 static TJSUdp *tjs_udp_get_open(JSContext *ctx, JSValueConst obj) {
-    TJSUdp *u = JS_GetOpaque2(ctx, obj, tjs_udp_class_id);
+    TJSUdp *u = tjs_udp_get(ctx, obj);
     if (!u) return NULL;
     if (u->closed || u->finalized || uv_is_closing((uv_handle_t *) &u->udp)) {
         tjs_throw_errno_msg(ctx, UV_EBADF, "UDP closed");
@@ -166,23 +231,30 @@ static JSValue tjs_udp_close(JSContext *ctx, JSValue this_val, int argc, JSValue
     if (!u) {
         return JS_EXCEPTION;
     }
+    if (u->closed || uv_is_closing((uv_handle_t *) &u->udp))
+        return JS_UNDEFINED;
     bool pending = TJS_IsPromisePending(ctx, &u->read.result);
     u->read.canceled = 1;
     u->read.settled = pending ? 1 : u->read.settled;
     uv_udp_recv_stop(&u->udp);
+    maybe_close(u);
     /* Recv stopped: late cbs only see the canceled flag; free buffer now. */
     tjs_udp_read_buffer_clear(ctx, u);
     if (pending) {
         JSValue arg = tjs_new_error(ctx, UV_ECANCELED);
         TJS_RejectPromise(ctx, &u->read.result, 1, &arg);
     }
-    maybe_close(u);
     return JS_UNDEFINED;
 }
 
 static void uv__udp_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSUdp *u = handle->data;
     CHECK_NOT_NULL(u);
+    if (u->runtime_cleaned || u->finalized) {
+        buf->base = NULL;
+        buf->len = 0;
+        return;
+    }
     buf->base = (char *) u->read.b.data;
     buf->len = u->read.b.len;
 }
@@ -194,22 +266,26 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
                             unsigned flags) {
     TJSUdp *u = handle->data;
     CHECK_NOT_NULL(u);
-
-    JSContext *ctx = u->ctx;
-    JSRuntime *rt = ctx ? JS_GetRuntime(ctx) : NULL;
-    TJSRuntime *qrt = rt ? JS_GetRuntimeOpaque(rt) : NULL;
+    /* The alloc callback is not the lifetime of a receive callback. Count
+     * this callback itself so a finalizer/close callback cannot free u while
+     * a JS settlement below is still re-entrant. */
+    u->callbacks++;
 
     /* Finalizer/teardown may leave a queued recv cb: no QuickJS values here. */
-    if (u->finalized || !qrt || qrt->freeing) {
+    if (u->finalized || u->runtime_cleaned || !u->trt || u->trt->freeing) {
         uv_udp_recv_stop(handle);
-        if (rt) {
-            tjs_udp_read_clear_rt(rt, u);
-        }
+        if (u->trt)
+            TJS_FreePromiseRT(u->trt->rt, &u->read.result);
+        tjs_udp_read_clear_rt(u->trt ? u->trt->rt : NULL, u);
+        tjs_udp_callback_leave(u);
         return;
     }
 
+    JSContext *ctx = u->ctx;
+
     /* nread==0 && addr==NULL is libuv's "nothing yet", not a datagram. */
     if (nread == 0 && addr == NULL) {
+        tjs_udp_callback_leave(u);
         return;
     }
 
@@ -217,6 +293,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
 
     if (u->read.canceled || u->read.settled) {
         tjs_udp_read_clear(ctx, u);
+        tjs_udp_callback_leave(u);
         return;
     }
 
@@ -252,6 +329,7 @@ static void uv__udp_recv_cb(uv_udp_t *handle,
     /* SettlePromise may hook/re-enter GC: free storage first, no `u` after. */
     tjs_udp_read_buffer_clear(ctx, u);
     TJS_SettlePromise(ctx, &u->read.result, is_reject, 1, &arg);
+    tjs_udp_callback_leave(u);
 }
 
 static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -261,7 +339,7 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
         return JS_EXCEPTION;
     }
 
-    if (TJS_IsPromisePending(ctx, &u->read.result)) {
+    if (u->read.starting || TJS_IsPromisePending(ctx, &u->read.result)) {
         return tjs_throw_errno(ctx, UV_EBUSY);
     }
 
@@ -269,26 +347,34 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
     if (!JS_GetUint8Array(ctx, &size, argv[0])) {
         return JS_EXCEPTION;
     }
-    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "udp.recv", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; if (TJS_IsPromisePending(ctx, &u->read.result)) return tjs_throw_errno(ctx, UV_EBUSY); if (!JS_GetUint8Array(ctx, &size, argv[0])) return JS_EXCEPTION; } while (0));
+    TJS_CAPABILITY_REVALIDATE(tjs__capability_network(ctx, TJS_CAP_NETWORK | TJS_CAP_IO_READ, TJS_CAP_FLAG_REPLACEABLE | TJS_CAP_FLAG_ASYNC, "udp.recv", NULL), (void)0, do { u = tjs_udp_get_open(ctx, this_val); if (!u) return JS_EXCEPTION; if (u->read.starting || TJS_IsPromisePending(ctx, &u->read.result)) return tjs_throw_errno(ctx, UV_EBUSY); if (!JS_GetUint8Array(ctx, &size, argv[0])) return JS_EXCEPTION; } while (0));
     u->read.b.tarray = JS_DupValue(ctx, argv[0]);
-    u->read.b.data = js_malloc(ctx, size);
+    /* libuv rejects a zero-length receive buffer before reading. Keep one
+     * private byte so an empty datagram remains observable; the JS target
+     * length is checked again in the receive callback before copying. */
+    u->read.b.data = js_malloc(ctx, size ? size : 1);
     if (!u->read.b.data) {
         JS_FreeValue(ctx, u->read.b.tarray);
         u->read.b.tarray = JS_UNDEFINED;
         return JS_ThrowOutOfMemory(ctx);
     }
-    u->read.b.len = size;
+    u->read.b.len = size ? size : 1;
     u->read.canceled = 0;
     u->read.settled = 0;
 
+    u->read.starting = 1;
     JSValue promise = TJS_InitPromise(ctx, &u->read.result);
+    u->read.starting = 0;
     if (JS_IsException(promise)) {
         tjs_udp_read_clear(ctx, u);
         return promise;
     }
+    TJSUdp *started_udp = u;
     u = tjs_udp_get_open(ctx, this_val);
     if (!u) {
-        /* Hook may have closed the receiver: only drop our duplicate ref. */
+        /* The Promise hook may have closed the socket before its result existed. */
+        TJS_FreePromise(ctx, &started_udp->read.result);
+        tjs_udp_read_clear(ctx, started_udp);
         JS_FreeValue(ctx, promise);
         return JS_EXCEPTION;
     }
@@ -306,20 +392,22 @@ static JSValue tjs_udp_recv(JSContext *ctx, JSValue this_val, int argc, JSValue 
 }
 
 static void uv__udp_send_cb(uv_udp_send_t *req, int status) {
-    TJSUdp *u = req->handle->data;
-    CHECK_NOT_NULL(u);
-
-    JSContext *ctx = u->ctx;
-    JSRuntime *rt = JS_GetRuntime(ctx);
     TJSSendReq *sr = req->data;
-    TJSRuntime *qrt = JS_GetRuntimeOpaque(rt);
+    TJSUdp *u = sr ? sr->owner : NULL;
+    CHECK_NOT_NULL(u);
+    u->callbacks++;
 
     // Safeguard: if runtime is being freed, don't call JS functions
-    if (!qrt || qrt->freeing) {
-        tjs_udp_send_req_free_rt(rt, sr);
+    if (u->finalized || u->runtime_cleaned || !u->trt || u->trt->freeing) {
+        tjs_udp_send_req_free_rt(u->trt ? u->trt->rt : NULL, sr);
+        tjs_udp_callback_leave(u);
         return;
     }
 
+    JSContext *ctx = u->ctx;
+    /* Detach before settlement. Releasing owner_ref may run the finalizer,
+     * so the callback pin must cover request cleanup too. */
+    tjs_udp_send_list_remove(sr);
     int is_reject = 0;
     JSValue arg;
     if (status < 0) {
@@ -331,6 +419,7 @@ static void uv__udp_send_cb(uv_udp_send_t *req, int status) {
 
     TJS_SettlePromise(ctx, &sr->result, is_reject, 1, &arg);
     tjs_udp_send_req_free(ctx, sr);
+    tjs_udp_callback_leave(u);
 }
 
 static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -383,13 +472,17 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
     memset(sr, 0, sizeof(*sr));
 
     sr->req.data = sr;
+    sr->owner = u;
+    init_list_head(&sr->link);
+    sr->linked = false;
+    /* Keep the owner wrapper from finalizing while the request holds its pointer. */
+    sr->owner_ref = JS_DupValue(ctx, this_val);
     sr->tarray = JS_UNDEFINED;
     TJS_ClearPromise(ctx, &sr->result);
     sr->tarray = JS_DupValue(ctx, argv[0]);
     sr->data = size ? js_malloc(ctx, size) : NULL;
     if (size && !sr->data) {
-        JS_FreeValue(ctx, sr->tarray);
-        js_free(ctx, sr);
+        tjs_udp_send_req_free(ctx, sr);
         return JS_ThrowOutOfMemory(ctx);
     }
     if (size) {
@@ -410,8 +503,11 @@ static JSValue tjs_udp_send(JSContext *ctx, JSValue this_val, int argc, JSValue 
     }
 
     b = uv_buf_init((char *) sr->data, size);
+    list_add(&sr->link, &u->sends);
+    sr->linked = true;
     r = uv_udp_send(&sr->req, &u->udp, &b, 1, sa, uv__udp_send_cb);
     if (r != 0) {
+        tjs_udp_send_list_remove(sr);
         TJS_FreePromise(ctx, &sr->result);
         JS_FreeValue(ctx, promise);
         tjs_udp_send_req_free(ctx, sr);
@@ -464,15 +560,74 @@ static JSValue tjs_new_udp(JSContext *ctx, int af) {
     }
 
     u->ctx = ctx;
+    u->trt = TJS_GetRuntime(ctx);
     u->udp.data = u;
     u->read.b.tarray = JS_UNDEFINED;
     u->read.b.data = NULL;
     u->read.b.len = 0;
 
     TJS_ClearPromise(ctx, &u->read.result);
+    tjs_udp_list_add(u);
 
     JS_SetOpaque(obj, u);
     return obj;
+}
+
+void tjs__mod_udp_cleanup_runtime(TJSRuntime *trt) {
+    struct list_head pending;
+    init_list_head(&pending);
+    while (!list_empty(&trt->udps)) {
+        struct list_head *el = trt->udps.next;
+        list_del(el);
+        list_add_tail(el, &pending);
+    }
+    while (!list_empty(&pending)) {
+        TJSUdp *u = list_entry(pending.next, TJSUdp, runtime_link);
+        /* Keep processed handles visible to the drain pass, but obtain each
+         * next handle from the live list: freeing JS roots below can finalize
+         * and remove any other UDP, not just the current one. */
+        list_del(&u->runtime_link);
+        list_add_tail(&u->runtime_link, &trt->udps);
+        u->runtime_cleaned = 1;
+        u->cleanup_active++;
+        u->read.canceled = 1;
+        u->read.settled = 1;
+        uv_udp_recv_stop(&u->udp);
+        maybe_close(u);
+        TJS_FreePromiseRT(trt->rt, &u->read.result);
+        tjs_udp_read_clear_rt(trt->rt, u);
+
+        struct list_head *sel;
+        list_for_each(sel, &u->sends) {
+            TJSSendReq *sr = list_entry(sel, TJSSendReq, link);
+            sr->js_released = 1;
+            JSValue tarray = sr->tarray;
+            JSValue owner_ref = sr->owner_ref;
+            sr->tarray = JS_UNDEFINED;
+            sr->owner_ref = JS_UNDEFINED;
+            TJS_FreePromiseRT(trt->rt, &sr->result);
+            JS_FreeValueRT(trt->rt, tarray);
+            JS_FreeValueRT(trt->rt, owner_ref);
+        }
+        u->cleanup_active--;
+        tjs_udp_maybe_free(u);
+    }
+}
+
+void tjs__mod_udp_drain_runtime(TJSRuntime *trt) {
+    for (;;) {
+        bool pending = false;
+        struct list_head *el;
+        list_for_each(el, &trt->udps) {
+            TJSUdp *u = list_entry(el, TJSUdp, runtime_link);
+            if (!list_empty(&u->sends)) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) return;
+        uv_run(&trt->loop, UV_RUN_ONCE);
+    }
 }
 
 static JSValue tjs_udp_constructor(JSContext *ctx, JSValue new_target, int argc, JSValue *argv) {
@@ -600,11 +755,19 @@ static const JSCFunctionListEntry tjs_udp_funcs[] = {
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSValue proto, obj;
-
     /* UDP class */
-    JS_NewClassID(rt, &tjs_udp_class_id);
-    JS_NewClass(rt, tjs_udp_class_id, &tjs_udp_class);
+    if (JS_NewClassID(rt, &tjs_udp_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate UDP class ID");
+        return;
+    }
+    if (!JS_IsRegisteredClass(rt, tjs_udp_class_id) &&
+        JS_NewClass(rt, tjs_udp_class_id, &tjs_udp_class) < 0) {
+        JS_ThrowInternalError(ctx, "failed to register UDP class");
+        return;
+    }
     proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return;
     JS_SetPropertyFunctionList(ctx, proto, tjs_udp_proto_funcs, countof(tjs_udp_proto_funcs));
     JS_SetClassProto(ctx, tjs_udp_class_id, proto);
 

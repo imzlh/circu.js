@@ -339,11 +339,10 @@ typedef struct {
     bool free_data;
 } napi_ab_payload;
 
-/* Thread-local class ids & registries */
+/* Process-wide class ids and thread-local registries */
 
-static thread_local JSClassID napi_ext_class_id;   /* external + wrap carriers */
-static thread_local JSClassID napi_func_class_id;  /* func bundle carrier      */
-static thread_local bool napi_classes_inited = false;
+static JSClassID napi_ext_class_id;   /* external + wrap carriers */
+static JSClassID napi_func_class_id;  /* func bundle carrier      */
 
 static thread_local struct list_head napi_envs;    /* all napi_env in this ctx */
 static thread_local bool napi_envs_inited = false;
@@ -398,8 +397,12 @@ static void napi_tsfn_dispose(napi_threadsafe_function tsfn) {
         uv_mutex_lock(&owner_env->cleanup_mutex);
         if (tsfn->link.prev && tsfn->link.next)
             list_del(&tsfn->link);
+        /* Removing the last TSFN may let the runtime cleanup waiter proceed
+         * to env finalization. Notify it before releasing the lock, and do not
+         * access owner_env after unlocking. */
+        if (owner_env->cleanup_wakeup)
+            uv_async_send(owner_env->cleanup_wakeup);
         uv_mutex_unlock(&owner_env->cleanup_mutex);
-        napi_env_signal(owner_env);
     }
     uv_mutex_destroy(&tsfn->mutex);
     uv_cond_destroy(&tsfn->cond);
@@ -571,23 +574,6 @@ static void napi_func_bundle_finalize(napi_env env, void *data, void *hint) {
     free(data);
 }
 
-static void napi_ensure_classes(JSContext *ctx) {
-    if (napi_classes_inited) return;
-    JSRuntime *rt = JS_GetRuntime(ctx);
-
-    static JSClassDef ext_def = { .class_name = "NapiExternal", .finalizer = napi_ext_finalizer };
-    static JSClassDef func_def = { .class_name = "NapiFunction",
-                                   .finalizer = napi_func_finalizer,
-                                   .call = napi_fn_call };
-
-    JS_NewClassID(rt, &napi_ext_class_id);
-    JS_NewClass(rt, napi_ext_class_id, &ext_def);
-    JS_NewClassID(rt, &napi_func_class_id);
-    JS_NewClass(rt, napi_func_class_id, &func_def);
-
-    napi_classes_inited = true;
-}
-
 /* Build an external-carrier JSValue (owned). */
 static JSValue napi_make_ext(napi_env env, void *data,
                              napi_finalize finalize_cb, void *finalize_hint) {
@@ -610,8 +596,6 @@ static void napi_run_runtime_finalizer(JSRuntime *rt, void *arg);
 static napi_env napi_env_new(JSContext *ctx, const char *filename, int api_version,
                              TJSDynLib *dynlib) {
     if (!napi_envs_inited) { init_list_head(&napi_envs); napi_envs_inited = true; }
-    napi_ensure_classes(ctx);
-
     napi_env env = calloc(1, sizeof(*env));
     if (!env) return NULL;
     env->ctx = ctx;
@@ -3657,6 +3641,23 @@ static const JSCFunctionListEntry napi_module_funcs[] = {
 };
 
 void tjs__mod_nodeapi_init(JSContext *ctx, JSValue ns) {
-    napi_ensure_classes(ctx);
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    static JSClassDef ext_def = { .class_name = "NapiExternal", .finalizer = napi_ext_finalizer };
+    static JSClassDef func_def = { .class_name = "NapiFunction",
+                                   .finalizer = napi_func_finalizer,
+                                   .call = napi_fn_call };
+
+    if (JS_NewClassID(rt, &napi_ext_class_id) == JS_INVALID_CLASS_ID ||
+        JS_NewClassID(rt, &napi_func_class_id) == JS_INVALID_CLASS_ID) {
+        JS_ThrowInternalError(ctx, "failed to allocate Node-API class IDs");
+        return;
+    }
+    if ((!JS_IsRegisteredClass(rt, napi_ext_class_id) &&
+         JS_NewClass(rt, napi_ext_class_id, &ext_def) < 0) ||
+        (!JS_IsRegisteredClass(rt, napi_func_class_id) &&
+         JS_NewClass(rt, napi_func_class_id, &func_def) < 0)) {
+        JS_ThrowOutOfMemory(ctx);
+        return;
+    }
     JS_SetPropertyFunctionList(ctx, ns, napi_module_funcs, countof(napi_module_funcs));
 }
