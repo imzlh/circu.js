@@ -830,14 +830,15 @@ static int materialize_spawn_stdio(JSContext *ctx, TJSProcess *p,
     if (has_stdio_extra) {
         p->stdio_extra = JS_NewArray(ctx);
         if (JS_IsException(p->stdio_extra)) return -1;
-        for (uint32_t fd = 0; fd < options->stdio_count; fd++) {
-            if (JS_SetPropertyUint32(ctx, p->stdio_extra, fd, JS_NULL) < 0)
+        for (int fd = 0; fd < options->stdio_count; fd++) {
+            if (JS_SetPropertyUint32(ctx, p->stdio_extra, (uint32_t)fd, JS_NULL) < 0)
                 return -1;
         }
     }
 
-    for (uint32_t fd = 0; fd < options->stdio_count; fd++) {
-        if (use_ipc && fd == ipc_fd) continue;
+    for (int fd = 0; fd < options->stdio_count; fd++) {
+        uint32_t index = (uint32_t)fd;
+        if (use_ipc && index == ipc_fd) continue;
         if (!(options->stdio[fd].flags & UV_CREATE_PIPE)) continue;
 
         JSValue pipe_obj = tjs_new_pipe(ctx);
@@ -853,7 +854,7 @@ static int materialize_spawn_stdio(JSContext *ctx, TJSProcess *p,
         if (fd < 3) {
             p->stdio[fd] = pipe_obj;
         } else if (!JS_IsUndefined(p->stdio_extra)) {
-            if (JS_SetPropertyUint32(ctx, p->stdio_extra, fd, pipe_obj) < 0)
+            if (JS_SetPropertyUint32(ctx, p->stdio_extra, index, pipe_obj) < 0)
                 return -1;
         } else {
             JS_FreeValue(ctx, pipe_obj);

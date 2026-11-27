@@ -265,29 +265,38 @@ if(NOT _cjs_libuv_major MATCHES "UV_VERSION_MAJOR +1$")
 endif()
 find_package(Git REQUIRED)
 set(_cjs_libuv_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/libuv-copyfile-safety.patch")
-execute_process(
-    COMMAND "${GIT_EXECUTABLE}" apply --check "${_cjs_libuv_patch}"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
-    RESULT_VARIABLE _cjs_libuv_patch_check
-    OUTPUT_QUIET ERROR_QUIET
-)
-if(_cjs_libuv_patch_check EQUAL 0)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" apply "${_cjs_libuv_patch}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
-        RESULT_VARIABLE _cjs_libuv_patch_result
-    )
-    if(NOT _cjs_libuv_patch_result EQUAL 0)
-        message(FATAL_ERROR "Failed to apply the required libuv copyfile safety patch")
-    endif()
+set(_cjs_libuv_source "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv/src/unix/fs.c")
+if(NOT EXISTS "${_cjs_libuv_source}")
+    message(FATAL_ERROR "The required libuv copyfile safety patch target does not exist")
+endif()
+file(READ "${_cjs_libuv_source}" _cjs_libuv_source_contents)
+set(_cjs_libuv_directory_guard "if (!S_ISREG(src_statsbuf.st_mode))")
+set(_cjs_libuv_zero_write_guard "if (bytes_written == 0)")
+string(FIND "${_cjs_libuv_source_contents}" "${_cjs_libuv_directory_guard}" _cjs_libuv_directory_guard_index)
+string(FIND "${_cjs_libuv_source_contents}" "${_cjs_libuv_zero_write_guard}" _cjs_libuv_zero_write_guard_index)
+string(FIND "${_cjs_libuv_source_contents}" "${_cjs_libuv_directory_guard}" _cjs_libuv_directory_guard_last_index REVERSE)
+string(FIND "${_cjs_libuv_source_contents}" "${_cjs_libuv_zero_write_guard}" _cjs_libuv_zero_write_guard_last_index REVERSE)
+if(_cjs_libuv_directory_guard_index GREATER_EQUAL 0 AND _cjs_libuv_directory_guard_index EQUAL _cjs_libuv_directory_guard_last_index AND _cjs_libuv_zero_write_guard_index GREATER_EQUAL 0 AND _cjs_libuv_zero_write_guard_index EQUAL _cjs_libuv_zero_write_guard_last_index)
+    message(STATUS "Required libuv copyfile safety patch is already applied")
+elseif(_cjs_libuv_directory_guard_index GREATER_EQUAL 0 OR _cjs_libuv_zero_write_guard_index GREATER_EQUAL 0)
+    message(FATAL_ERROR "The required libuv copyfile safety patch is partial or duplicated")
 else()
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_cjs_libuv_patch}"
+        COMMAND "${GIT_EXECUTABLE}" apply --check "${_cjs_libuv_patch}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
-        RESULT_VARIABLE _cjs_libuv_patch_reverse_check
+        RESULT_VARIABLE _cjs_libuv_patch_check
         OUTPUT_QUIET ERROR_QUIET
     )
-    if(NOT _cjs_libuv_patch_reverse_check EQUAL 0)
+    if(_cjs_libuv_patch_check EQUAL 0)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply "${_cjs_libuv_patch}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
+            RESULT_VARIABLE _cjs_libuv_patch_result
+        )
+        if(NOT _cjs_libuv_patch_result EQUAL 0)
+            message(FATAL_ERROR "Failed to apply the required libuv copyfile safety patch")
+        endif()
+    else()
         message(FATAL_ERROR "The required libuv copyfile safety patch does not apply cleanly")
     endif()
 endif()
