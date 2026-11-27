@@ -280,6 +280,36 @@ static void test_process_classes_across_runtimes(void) {
     TJS_FreeRuntime(first_runtime);
 }
 
+static void test_process_probe_preserves_permission_errors(void) {
+    TJSRuntime *runtime = new_runtime();
+    JSContext *ctx = runtime->main_ctx;
+    fail_kill_pids[0] = 424242;
+    fail_kill_pid_count = 1;
+    injected_kill_failures = 0;
+
+    JSValue result = eval(ctx,
+        "(() => {"
+        " let code;"
+        " try { process.probe(424242); } catch (error) { code = error.code; }"
+        " return [code, process.isAlive(424242)];"
+        "})()");
+    JSValue code = JS_GetPropertyUint32(ctx, result, 0);
+    int32_t error_code;
+    CHECK_EQ(JS_ToInt32(ctx, &error_code, code), 0);
+    CHECK_EQ(error_code, UV_EPERM);
+    JSValue alive = JS_GetPropertyUint32(ctx, result, 1);
+    CHECK(JS_ToBool(ctx, alive));
+    CHECK_EQ(injected_kill_failures, 2);
+    JS_FreeValue(ctx, alive);
+    JS_FreeValue(ctx, code);
+    JS_FreeValue(ctx, result);
+
+    fail_kill_pids[0] = 0;
+    fail_kill_pid_count = 0;
+    injected_kill_failures = 0;
+    TJS_FreeRuntime(runtime);
+}
+
 static unsigned fork_jobs_run;
 
 static JSValue fork_last_job(JSContext *ctx, int argc, JSValueConst *argv) {
@@ -447,6 +477,7 @@ int main(void) {
     test_wait_init_reentry(true);
     test_wait_init_reentry(false);
     test_process_classes_across_runtimes();
+    test_process_probe_preserves_permission_errors();
     test_fork_last_job();
     test_fork_rejects_unref_timer();
     test_teardown_reaps_children();

@@ -3732,6 +3732,20 @@ static JSValue tjs_process_is_alive(JSContext *ctx, JSValue this_val, int argc, 
     return tjs_throw_errno(ctx, r);
 }
 
+static JSValue tjs_process_probe(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+    if (argc == 0 || JS_IsUndefined(argv[0]))
+        return JS_ThrowTypeError(ctx, "probe(pid)");
+
+    int32_t pid;
+    if (JS_ToInt32(ctx, &pid, argv[0])) return JS_EXCEPTION;
+
+    TJS_CAPABILITY(tjs__capability(ctx, TJS_CAP_PROCESS | TJS_CAP_IO_ACCESS, TJS_CAP_FLAG_REPLACEABLE, "process.probe"), (void)0);
+
+    int r = uv_kill(pid, 0);
+    if (r != 0) return tjs_throw_errno(ctx, r);
+    return JS_UNDEFINED;
+}
+
 static JSValue tjs_exec(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
 #ifdef _WIN32
     return tjs_throw_errno_msg(ctx, UV_ENOSYS, "exec() not supported on Windows");
@@ -3791,6 +3805,7 @@ static const JSCFunctionListEntry tjs_process_funcs[] = {
     TJS_CFUNC_DEF("fork",      0, tjs_fork),
     TJS_CFUNC_DEF("kill",      2, tjs_kill),
     TJS_CFUNC_DEF("isAlive",   1, tjs_process_is_alive),
+    TJS_CFUNC_DEF("probe",     1, tjs_process_probe),
     TJS_CFUNC_DEF("exec",      1, tjs_exec),
 };
 /* clang-format on */

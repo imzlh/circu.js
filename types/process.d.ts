@@ -247,4 +247,10 @@ declare namespace CModuleProcess {
      * A permissions error still counts as alive.
      */
     export function isAlive(pid: number): boolean;
+
+    /**
+     * Check process existence without sending a signal, preserving permission errors.
+     * @param pid Process ID
+     */
+    export function probe(pid: number): void;
 }
