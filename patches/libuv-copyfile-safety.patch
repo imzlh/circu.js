@@ -1,0 +1,33 @@
+diff --git a/src/unix/fs.c b/src/unix/fs.c
+index 06a6986e..56bda381 100644
+--- a/src/unix/fs.c
++++ b/src/unix/fs.c
+@@ -1274,6 +1274,14 @@ static int uv__fs_copyfile(uv_fs_t* req) {
+     goto out;
+   }
+ 
++  /* Reject directories before opening the destination.  The source fd is the
++   * identity that was validated; checking the path before uv_fs_copyfile()
++   * would leave a source-replacement window and could truncate the target. */
++  if (!S_ISREG(src_statsbuf.st_mode)) {
++    err = UV_EISDIR;
++    goto out;
++  }
++
+   dst_flags = O_WRONLY | O_CREAT;
+ 
+   if (req->flags & UV_FS_COPYFILE_EXCL)
+@@ -1407,6 +1415,13 @@ static int uv__fs_copyfile(uv_fs_t* req) {
+       break;
+     }
+ 
++    if (bytes_written == 0) {
++      /* The source may have shrunk after fstat(). A zero-byte sendfile
++       * otherwise leaves bytes_to_send unchanged and spins forever. */
++      err = UV_EIO;
++      break;
++    }
++
+     bytes_to_send -= bytes_written;
+     in_offset += bytes_written;
+   }

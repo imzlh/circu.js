@@ -263,6 +263,34 @@ if(NOT _cjs_libuv_major MATCHES "UV_VERSION_MAJOR +1$")
         "circu.js requires libuv 1.x. Use the stable v1.53.0 tag; "
         "libuv 2.x has incompatible file descriptor and other APIs.")
 endif()
+find_package(Git REQUIRED)
+set(_cjs_libuv_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/libuv-copyfile-safety.patch")
+execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --check "${_cjs_libuv_patch}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
+    RESULT_VARIABLE _cjs_libuv_patch_check
+    OUTPUT_QUIET ERROR_QUIET
+)
+if(_cjs_libuv_patch_check EQUAL 0)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply "${_cjs_libuv_patch}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
+        RESULT_VARIABLE _cjs_libuv_patch_result
+    )
+    if(NOT _cjs_libuv_patch_result EQUAL 0)
+        message(FATAL_ERROR "Failed to apply the required libuv copyfile safety patch")
+    endif()
+else()
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_cjs_libuv_patch}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/libuv"
+        RESULT_VARIABLE _cjs_libuv_patch_reverse_check
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(NOT _cjs_libuv_patch_reverse_check EQUAL 0)
+        message(FATAL_ERROR "The required libuv copyfile safety patch does not apply cleanly")
+    endif()
+endif()
 add_subdirectory(deps/libuv EXCLUDE_FROM_ALL)
 
 set(_cjs_enable_static_esm_test OFF)
