@@ -88,6 +88,7 @@ typedef struct {
     int pin_count;
     JSValue callbacks[STREAM_CB_MAX];
     uint8_t *read_buf;               /* dynamically allocated for the streaming onread path */
+    bool read_alloc_failed;
 #ifdef _WIN32
     uint8_t *tty_read_buf;
     size_t tty_read_buf_size;
@@ -420,6 +421,7 @@ static void stream_alloc_tty_read_buf(TJSStream *s,
     if (s->tty_read_buf_size < size) {
         uint8_t *data = tjs__realloc(s->tty_read_buf, size);
         if (!data) {
+            s->read_alloc_failed = true;
             buf->base = NULL;
             buf->len = 0;
             return;
@@ -612,6 +614,7 @@ static JSValue tjs_stream_close(JSContext *ctx, JSValue this_val, int argc, JSVa
 static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     TJSStream *s = handle->data;
     CHECK_NOT_NULL(s);
+    s->read_alloc_failed = false;
 #ifdef _WIN32
     if (stream_is_windows_tty(s)) {
         stream_alloc_tty_read_buf(s, suggested_size, buf);
@@ -619,6 +622,7 @@ static void uv__stream_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_b
     }
 #endif
     s->read_buf = js_malloc(s->ctx, suggested_size);
+    s->read_alloc_failed = s->read_buf == NULL;
     if (s->read_buf) {
         buf->base = (char *)s->read_buf;
         buf->len  = suggested_size;
@@ -635,6 +639,8 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
         uv_is_closing(&s->h.handle))
         return;
     JSContext *ctx = s->ctx;
+    bool read_alloc_failed = s->read_alloc_failed;
+    s->read_alloc_failed = false;
 
     if (nread == 0) { /* EAGAIN — nothing to read, discard buffer */
         js_free(ctx, s->read_buf);
@@ -650,7 +656,15 @@ static void uv__stream_read_cb(uv_stream_t *handle, ssize_t nread, const uv_buf_
     if (nread < 0) {
         js_free(ctx, s->read_buf);
         s->read_buf = NULL;
-        if (stream_is_eof(s, nread)) {
+        if (read_alloc_failed) {
+            JS_ThrowOutOfMemory(ctx);
+            args[0] = JS_UNDEFINED;
+            args[1] = JS_GetException(ctx);
+            if (JS_IsNull(args[1])) {
+                JS_ThrowOutOfMemory(ctx);
+                args[1] = JS_GetException(ctx);
+            }
+        } else if (stream_is_eof(s, nread)) {
             args[0] = JS_NULL;       /* EOF: onread(null, undefined) */
             args[1] = JS_UNDEFINED;
         } else {
@@ -1364,6 +1378,7 @@ static JSValue tjs_init_stream(JSContext *ctx, JSValue obj, TJSStream *s) {
     s->pin_count     = 0;
     s->callback_refs = 0;
     s->read_buf      = NULL;
+    s->read_alloc_failed = false;
 #ifdef _WIN32
     s->tty_read_buf = NULL;
     s->tty_read_buf_size = 0;
