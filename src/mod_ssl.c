@@ -695,7 +695,7 @@ static JSValue tjs_ssl_certificate_bio_string(JSContext *ctx, BIO *output) {
 }
 
 static int tjs_ssl_certificate_set_name(JSContext *ctx, JSValue target, const char *key,
-                                        X509_NAME *name, BIO *output) {
+                                        const X509_NAME *name, BIO *output) {
     BIO_reset(output);
     if (X509_NAME_print_ex(output, name, 0,
             ASN1_STRFLGS_ESC_2253 | ASN1_STRFLGS_ESC_CTRL | ASN1_STRFLGS_UTF8_CONVERT |
