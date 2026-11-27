@@ -686,6 +686,11 @@ int main(int argc, char **argv) {
     CHECK_EQ(uv_dlsym(&fixture, "nodeapi_fixture_prepare_closing_tsfn",
                       (void **)&prepare_closing_tsfn), 0);
     prepare_closing_tsfn();
+    /* Drop the test loader's reference.  The runtime-owned reference is the
+     * only one left, so calling this function after TJS_FreeRuntime verifies
+     * that Node-API teardown deferred image unload instead of relying on an
+     * unrelated external dlopen reference. */
+    uv_dlclose(&fixture);
     JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, path);
     JS_FreeValue(ctx, dlopen);
@@ -703,7 +708,6 @@ int main(int argc, char **argv) {
     CHECK_EQ(probe.checks, 1);
     CHECK_EQ(teardown_jobs_run, 0);
     check_fixture();
-    uv_dlclose(&fixture);
     return 0;
 }
 #endif

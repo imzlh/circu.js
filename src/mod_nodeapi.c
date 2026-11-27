@@ -142,9 +142,12 @@ bool tjs__nodeapi_defer_dynlib(TJSDynLib *lib) {
     bool deferred = false;
     napi_dynlib_init();
     uv_mutex_lock(&napi_deferred_dynlibs_mutex);
-    if (lib->nodeapi_pins != 0 && !lib->nodeapi_deferred) {
-        napi_dynlib_state *state = napi_dynlib_state_find_locked(lib);
-        CHECK_NOT_NULL(state);
+    /* N-API exposes a process-wide C ABI. Runtime teardown cannot enumerate
+     * every exported API invocation that may still be returning through an
+     * addon image (for example napi_release_threadsafe_function on a worker
+     * thread). Keep every Node-API image loaded until process exit instead of
+     * relying solely on TSFN pins, which only model one subset of that ABI. */
+    if (!lib->nodeapi_deferred) {
         list_add_tail(&lib->link, &napi_deferred_dynlibs);
         lib->nodeapi_deferred = true;
         deferred = true;
